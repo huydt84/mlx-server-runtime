@@ -1,67 +1,106 @@
-"""Phase 1 non-streaming inference engine backed by direct `mlx-lm` calls."""
+"""Phase 1 worker engine with direct `mlx-lm` calls and batch completions."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Callable, Sequence
 
-from mlx_lm import load, stream_generate
-from mlx_lm.sample_utils import make_sampler
-
-from typing import Callable
-
-from .ipc import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-    ChatMessage,
+from .batching import (
+    BatchBackendContext,
+    BatchCompletionBackend,
+    PromptCacheStore,
+    create_default_batch_backend,
 )
+from .ipc import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
+
+
+def _load_mlx_components() -> tuple[
+    Callable[[str], tuple[Any, Any]],
+    Callable[..., Any],
+    Callable[[float, float], Callable[[Any], Any]],
+]:
+    """Load the runtime MLX components lazily."""
+
+    try:
+        from mlx_lm import load, stream_generate
+        from mlx_lm.sample_utils import make_sampler
+    except ModuleNotFoundError as exc:  # pragma: no cover - host-only dependency
+        raise RuntimeError("mlx_lm is required for the default worker engine") from exc
+
+    return load, stream_generate, make_sampler
+
+
+def _noop_sampler(_temp: float, _top_p: float) -> Callable[[Any], Any]:
+    """Fallback sampler used only when tests inject their own backend."""
+
+    return lambda logits: logits
 
 
 @dataclass
 class MlxWorkerEngine:
-    """A minimal Phase 1 worker engine using direct `mlx-lm` primitives."""
+    """A worker engine using direct `mlx-lm` generation primitives."""
 
     model_id: str
+    model_loader: Callable[[str], tuple[Any, Any]] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    batch_backend_factory: (
+        Callable[[BatchBackendContext], BatchCompletionBackend] | None
+    ) = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
-        """Load the configured model and tokenizer once at worker startup."""
+        """Load the configured model and configure batching."""
 
-        self.model, self.tokenizer = load(self.model_id)
+        if self.model_loader is None:
+            load_model, sg, ms = _load_mlx_components()
+            self._model_loader = load_model
+            self._stream_generate = sg
+            self._make_sampler = ms
+        else:
+            self._model_loader = self.model_loader
+            if self.batch_backend_factory is None:
+                _, self._stream_generate, self._make_sampler = _load_mlx_components()
+            else:
+                self._stream_generate = None
+                self._make_sampler = _noop_sampler
+
+        self.model, self.tokenizer = self._model_loader(self.model_id)
+        self._prompt_cache_store = PromptCacheStore()
+        context = BatchBackendContext(
+            model_id=self.model_id,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt_cache_store=self._prompt_cache_store,
+            build_prompt_tokens=self._build_prompt_tokens,
+            validate_token_limits=self._validate_token_limits,
+            make_sampler=self._make_sampler,
+        )
+        backend_factory = self.batch_backend_factory or create_default_batch_backend
+        self._batch_backend = backend_factory(context)
 
     def complete_chat(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Generate one non-streaming chat completion."""
 
-        if request.model != self.model_id:
-            raise ValueError(
-                f"requested model '{request.model}' does not match loaded model '{self.model_id}'"
-            )
+        return self.complete_many([request])[0]
 
-        prompt = self._build_prompt(request)
-        self._validate_token_limits(request, prompt)
-        sampler = make_sampler(temp=request.temperature, top_p=request.top_p)
-        text_segments: list[str] = []
-        final_response = None
+    def complete_many(
+        self, requests: Sequence[ChatCompletionRequest]
+    ) -> list[ChatCompletionResponse]:
+        """Generate a batch of non-streaming chat completions."""
 
-        for response in stream_generate(
-            self.model,
-            self.tokenizer,
-            prompt,
-            max_tokens=request.max_tokens,
-            sampler=sampler,
-        ):
-            text_segments.append(response.text)
-            final_response = response
+        for request in requests:
+            if request.model != self.model_id:
+                raise ValueError(
+                    f"requested model '{request.model}' does not match loaded model '{self.model_id}'"
+                )
 
-        if final_response is None:
-            raise RuntimeError("mlx-lm returned no completion response")
-
-        return ChatCompletionResponse(
-            request_id=request.request_id,
-            model=self.model_id,
-            text="".join(text_segments),
-            finish_reason=final_response.finish_reason or "stop",
-            prompt_tokens=int(final_response.prompt_tokens),
-            completion_tokens=int(final_response.generation_tokens),
-        )
+        return self._batch_backend.complete_many(list(requests))
 
     def stream_chat(
         self,
@@ -76,16 +115,19 @@ class MlxWorkerEngine:
                 f"requested model '{request.model}' does not match loaded model '{self.model_id}'"
             )
 
-        prompt = self._build_prompt(request)
-        self._validate_token_limits(request, prompt)
-        sampler = make_sampler(temp=request.temperature, top_p=request.top_p)
+        prompt_tokens = self._build_prompt_tokens(request)
+        self._validate_token_limits(request, prompt_tokens)
+        if self._stream_generate is None:
+            raise RuntimeError("streaming requires the MLX runtime components")
+
+        sampler = self._make_sampler(request.temperature, request.top_p)
         text_segments: list[str] = []
         final_response = None
 
-        for response in stream_generate(
+        for response in self._stream_generate(
             self.model,
             self.tokenizer,
-            prompt,
+            prompt_tokens,
             max_tokens=request.max_tokens,
             sampler=sampler,
         ):
@@ -140,8 +182,8 @@ class MlxWorkerEngine:
             )
         )
 
-    def _build_prompt(self, request: ChatCompletionRequest) -> list[int] | str:
-        """Convert chat messages into the simplest supported prompt form."""
+    def _build_prompt_tokens(self, request: ChatCompletionRequest) -> list[int]:
+        """Convert chat messages into prompt token ids."""
 
         messages = [
             {"role": message.role, "content": message.content}
@@ -149,38 +191,39 @@ class MlxWorkerEngine:
         ]
 
         if getattr(self.tokenizer, "has_chat_template", False):
-            return self.tokenizer.apply_chat_template(
+            tokens = self.tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
             )
-
-        return (
-            "\n".join(
-                f"{message.role.capitalize()}: {message.content}"
-                for message in request.messages
+        else:
+            prompt = (
+                "\n".join(
+                    f"{message.role.capitalize()}: {message.content}"
+                    for message in request.messages
+                )
+                + "\nAssistant:"
             )
-            + "\nAssistant:"
-        )
+            tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+
+        if hasattr(tokens, "tolist"):
+            tokens = tokens.tolist()
+        return list(tokens)
 
     def _validate_token_limits(
         self,
         request: ChatCompletionRequest,
-        prompt: list[int] | str,
+        prompt_tokens: Sequence[int],
     ) -> None:
         """Reject prompts that exceed gateway token caps."""
 
-        if isinstance(prompt, list):
-            prompt_tokens = len(prompt)
-        else:
-            prompt_tokens = len(self.tokenizer.encode(prompt, add_special_tokens=False))
-
+        prompt_token_count = len(prompt_tokens)
         completion_tokens = request.max_tokens
-        total_tokens = prompt_tokens + completion_tokens
+        total_tokens = prompt_token_count + completion_tokens
 
-        if prompt_tokens > request.max_prompt_tokens:
+        if prompt_token_count > request.max_prompt_tokens:
             raise ValueError(
-                f"prompt too long: {prompt_tokens} tokens exceeds max_prompt_tokens {request.max_prompt_tokens}"
+                f"prompt too long: {prompt_token_count} tokens exceeds max_prompt_tokens {request.max_prompt_tokens}"
             )
         if completion_tokens > request.max_completion_tokens:
             raise ValueError(
