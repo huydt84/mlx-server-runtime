@@ -1,6 +1,7 @@
 use crate::config::RuntimeConfig;
 use crate::errors::GatewayError;
 use crate::ipc::WorkerClient;
+use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
     decode_worker_message, ModelState, ModelStatus, WorkerError, WorkerMessage, WorkerReady,
 };
@@ -23,6 +24,8 @@ pub struct RuntimeState {
     pub model_status: Arc<RwLock<ModelStatus>>,
     /// The active worker client, if the bootstrap handshake completed.
     pub worker_client: Arc<Mutex<Option<Arc<WorkerClient>>>>,
+    /// Shared telemetry registry.
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 impl RuntimeState {
@@ -33,6 +36,24 @@ impl RuntimeState {
             pid: std::process::id(),
             model_status: Arc::new(RwLock::new(ModelStatus::new(model))),
             worker_client: Arc::new(Mutex::new(None)),
+            metrics: {
+                let metrics = Arc::new(MetricsRegistry::new());
+                metrics.set_worker_memory_bytes(0);
+                metrics.set_kv_cache_bytes(0);
+                metrics
+            },
+        }
+    }
+
+    /// Creates a runtime state with a shared metrics registry (for tests).
+    #[cfg(test)]
+    pub fn new_with_metrics(model: impl Into<String>, metrics: Arc<MetricsRegistry>) -> Self {
+        Self {
+            started_at: Instant::now(),
+            pid: std::process::id(),
+            model_status: Arc::new(RwLock::new(ModelStatus::new(model))),
+            worker_client: Arc::new(Mutex::new(None)),
+            metrics,
         }
     }
 
@@ -58,6 +79,7 @@ impl RuntimeState {
                 status.model, previous_state, new_state
             );
         }
+        self.metrics.set_worker_up(status.ready);
         *guard = status;
         Ok(())
     }
@@ -76,6 +98,7 @@ impl RuntimeState {
                 guard.model, previous_state, state
             );
         }
+        self.metrics.set_worker_up(guard.ready);
         Ok(())
     }
 
@@ -97,6 +120,7 @@ impl RuntimeState {
                 guard.model, previous_state, guard.state
             );
         }
+        self.metrics.set_worker_up(false);
         Ok(())
     }
 }
@@ -204,7 +228,10 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
                 let _ = runtime.set_status(*status);
             }
             Some(WorkerMessage::Ready(WorkerReady)) => {
-                let client = Arc::new(WorkerClient::new(connection.try_clone()?)?);
+                let client = Arc::new(WorkerClient::new(
+                    connection.try_clone()?,
+                    runtime.metrics.clone(),
+                )?);
                 let mut guard = runtime.worker_client.lock().map_err(|_| {
                     GatewayError::Protocol("worker client lock poisoned".to_string())
                 })?;

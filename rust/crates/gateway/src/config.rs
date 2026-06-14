@@ -52,6 +52,24 @@ pub struct RequestLimits {
     pub request_timeout_seconds: u64,
 }
 
+/// Telemetry settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelemetryConfig {
+    /// Whether Prometheus metrics are enabled.
+    pub enable_prometheus: bool,
+    /// HTTP path for metrics exposition.
+    pub metrics_path: String,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enable_prometheus: true,
+            metrics_path: "/metrics".to_string(),
+        }
+    }
+}
+
 /// Runtime configuration for the Phase 0 skeleton.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -63,6 +81,8 @@ pub struct RuntimeConfig {
     pub generation: GenerationConfig,
     /// Request backpressure limits.
     pub limits: RequestLimits,
+    /// Telemetry settings.
+    pub telemetry: TelemetryConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -90,6 +110,10 @@ impl Default for RuntimeConfig {
                 max_completion_tokens: 4_096,
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
+            },
+            telemetry: TelemetryConfig {
+                enable_prometheus: true,
+                metrics_path: "/metrics".to_string(),
             },
         }
     }
@@ -200,6 +224,12 @@ impl RuntimeConfig {
                         )
                     })?
                 }
+                ("telemetry", "enable_prometheus", Value::Bool(value)) => {
+                    config.telemetry.enable_prometheus = value
+                }
+                ("telemetry", "metrics_path", Value::String(metrics_path)) => {
+                    config.telemetry.metrics_path = metrics_path
+                }
                 _ => {}
             }
         }
@@ -224,7 +254,7 @@ enum Value {
     String(String),
     Integer(i64),
     Float(f32),
-    Bool(()),
+    Bool(bool),
 }
 
 fn parse_value(raw: &str) -> io::Result<Value> {
@@ -241,7 +271,8 @@ fn parse_value(raw: &str) -> io::Result<Value> {
     }
 
     match raw {
-        "true" | "false" => Ok(Value::Bool(())),
+        "true" => Ok(Value::Bool(true)),
+        "false" => Ok(Value::Bool(false)),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported value: {other}"),
@@ -296,6 +327,10 @@ mod tests {
             max_completion_tokens = 256
             max_total_tokens_per_request = 2048
             request_timeout_seconds = 10
+
+            [telemetry]
+            enable_prometheus = false
+            metrics_path = "/custom-metrics"
             "#,
         )
         .unwrap();
@@ -317,5 +352,7 @@ mod tests {
         assert_eq!(config.limits.max_completion_tokens, 256);
         assert_eq!(config.limits.max_total_tokens_per_request, 2048);
         assert_eq!(config.limits.request_timeout_seconds, 10);
+        assert!(!config.telemetry.enable_prometheus);
+        assert_eq!(config.telemetry.metrics_path, "/custom-metrics");
     }
 }

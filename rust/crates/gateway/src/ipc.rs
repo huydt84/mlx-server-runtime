@@ -1,27 +1,30 @@
 use crate::errors::GatewayError;
+use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
     decode_worker_event, encode_gateway_command, ChatCompletionRequest, ChatCompletionResponse,
     GatewayCommand, WorkerEvent,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A serialized request/response client for the Python worker.
 pub struct WorkerClient {
     request_lock: Mutex<()>,
     writer: Mutex<UnixStream>,
     reader: Mutex<BufReader<UnixStream>>,
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl WorkerClient {
     /// Creates a client from an established worker connection.
-    pub fn new(stream: UnixStream) -> Result<Self, GatewayError> {
+    pub fn new(stream: UnixStream, metrics: Arc<MetricsRegistry>) -> Result<Self, GatewayError> {
         let reader_stream = stream.try_clone()?;
         Ok(Self {
             request_lock: Mutex::new(()),
             writer: Mutex::new(stream),
             reader: Mutex::new(BufReader::new(reader_stream)),
+            metrics,
         })
     }
 
@@ -56,6 +59,7 @@ impl WorkerClient {
             .map_err(|err| GatewayError::Protocol(format!("encode command failed: {err}")))?;
         writeln!(writer, "{encoded}")?;
         writer.flush()?;
+        self.metrics.increment_ipc_messages_sent_total();
         Ok(())
     }
 
@@ -82,6 +86,8 @@ impl WorkerClient {
             writeln!(writer, "{encoded}")?;
             writer.flush()?;
         }
+        self.metrics.increment_ipc_messages_sent_total();
+        let roundtrip_started = std::time::Instant::now();
 
         let mut stale_count = 0u32;
         const MAX_STALE_EVENTS: u32 = 10000;
@@ -99,6 +105,7 @@ impl WorkerClient {
                     "worker closed the inference socket".to_string(),
                 ));
             }
+            self.metrics.increment_ipc_messages_received_total();
 
             match decode_worker_event(&line).map_err(|err| {
                 GatewayError::Protocol(format!("decode worker event failed: {err}"))
@@ -130,6 +137,9 @@ impl WorkerClient {
                         }
                         continue;
                     }
+                    self.metrics.record_ipc_roundtrip_latency_ms(
+                        roundtrip_started.elapsed().as_millis() as u64,
+                    );
                     return Ok(response);
                 }
                 WorkerEvent::Error {

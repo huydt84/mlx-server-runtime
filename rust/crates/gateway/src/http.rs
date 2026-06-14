@@ -2,6 +2,7 @@ use crate::config::RuntimeConfig;
 use crate::errors::GatewayError;
 use crate::openai::{ChatCompletionHttpRequest, ChatCompletionHttpResponse};
 use crate::supervisor::RuntimeState;
+use crate::telemetry::RequestTracker;
 use mlx_runtime_protocol::{
     ChatCompletionRequest, ChatCompletionResponse, ModelState, ModelStatus,
 };
@@ -84,6 +85,7 @@ struct AppState {
     runtime: RuntimeState,
     generation: crate::config::GenerationConfig,
     limits: crate::config::RequestLimits,
+    telemetry: crate::config::TelemetryConfig,
     admission: Arc<RequestAdmission>,
     model: String,
     test_backend: Option<Arc<dyn ChatCompletionService>>,
@@ -144,6 +146,17 @@ impl RequestAdmission {
                 "request admission cancelled unexpectedly",
             )),
         }
+    }
+
+    fn snapshot(&self) -> Result<(usize, usize), HttpResponse> {
+        let guard = self.state.lock().map_err(|_| {
+            json_error_response(
+                "500 Internal Server Error",
+                "BACKPRESSURE_LOCK_POISONED",
+                "request admission lock poisoned",
+            )
+        })?;
+        Ok((guard.active, guard.waiting))
     }
 
     fn acquire_until(
@@ -226,6 +239,7 @@ pub fn serve(config: RuntimeConfig, runtime: RuntimeState) -> Result<(), Gateway
                     runtime: runtime.clone(),
                     generation: config.generation.clone(),
                     limits: config.limits.clone(),
+                    telemetry: config.telemetry.clone(),
                     admission: admission.clone(),
                     model: config.worker.model.clone(),
                     test_backend: None,
@@ -306,6 +320,11 @@ fn response_for_request(request_line: &str, body: &[u8], state: &AppState) -> Ht
         ("GET", "/startup") => startup_response(&state.runtime),
         ("GET", "/ready") => readiness_response(&state.runtime),
         ("GET", "/health") => health_response(&state.runtime),
+        ("GET", path)
+            if state.telemetry.enable_prometheus && path == state.telemetry.metrics_path =>
+        {
+            metrics_response(&state.runtime, &state.admission)
+        }
         ("GET", "/models") => models_response(&state.runtime),
         ("POST", "/v1/chat/completions") => handle_chat_completion(body, state),
         _ if method == "GET" && path.starts_with("/models/") && path.ends_with("/status") => {
@@ -415,6 +434,21 @@ fn health_response(runtime: &RuntimeState) -> HttpResponse {
     }
 }
 
+fn metrics_response(runtime: &RuntimeState, admission: &Arc<RequestAdmission>) -> HttpResponse {
+    let queue_depth = match admission.snapshot() {
+        Ok((_, waiting)) => waiting as u64,
+        Err(response) => {
+            return response;
+        }
+    };
+    let body = runtime.metrics.render_prometheus(queue_depth);
+    HttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "text/plain; version=0.0.4; charset=utf-8",
+        body,
+    }
+}
+
 fn models_response(runtime: &RuntimeState) -> HttpResponse {
     match runtime.snapshot() {
         Ok(status) => HttpResponse {
@@ -506,10 +540,25 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
             }
         };
 
+    let queue_started_at = Instant::now();
     let _permit = match state.admission.acquire() {
         Ok(permit) => permit,
-        Err(response) => return response,
+        Err(response) => {
+            if response.status.starts_with("429") {
+                state.runtime.metrics.increment_queue_rejected_total();
+            }
+            return response;
+        }
     };
+    let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
+    let request_tracker = Arc::new(RequestTracker::new(
+        state.runtime.metrics.clone(),
+        worker_request.request_id.clone(),
+        state.model.clone(),
+        worker_request.max_tokens,
+        false,
+        queue_time_ms,
+    ));
 
     let backend = if let Some(backend) = &state.test_backend {
         Some(backend.clone())
@@ -519,6 +568,13 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
                 .as_ref()
                 .map(|client| client.clone() as Arc<dyn ChatCompletionService>),
             Err(_) => {
+                request_tracker.finish(
+                    0,
+                    0,
+                    None,
+                    false,
+                    Some("worker client lock poisoned".to_string()),
+                );
                 return json_error_response(
                     "500 Internal Server Error",
                     "WORKER_CLIENT_LOCK_POISONED",
@@ -529,11 +585,19 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
     };
 
     let Some(backend) = backend else {
+        request_tracker.finish(0, 0, None, false, Some("backend unavailable".to_string()));
         return not_ready_error(&status);
     };
 
     match backend.complete(worker_request) {
         Ok(response) => {
+            request_tracker.finish(
+                response.prompt_tokens as u64,
+                response.completion_tokens as u64,
+                Some(response.finish_reason.clone()),
+                false,
+                None,
+            );
             let body = serde_json::to_string(&ChatCompletionHttpResponse::from(response))
                 .unwrap_or_else(|_| {
                     "{\"error\":{\"message\":\"response serialization failed\"}}".to_string()
@@ -544,7 +608,10 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
                 body,
             }
         }
-        Err(err) => gateway_error_response(&err),
+        Err(err) => {
+            request_tracker.finish(0, 0, None, false, Some(err.to_string()));
+            gateway_error_response(&err)
+        }
     }
 }
 
@@ -615,20 +682,33 @@ fn stream_chat_completion_with_disconnect<W: Write>(
             }
         };
 
+    let queue_started_at = Instant::now();
     let _permit = match state.admission.acquire_until(disconnected.as_deref()) {
         Ok(Some(permit)) => permit,
         Ok(None) => {
             return Ok(());
         }
         Err(response) => {
+            if response.status.starts_with("429") {
+                state.runtime.metrics.increment_queue_rejected_total();
+            }
             return write_response(
                 writer,
                 &response.status,
                 response.content_type,
                 &response.body,
-            )
+            );
         }
     };
+    let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
+    let request_tracker = Arc::new(RequestTracker::new(
+        state.runtime.metrics.clone(),
+        worker_request.request_id.clone(),
+        state.model.clone(),
+        worker_request.max_tokens,
+        true,
+        queue_time_ms,
+    ));
 
     let backend = if let Some(backend) = &state.test_backend {
         Some(backend.clone())
@@ -638,6 +718,13 @@ fn stream_chat_completion_with_disconnect<W: Write>(
                 .as_ref()
                 .map(|client| client.clone() as Arc<dyn ChatCompletionService>),
             Err(_) => {
+                request_tracker.finish(
+                    0,
+                    0,
+                    None,
+                    false,
+                    Some("worker client lock poisoned".to_string()),
+                );
                 let response = json_error_response(
                     "500 Internal Server Error",
                     "WORKER_CLIENT_LOCK_POISONED",
@@ -654,6 +741,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     };
 
     let Some(backend) = backend else {
+        request_tracker.finish(0, 0, None, false, Some("backend unavailable".to_string()));
         let response = not_ready_error(&status);
         return write_response(
             writer,
@@ -671,6 +759,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         DisconnectCancellation::start(disconnected.clone(), backend.clone(), request_id.clone());
 
     let mut on_delta = |delta: String| -> Result<(), GatewayError> {
+        request_tracker.record_first_delta();
         ensure_sse_stream_started(writer, &mut stream_started)?;
         let event = json!({
             "id": format!("chatcmpl-{}", request_id),
@@ -700,8 +789,10 @@ fn stream_chat_completion_with_disconnect<W: Write>(
                 .as_ref()
                 .is_some_and(|flag| flag.load(Ordering::Relaxed))
             {
+                request_tracker.finish(0, 0, None, true, None);
                 return Ok(());
             }
+            request_tracker.finish(0, 0, None, false, Some(err.to_string()));
             return match err {
                 GatewayError::InvalidRequest(message) if !stream_started => {
                     let response =
@@ -732,9 +823,23 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
     {
+        request_tracker.finish(
+            response.prompt_tokens as u64,
+            response.completion_tokens as u64,
+            Some(response.finish_reason.clone()),
+            true,
+            None,
+        );
         return Ok(());
     }
     ensure_sse_stream_started(writer, &mut stream_started)?;
+    request_tracker.finish(
+        response.prompt_tokens as u64,
+        response.completion_tokens as u64,
+        Some(response.finish_reason.clone()),
+        false,
+        None,
+    );
     let done_event = json!({
         "id": format!("chatcmpl-{}", response.request_id),
         "object": "chat.completion.chunk",
@@ -1031,6 +1136,7 @@ mod tests {
     use super::*;
     use crate::config::GenerationConfig;
     use crate::supervisor::RuntimeState;
+    use crate::telemetry::MetricsRegistry;
     use mlx_runtime_protocol::{ModelLoadProgress, ModelState, ModelStatus};
     use std::io::Cursor;
     use std::sync::Mutex;
@@ -1097,6 +1203,7 @@ mod tests {
                     max_total_tokens_per_request: 65_536,
                     request_timeout_seconds: 300,
                 },
+                telemetry: crate::config::TelemetryConfig::default(),
                 admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
                 test_backend: Some(Arc::new(FakeService::default())),
@@ -1167,6 +1274,137 @@ mod tests {
     }
 
     #[test]
+    fn metrics_endpoint_exposes_prometheus_metrics() {
+        let service = Arc::new(FakeService {
+            response: Mutex::new(Some(ChatCompletionResponse {
+                request_id: "req-1".to_string(),
+                model: "test-model".to_string(),
+                text: "hello".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 12,
+                completion_tokens: 7,
+            })),
+        });
+        let state = test_state(ModelState::Ready, service);
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+
+        let metrics = response_for_request("GET /metrics HTTP/1.1\r\n", &[], &state);
+        assert_eq!(metrics.status, "200 OK");
+        assert_eq!(
+            metrics.content_type,
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        assert!(metrics.body.contains("mlx_requests_total 1"));
+        assert!(metrics.body.contains("mlx_requests_active 0"));
+        assert!(metrics.body.contains("mlx_prompt_tokens_total 12"));
+        assert!(metrics.body.contains("mlx_completion_tokens_total 7"));
+        assert!(metrics.body.contains("mlx_worker_up 1"));
+        assert!(metrics.body.contains("mlx_ttft_ms_bucket"));
+    }
+
+    #[test]
+    fn metrics_disabled_when_prometheus_off() {
+        let state = AppState {
+            telemetry: crate::config::TelemetryConfig {
+                enable_prometheus: false,
+                ..Default::default()
+            },
+            ..test_state(ModelState::Ready, Arc::new(FakeService::default()))
+        };
+        let response = response_for_request("GET /metrics HTTP/1.1\r\n", &[], &state);
+        assert_eq!(response.status, "404 Not Found");
+    }
+
+    #[test]
+    fn metrics_served_on_custom_path() {
+        let state = AppState {
+            telemetry: crate::config::TelemetryConfig {
+                enable_prometheus: true,
+                metrics_path: "/custom-metrics".to_string(),
+            },
+            ..test_state(ModelState::Ready, Arc::new(FakeService::default()))
+        };
+        let ok = response_for_request("GET /custom-metrics HTTP/1.1\r\n", &[], &state);
+        assert_eq!(ok.status, "200 OK");
+        assert_eq!(ok.content_type, "text/plain; version=0.0.4; charset=utf-8");
+
+        let not_found = response_for_request("GET /metrics HTTP/1.1\r\n", &[], &state);
+        assert_eq!(not_found.status, "404 Not Found");
+    }
+
+    #[test]
+    fn queue_rejected_counter_only_increments_on_429() {
+        let metrics = Arc::new(MetricsRegistry::new());
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0
+        }))
+        .unwrap();
+
+        let runtime = RuntimeState::new_with_metrics("test-model", metrics.clone());
+        let mut status = ModelStatus::new("test-model");
+        status.set_state(ModelState::Ready);
+        status.mark_ready(None, None, 0);
+        runtime.set_status(status).unwrap();
+
+        let state = AppState {
+            runtime,
+            admission: Arc::new(RequestAdmission::new(10, 10, Duration::from_secs(300))),
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            model: "test-model".to_string(),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+
+        let ok_response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(ok_response.status, "200 OK");
+
+        let before_reject = metrics.render_prometheus(0);
+        assert!(before_reject.contains("mlx_queue_rejected_total 0"));
+
+        let rejected_state = AppState {
+            admission: Arc::new(RequestAdmission::new(0, 0, Duration::from_secs(300))),
+            ..state
+        };
+        let reject_response = response_for_request(
+            "POST /v1/chat/completions HTTP/1.1\r\n",
+            &body,
+            &rejected_state,
+        );
+        assert_eq!(reject_response.status, "429 Too Many Requests");
+
+        let after_reject = metrics.render_prometheus(0);
+        assert!(after_reject.contains("mlx_queue_rejected_total 1"));
+    }
+
+    #[test]
     fn model_status_endpoint_returns_detailed_state() {
         let runtime = test_runtime(ModelState::LoadingWeights);
         runtime
@@ -1213,6 +1451,7 @@ mod tests {
                     max_total_tokens_per_request: 65_536,
                     request_timeout_seconds: 300,
                 },
+                telemetry: crate::config::TelemetryConfig::default(),
                 admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
                 test_backend: Some(Arc::new(FakeService::default())),
@@ -1274,6 +1513,7 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
             },
+            telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(0, 1, Duration::from_secs(300))),
             model: "test-model".to_string(),
             test_backend: Some(Arc::new(FakeService::default())),
@@ -1414,6 +1654,7 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
             },
+            telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "test-model".to_string(),
             test_backend: Some(backend),
