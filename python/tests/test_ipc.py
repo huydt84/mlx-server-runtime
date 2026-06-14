@@ -4,6 +4,7 @@ import unittest
 
 from mlx_worker.ipc import (
     ChatCompletionRequest,
+    ChatCompletionDelta,
     ChatCompletionResponse,
     ChatMessage,
     ModelError,
@@ -70,6 +71,7 @@ class IpcEncodingTests(unittest.TestCase):
             max_tokens=12,
             temperature=0.0,
             top_p=1.0,
+            stream=True,
         )
 
         encoded = encode_command(request)
@@ -87,6 +89,11 @@ class IpcEncodingTests(unittest.TestCase):
 
         encoded = encode_event(response)
         self.assertEqual(decode_event(encoded), response)
+
+    def test_chat_completion_delta_round_trip(self) -> None:
+        delta = ChatCompletionDelta(request_id="req-1", delta="hel")
+        encoded = encode_event(delta)
+        self.assertEqual(decode_event(encoded), delta)
 
     def test_worker_error_event_round_trip(self) -> None:
         event = WorkerCommandError(request_id="req-1", message="boom\nmore")

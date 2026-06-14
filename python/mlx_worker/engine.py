@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 
-from .ipc import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
+from typing import Callable
+
+from .ipc import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatMessage,
+)
 
 
 @dataclass
@@ -42,6 +48,46 @@ class MlxWorkerEngine:
             sampler=sampler,
         ):
             text_segments.append(response.text)
+            final_response = response
+
+        if final_response is None:
+            raise RuntimeError("mlx-lm returned no completion response")
+
+        return ChatCompletionResponse(
+            request_id=request.request_id,
+            model=self.model_id,
+            text="".join(text_segments),
+            finish_reason=final_response.finish_reason or "stop",
+            prompt_tokens=int(final_response.prompt_tokens),
+            completion_tokens=int(final_response.generation_tokens),
+        )
+
+    def stream_chat(
+        self,
+        request: ChatCompletionRequest,
+        emit_delta: Callable[[str], None],
+    ) -> ChatCompletionResponse:
+        """Generate a streaming chat completion and emit text deltas."""
+
+        if request.model != self.model_id:
+            raise ValueError(
+                f"requested model '{request.model}' does not match loaded model '{self.model_id}'"
+            )
+
+        prompt = self._build_prompt(request)
+        sampler = make_sampler(temp=request.temperature, top_p=request.top_p)
+        text_segments: list[str] = []
+        final_response = None
+
+        for response in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt,
+            max_tokens=request.max_tokens,
+            sampler=sampler,
+        ):
+            text_segments.append(response.text)
+            emit_delta(response.text)
             final_response = response
 
         if final_response is None:

@@ -40,4 +40,7 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     /// Top-p sampling cutoff.
     pub top_p: f32,
+    /// Whether the request should stream token deltas.
+    #[serde(default)]
+    pub stream: bool,
 }

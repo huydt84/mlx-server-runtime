@@ -34,6 +34,25 @@ impl WorkerClient {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError> {
+        self.execute_chat(request, false, &mut |_| Ok(()))
+    }
+
+    /// Streams a chat completion and invokes the callback for each delta.
+    pub fn stream_chat(
+        &self,
+        mut request: ChatCompletionRequest,
+        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
+        request.stream = true;
+        self.execute_chat(request, true, on_delta)
+    }
+
+    fn execute_chat(
+        &self,
+        request: ChatCompletionRequest,
+        stream: bool,
+        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
         let mut guard = self
             .inner
             .lock()
@@ -45,22 +64,32 @@ impl WorkerClient {
         writeln!(guard.writer, "{encoded}")?;
         guard.writer.flush()?;
 
-        let mut line = String::new();
-        let bytes = guard.reader.read_line(&mut line)?;
-        if bytes == 0 {
-            return Err(GatewayError::Protocol(
-                "worker closed the inference socket".to_string(),
-            ));
-        }
+        loop {
+            let mut line = String::new();
+            let bytes = guard.reader.read_line(&mut line)?;
+            if bytes == 0 {
+                return Err(GatewayError::Protocol(
+                    "worker closed the inference socket".to_string(),
+                ));
+            }
 
-        match decode_worker_event(&line)
-            .map_err(|err| GatewayError::Protocol(format!("decode worker event failed: {err}")))?
-        {
-            WorkerEvent::ChatCompletion { response } => Ok(response),
-            WorkerEvent::Error {
-                request_id: _,
-                message,
-            } => Err(GatewayError::Protocol(message)),
+            match decode_worker_event(&line).map_err(|err| {
+                GatewayError::Protocol(format!("decode worker event failed: {err}"))
+            })? {
+                WorkerEvent::ChatCompletionDelta { delta } => {
+                    if !stream {
+                        return Err(GatewayError::Protocol(
+                            "received unexpected stream delta".to_string(),
+                        ));
+                    }
+                    on_delta(delta.delta)?;
+                }
+                WorkerEvent::ChatCompletion { response } => return Ok(response),
+                WorkerEvent::Error {
+                    request_id: _,
+                    message,
+                } => return Err(GatewayError::Protocol(message)),
+            }
         }
     }
 }

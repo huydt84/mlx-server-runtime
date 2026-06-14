@@ -92,6 +92,7 @@ class ChatCompletionRequest:
     max_tokens: int
     temperature: float
     top_p: float
+    stream: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,14 @@ class ChatCompletionResponse:
     finish_reason: str
     prompt_tokens: int
     completion_tokens: int
+
+
+@dataclass(frozen=True)
+class ChatCompletionDelta:
+    """A streamed completion delta."""
+
+    request_id: str
+    delta: str
 
 
 @dataclass(frozen=True)
@@ -202,6 +211,7 @@ def encode_command(request: ChatCompletionRequest) -> bytes:
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "top_p": request.top_p,
+            "stream": request.stream,
         },
     }
     return (json.dumps(payload) + "\n").encode("utf-8")
@@ -224,10 +234,13 @@ def decode_command(raw_line: bytes) -> ChatCompletionRequest | None:
         max_tokens=request["max_tokens"],
         temperature=request["temperature"],
         top_p=request["top_p"],
+        stream=request.get("stream", False),
     )
 
 
-def encode_event(event: ChatCompletionResponse | WorkerCommandError) -> bytes:
+def encode_event(
+    event: ChatCompletionResponse | ChatCompletionDelta | WorkerCommandError,
+) -> bytes:
     """Encode a Phase 1 worker event."""
 
     payload: dict[str, Any]
@@ -243,6 +256,14 @@ def encode_event(event: ChatCompletionResponse | WorkerCommandError) -> bytes:
                 "completion_tokens": event.completion_tokens,
             },
         }
+    elif isinstance(event, ChatCompletionDelta):
+        payload = {
+            "type": "chat_completion_delta",
+            "delta": {
+                "request_id": event.request_id,
+                "delta": event.delta,
+            },
+        }
     else:
         payload = {
             "type": "error",
@@ -253,7 +274,9 @@ def encode_event(event: ChatCompletionResponse | WorkerCommandError) -> bytes:
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
-def decode_event(raw_line: bytes) -> ChatCompletionResponse | WorkerCommandError | None:
+def decode_event(
+    raw_line: bytes,
+) -> ChatCompletionResponse | ChatCompletionDelta | WorkerCommandError | None:
     """Decode a Phase 1 worker event."""
 
     payload = json.loads(raw_line.decode("utf-8"))
@@ -266,6 +289,12 @@ def decode_event(raw_line: bytes) -> ChatCompletionResponse | WorkerCommandError
             finish_reason=response["finish_reason"],
             prompt_tokens=response["prompt_tokens"],
             completion_tokens=response["completion_tokens"],
+        )
+    if payload.get("type") == "chat_completion_delta":
+        delta = payload["delta"]
+        return ChatCompletionDelta(
+            request_id=delta["request_id"],
+            delta=delta["delta"],
         )
     if payload.get("type") == "error":
         return WorkerCommandError(

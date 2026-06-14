@@ -1,5 +1,5 @@
 use super::request::ChatCompletionRequest;
-use super::response::{ChatCompletionResponse, WorkerError, WorkerReady};
+use super::response::{ChatCompletionDelta, ChatCompletionResponse, WorkerError, WorkerReady};
 use super::status::ModelStatus;
 use core::fmt;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,8 @@ pub enum GatewayCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerEvent {
+    /// A streamed chat completion delta.
+    ChatCompletionDelta { delta: ChatCompletionDelta },
     /// A non-streaming chat completion result.
     ChatCompletion { response: ChatCompletionResponse },
     /// A worker-side request failure.
@@ -99,7 +101,7 @@ pub fn decode_worker_event(line: &str) -> Result<WorkerEvent, serde_json::Error>
 mod tests {
     use super::*;
     use crate::request::{ChatMessage, MessageRole};
-    use crate::response::ChatCompletionResponse;
+    use crate::response::{ChatCompletionDelta, ChatCompletionResponse};
 
     #[test]
     fn encode_and_decode_ready_round_trip() {
@@ -146,6 +148,7 @@ mod tests {
                 max_tokens: 16,
                 temperature: 0.2,
                 top_p: 0.9,
+                stream: false,
             },
         };
 
@@ -164,6 +167,20 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 12,
                 completion_tokens: 3,
+            },
+        };
+
+        let encoded = encode_worker_event(&event).unwrap();
+        let decoded = decode_worker_event(&encoded).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn worker_delta_round_trip() {
+        let event = WorkerEvent::ChatCompletionDelta {
+            delta: ChatCompletionDelta {
+                request_id: "req-1".to_string(),
+                delta: "hello".to_string(),
             },
         };
 

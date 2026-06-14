@@ -11,6 +11,7 @@ from typing import Callable
 from .config import load_config
 from .ipc import (
     ChatCompletionResponse,
+    ChatCompletionDelta,
     ModelError,
     ModelLoadProgress,
     ModelStatus,
@@ -132,7 +133,20 @@ def main(
             else:
                 try:
                     assert engine is not None
-                    event = engine.complete_chat(request)  # type: ignore[attr-defined]
+                    if request.stream:
+                        def emit_delta(delta: str) -> None:
+                            client.sendall(
+                                encode_event(
+                                    ChatCompletionDelta(
+                                        request_id=request.request_id,
+                                        delta=delta,
+                                    )
+                                )
+                            )
+
+                        event = engine.stream_chat(request, emit_delta)  # type: ignore[attr-defined]
+                    else:
+                        event = engine.complete_chat(request)  # type: ignore[attr-defined]
                 except Exception as exc:
                     event = WorkerCommandError(
                         request_id=request.request_id,

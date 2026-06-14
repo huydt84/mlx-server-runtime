@@ -93,9 +93,6 @@ impl ChatCompletionHttpRequest {
         if self.messages.is_empty() {
             return Err("messages must not be empty".to_string());
         }
-        if self.stream.unwrap_or(false) {
-            return Err("stream=true is not supported in Phase 1".to_string());
-        }
         if self
             .messages
             .iter()
@@ -111,6 +108,7 @@ impl ChatCompletionHttpRequest {
             max_tokens: self.max_tokens.unwrap_or(generation.max_tokens),
             temperature: self.temperature.unwrap_or(generation.temperature),
             top_p: self.top_p.unwrap_or(generation.top_p),
+            stream: self.stream.unwrap_or(false),
         })
     }
 }

@@ -19,6 +19,16 @@ pub trait ChatCompletionService: Send + Sync {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError>;
+
+    /// Stream a chat completion and return the final response.
+    fn stream(
+        &self,
+        request: ChatCompletionRequest,
+        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
+        let _ = on_delta;
+        self.complete(request)
+    }
 }
 
 impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
@@ -28,6 +38,14 @@ impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
     ) -> Result<ChatCompletionResponse, GatewayError> {
         (**self).complete(request)
     }
+
+    fn stream(
+        &self,
+        request: ChatCompletionRequest,
+        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
+        (**self).stream(request, on_delta)
+    }
 }
 
 impl ChatCompletionService for crate::ipc::WorkerClient {
@@ -36,6 +54,14 @@ impl ChatCompletionService for crate::ipc::WorkerClient {
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         self.complete_chat(request)
+    }
+
+    fn stream(
+        &self,
+        request: ChatCompletionRequest,
+        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+    ) -> Result<ChatCompletionResponse, GatewayError> {
+        self.stream_chat(request, on_delta)
     }
 }
 
@@ -83,6 +109,13 @@ fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), Gatew
     let mut body = vec![0; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
+    }
+
+    if request_line.starts_with("POST /v1/chat/completions ")
+        && request_streams(&body).unwrap_or(false)
+    {
+        stream_chat_completion(&mut stream, &body, &state)?;
+        return Ok(());
     }
 
     let response = response_for_request(&request_line, &body, &state);
@@ -138,6 +171,12 @@ fn response_for_request(request_line: &str, body: &[u8], state: &AppState) -> Ht
         }
         _ => not_found_response(),
     }
+}
+
+fn request_streams(body: &[u8]) -> Option<bool> {
+    serde_json::from_slice::<ChatCompletionHttpRequest>(body)
+        .ok()
+        .map(|request| request.stream.unwrap_or(false))
 }
 
 fn parse_request_line(request_line: &str) -> Option<(&str, String)> {
@@ -364,6 +403,136 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
     }
 }
 
+fn stream_chat_completion<W: Write>(
+    writer: &mut W,
+    body: &[u8],
+    state: &AppState,
+) -> Result<(), GatewayError> {
+    let status = state
+        .runtime
+        .snapshot()
+        .map_err(|err| GatewayError::Protocol(err.to_string()))?;
+    if !status.ready {
+        let response = not_ready_error(&status);
+        return write_response(
+            writer,
+            &response.status,
+            response.content_type,
+            &response.body,
+        );
+    }
+
+    let request = match serde_json::from_slice::<ChatCompletionHttpRequest>(body) {
+        Ok(request) => request,
+        Err(err) => {
+            let response = json_error_response(
+                "400 Bad Request",
+                "INVALID_REQUEST",
+                &format!("invalid JSON body: {err}"),
+            );
+            return write_response(
+                writer,
+                &response.status,
+                response.content_type,
+                &response.body,
+            );
+        }
+    };
+
+    let worker_request = match request.into_worker_request(&state.generation, &state.model) {
+        Ok(request) => request,
+        Err(message) => {
+            let response = json_error_response("400 Bad Request", "INVALID_REQUEST", &message);
+            return write_response(
+                writer,
+                &response.status,
+                response.content_type,
+                &response.body,
+            );
+        }
+    };
+
+    let backend = if let Some(backend) = &state.test_backend {
+        Some(backend.clone())
+    } else {
+        match state.runtime.worker_client.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|client| client.clone() as Arc<dyn ChatCompletionService>),
+            Err(_) => {
+                let response = json_error_response(
+                    "500 Internal Server Error",
+                    "WORKER_CLIENT_LOCK_POISONED",
+                    "worker client lock poisoned",
+                );
+                return write_response(
+                    writer,
+                    &response.status,
+                    response.content_type,
+                    &response.body,
+                );
+            }
+        }
+    };
+
+    let Some(backend) = backend else {
+        let response = not_ready_error(&status);
+        return write_response(
+            writer,
+            &response.status,
+            response.content_type,
+            &response.body,
+        );
+    };
+
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )?;
+    writer.flush()?;
+
+    let created = stream_completion_created();
+    let model = state.model.clone();
+    let request_id = worker_request.request_id.clone();
+
+    let mut on_delta = |delta: String| -> Result<(), GatewayError> {
+        let event = json!({
+            "id": format!("chatcmpl-{}", request_id),
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": delta,
+                },
+                "finish_reason": null,
+            }],
+        });
+        write!(writer, "data: {}\n\n", event)?;
+        writer.flush()?;
+        Ok(())
+    };
+
+    let response = backend.stream(worker_request, &mut on_delta)?;
+    let done_event = json!({
+        "id": format!("chatcmpl-{}", response.request_id),
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": response.model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": response.finish_reason,
+        }],
+    });
+    write!(writer, "data: {}\n\n", done_event)?;
+    write!(writer, "data: [DONE]\n\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
 fn not_ready_response(status: &ModelStatus) -> HttpResponse {
     HttpResponse {
         status: "503 Service Unavailable".to_string(),
@@ -445,6 +614,15 @@ fn runtime_model_name(runtime: &RuntimeState) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+fn stream_completion_created() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn model_path_name(path: &str) -> Option<String> {
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     match segments.as_slice() {
@@ -484,8 +662,8 @@ fn not_found_response() -> HttpResponse {
     }
 }
 
-fn write_response(
-    stream: &mut TcpStream,
+fn write_response<W: Write>(
+    stream: &mut W,
     status: &str,
     content_type: &str,
     body: &str,
@@ -506,6 +684,7 @@ mod tests {
     use crate::config::GenerationConfig;
     use crate::supervisor::RuntimeState;
     use mlx_runtime_protocol::{ModelLoadProgress, ModelState, ModelStatus};
+    use std::io::Cursor;
     use std::sync::Mutex;
 
     #[test]
@@ -739,6 +918,29 @@ mod tests {
         assert!(response.body.contains("\"hello back\""));
     }
 
+    #[test]
+    fn streaming_chat_completion_writes_sse_chunks() {
+        let service = Arc::new(StreamingService);
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": true
+        }))
+        .unwrap();
+        let state = test_state(ModelState::Ready, service);
+        let mut buffer = Cursor::new(Vec::new());
+
+        stream_chat_completion(&mut buffer, &body, &state).unwrap();
+
+        let body = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(body.contains("text/event-stream"));
+        assert!(body.contains("chat.completion.chunk"));
+        assert!(body.contains("data: [DONE]"));
+    }
+
     fn test_state(state: ModelState, backend: Arc<dyn ChatCompletionService>) -> AppState {
         let runtime = test_runtime(state);
         AppState {
@@ -784,6 +986,60 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                 }))
+        }
+
+        fn stream(
+            &self,
+            request: ChatCompletionRequest,
+            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            let response = self.complete(request.clone())?;
+            on_delta("hel".to_string())?;
+            on_delta("lo".to_string())?;
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: response.model,
+                text: "hello".to_string(),
+                finish_reason: response.finish_reason,
+                prompt_tokens: response.prompt_tokens,
+                completion_tokens: response.completion_tokens,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct StreamingService;
+
+    impl ChatCompletionService for StreamingService {
+        fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: "hello".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+
+        fn stream(
+            &self,
+            request: ChatCompletionRequest,
+            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            on_delta("hel".to_string())?;
+            on_delta("lo".to_string())?;
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: "hello".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
         }
     }
 }
