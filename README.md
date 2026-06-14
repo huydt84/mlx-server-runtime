@@ -37,3 +37,14 @@ Request logs are structured JSON lines written by the Rust gateway and include:
 - `finish_reason`
 - `cancelled`
 - `error`
+
+## Benchmarks
+
+Generate the phase 6 benchmark report with:
+
+```bash
+bash scripts/benchmark.sh
+```
+
+The report is written to `benchmarks/results/phase_6_report.md` and compares raw
+`mlx-lm`, `mlx_lm.server`, and this project on the same prompt.
