@@ -1,11 +1,14 @@
 use super::request::ChatCompletionRequest;
 use super::response::{ChatCompletionResponse, WorkerError, WorkerReady};
+use super::status::ModelStatus;
 use core::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Messages sent from the worker to the gateway during bootstrap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerMessage {
+    /// The worker reported a lifecycle update.
+    Status(Box<ModelStatus>),
     /// The worker is ready to serve requests.
     Ready(WorkerReady),
     /// The worker failed to start.
@@ -15,6 +18,10 @@ pub enum WorkerMessage {
 /// Encodes a worker message as a single line.
 pub fn encode_worker_message(message: &WorkerMessage) -> String {
     match message {
+        WorkerMessage::Status(status) => match serde_json::to_string(status) {
+            Ok(payload) => format!("STATUS\t{payload}"),
+            Err(_) => "STATUS\t{}".to_string(),
+        },
         WorkerMessage::Ready(_) => "READY".to_string(),
         WorkerMessage::Error(error) => format!("ERROR\t{}", error.message.replace('\n', " ")),
     }
@@ -29,6 +36,9 @@ pub fn decode_worker_message(line: &str) -> Option<WorkerMessage> {
 
     let (prefix, payload) = trimmed.split_once('\t')?;
     match prefix {
+        "STATUS" => serde_json::from_str::<ModelStatus>(payload)
+            .ok()
+            .map(|status| WorkerMessage::Status(Box::new(status))),
         "ERROR" => Some(WorkerMessage::Error(WorkerError {
             message: payload.to_string(),
         })),
@@ -112,6 +122,15 @@ mod tests {
                 message: "boom more".to_string(),
             }))
         );
+    }
+
+    #[test]
+    fn encode_and_decode_status_round_trip() {
+        let status = ModelStatus::new("test-model");
+        let message = WorkerMessage::Status(Box::new(status.clone()));
+        let encoded = encode_worker_message(&message);
+        assert!(encoded.starts_with("STATUS\t"));
+        assert_eq!(decode_worker_message(&encoded), Some(message));
     }
 
     #[test]

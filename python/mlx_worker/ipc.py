@@ -3,8 +3,22 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal
+
+
+ModelState = Literal[
+    "not_loaded",
+    "downloading",
+    "verifying",
+    "loading_weights",
+    "initializing_runtime",
+    "warming_up",
+    "ready",
+    "degraded",
+    "failed",
+    "unloading",
+]
 
 
 @dataclass(frozen=True)
@@ -17,6 +31,47 @@ class WorkerError:
     """Worker startup error."""
 
     message: str
+
+
+@dataclass(frozen=True)
+class ModelError:
+    """Model lifecycle error information."""
+
+    code: str
+    message: str
+    at: int
+
+
+@dataclass(frozen=True)
+class ModelLoadProgress:
+    """Optional model loading progress details."""
+
+    downloaded_bytes: int | None = None
+    total_bytes: int | None = None
+    loaded_tensors: int | None = None
+    total_tensors: int | None = None
+    current_phase: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelStatus:
+    """Detailed model lifecycle status."""
+
+    model: str
+    revision: str | None
+    state: ModelState
+    ready: bool
+    servable: bool
+    progress: ModelLoadProgress | None
+    device: str | None
+    dtype: str | None
+    loaded_at: int | None
+    started_loading_at: int | None
+    last_transition_at: int
+    last_error: ModelError | None
+    warmup_passed: bool
+    last_warmup_at: int | None
+    last_warmup_latency_ms: int | None
 
 
 @dataclass(frozen=True)
@@ -59,16 +114,47 @@ class WorkerCommandError:
     message: str
 
 
-def encode_bootstrap_message(message: WorkerReady | WorkerError) -> bytes:
+def encode_bootstrap_message(
+    message: WorkerReady | WorkerError | ModelStatus,
+) -> bytes:
     """Encode a worker bootstrap message."""
 
     if isinstance(message, WorkerReady):
         return b"READY\n"
-    sanitized = message.message.replace("\n", " ")
-    return f"ERROR\t{sanitized}\n".encode("utf-8")
+    if isinstance(message, WorkerError):
+        sanitized = message.message.replace("\n", " ")
+        return f"ERROR\t{sanitized}\n".encode("utf-8")
+
+    return f"STATUS\t{json.dumps(asdict(message))}\n".encode("utf-8")
 
 
-def decode_bootstrap_message(raw_line: bytes) -> WorkerReady | WorkerError | None:
+def _model_error_from_dict(data: dict[str, Any] | None) -> ModelError | None:
+    if data is None:
+        return None
+    return ModelError(
+        code=data["code"],
+        message=data["message"],
+        at=data["at"],
+    )
+
+
+def _model_progress_from_dict(
+    data: dict[str, Any] | None,
+) -> ModelLoadProgress | None:
+    if data is None:
+        return None
+    return ModelLoadProgress(
+        downloaded_bytes=data.get("downloaded_bytes"),
+        total_bytes=data.get("total_bytes"),
+        loaded_tensors=data.get("loaded_tensors"),
+        total_tensors=data.get("total_tensors"),
+        current_phase=data.get("current_phase"),
+    )
+
+
+def decode_bootstrap_message(
+    raw_line: bytes,
+) -> WorkerReady | WorkerError | ModelStatus | None:
     """Decode a worker bootstrap message."""
 
     line = raw_line.decode("utf-8", errors="replace").strip()
@@ -77,6 +163,26 @@ def decode_bootstrap_message(raw_line: bytes) -> WorkerReady | WorkerError | Non
 
     if line.startswith("ERROR\t"):
         return WorkerError(message=line.split("\t", 1)[1])
+
+    if line.startswith("STATUS\t"):
+        payload = json.loads(line.split("\t", 1)[1])
+        return ModelStatus(
+            model=payload["model"],
+            revision=payload.get("revision"),
+            state=payload["state"],
+            ready=payload["ready"],
+            servable=payload["servable"],
+            progress=_model_progress_from_dict(payload.get("progress")),
+            device=payload.get("device"),
+            dtype=payload.get("dtype"),
+            loaded_at=payload.get("loaded_at"),
+            started_loading_at=payload.get("started_loading_at"),
+            last_transition_at=payload["last_transition_at"],
+            last_error=_model_error_from_dict(payload.get("last_error")),
+            warmup_passed=payload["warmup_passed"],
+            last_warmup_at=payload.get("last_warmup_at"),
+            last_warmup_latency_ms=payload.get("last_warmup_latency_ms"),
+        )
 
     return None
 

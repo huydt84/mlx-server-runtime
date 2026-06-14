@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from mlx_lm import load, stream_generate
 from mlx_lm.sample_utils import make_sampler
 
-from .ipc import ChatCompletionRequest, ChatCompletionResponse
+from .ipc import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
 
 
 @dataclass
@@ -54,6 +54,20 @@ class MlxWorkerEngine:
             finish_reason=final_response.finish_reason or "stop",
             prompt_tokens=int(final_response.prompt_tokens),
             completion_tokens=int(final_response.generation_tokens),
+        )
+
+    def warmup(self) -> ChatCompletionResponse:
+        """Run a tiny warmup completion before reporting readiness."""
+
+        return self.complete_chat(
+            ChatCompletionRequest(
+                request_id="warmup",
+                model=self.model_id,
+                messages=[ChatMessage(role="user", content="ping")],
+                max_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+            )
         )
 
     def _build_prompt(self, request: ChatCompletionRequest) -> list[int] | str:

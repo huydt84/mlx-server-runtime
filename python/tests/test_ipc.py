@@ -6,6 +6,9 @@ from mlx_worker.ipc import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
+    ModelError,
+    ModelLoadProgress,
+    ModelStatus,
     WorkerCommandError,
     WorkerError,
     WorkerReady,
@@ -30,6 +33,34 @@ class IpcEncodingTests(unittest.TestCase):
         encoded = encode_bootstrap_message(message)
         self.assertEqual(encoded, b"ERROR\tboom more\n")
         self.assertEqual(decode_bootstrap_message(encoded), WorkerError("boom more"))
+
+    def test_encode_status_round_trip(self) -> None:
+        message = ModelStatus(
+            model="test-model",
+            revision="rev-1",
+            state="warming_up",
+            ready=False,
+            servable=False,
+            progress=ModelLoadProgress(
+                downloaded_bytes=8,
+                total_bytes=16,
+                loaded_tensors=1,
+                total_tensors=2,
+                current_phase="warming_up",
+            ),
+            device="mps",
+            dtype="float16",
+            loaded_at=None,
+            started_loading_at=1,
+            last_transition_at=2,
+            last_error=ModelError(code="MODEL_LOAD_FAILED", message="boom", at=3),
+            warmup_passed=False,
+            last_warmup_at=None,
+            last_warmup_latency_ms=None,
+        )
+
+        encoded = encode_bootstrap_message(message)
+        self.assertEqual(decode_bootstrap_message(encoded), message)
 
     def test_chat_completion_command_round_trip(self) -> None:
         request = ChatCompletionRequest(

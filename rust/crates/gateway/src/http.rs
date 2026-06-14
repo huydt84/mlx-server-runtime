@@ -1,17 +1,15 @@
 use crate::config::RuntimeConfig;
 use crate::errors::GatewayError;
-use crate::ipc::WorkerClient;
 use crate::openai::{ChatCompletionHttpRequest, ChatCompletionHttpResponse};
 use crate::supervisor::RuntimeState;
-use mlx_runtime_protocol::{ChatCompletionRequest, ChatCompletionResponse};
+use mlx_runtime_protocol::{
+    ChatCompletionRequest, ChatCompletionResponse, ModelState, ModelStatus,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
+use std::sync::Arc;
 use std::thread;
 
 /// Service used by the HTTP layer to fulfill completions.
@@ -42,8 +40,7 @@ impl ChatCompletionService for crate::ipc::WorkerClient {
 }
 
 struct AppState {
-    healthy: Arc<AtomicBool>,
-    worker_client: Arc<Mutex<Option<Arc<WorkerClient>>>>,
+    runtime: RuntimeState,
     generation: crate::config::GenerationConfig,
     model: String,
     test_backend: Option<Arc<dyn ChatCompletionService>>,
@@ -57,8 +54,7 @@ pub fn serve(config: RuntimeConfig, runtime: RuntimeState) -> Result<(), Gateway
         match stream {
             Ok(stream) => {
                 let state = AppState {
-                    healthy: runtime.healthy.clone(),
-                    worker_client: runtime.worker_client.clone(),
+                    runtime: runtime.clone(),
                     generation: config.generation.clone(),
                     model: config.worker.model.clone(),
                     test_backend: None,
@@ -123,60 +119,217 @@ struct HttpResponse {
 }
 
 fn response_for_request(request_line: &str, body: &[u8], state: &AppState) -> HttpResponse {
-    if request_line.starts_with("GET /health ") {
-        return if state.healthy.load(Ordering::SeqCst) {
-            HttpResponse {
-                status: "200 OK".to_string(),
-                content_type: "text/plain; charset=utf-8",
-                body: "healthy".to_string(),
-            }
-        } else {
-            HttpResponse {
-                status: "503 Service Unavailable".to_string(),
-                content_type: "text/plain; charset=utf-8",
-                body: "unhealthy".to_string(),
-            }
-        };
-    }
+    let Some((method, path)) = parse_request_line(request_line) else {
+        return not_found_response();
+    };
 
-    if request_line.starts_with("POST /v1/chat/completions ") {
-        return handle_chat_completion(body, state);
+    match (method, path.as_str()) {
+        ("GET", "/live") => live_response(&state.runtime),
+        ("GET", "/startup") => startup_response(&state.runtime),
+        ("GET", "/ready") => readiness_response(&state.runtime),
+        ("GET", "/health") => health_response(&state.runtime),
+        ("GET", "/models") => models_response(&state.runtime),
+        ("POST", "/v1/chat/completions") => handle_chat_completion(body, state),
+        _ if method == "GET" && path.starts_with("/models/") && path.ends_with("/status") => {
+            model_status_response(&state.runtime, &path)
+        }
+        _ if method == "GET" && path.starts_with("/models/") && path.ends_with("/ready") => {
+            model_ready_response(&state.runtime, &path)
+        }
+        _ => not_found_response(),
     }
+}
 
+fn parse_request_line(request_line: &str) -> Option<(&str, String)> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path.to_string()))
+}
+
+fn live_response(runtime: &RuntimeState) -> HttpResponse {
+    let body = json!({
+        "status": "live",
+        "uptime_seconds": runtime.started_at.elapsed().as_secs(),
+        "pid": runtime.pid,
+    })
+    .to_string();
     HttpResponse {
-        status: "404 Not Found".to_string(),
-        content_type: "text/plain; charset=utf-8",
-        body: "not found".to_string(),
+        status: "200 OK".to_string(),
+        content_type: "application/json",
+        body,
+    }
+}
+
+fn startup_response(runtime: &RuntimeState) -> HttpResponse {
+    match runtime.snapshot() {
+        Ok(status) if status.ready => HttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "application/json",
+            body: json!({ "status": "started" }).to_string(),
+        },
+        Ok(status) if status.state == ModelState::Failed => HttpResponse {
+            status: "503 Service Unavailable".to_string(),
+            content_type: "application/json",
+            body: json!({
+                "status": "failed",
+                "phase": status.state,
+                "elapsed_seconds": runtime.started_at.elapsed().as_secs(),
+                "error": status.last_error,
+            })
+            .to_string(),
+        },
+        Ok(status) => HttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "application/json",
+            body: json!({
+                "status": "starting",
+                "phase": status.state,
+                "elapsed_seconds": runtime.started_at.elapsed().as_secs(),
+            })
+            .to_string(),
+        },
+        Err(err) => internal_error_response(&err.to_string()),
+    }
+}
+
+fn readiness_response(runtime: &RuntimeState) -> HttpResponse {
+    match runtime.snapshot() {
+        Ok(status) if status.ready => HttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "application/json",
+            body: json!({
+                "status": "ready",
+                "ready": true,
+                "model": status.model,
+                "revision": status.revision,
+                "loaded_at": status.loaded_at,
+                "device": status.device,
+                "dtype": status.dtype,
+                "warmup_passed": status.warmup_passed,
+            })
+            .to_string(),
+        },
+        Ok(status) => not_ready_response(&status),
+        Err(err) => internal_error_response(&err.to_string()),
+    }
+}
+
+fn health_response(runtime: &RuntimeState) -> HttpResponse {
+    match runtime.snapshot() {
+        Ok(status) if status.ready => HttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "text/plain; charset=utf-8",
+            body: "healthy".to_string(),
+        },
+        Ok(_) => HttpResponse {
+            status: "503 Service Unavailable".to_string(),
+            content_type: "text/plain; charset=utf-8",
+            body: "unhealthy".to_string(),
+        },
+        Err(err) => internal_error_response(&err.to_string()),
+    }
+}
+
+fn models_response(runtime: &RuntimeState) -> HttpResponse {
+    match runtime.snapshot() {
+        Ok(status) => HttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "application/json",
+            body: json!({
+                "models": [status.summary()],
+            })
+            .to_string(),
+        },
+        Err(err) => internal_error_response(&err.to_string()),
+    }
+}
+
+fn model_status_response(runtime: &RuntimeState, path: &str) -> HttpResponse {
+    let model_name = runtime_model_name(runtime);
+    match model_path_name(path) {
+        Some(name) if name == model_name => match runtime.snapshot() {
+            Ok(status) => HttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "application/json",
+                body: serde_json::to_string(&status).unwrap_or_else(|_| {
+                    "{\"error\":{\"message\":\"status serialization failed\"}}".to_string()
+                }),
+            },
+            Err(err) => internal_error_response(&err.to_string()),
+        },
+        _ => not_found_response(),
+    }
+}
+
+fn model_ready_response(runtime: &RuntimeState, path: &str) -> HttpResponse {
+    let model_name = runtime_model_name(runtime);
+    match model_path_name(path) {
+        Some(name) if name == model_name => match runtime.snapshot() {
+            Ok(status) if status.ready => HttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "application/json",
+                body: json!({
+                    "model": status.model,
+                    "ready": true,
+                    "state": status.state,
+                })
+                .to_string(),
+            },
+            Ok(status) => HttpResponse {
+                status: "503 Service Unavailable".to_string(),
+                content_type: "application/json",
+                body: json!({
+                    "model": status.model,
+                    "ready": false,
+                    "state": status.state,
+                    "reason": readiness_reason(&status),
+                })
+                .to_string(),
+            },
+            Err(err) => internal_error_response(&err.to_string()),
+        },
+        _ => not_found_response(),
     }
 }
 
 fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
-    if !state.healthy.load(Ordering::SeqCst) {
-        return json_error_response("503 Service Unavailable", "worker is not ready");
+    let status = match state.runtime.snapshot() {
+        Ok(status) => status,
+        Err(err) => return internal_error_response(&err.to_string()),
+    };
+
+    if !status.ready {
+        return not_ready_error(&status);
     }
 
     let request = match serde_json::from_slice::<ChatCompletionHttpRequest>(body) {
         Ok(request) => request,
         Err(err) => {
-            return json_error_response("400 Bad Request", &format!("invalid JSON body: {err}"));
+            return json_error_response(
+                "400 Bad Request",
+                "INVALID_REQUEST",
+                &format!("invalid JSON body: {err}"),
+            );
         }
     };
 
     let worker_request = match request.into_worker_request(&state.generation, &state.model) {
         Ok(request) => request,
-        Err(message) => return json_error_response("400 Bad Request", &message),
+        Err(message) => return json_error_response("400 Bad Request", "INVALID_REQUEST", &message),
     };
 
     let backend = if let Some(backend) = &state.test_backend {
         Some(backend.clone())
     } else {
-        match state.worker_client.lock() {
+        match state.runtime.worker_client.lock() {
             Ok(guard) => guard
                 .as_ref()
                 .map(|client| client.clone() as Arc<dyn ChatCompletionService>),
             Err(_) => {
                 return json_error_response(
                     "500 Internal Server Error",
+                    "WORKER_CLIENT_LOCK_POISONED",
                     "worker client lock poisoned",
                 );
             }
@@ -184,7 +337,7 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
     };
 
     let Some(backend) = backend else {
-        return json_error_response("503 Service Unavailable", "worker is not ready");
+        return not_ready_error(&status);
     };
 
     match backend.complete(worker_request) {
@@ -200,22 +353,134 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
             }
         }
         Err(GatewayError::WorkerStartup(message)) => {
-            json_error_response("503 Service Unavailable", &message)
+            json_error_response("503 Service Unavailable", "WORKER_UNAVAILABLE", &message)
         }
         Err(GatewayError::Protocol(message)) => {
-            json_error_response("500 Internal Server Error", &message)
+            json_error_response("500 Internal Server Error", "PROTOCOL_ERROR", &message)
         }
         Err(GatewayError::Io(err)) => {
-            json_error_response("500 Internal Server Error", &err.to_string())
+            json_error_response("500 Internal Server Error", "IO_ERROR", &err.to_string())
         }
     }
 }
 
-fn json_error_response(status: &str, message: &str) -> HttpResponse {
+fn not_ready_response(status: &ModelStatus) -> HttpResponse {
+    HttpResponse {
+        status: "503 Service Unavailable".to_string(),
+        content_type: "application/json",
+        body: json!({
+            "status": "not_ready",
+            "ready": false,
+            "reason": readiness_reason(status),
+            "model": status.model,
+            "state": status.state,
+            "last_error": status.last_error,
+        })
+        .to_string(),
+    }
+}
+
+fn not_ready_error(status: &ModelStatus) -> HttpResponse {
+    let code = if status.state == ModelState::Failed {
+        "MODEL_LOAD_FAILED"
+    } else {
+        "MODEL_NOT_READY"
+    };
+    let message = if status.state == ModelState::Failed {
+        "model failed to load"
+    } else {
+        "model is not ready"
+    };
+    let mut payload = json!({
+        "error": {
+            "code": code,
+            "message": message,
+            "model": status.model,
+            "state": status.state,
+        }
+    });
+
+    if let Some(error) = &status.last_error {
+        payload["error"]["last_error"] = json!(error);
+    }
+
+    HttpResponse {
+        status: "503 Service Unavailable".to_string(),
+        content_type: "application/json",
+        body: payload.to_string(),
+    }
+}
+
+fn readiness_reason(status: &ModelStatus) -> &'static str {
+    match status.state {
+        ModelState::NotLoaded => "model_not_loaded",
+        ModelState::Downloading => "model_downloading",
+        ModelState::Verifying => "model_verifying",
+        ModelState::LoadingWeights => "model_loading",
+        ModelState::InitializingRuntime => "runtime_initializing",
+        ModelState::WarmingUp => "warmup_not_finished",
+        ModelState::Ready => "ready",
+        ModelState::Degraded => "model_degraded",
+        ModelState::Failed => "model_load_failed",
+        ModelState::Unloading => "model_unloading",
+    }
+}
+
+fn json_error_response(status: &str, code: &str, message: &str) -> HttpResponse {
     HttpResponse {
         status: status.to_string(),
         content_type: "application/json",
-        body: json!({ "error": { "message": message } }).to_string(),
+        body: json!({ "error": { "code": code, "message": message } }).to_string(),
+    }
+}
+
+fn internal_error_response(message: &str) -> HttpResponse {
+    json_error_response("500 Internal Server Error", "INTERNAL_ERROR", message)
+}
+
+fn runtime_model_name(runtime: &RuntimeState) -> String {
+    runtime
+        .snapshot()
+        .map(|status| status.model)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn model_path_name(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segments.as_slice() {
+        ["models", model, "status"] | ["models", model, "ready"] => percent_decode(model),
+        _ => None,
+    }
+}
+
+fn percent_decode(segment: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(segment.len());
+    let mut index = 0;
+    let raw = segment.as_bytes();
+
+    while index < raw.len() {
+        match raw[index] {
+            b'%' if index + 2 < raw.len() => {
+                let hex = &segment[index + 1..index + 3];
+                let value = u8::from_str_radix(hex, 16).ok()?;
+                bytes.push(value);
+                index += 3;
+            }
+            value => {
+                bytes.push(value);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(bytes).ok()
+}
+
+fn not_found_response() -> HttpResponse {
+    HttpResponse {
+        status: "404 Not Found".to_string(),
+        content_type: "text/plain; charset=utf-8",
+        body: "not found".to_string(),
     }
 }
 
@@ -239,28 +504,17 @@ fn write_response(
 mod tests {
     use super::*;
     use crate::config::GenerationConfig;
+    use crate::supervisor::RuntimeState;
+    use mlx_runtime_protocol::{ModelLoadProgress, ModelState, ModelStatus};
     use std::sync::Mutex;
 
     #[test]
-    fn health_endpoint_returns_503_when_worker_is_not_ready() {
+    fn live_endpoint_returns_200_even_when_not_ready() {
         assert_eq!(
             response_for_request(
-                "GET /health HTTP/1.1\r\n",
+                "GET /live HTTP/1.1\r\n",
                 &[],
-                &test_state(false, Arc::new(FakeService::default()))
-            )
-            .status,
-            "503 Service Unavailable"
-        );
-    }
-
-    #[test]
-    fn health_endpoint_returns_200_when_worker_is_ready() {
-        assert_eq!(
-            response_for_request(
-                "GET /health HTTP/1.1\r\n",
-                &[],
-                &test_state(true, Arc::new(FakeService::default()))
+                &test_state(ModelState::LoadingWeights, Arc::new(FakeService::default()))
             )
             .status,
             "200 OK"
@@ -268,21 +522,189 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_rejects_streaming_requests() {
+    fn ready_endpoint_returns_503_when_model_is_not_loaded() {
+        assert_eq!(
+            response_for_request(
+                "GET /ready HTTP/1.1\r\n",
+                &[],
+                &test_state(ModelState::NotLoaded, Arc::new(FakeService::default()))
+            )
+            .status,
+            "503 Service Unavailable"
+        );
+    }
+
+    #[test]
+    fn ready_endpoint_returns_200_when_model_is_ready() {
+        let response = response_for_request(
+            "GET /ready HTTP/1.1\r\n",
+            &[],
+            &test_state(ModelState::Ready, Arc::new(FakeService::default())),
+        );
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"ready\":true"));
+    }
+
+    #[test]
+    fn ready_endpoint_returns_503_when_model_has_failed() {
+        let runtime = test_runtime(ModelState::Failed);
+        runtime
+            .mark_failed("MODEL_LOAD_FAILED", "failed to load model weights")
+            .unwrap();
+
+        let response = response_for_request(
+            "GET /ready HTTP/1.1\r\n",
+            &[],
+            &AppState {
+                runtime,
+                generation: GenerationConfig {
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    max_tokens: 32,
+                },
+                model: "test-model".to_string(),
+                test_backend: Some(Arc::new(FakeService::default())),
+            },
+        );
+
+        assert_eq!(response.status, "503 Service Unavailable");
+        assert!(response.body.contains("\"MODEL_LOAD_FAILED\""));
+    }
+
+    #[test]
+    fn models_endpoint_lists_the_configured_model() {
+        let response = response_for_request(
+            "GET /models HTTP/1.1\r\n",
+            &[],
+            &test_state(ModelState::Ready, Arc::new(FakeService::default())),
+        );
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"models\""));
+        assert!(response.body.contains("\"test-model\""));
+    }
+
+    #[test]
+    fn model_ready_endpoint_returns_200_for_ready_model() {
+        let response = response_for_request(
+            "GET /models/test-model/ready HTTP/1.1\r\n",
+            &[],
+            &test_state(ModelState::Ready, Arc::new(FakeService::default())),
+        );
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"ready\":true"));
+    }
+
+    #[test]
+    fn startup_endpoint_reports_starting_state() {
+        let response = response_for_request(
+            "GET /startup HTTP/1.1\r\n",
+            &[],
+            &test_state(ModelState::LoadingWeights, Arc::new(FakeService::default())),
+        );
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"status\":\"starting\""));
+        assert!(response.body.contains("\"loading_weights\""));
+    }
+
+    #[test]
+    fn health_endpoint_remains_plain_text_healthy_when_ready() {
+        let response = response_for_request(
+            "GET /health HTTP/1.1\r\n",
+            &[],
+            &test_state(ModelState::Ready, Arc::new(FakeService::default())),
+        );
+        assert_eq!(response.status, "200 OK");
+        assert_eq!(response.content_type, "text/plain; charset=utf-8");
+        assert_eq!(response.body, "healthy");
+    }
+
+    #[test]
+    fn health_endpoint_remains_plain_text_unhealthy_when_loading() {
+        let response = response_for_request(
+            "GET /health HTTP/1.1\r\n",
+            &[],
+            &test_state(ModelState::LoadingWeights, Arc::new(FakeService::default())),
+        );
+        assert_eq!(response.status, "503 Service Unavailable");
+        assert_eq!(response.content_type, "text/plain; charset=utf-8");
+        assert_eq!(response.body, "unhealthy");
+    }
+
+    #[test]
+    fn model_status_endpoint_returns_detailed_state() {
+        let runtime = test_runtime(ModelState::LoadingWeights);
+        runtime
+            .set_status(ModelStatus {
+                model: "test-model".to_string(),
+                revision: Some("rev-1".to_string()),
+                state: ModelState::LoadingWeights,
+                ready: false,
+                servable: false,
+                progress: Some(ModelLoadProgress {
+                    downloaded_bytes: Some(8),
+                    total_bytes: Some(16),
+                    loaded_tensors: Some(1),
+                    total_tensors: Some(2),
+                    current_phase: Some("loading_weights".to_string()),
+                }),
+                device: Some("mps".to_string()),
+                dtype: Some("float16".to_string()),
+                loaded_at: None,
+                started_loading_at: Some(1),
+                last_transition_at: 2,
+                last_error: None,
+                warmup_passed: false,
+                last_warmup_at: None,
+                last_warmup_latency_ms: None,
+            })
+            .unwrap();
+
+        let response = response_for_request(
+            "GET /models/test-model/status HTTP/1.1\r\n",
+            &[],
+            &AppState {
+                runtime,
+                generation: GenerationConfig {
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    max_tokens: 32,
+                },
+                model: "test-model".to_string(),
+                test_backend: Some(Arc::new(FakeService::default())),
+            },
+        );
+
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"loading_weights\""));
+        assert!(response.body.contains("\"loaded_tensors\":1"));
+    }
+
+    #[test]
+    fn model_ready_endpoint_returns_404_for_unknown_model() {
+        let response = response_for_request(
+            "GET /models/other-model/ready HTTP/1.1\r\n",
+            &[],
+            &test_state(ModelState::Ready, Arc::new(FakeService::default())),
+        );
+        assert_eq!(response.status, "404 Not Found");
+    }
+
+    #[test]
+    fn chat_completion_rejects_when_model_is_not_ready() {
         let body = serde_json::to_vec(&json!({
             "model": "test-model",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": true
+            "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
 
         let response = response_for_request(
             "POST /v1/chat/completions HTTP/1.1\r\n",
             &body,
-            &test_state(true, Arc::new(FakeService::default())),
+            &test_state(ModelState::LoadingWeights, Arc::new(FakeService::default())),
         );
 
-        assert_eq!(response.status, "400 Bad Request");
+        assert_eq!(response.status, "503 Service Unavailable");
+        assert!(response.body.contains("\"MODEL_NOT_READY\""));
     }
 
     #[test]
@@ -309,7 +731,7 @@ mod tests {
         let response = response_for_request(
             "POST /v1/chat/completions HTTP/1.1\r\n",
             &body,
-            &test_state(true, service),
+            &test_state(ModelState::Ready, service),
         );
 
         assert_eq!(response.status, "200 OK");
@@ -317,28 +739,10 @@ mod tests {
         assert!(response.body.contains("\"hello back\""));
     }
 
-    #[test]
-    fn chat_completion_rejects_wrong_model() {
-        let body = serde_json::to_vec(&json!({
-            "model": "wrong-model",
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap();
-
-        let response = response_for_request(
-            "POST /v1/chat/completions HTTP/1.1\r\n",
-            &body,
-            &test_state(true, Arc::new(FakeService::default())),
-        );
-
-        assert_eq!(response.status, "400 Bad Request");
-        assert!(response.body.contains("configured model"));
-    }
-
-    fn test_state(healthy: bool, backend: Arc<dyn ChatCompletionService>) -> AppState {
+    fn test_state(state: ModelState, backend: Arc<dyn ChatCompletionService>) -> AppState {
+        let runtime = test_runtime(state);
         AppState {
-            healthy: Arc::new(AtomicBool::new(healthy)),
-            worker_client: Arc::new(Mutex::new(None)),
+            runtime,
             generation: GenerationConfig {
                 temperature: 0.7,
                 top_p: 0.9,
@@ -347,6 +751,14 @@ mod tests {
             model: "test-model".to_string(),
             test_backend: Some(backend),
         }
+    }
+
+    fn test_runtime(state: ModelState) -> RuntimeState {
+        let runtime = RuntimeState::new("test-model");
+        let mut status = ModelStatus::new("test-model");
+        status.set_state(state);
+        runtime.set_status(status).unwrap();
+        runtime
     }
 
     #[derive(Default)]
