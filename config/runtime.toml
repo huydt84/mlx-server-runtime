@@ -1,0 +1,9 @@
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[worker]
+python = "python3"
+module = "mlx_worker.main"
+model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+ipc_path = "/tmp/mlx-runtime.sock"

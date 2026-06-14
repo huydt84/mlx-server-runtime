@@ -1,0 +1,8 @@
+[package]
+name = "mlx_runtime_gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mlx_runtime_protocol = { path = "../protocol" }
+
