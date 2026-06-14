@@ -7,6 +7,7 @@ from mlx_worker.ipc import (
     ChatCompletionDelta,
     ChatCompletionResponse,
     ChatMessage,
+    CancelRequest,
     ModelError,
     ModelLoadProgress,
     ModelStatus,
@@ -71,6 +72,9 @@ class IpcEncodingTests(unittest.TestCase):
             max_tokens=12,
             temperature=0.0,
             top_p=1.0,
+            max_prompt_tokens=32,
+            max_completion_tokens=32,
+            max_total_tokens_per_request=64,
             stream=True,
         )
 
@@ -96,13 +100,21 @@ class IpcEncodingTests(unittest.TestCase):
         self.assertEqual(decode_event(encoded), delta)
 
     def test_worker_error_event_round_trip(self) -> None:
-        event = WorkerCommandError(request_id="req-1", message="boom\nmore")
+        event = WorkerCommandError(
+            code="WORKER_ERROR", request_id="req-1", message="boom\nmore"
+        )
 
         encoded = encode_event(event)
         self.assertEqual(
             decode_event(encoded),
-            WorkerCommandError(request_id="req-1", message="boom more"),
+            WorkerCommandError(
+                code="WORKER_ERROR", request_id="req-1", message="boom more"
+            ),
         )
+
+    def test_cancel_command_round_trip(self) -> None:
+        encoded = b'{"type":"cancel_request","request_id":"req-1"}\n'
+        self.assertEqual(decode_command(encoded), CancelRequest(request_id="req-1"))
 
 
 if __name__ == "__main__":

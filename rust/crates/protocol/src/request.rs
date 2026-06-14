@@ -40,6 +40,12 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     /// Top-p sampling cutoff.
     pub top_p: f32,
+    /// Maximum prompt tokens allowed for this request.
+    pub max_prompt_tokens: u32,
+    /// Maximum completion tokens allowed for this request.
+    pub max_completion_tokens: u32,
+    /// Maximum total tokens allowed for this request.
+    pub max_total_tokens_per_request: u32,
     /// Whether the request should stream token deltas.
     #[serde(default)]
     pub stream: bool,

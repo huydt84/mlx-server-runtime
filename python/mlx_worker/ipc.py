@@ -92,6 +92,9 @@ class ChatCompletionRequest:
     max_tokens: int
     temperature: float
     top_p: float
+    max_prompt_tokens: int
+    max_completion_tokens: int
+    max_total_tokens_per_request: int
     stream: bool = False
 
 
@@ -116,9 +119,17 @@ class ChatCompletionDelta:
 
 
 @dataclass(frozen=True)
+class CancelRequest:
+    """A cancellation request for an in-flight completion."""
+
+    request_id: str
+
+
+@dataclass(frozen=True)
 class WorkerCommandError:
     """A worker-side request failure."""
 
+    code: str
     request_id: str
     message: str
 
@@ -211,17 +222,22 @@ def encode_command(request: ChatCompletionRequest) -> bytes:
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "top_p": request.top_p,
+            "max_prompt_tokens": request.max_prompt_tokens,
+            "max_completion_tokens": request.max_completion_tokens,
+            "max_total_tokens_per_request": request.max_total_tokens_per_request,
             "stream": request.stream,
         },
     }
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
-def decode_command(raw_line: bytes) -> ChatCompletionRequest | None:
+def decode_command(raw_line: bytes) -> ChatCompletionRequest | CancelRequest | None:
     """Decode a Phase 1 gateway command."""
 
     payload = json.loads(raw_line.decode("utf-8"))
     if payload.get("type") != "chat_completion":
+        if payload.get("type") == "cancel_request":
+            return CancelRequest(request_id=payload["request_id"])
         return None
     request = payload["request"]
     return ChatCompletionRequest(
@@ -234,6 +250,9 @@ def decode_command(raw_line: bytes) -> ChatCompletionRequest | None:
         max_tokens=request["max_tokens"],
         temperature=request["temperature"],
         top_p=request["top_p"],
+        max_prompt_tokens=request["max_prompt_tokens"],
+        max_completion_tokens=request["max_completion_tokens"],
+        max_total_tokens_per_request=request["max_total_tokens_per_request"],
         stream=request.get("stream", False),
     )
 
@@ -267,10 +286,18 @@ def encode_event(
     else:
         payload = {
             "type": "error",
+            "code": event.code,
             "request_id": event.request_id,
             "message": event.message.replace("\n", " "),
         }
 
+    return (json.dumps(payload) + "\n").encode("utf-8")
+
+
+def encode_cancel_request(request_id: str) -> bytes:
+    """Encode a cancellation command."""
+
+    payload = {"type": "cancel_request", "request_id": request_id}
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
@@ -298,6 +325,7 @@ def decode_event(
         )
     if payload.get("type") == "error":
         return WorkerCommandError(
+            code=payload["code"],
             request_id=payload["request_id"],
             message=payload["message"],
         )

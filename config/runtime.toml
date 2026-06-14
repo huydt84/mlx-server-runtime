@@ -12,3 +12,11 @@ ipc_path = "/tmp/mlx-runtime.sock"
 temperature = 0.7
 top_p = 0.9
 max_tokens = 512
+
+[limits]
+max_pending_requests = 64
+max_active_requests = 16
+max_prompt_tokens = 32768
+max_completion_tokens = 4096
+max_total_tokens_per_request = 65536
+request_timeout_seconds = 300

@@ -58,6 +58,8 @@ impl fmt::Display for WorkerMessage {
 pub enum GatewayCommand {
     /// A non-streaming chat completion request.
     ChatCompletion { request: ChatCompletionRequest },
+    /// Cancel an in-flight chat completion request.
+    CancelRequest { request_id: String },
 }
 
 /// Events sent from the worker to the gateway after bootstrap.
@@ -70,6 +72,8 @@ pub enum WorkerEvent {
     ChatCompletion { response: ChatCompletionResponse },
     /// A worker-side request failure.
     Error {
+        /// Machine-readable failure code.
+        code: String,
         /// The request id associated with the error.
         request_id: String,
         /// Human-readable failure reason.
@@ -148,8 +152,22 @@ mod tests {
                 max_tokens: 16,
                 temperature: 0.2,
                 top_p: 0.9,
+                max_prompt_tokens: 10,
+                max_completion_tokens: 10,
+                max_total_tokens_per_request: 20,
                 stream: false,
             },
+        };
+
+        let encoded = encode_gateway_command(&command).unwrap();
+        let decoded = decode_gateway_command(&encoded).unwrap();
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn cancel_request_round_trip() {
+        let command = GatewayCommand::CancelRequest {
+            request_id: "req-1".to_string(),
         };
 
         let encoded = encode_gateway_command(&command).unwrap();
@@ -168,6 +186,19 @@ mod tests {
                 prompt_tokens: 12,
                 completion_tokens: 3,
             },
+        };
+
+        let encoded = encode_worker_event(&event).unwrap();
+        let decoded = decode_worker_event(&encoded).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn worker_error_round_trip() {
+        let event = WorkerEvent::Error {
+            code: "INVALID_REQUEST".to_string(),
+            request_id: "req-1".to_string(),
+            message: "prompt too long".to_string(),
         };
 
         let encoded = encode_worker_event(&event).unwrap();

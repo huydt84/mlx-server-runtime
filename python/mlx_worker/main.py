@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import signal
 import socket
+import select
 import time
 from contextlib import suppress
 from typing import Callable
@@ -12,6 +14,7 @@ from .config import load_config
 from .ipc import (
     ChatCompletionResponse,
     ChatCompletionDelta,
+    CancelRequest,
     ModelError,
     ModelLoadProgress,
     ModelStatus,
@@ -22,6 +25,65 @@ from .ipc import (
     encode_bootstrap_message,
     encode_event,
 )
+
+
+def _pop_buffered_line(read_buffer: bytearray) -> bytes | None:
+    """Pop one newline-delimited frame from buffer."""
+
+    newline = read_buffer.find(b"\n")
+    if newline < 0:
+        return None
+    line = bytes(read_buffer[: newline + 1])
+    del read_buffer[: newline + 1]
+    return line
+
+
+def _read_command_line(
+    client: socket.socket,
+    read_buffer: bytearray,
+    *,
+    block: bool,
+) -> bytes | None:
+    """Read one newline-delimited frame from socket.
+
+    Returns `None` only for non-blocking polls with no full frame available.
+    Returns `b""` on EOF.
+    """
+
+    line = _pop_buffered_line(read_buffer)
+    if line is not None:
+        return line
+
+    while True:
+        if not block and not select.select([client], [], [], 0)[0]:
+            return None
+
+        chunk = client.recv(4096)
+        if not chunk:
+            return b""
+
+        read_buffer.extend(chunk)
+        line = _pop_buffered_line(read_buffer)
+        if line is not None:
+            return line
+
+        if not block:
+            return None
+
+
+def _is_matching_cancel_request(raw_line: bytes, request_id: str) -> bool:
+    """Return true when raw frame is cancel for active request."""
+
+    try:
+        payload = json.loads(raw_line)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("type") == "cancel_request"
+        and payload.get("request_id") == request_id
+    )
 
 
 def main(
@@ -117,43 +179,96 @@ def main(
             return 1
 
         client.sendall(encode_bootstrap_message(WorkerReady()))
-        reader = client.makefile("rb")
+        read_buffer = bytearray()
+        pending_lines: list[bytes] = []
 
         while not stop:
-            raw_line = reader.readline()
+            if pending_lines:
+                raw_line = pending_lines.pop(0)
+            else:
+                raw_line = _read_command_line(client, read_buffer, block=True)
             if not raw_line:
                 break
 
-            request = decode_command(raw_line)
-            if request is None:
-                event: ChatCompletionResponse | WorkerCommandError = WorkerCommandError(
-                    request_id="unknown",
-                    message="unsupported worker command",
-                )
-            else:
-                try:
-                    assert engine is not None
-                    if request.stream:
-                        def emit_delta(delta: str) -> None:
-                            client.sendall(
-                                encode_event(
-                                    ChatCompletionDelta(
-                                        request_id=request.request_id,
-                                        delta=delta,
-                                    )
-                                )
-                            )
-
-                        event = engine.stream_chat(request, emit_delta)  # type: ignore[attr-defined]
-                    else:
-                        event = engine.complete_chat(request)  # type: ignore[attr-defined]
-                except Exception as exc:
-                    event = WorkerCommandError(
-                        request_id=request.request_id,
+            try:
+                request = decode_command(raw_line)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                event: ChatCompletionResponse | WorkerCommandError | None = (
+                    WorkerCommandError(
+                        code="INVALID_REQUEST",
+                        request_id="unknown",
                         message=str(exc),
                     )
+                )
+            else:
+                if request is None:
+                    event = WorkerCommandError(
+                        code="INVALID_REQUEST",
+                        request_id="unknown",
+                        message="unsupported worker command",
+                    )
+                elif isinstance(request, CancelRequest):
+                    continue
+                else:
+                    try:
+                        assert engine is not None
+                        if request.stream:
+                            cancelled = False
 
-            client.sendall(encode_event(event))
+                            def should_cancel() -> bool:
+                                nonlocal cancelled
+                                if cancelled:
+                                    return True
+                                pending = _read_command_line(
+                                    client,
+                                    read_buffer,
+                                    block=False,
+                                )
+                                if pending is None:
+                                    return False
+                                if not pending:
+                                    cancelled = True
+                                    return True
+                                if _is_matching_cancel_request(
+                                    pending,
+                                    request.request_id,
+                                ):
+                                    cancelled = True
+                                    return True
+                                pending_lines.append(pending)
+                                return False
+
+                            def emit_delta(delta: str) -> None:
+                                client.sendall(
+                                    encode_event(
+                                        ChatCompletionDelta(
+                                            request_id=request.request_id,
+                                            delta=delta,
+                                        )
+                                    )
+                                )
+
+                            event = engine.stream_chat(  # type: ignore[attr-defined]
+                                request,
+                                emit_delta,
+                                should_cancel,
+                            )
+                        else:
+                            event = engine.complete_chat(request)  # type: ignore[attr-defined]
+                    except Exception as exc:
+                        code = (
+                            "INVALID_REQUEST"
+                            if isinstance(exc, ValueError)
+                            else "WORKER_ERROR"
+                        )
+                        event = WorkerCommandError(
+                            code=code,
+                            request_id=request.request_id,
+                            message=str(exc),
+                        )
+
+            if event is not None:
+                client.sendall(encode_event(event))
 
         with suppress(OSError):
             client.shutdown(socket.SHUT_RDWR)
@@ -189,7 +304,9 @@ def _status(
         dtype=None,
         loaded_at=loaded_at,
         started_loading_at=started_loading_at,
-        last_transition_at=last_transition_at if last_transition_at is not None else now,
+        last_transition_at=last_transition_at
+        if last_transition_at is not None
+        else now,
         last_error=last_error,
         warmup_passed=warmup_passed,
         last_warmup_at=last_warmup_at,

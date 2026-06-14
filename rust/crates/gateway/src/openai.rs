@@ -1,4 +1,4 @@
-use crate::config::GenerationConfig;
+use crate::config::{GenerationConfig, RequestLimits};
 use mlx_runtime_protocol::{
     ChatCompletionRequest as WorkerChatCompletionRequest, ChatCompletionResponse, ChatMessage,
     MessageRole,
@@ -79,6 +79,7 @@ impl ChatCompletionHttpRequest {
     pub fn into_worker_request(
         self,
         generation: &GenerationConfig,
+        limits: &RequestLimits,
         configured_model: &str,
     ) -> Result<WorkerChatCompletionRequest, String> {
         if self.model.trim().is_empty() {
@@ -100,6 +101,9 @@ impl ChatCompletionHttpRequest {
         {
             return Err("message content must not be empty".to_string());
         }
+        if self.max_tokens == Some(0) {
+            return Err("max_tokens must be positive".to_string());
+        }
 
         Ok(WorkerChatCompletionRequest {
             request_id: format!("req-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)),
@@ -108,6 +112,12 @@ impl ChatCompletionHttpRequest {
             max_tokens: self.max_tokens.unwrap_or(generation.max_tokens),
             temperature: self.temperature.unwrap_or(generation.temperature),
             top_p: self.top_p.unwrap_or(generation.top_p),
+            max_prompt_tokens: u32::try_from(limits.max_prompt_tokens)
+                .map_err(|_| "max_prompt_tokens out of range".to_string())?,
+            max_completion_tokens: u32::try_from(limits.max_completion_tokens)
+                .map_err(|_| "max_completion_tokens out of range".to_string())?,
+            max_total_tokens_per_request: u32::try_from(limits.max_total_tokens_per_request)
+                .map_err(|_| "max_total_tokens_per_request out of range".to_string())?,
             stream: self.stream.unwrap_or(false),
         })
     }

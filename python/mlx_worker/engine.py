@@ -36,6 +36,7 @@ class MlxWorkerEngine:
             )
 
         prompt = self._build_prompt(request)
+        self._validate_token_limits(request, prompt)
         sampler = make_sampler(temp=request.temperature, top_p=request.top_p)
         text_segments: list[str] = []
         final_response = None
@@ -66,6 +67,7 @@ class MlxWorkerEngine:
         self,
         request: ChatCompletionRequest,
         emit_delta: Callable[[str], None],
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ChatCompletionResponse:
         """Generate a streaming chat completion and emit text deltas."""
 
@@ -75,6 +77,7 @@ class MlxWorkerEngine:
             )
 
         prompt = self._build_prompt(request)
+        self._validate_token_limits(request, prompt)
         sampler = make_sampler(temp=request.temperature, top_p=request.top_p)
         text_segments: list[str] = []
         final_response = None
@@ -86,9 +89,27 @@ class MlxWorkerEngine:
             max_tokens=request.max_tokens,
             sampler=sampler,
         ):
+            if should_cancel is not None and should_cancel():
+                return ChatCompletionResponse(
+                    request_id=request.request_id,
+                    model=self.model_id,
+                    text="".join(text_segments),
+                    finish_reason="cancelled",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                )
             text_segments.append(response.text)
             emit_delta(response.text)
             final_response = response
+            if should_cancel is not None and should_cancel():
+                return ChatCompletionResponse(
+                    request_id=request.request_id,
+                    model=self.model_id,
+                    text="".join(text_segments),
+                    finish_reason="cancelled",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                )
 
         if final_response is None:
             raise RuntimeError("mlx-lm returned no completion response")
@@ -113,6 +134,9 @@ class MlxWorkerEngine:
                 max_tokens=1,
                 temperature=0.0,
                 top_p=1.0,
+                max_prompt_tokens=64,
+                max_completion_tokens=64,
+                max_total_tokens_per_request=128,
             )
         )
 
@@ -138,3 +162,31 @@ class MlxWorkerEngine:
             )
             + "\nAssistant:"
         )
+
+    def _validate_token_limits(
+        self,
+        request: ChatCompletionRequest,
+        prompt: list[int] | str,
+    ) -> None:
+        """Reject prompts that exceed gateway token caps."""
+
+        if isinstance(prompt, list):
+            prompt_tokens = len(prompt)
+        else:
+            prompt_tokens = len(self.tokenizer.encode(prompt, add_special_tokens=False))
+
+        completion_tokens = request.max_tokens
+        total_tokens = prompt_tokens + completion_tokens
+
+        if prompt_tokens > request.max_prompt_tokens:
+            raise ValueError(
+                f"prompt too long: {prompt_tokens} tokens exceeds max_prompt_tokens {request.max_prompt_tokens}"
+            )
+        if completion_tokens > request.max_completion_tokens:
+            raise ValueError(
+                f"completion too long: {completion_tokens} tokens exceeds max_completion_tokens {request.max_completion_tokens}"
+            )
+        if total_tokens > request.max_total_tokens_per_request:
+            raise ValueError(
+                f"request too large: {total_tokens} tokens exceeds max_total_tokens_per_request {request.max_total_tokens_per_request}"
+            )

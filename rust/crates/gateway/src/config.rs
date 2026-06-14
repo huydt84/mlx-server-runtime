@@ -35,6 +35,23 @@ pub struct GenerationConfig {
     pub max_tokens: u32,
 }
 
+/// Backpressure limits for inbound requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestLimits {
+    /// Maximum queued requests waiting for a worker slot.
+    pub max_pending_requests: usize,
+    /// Maximum concurrent active requests.
+    pub max_active_requests: usize,
+    /// Maximum prompt tokens allowed per request.
+    pub max_prompt_tokens: usize,
+    /// Maximum completion tokens allowed per request.
+    pub max_completion_tokens: usize,
+    /// Maximum prompt + completion tokens allowed per request.
+    pub max_total_tokens_per_request: usize,
+    /// Seconds to wait for a slot before returning 429.
+    pub request_timeout_seconds: u64,
+}
+
 /// Runtime configuration for the Phase 0 skeleton.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -44,6 +61,8 @@ pub struct RuntimeConfig {
     pub worker: WorkerConfig,
     /// Generation defaults.
     pub generation: GenerationConfig,
+    /// Request backpressure limits.
+    pub limits: RequestLimits,
 }
 
 impl Default for RuntimeConfig {
@@ -63,6 +82,14 @@ impl Default for RuntimeConfig {
                 temperature: 0.7,
                 top_p: 0.9,
                 max_tokens: 512,
+            },
+            limits: RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
             },
         }
     }
@@ -121,6 +148,55 @@ impl RuntimeConfig {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             "generation.max_tokens out of range",
+                        )
+                    })?
+                }
+                ("limits", "max_pending_requests", Value::Integer(value)) => {
+                    config.limits.max_pending_requests = usize::try_from(value).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "limits.max_pending_requests out of range",
+                        )
+                    })?
+                }
+                ("limits", "max_active_requests", Value::Integer(value)) => {
+                    config.limits.max_active_requests = usize::try_from(value).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "limits.max_active_requests out of range",
+                        )
+                    })?
+                }
+                ("limits", "max_prompt_tokens", Value::Integer(value)) => {
+                    config.limits.max_prompt_tokens = usize::try_from(value).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "limits.max_prompt_tokens out of range",
+                        )
+                    })?
+                }
+                ("limits", "max_completion_tokens", Value::Integer(value)) => {
+                    config.limits.max_completion_tokens = usize::try_from(value).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "limits.max_completion_tokens out of range",
+                        )
+                    })?
+                }
+                ("limits", "max_total_tokens_per_request", Value::Integer(value)) => {
+                    config.limits.max_total_tokens_per_request =
+                        usize::try_from(value).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "limits.max_total_tokens_per_request out of range",
+                            )
+                        })?
+                }
+                ("limits", "request_timeout_seconds", Value::Integer(value)) => {
+                    config.limits.request_timeout_seconds = u64::try_from(value).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "limits.request_timeout_seconds out of range",
                         )
                     })?
                 }
@@ -212,6 +288,14 @@ mod tests {
             temperature = 0.1
             top_p = 0.8
             max_tokens = 42
+
+            [limits]
+            max_pending_requests = 8
+            max_active_requests = 4
+            max_prompt_tokens = 1024
+            max_completion_tokens = 256
+            max_total_tokens_per_request = 2048
+            request_timeout_seconds = 10
             "#,
         )
         .unwrap();
@@ -227,5 +311,11 @@ mod tests {
         assert_eq!(config.generation.temperature, 0.1);
         assert_eq!(config.generation.top_p, 0.8);
         assert_eq!(config.generation.max_tokens, 42);
+        assert_eq!(config.limits.max_pending_requests, 8);
+        assert_eq!(config.limits.max_active_requests, 4);
+        assert_eq!(config.limits.max_prompt_tokens, 1024);
+        assert_eq!(config.limits.max_completion_tokens, 256);
+        assert_eq!(config.limits.max_total_tokens_per_request, 2048);
+        assert_eq!(config.limits.request_timeout_seconds, 10);
     }
 }

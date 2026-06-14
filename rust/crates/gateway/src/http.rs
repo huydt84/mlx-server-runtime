@@ -9,8 +9,10 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Service used by the HTTP layer to fulfill completions.
 pub trait ChatCompletionService: Send + Sync {
@@ -29,6 +31,11 @@ pub trait ChatCompletionService: Send + Sync {
         let _ = on_delta;
         self.complete(request)
     }
+
+    /// Cancel an in-flight completion, if supported.
+    fn cancel(&self, _request_id: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
 }
 
 impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
@@ -45,6 +52,10 @@ impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
         on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         (**self).stream(request, on_delta)
+    }
+
+    fn cancel(&self, request_id: &str) -> Result<(), GatewayError> {
+        (**self).cancel(request_id)
     }
 }
 
@@ -63,18 +74,150 @@ impl ChatCompletionService for crate::ipc::WorkerClient {
     ) -> Result<ChatCompletionResponse, GatewayError> {
         self.stream_chat(request, on_delta)
     }
+
+    fn cancel(&self, request_id: &str) -> Result<(), GatewayError> {
+        self.cancel_chat(request_id)
+    }
 }
 
 struct AppState {
     runtime: RuntimeState,
     generation: crate::config::GenerationConfig,
+    limits: crate::config::RequestLimits,
+    admission: Arc<RequestAdmission>,
     model: String,
     test_backend: Option<Arc<dyn ChatCompletionService>>,
+}
+
+struct RequestAdmission {
+    max_pending_requests: usize,
+    max_active_requests: usize,
+    request_timeout: Duration,
+    state: Mutex<AdmissionState>,
+    wakeup: Condvar,
+}
+
+struct AdmissionState {
+    active: usize,
+    waiting: usize,
+}
+
+struct RequestPermit {
+    admission: Arc<RequestAdmission>,
+}
+
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.admission.state.lock() {
+            if state.active > 0 {
+                state.active -= 1;
+            }
+            self.admission.wakeup.notify_one();
+        }
+    }
+}
+
+impl RequestAdmission {
+    fn new(
+        max_pending_requests: usize,
+        max_active_requests: usize,
+        request_timeout: Duration,
+    ) -> Self {
+        Self {
+            max_pending_requests,
+            max_active_requests,
+            request_timeout,
+            state: Mutex::new(AdmissionState {
+                active: 0,
+                waiting: 0,
+            }),
+            wakeup: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<RequestPermit, HttpResponse> {
+        match self.acquire_until(None)? {
+            Some(permit) => Ok(permit),
+            None => Err(json_error_response(
+                "500 Internal Server Error",
+                "BACKPRESSURE_CANCELLED",
+                "request admission cancelled unexpectedly",
+            )),
+        }
+    }
+
+    fn acquire_until(
+        self: &Arc<Self>,
+        disconnected: Option<&AtomicBool>,
+    ) -> Result<Option<RequestPermit>, HttpResponse> {
+        let deadline = Instant::now() + self.request_timeout;
+        let mut guard = self.state.lock().map_err(|_| {
+            json_error_response(
+                "500 Internal Server Error",
+                "BACKPRESSURE_LOCK_POISONED",
+                "request admission lock poisoned",
+            )
+        })?;
+
+        loop {
+            if disconnected.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Ok(None);
+            }
+            if guard.active < self.max_active_requests {
+                guard.active += 1;
+                return Ok(Some(RequestPermit {
+                    admission: self.clone(),
+                }));
+            }
+
+            if guard.waiting >= self.max_pending_requests {
+                return Err(json_error_response(
+                    "429 Too Many Requests",
+                    "QUEUE_FULL",
+                    "request queue is full",
+                ));
+            }
+
+            guard.waiting += 1;
+            let now = Instant::now();
+            let wait_for = deadline.saturating_duration_since(now);
+            let wait_for = if disconnected.is_some() {
+                wait_for.min(Duration::from_millis(50))
+            } else {
+                wait_for
+            };
+            let (next_guard, wait_result) =
+                self.wakeup.wait_timeout(guard, wait_for).map_err(|_| {
+                    json_error_response(
+                        "500 Internal Server Error",
+                        "BACKPRESSURE_LOCK_POISONED",
+                        "request admission lock poisoned",
+                    )
+                })?;
+            guard = next_guard;
+            if guard.waiting > 0 {
+                guard.waiting -= 1;
+            }
+
+            if wait_result.timed_out() && Instant::now() >= deadline {
+                return Err(json_error_response(
+                    "429 Too Many Requests",
+                    "QUEUE_TIMEOUT",
+                    "request queue wait timed out",
+                ));
+            }
+        }
+    }
 }
 
 /// Serves the Phase 1 HTTP surface.
 pub fn serve(config: RuntimeConfig, runtime: RuntimeState) -> Result<(), GatewayError> {
     let listener = TcpListener::bind(format!("{}:{}", config.server.host, config.server.port))?;
+    let admission = Arc::new(RequestAdmission::new(
+        config.limits.max_pending_requests,
+        config.limits.max_active_requests,
+        Duration::from_secs(config.limits.request_timeout_seconds),
+    ));
 
     for stream in listener.incoming() {
         match stream {
@@ -82,6 +225,8 @@ pub fn serve(config: RuntimeConfig, runtime: RuntimeState) -> Result<(), Gateway
                 let state = AppState {
                     runtime: runtime.clone(),
                     generation: config.generation.clone(),
+                    limits: config.limits.clone(),
+                    admission: admission.clone(),
                     model: config.worker.model.clone(),
                     test_backend: None,
                 };
@@ -111,9 +256,9 @@ fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), Gatew
         reader.read_exact(&mut body)?;
     }
 
-    if request_line.starts_with("POST /v1/chat/completions ")
-        && request_streams(&body).unwrap_or(false)
-    {
+    let is_stream = request_line.starts_with("POST /v1/chat/completions ")
+        && request_streams(&body).unwrap_or(false);
+    if is_stream {
         stream_chat_completion(&mut stream, &body, &state)?;
         return Ok(());
     }
@@ -353,9 +498,17 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
         }
     };
 
-    let worker_request = match request.into_worker_request(&state.generation, &state.model) {
-        Ok(request) => request,
-        Err(message) => return json_error_response("400 Bad Request", "INVALID_REQUEST", &message),
+    let worker_request =
+        match request.into_worker_request(&state.generation, &state.limits, &state.model) {
+            Ok(request) => request,
+            Err(message) => {
+                return json_error_response("400 Bad Request", "INVALID_REQUEST", &message)
+            }
+        };
+
+    let _permit = match state.admission.acquire() {
+        Ok(permit) => permit,
+        Err(response) => return response,
     };
 
     let backend = if let Some(backend) = &state.test_backend {
@@ -391,22 +544,31 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
                 body,
             }
         }
-        Err(GatewayError::WorkerStartup(message)) => {
-            json_error_response("503 Service Unavailable", "WORKER_UNAVAILABLE", &message)
-        }
-        Err(GatewayError::Protocol(message)) => {
-            json_error_response("500 Internal Server Error", "PROTOCOL_ERROR", &message)
-        }
-        Err(GatewayError::Io(err)) => {
-            json_error_response("500 Internal Server Error", "IO_ERROR", &err.to_string())
-        }
+        Err(err) => gateway_error_response(&err),
     }
 }
 
-fn stream_chat_completion<W: Write>(
+fn stream_chat_completion(
+    stream: &mut TcpStream,
+    body: &[u8],
+    state: &AppState,
+) -> Result<(), GatewayError> {
+    let disconnect_monitor = DisconnectMonitor::start(stream.try_clone()?)?;
+    let result = stream_chat_completion_with_disconnect(
+        stream,
+        body,
+        state,
+        Some(disconnect_monitor.disconnected()),
+    );
+    drop(disconnect_monitor);
+    result
+}
+
+fn stream_chat_completion_with_disconnect<W: Write>(
     writer: &mut W,
     body: &[u8],
     state: &AppState,
+    disconnected: Option<Arc<AtomicBool>>,
 ) -> Result<(), GatewayError> {
     let status = state
         .runtime
@@ -439,16 +601,32 @@ fn stream_chat_completion<W: Write>(
         }
     };
 
-    let worker_request = match request.into_worker_request(&state.generation, &state.model) {
-        Ok(request) => request,
-        Err(message) => {
-            let response = json_error_response("400 Bad Request", "INVALID_REQUEST", &message);
+    let worker_request =
+        match request.into_worker_request(&state.generation, &state.limits, &state.model) {
+            Ok(request) => request,
+            Err(message) => {
+                let response = json_error_response("400 Bad Request", "INVALID_REQUEST", &message);
+                return write_response(
+                    writer,
+                    &response.status,
+                    response.content_type,
+                    &response.body,
+                );
+            }
+        };
+
+    let _permit = match state.admission.acquire_until(disconnected.as_deref()) {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            return Ok(());
+        }
+        Err(response) => {
             return write_response(
                 writer,
                 &response.status,
                 response.content_type,
                 &response.body,
-            );
+            )
         }
     };
 
@@ -485,17 +663,15 @@ fn stream_chat_completion<W: Write>(
         );
     };
 
-    write!(
-        writer,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
-    )?;
-    writer.flush()?;
-
     let created = stream_completion_created();
     let model = state.model.clone();
     let request_id = worker_request.request_id.clone();
+    let mut stream_started = false;
+    let cancel_on_disconnect =
+        DisconnectCancellation::start(disconnected.clone(), backend.clone(), request_id.clone());
 
     let mut on_delta = |delta: String| -> Result<(), GatewayError> {
+        ensure_sse_stream_started(writer, &mut stream_started)?;
         let event = json!({
             "id": format!("chatcmpl-{}", request_id),
             "object": "chat.completion.chunk",
@@ -515,7 +691,50 @@ fn stream_chat_completion<W: Write>(
         Ok(())
     };
 
-    let response = backend.stream(worker_request, &mut on_delta)?;
+    let response = match backend.stream(worker_request, &mut on_delta) {
+        Ok(response) => response,
+        Err(err) => {
+            drop(cancel_on_disconnect);
+            let _ = backend.cancel(&request_id);
+            if disconnected
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return Ok(());
+            }
+            return match err {
+                GatewayError::InvalidRequest(message) if !stream_started => {
+                    let response =
+                        json_error_response("400 Bad Request", "INVALID_REQUEST", &message);
+                    write_response(
+                        writer,
+                        &response.status,
+                        response.content_type,
+                        &response.body,
+                    )
+                }
+                other if !stream_started => {
+                    let response = gateway_error_response(&other);
+                    write_response(
+                        writer,
+                        &response.status,
+                        response.content_type,
+                        &response.body,
+                    )
+                }
+                GatewayError::InvalidRequest(message) => Err(GatewayError::Protocol(message)),
+                other => Err(other),
+            };
+        }
+    };
+    drop(cancel_on_disconnect);
+    if disconnected
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Ok(());
+    }
+    ensure_sse_stream_started(writer, &mut stream_started)?;
     let done_event = json!({
         "id": format!("chatcmpl-{}", response.request_id),
         "object": "chat.completion.chunk",
@@ -531,6 +750,135 @@ fn stream_chat_completion<W: Write>(
     write!(writer, "data: [DONE]\n\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn ensure_sse_stream_started<W: Write>(
+    writer: &mut W,
+    stream_started: &mut bool,
+) -> Result<(), GatewayError> {
+    if *stream_started {
+        return Ok(());
+    }
+    write!(
+        writer,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+    )?;
+    writer.flush()?;
+    *stream_started = true;
+    Ok(())
+}
+
+fn gateway_error_response(err: &GatewayError) -> HttpResponse {
+    match err {
+        GatewayError::InvalidRequest(message) => {
+            json_error_response("400 Bad Request", "INVALID_REQUEST", message)
+        }
+        GatewayError::WorkerStartup(message) => {
+            json_error_response("503 Service Unavailable", "WORKER_UNAVAILABLE", message)
+        }
+        GatewayError::Protocol(message) => {
+            json_error_response("500 Internal Server Error", "PROTOCOL_ERROR", message)
+        }
+        GatewayError::Io(err) => {
+            json_error_response("500 Internal Server Error", "IO_ERROR", &err.to_string())
+        }
+    }
+}
+
+struct DisconnectMonitor {
+    disconnected: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl DisconnectMonitor {
+    fn start(stream: TcpStream) -> Result<Self, GatewayError> {
+        stream.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let watch_disconnected = disconnected.clone();
+        let watch_stop = stop.clone();
+        let handle = thread::spawn(move || {
+            let mut probe = [0_u8; 1];
+            while !watch_stop.load(Ordering::Relaxed) {
+                match stream.peek(&mut probe) {
+                    Ok(0) => {
+                        watch_disconnected.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Ok(_) => thread::sleep(Duration::from_millis(50)),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        watch_disconnected.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            disconnected,
+            stop,
+            handle: Some(handle),
+        })
+    }
+
+    fn disconnected(&self) -> Arc<AtomicBool> {
+        self.disconnected.clone()
+    }
+}
+
+impl Drop for DisconnectMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct DisconnectCancellation {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl DisconnectCancellation {
+    fn start(
+        disconnected: Option<Arc<AtomicBool>>,
+        backend: Arc<dyn ChatCompletionService>,
+        request_id: String,
+    ) -> Option<Self> {
+        let disconnected = disconnected?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancel_stop = stop.clone();
+        let handle = thread::spawn(move || {
+            while !cancel_stop.load(Ordering::Relaxed) {
+                if disconnected.load(Ordering::Relaxed) {
+                    let _ = backend.cancel(&request_id);
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Some(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for DisconnectCancellation {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 fn not_ready_response(status: &ModelStatus) -> HttpResponse {
@@ -741,6 +1089,15 @@ mod tests {
                     top_p: 0.9,
                     max_tokens: 32,
                 },
+                limits: crate::config::RequestLimits {
+                    max_pending_requests: 64,
+                    max_active_requests: 16,
+                    max_prompt_tokens: 32_768,
+                    max_completion_tokens: 4_096,
+                    max_total_tokens_per_request: 65_536,
+                    request_timeout_seconds: 300,
+                },
+                admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
                 test_backend: Some(Arc::new(FakeService::default())),
             },
@@ -848,6 +1205,15 @@ mod tests {
                     top_p: 0.9,
                     max_tokens: 32,
                 },
+                limits: crate::config::RequestLimits {
+                    max_pending_requests: 64,
+                    max_active_requests: 16,
+                    max_prompt_tokens: 32_768,
+                    max_completion_tokens: 4_096,
+                    max_total_tokens_per_request: 65_536,
+                    request_timeout_seconds: 300,
+                },
+                admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
                 test_backend: Some(Arc::new(FakeService::default())),
             },
@@ -884,6 +1250,43 @@ mod tests {
 
         assert_eq!(response.status, "503 Service Unavailable");
         assert!(response.body.contains("\"MODEL_NOT_READY\""));
+    }
+
+    #[test]
+    fn chat_completion_returns_429_when_queue_full() {
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let state = AppState {
+            runtime: test_runtime(ModelState::Ready),
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 0,
+                max_active_requests: 1,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+            },
+            admission: Arc::new(RequestAdmission::new(0, 1, Duration::from_secs(300))),
+            model: "test-model".to_string(),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+        let _permit = match state.admission.acquire() {
+            Ok(permit) => permit,
+            Err(response) => panic!("unexpected admission error: {}", response.status),
+        };
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+
+        assert_eq!(response.status, "429 Too Many Requests");
+        assert!(response.body.contains("\"QUEUE_FULL\""));
     }
 
     #[test]
@@ -933,12 +1336,65 @@ mod tests {
         let state = test_state(ModelState::Ready, service);
         let mut buffer = Cursor::new(Vec::new());
 
-        stream_chat_completion(&mut buffer, &body, &state).unwrap();
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
 
         let body = String::from_utf8(buffer.into_inner()).unwrap();
         assert!(body.contains("text/event-stream"));
         assert!(body.contains("chat.completion.chunk"));
         assert!(body.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn streaming_chat_completion_returns_http_400_before_stream_starts() {
+        let service = Arc::new(InvalidStreamingService);
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": true
+        }))
+        .unwrap();
+        let state = test_state(ModelState::Ready, service);
+        let mut buffer = Cursor::new(Vec::new());
+
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
+
+        let body = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(body.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(body.contains("\"INVALID_REQUEST\""));
+        assert!(!body.contains("text/event-stream"));
+    }
+
+    #[test]
+    fn streaming_chat_completion_cancels_when_disconnected_before_first_delta() {
+        let service = Arc::new(CancellableStreamingService::default());
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": true
+        }))
+        .unwrap();
+        let state = test_state(ModelState::Ready, service.clone());
+        let mut buffer = Cursor::new(Vec::new());
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let trigger = disconnected.clone();
+
+        let flip = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            trigger.store(true, Ordering::Relaxed);
+        });
+
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, Some(disconnected))
+            .unwrap();
+        flip.join().unwrap();
+
+        assert_eq!(service.cancel_count(), 2);
+        assert_eq!(String::from_utf8(buffer.into_inner()).unwrap(), "");
     }
 
     fn test_state(state: ModelState, backend: Arc<dyn ChatCompletionService>) -> AppState {
@@ -950,6 +1406,15 @@ mod tests {
                 top_p: 0.9,
                 max_tokens: 32,
             },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+            },
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "test-model".to_string(),
             test_backend: Some(backend),
         }
@@ -1040,6 +1505,78 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct InvalidStreamingService;
+
+    impl ChatCompletionService for InvalidStreamingService {
+        fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: "hello".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+
+        fn stream(
+            &self,
+            _request: ChatCompletionRequest,
+            _on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Err(GatewayError::InvalidRequest("prompt too long".to_string()))
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct CancellableStreamingService {
+        cancelled: Arc<AtomicBool>,
+        cancel_calls: Arc<Mutex<usize>>,
+    }
+
+    impl CancellableStreamingService {
+        fn cancel_count(&self) -> usize {
+            *self.cancel_calls.lock().unwrap()
+        }
+    }
+
+    impl ChatCompletionService for CancellableStreamingService {
+        fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: "hello".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+        }
+
+        fn stream(
+            &self,
+            _request: ChatCompletionRequest,
+            _on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            while !self.cancelled.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(GatewayError::Protocol("cancelled".to_string()))
+        }
+
+        fn cancel(&self, _request_id: &str) -> Result<(), GatewayError> {
+            self.cancelled.store(true, Ordering::Relaxed);
+            *self.cancel_calls.lock().unwrap() += 1;
+            Ok(())
         }
     }
 }
