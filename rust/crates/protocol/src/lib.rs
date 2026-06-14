@@ -4,6 +4,9 @@ mod events;
 mod request;
 mod response;
 
-pub use events::{decode_worker_message, encode_worker_message, WorkerMessage};
-pub use request::HealthCheck;
-pub use response::{WorkerError, WorkerReady};
+pub use events::{
+    decode_gateway_command, decode_worker_event, decode_worker_message, encode_gateway_command,
+    encode_worker_event, encode_worker_message, GatewayCommand, WorkerEvent, WorkerMessage,
+};
+pub use request::{ChatCompletionRequest, ChatMessage, HealthCheck, MessageRole};
+pub use response::{ChatCompletionResponse, WorkerError, WorkerReady};

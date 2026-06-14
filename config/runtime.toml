@@ -3,7 +3,12 @@ host = "127.0.0.1"
 port = 8000
 
 [worker]
-python = "python3"
+python = "python/.venv/bin/python"
 module = "mlx_worker.main"
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 ipc_path = "/tmp/mlx-runtime.sock"
+
+[generation]
+temperature = 0.7
+top_p = 0.9
+max_tokens = 512

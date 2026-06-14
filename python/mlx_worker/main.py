@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import signal
 import socket
-import time
 from contextlib import suppress
 
 from .config import load_config
-from .ipc import WorkerReady, encode_message
+from .ipc import (
+    ChatCompletionResponse,
+    WorkerCommandError,
+    WorkerError,
+    WorkerReady,
+    decode_command,
+    encode_bootstrap_message,
+    encode_event,
+)
 
 
 def main() -> int:
-    """Run the readiness handshake and then keep the worker alive."""
+    """Run the readiness handshake and Phase 1 worker loop."""
 
     config = load_config()
     stop = False
@@ -26,10 +33,38 @@ def main() -> int:
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.connect(config.socket_path)
-        client.sendall(encode_message(WorkerReady()))
+        try:
+            from .engine import MlxWorkerEngine
+
+            engine = MlxWorkerEngine(config.model)
+        except Exception as exc:
+            client.sendall(encode_bootstrap_message(WorkerError(str(exc))))
+            return 1
+
+        client.sendall(encode_bootstrap_message(WorkerReady()))
+        reader = client.makefile("rb")
 
         while not stop:
-            time.sleep(1.0)
+            raw_line = reader.readline()
+            if not raw_line:
+                break
+
+            request = decode_command(raw_line)
+            if request is None:
+                event: ChatCompletionResponse | WorkerCommandError = WorkerCommandError(
+                    request_id="unknown",
+                    message="unsupported worker command",
+                )
+            else:
+                try:
+                    event = engine.complete_chat(request)
+                except Exception as exc:
+                    event = WorkerCommandError(
+                        request_id=request.request_id,
+                        message=str(exc),
+                    )
+
+            client.sendall(encode_event(event))
 
         with suppress(OSError):
             client.shutdown(socket.SHUT_RDWR)
@@ -39,4 +74,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

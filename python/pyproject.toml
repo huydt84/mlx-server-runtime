@@ -9,6 +9,7 @@ description = "Python MLX worker bootstrap for the local runtime"
 requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.31.2",
+    "mlx-lm>=0.31.3",
 ]
 
 [dependency-groups]

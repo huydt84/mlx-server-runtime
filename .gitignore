@@ -99,6 +99,8 @@ Desktop.ini
 *.sln
 *.sw?
 
+# Vibe-code
 .agents/
 .codex/
 .opencode/
+prompts/

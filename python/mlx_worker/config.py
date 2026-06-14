@@ -8,7 +8,7 @@ import os
 
 @dataclass(frozen=True)
 class WorkerConfig:
-    """Configuration needed for the Phase 0 readiness handshake."""
+    """Configuration needed for the worker runtime."""
 
     socket_path: str
     model: str
@@ -23,4 +23,3 @@ def load_config() -> WorkerConfig:
             "MLX_RUNTIME_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit"
         ),
     )
-

@@ -9,6 +9,8 @@ pub enum GatewayError {
     Io(io::Error),
     /// Worker startup failure.
     WorkerStartup(String),
+    /// Request/response protocol failure.
+    Protocol(String),
 }
 
 impl fmt::Display for GatewayError {
@@ -16,6 +18,7 @@ impl fmt::Display for GatewayError {
         match self {
             GatewayError::Io(err) => write!(f, "io error: {err}"),
             GatewayError::WorkerStartup(message) => write!(f, "worker startup error: {message}"),
+            GatewayError::Protocol(message) => write!(f, "protocol error: {message}"),
         }
     }
 }

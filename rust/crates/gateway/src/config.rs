@@ -24,13 +24,26 @@ pub struct WorkerConfig {
     pub ipc_path: String,
 }
 
+/// Default generation settings used by the gateway for omitted request fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerationConfig {
+    /// Default temperature.
+    pub temperature: f32,
+    /// Default top-p.
+    pub top_p: f32,
+    /// Default maximum completion length.
+    pub max_tokens: u32,
+}
+
 /// Runtime configuration for the Phase 0 skeleton.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     /// HTTP server configuration.
     pub server: ServerConfig,
     /// Worker process configuration.
     pub worker: WorkerConfig,
+    /// Generation defaults.
+    pub generation: GenerationConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -41,10 +54,15 @@ impl Default for RuntimeConfig {
                 port: 8000,
             },
             worker: WorkerConfig {
-                python: "python3".to_string(),
+                python: "python/.venv/bin/python".to_string(),
                 module: "mlx_worker.main".to_string(),
                 model: "mlx-community/Qwen2.5-7B-Instruct-4bit".to_string(),
                 ipc_path: "/tmp/mlx-runtime.sock".to_string(),
+            },
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 512,
             },
         }
     }
@@ -94,6 +112,18 @@ impl RuntimeConfig {
                 ("worker", "ipc_path", Value::String(ipc_path)) => {
                     config.worker.ipc_path = ipc_path
                 }
+                ("generation", "temperature", Value::Float(temperature)) => {
+                    config.generation.temperature = temperature
+                }
+                ("generation", "top_p", Value::Float(top_p)) => config.generation.top_p = top_p,
+                ("generation", "max_tokens", Value::Integer(max_tokens)) => {
+                    config.generation.max_tokens = u32::try_from(max_tokens).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "generation.max_tokens out of range",
+                        )
+                    })?
+                }
                 _ => {}
             }
         }
@@ -117,6 +147,7 @@ fn parse_section(line: &str) -> Option<String> {
 enum Value {
     String(String),
     Integer(i64),
+    Float(f32),
     Bool(()),
 }
 
@@ -127,6 +158,10 @@ fn parse_value(raw: &str) -> io::Result<Value> {
 
     if let Ok(value) = raw.parse::<i64>() {
         return Ok(Value::Integer(value));
+    }
+
+    if let Ok(value) = raw.parse::<f32>() {
+        return Ok(Value::Float(value));
     }
 
     match raw {
@@ -172,6 +207,11 @@ mod tests {
             module = "mlx_worker.main"
             model = "test-model"
             ipc_path = "/tmp/test.sock"
+
+            [generation]
+            temperature = 0.1
+            top_p = 0.8
+            max_tokens = 42
             "#,
         )
         .unwrap();
@@ -184,5 +224,8 @@ mod tests {
         assert_eq!(config.worker.python, "/usr/bin/python3");
         assert_eq!(config.worker.model, "test-model");
         assert_eq!(config.worker.ipc_path, "/tmp/test.sock");
+        assert_eq!(config.generation.temperature, 0.1);
+        assert_eq!(config.generation.top_p, 0.8);
+        assert_eq!(config.generation.max_tokens, 42);
     }
 }
