@@ -760,7 +760,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
 
     let mut on_delta = |delta: String| -> Result<(), GatewayError> {
         request_tracker.record_first_delta();
-        ensure_sse_stream_started(writer, &mut stream_started)?;
         let event = json!({
             "id": format!("chatcmpl-{}", request_id),
             "object": "chat.completion.chunk",
@@ -775,7 +774,18 @@ fn stream_chat_completion_with_disconnect<W: Write>(
                 "finish_reason": null,
             }],
         });
-        write!(writer, "data: {}\n\n", event)?;
+        if !stream_started {
+            // First delta: combine SSE headers + data into a single write
+            // to save one write(2) syscall and avoid split TCP segments.
+            stream_started = true;
+            write!(
+                writer,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\ndata: {}\n\n",
+                event
+            )?;
+        } else {
+            write!(writer, "data: {}\n\n", event)?;
+        }
         writer.flush()?;
         Ok(())
     };
@@ -868,7 +878,6 @@ fn ensure_sse_stream_started<W: Write>(
         writer,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
     )?;
-    writer.flush()?;
     *stream_started = true;
     Ok(())
 }
@@ -1582,6 +1591,19 @@ mod tests {
         assert!(body.contains("text/event-stream"));
         assert!(body.contains("chat.completion.chunk"));
         assert!(body.contains("data: [DONE]"));
+
+        // Validate combined-write optimization: headers immediately followed by
+        // first data event (no empty output between them, confirming a single write).
+        let header_end = "\r\n\r\n";
+        let after_headers = body
+            .find(header_end)
+            .map(|pos| &body[pos + header_end.len()..])
+            .unwrap_or("");
+        assert!(
+            after_headers.starts_with("data: "),
+            "expected headers immediately followed by first data event, got: {:?}",
+            &after_headers.chars().take(30).collect::<String>()
+        );
     }
 
     #[test]
