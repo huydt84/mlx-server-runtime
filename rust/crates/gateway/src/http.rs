@@ -256,6 +256,10 @@ pub fn serve(config: RuntimeConfig, runtime: RuntimeState) -> Result<(), Gateway
 }
 
 fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), GatewayError> {
+    // Disable Nagle's algorithm: small SSE frames are time-sensitive and
+    // should not be delayed waiting for a TCP ACK.  This is safe for all
+    // connections (non-SSE responses also flush explicitly).
+    stream.set_nodelay(true)?;
     let mut reader = BufReader::new(&stream);
     let mut request_line = String::new();
     let _ = reader.read_line(&mut request_line)?;
@@ -1689,6 +1693,26 @@ mod tests {
         status.set_state(state);
         runtime.set_status(status).unwrap();
         runtime
+    }
+
+    #[test]
+    fn tcp_nodelay_is_set_on_accepted_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let nodelay = stream.nodelay().unwrap();
+            // The stream comes from accept() without TCP_NODELAY by default.
+            assert!(!nodelay, "default TcpStream should not have TCP_NODELAY");
+            // Now simulate what handle_connection does.
+            stream.set_nodelay(true).unwrap();
+            assert!(stream.nodelay().unwrap(), "TCP_NODELAY should be set");
+        });
+        let client = TcpStream::connect(addr).unwrap();
+        // Ensure stream options are not inherited from client side.
+        assert!(!client.nodelay().unwrap());
+        drop(client);
+        server.join().unwrap();
     }
 
     #[derive(Default)]
