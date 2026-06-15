@@ -705,6 +705,218 @@ class TestRequestCompletionSseParsing:
 # ===========================================================================
 
 
+# ===========================================================================
+# _wait_for_service_ready
+# ===========================================================================
+
+
+class TestWaitForServiceReady:
+    """Verify readiness-check behavior with and without readiness_url.
+
+    This is the function whose branch changed: previously _benchmark_project
+    passed readiness_url="/health" (fast health-check path). Now it passes
+    None, falling through to the streaming-completion readiness path used
+    by _benchmark_mlx_lm_server -- making the readiness check fair between
+    both backends.
+    """
+
+    def _make_response(self, status: int) -> MagicMock:
+        """Build a context-manager mock that simulates urlopen response."""
+        resp = MagicMock()
+        resp.status = status
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = None
+        return resp
+
+    def test_with_readiness_url_success(self) -> None:
+        """When readiness_url is set and endpoint returns < 500, returns."""
+        from benchmarks.compare import _wait_for_service_ready
+
+        mock_resp = self._make_response(200)
+
+        with patch("benchmarks.compare.urlopen", return_value=mock_resp):
+            _wait_for_service_ready(
+                base_url="http://127.0.0.1:8000",
+                readiness_url="/health",
+                model="m",
+                messages=[],
+                max_tokens=16,
+                timeout_s=10,
+            )
+        # No exception means success
+
+    def test_with_readiness_url_server_error_retries(self) -> None:
+        """When readiness_url returns 503 first, then 200 -- retries."""
+        from benchmarks.compare import _wait_for_service_ready
+
+        mock_503 = self._make_response(503)
+        mock_200 = self._make_response(200)
+
+        with (
+            patch(
+                "benchmarks.compare.urlopen", side_effect=[mock_503, mock_200]
+            ) as mock_urlopen,
+            patch("benchmarks.compare.time.sleep", return_value=None),
+        ):
+            _wait_for_service_ready(
+                base_url="http://127.0.0.1:8000",
+                readiness_url="/health",
+                model="m",
+                messages=[],
+                max_tokens=16,
+                timeout_s=10,
+            )
+        assert mock_urlopen.call_count == 2
+
+    def test_with_readiness_url_timeout(self) -> None:
+        """When readiness_url always returns 503, raises RuntimeError."""
+        from benchmarks.compare import _wait_for_service_ready
+
+        mock_resp = self._make_response(503)
+
+        with (
+            patch("benchmarks.compare.urlopen", return_value=mock_resp),
+            patch("benchmarks.compare.time.sleep", return_value=None),
+            patch(
+                "benchmarks.compare.time.monotonic",
+                side_effect=[100.0, 100.1, 100.2, 100.3, 120.0],
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="service did not become ready"):
+                _wait_for_service_ready(
+                    base_url="http://127.0.0.1:8000",
+                    readiness_url="/health",
+                    model="m",
+                    messages=[],
+                    max_tokens=16,
+                    timeout_s=10,
+                )
+
+    def test_without_readiness_url_success(self) -> None:
+        """When readiness_url is None, calls _request_completion and returns."""
+        from benchmarks.compare import _wait_for_service_ready
+
+        mock_result = StreamResult(
+            ttft_ms=5.0,
+            latency_ms=15.0,
+            prompt_tokens=8,
+            completion_tokens=4,
+            text="ready",
+        )
+
+        with patch(
+            "benchmarks.compare._request_completion", return_value=mock_result
+        ) as mock_req:
+            _wait_for_service_ready(
+                base_url="http://127.0.0.1:8000",
+                readiness_url=None,
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=16,
+                timeout_s=10,
+            )
+        mock_req.assert_called_once_with(
+            "http://127.0.0.1:8000",
+            "m",
+            [{"role": "user", "content": "hi"}],
+            16,
+            tokenizer=None,
+            prompt_tokens=None,
+        )
+
+    def test_without_readiness_url_retries_then_succeeds(self) -> None:
+        """When _request_completion fails first, then succeeds -- retries."""
+        from benchmarks.compare import _wait_for_service_ready
+
+        mock_result = StreamResult(
+            ttft_ms=5.0,
+            latency_ms=15.0,
+            prompt_tokens=8,
+            completion_tokens=4,
+            text="ready",
+        )
+
+        with (
+            patch(
+                "benchmarks.compare._request_completion",
+                side_effect=[RuntimeError("not ready"), mock_result],
+            ) as mock_req,
+            patch("benchmarks.compare.time.sleep", return_value=None),
+        ):
+            _wait_for_service_ready(
+                base_url="http://127.0.0.1:8000",
+                readiness_url=None,
+                model="m",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=16,
+                timeout_s=10,
+            )
+        assert mock_req.call_count == 2
+
+    def test_without_readiness_url_timeout(self) -> None:
+        """When _request_completion always fails, raises RuntimeError."""
+        from benchmarks.compare import _wait_for_service_ready
+
+        with (
+            patch(
+                "benchmarks.compare._request_completion",
+                side_effect=RuntimeError("model not loaded"),
+            ),
+            patch("benchmarks.compare.time.sleep", return_value=None),
+            patch(
+                "benchmarks.compare.time.monotonic",
+                side_effect=[100.0, 100.1, 100.2, 100.3, 120.0],
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError, match="service did not become ready: model not loaded"
+            ):
+                _wait_for_service_ready(
+                    base_url="http://127.0.0.1:8000",
+                    readiness_url=None,
+                    model="m",
+                    messages=[],
+                    max_tokens=16,
+                    timeout_s=10,
+                )
+
+    def test_without_readiness_url_http_error(self) -> None:
+        """When readiness_url is None and _request_completion raises HTTPError."""
+        from benchmarks.compare import _wait_for_service_ready
+
+        from urllib.error import HTTPError
+
+        with (
+            patch(
+                "benchmarks.compare._request_completion",
+                side_effect=HTTPError(
+                    "http://127.0.0.1:8000/v1/chat/completions",
+                    503,
+                    "Service Unavailable",
+                    {},
+                    None,
+                ),
+            ),
+            patch("benchmarks.compare.time.sleep", return_value=None),
+            patch(
+                "benchmarks.compare.time.monotonic",
+                side_effect=[100.0, 100.1, 100.2, 100.3, 120.0],
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="service did not become ready: HTTP Error 503: Service Unavailable",
+            ):
+                _wait_for_service_ready(
+                    base_url="http://127.0.0.1:8000",
+                    readiness_url=None,
+                    model="m",
+                    messages=[],
+                    max_tokens=16,
+                    timeout_s=10,
+                )
+
+
 class TestBenchmarkHttpServiceCleanup:
     """Verify process group kill and file cleanup on success path.
 

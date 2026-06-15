@@ -239,7 +239,6 @@ def _benchmark_project(
             trials,
             cwd=REPO_ROOT,
             extra_env={"MLX_RUNTIME_CONFIG": str(config_path)},
-            readiness_url="/health",
         )
 
 
