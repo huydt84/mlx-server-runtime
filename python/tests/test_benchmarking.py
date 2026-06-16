@@ -3,6 +3,7 @@ from __future__ import annotations
 import signal
 import subprocess
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +13,7 @@ from benchmarks.compare import (
     _extract_port,
     _is_port_free,
     _reduce_measurements,
+    _prepare_project_config,
     _replace_config_value,
     _request_completion,
 )
@@ -22,6 +24,7 @@ from mlx_worker.benchmarking import (
     _format_overhead,
     _overhead_summary,
     now_utc_iso,
+    summarize_report,
     summarize_results,
 )
 
@@ -130,6 +133,17 @@ class TestReplaceConfigValue:
         text = "port = 8000\nport = 8001\n"
         result = _replace_config_value(text, "port", "9000")
         assert result == "port = 9000\nport = 9000\n"
+
+
+class TestPrepareProjectConfig:
+    def test_overrides_model_port_and_ipc_path(self, tmp_path: Path) -> None:
+        path = _prepare_project_config(
+            "mlx-community/Qwen3-8B-4bit", 8123, config_dir=tmp_path
+        )
+        content = path.read_text(encoding="utf-8")
+        assert 'model = "mlx-community/Qwen3-8B-4bit"' in content
+        assert "port = 8123" in content
+        assert ".sock" in content
 
 
 # ===========================================================================
@@ -438,6 +452,50 @@ class TestSummarizeResultsEdgeCases:
         )
         with pytest.raises(ValueError, match="at least one result"):
             summarize_results(run)
+
+
+class TestSummarizeReport:
+    def test_multiple_runs_render_separate_sections(self) -> None:
+        raw = BenchmarkResult(
+            backend="raw mlx-lm",
+            ttft_ms=10.0,
+            latency_ms=30.0,
+            prompt_tokens=8,
+            completion_tokens=4,
+        )
+        project = BenchmarkResult(
+            backend="this project",
+            ttft_ms=12.0,
+            latency_ms=35.0,
+            prompt_tokens=8,
+            completion_tokens=4,
+        )
+        report = summarize_report(
+            [
+                BenchmarkRun(
+                    model="model-a",
+                    prompt="p",
+                    max_tokens=16,
+                    generated_at="2026-06-14T00:00:00+00:00",
+                    results=(raw, project),
+                ),
+                BenchmarkRun(
+                    model="model-b",
+                    prompt="p",
+                    max_tokens=16,
+                    generated_at="2026-06-14T00:00:01+00:00",
+                    results=(raw, project),
+                ),
+            ]
+        )
+        assert report.count("# Phase 6 Benchmark Report") == 1
+        assert "## Model: model-a" in report
+        assert "## Model: model-b" in report
+        assert report.count("| backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |") == 2
+
+    def test_no_runs_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least one run"):
+            summarize_report([])
 
 
 # ===========================================================================

@@ -40,6 +40,32 @@ def now_utc_iso() -> str:
 def summarize_results(run: BenchmarkRun) -> str:
     """Render a markdown benchmark report."""
 
+    return "\n".join(_render_run(run, include_heading=True))
+
+
+def summarize_report(runs: Sequence[BenchmarkRun]) -> str:
+    """Render a markdown report for multiple benchmark runs."""
+
+    if not runs:
+        raise ValueError("benchmark report requires at least one run")
+
+    lines = ["# Phase 6 Benchmark Report", ""]
+    for index, run in enumerate(runs):
+        if index:
+            lines.append("")
+        lines.extend([f"## Model: {run.model}", ""])
+        lines.extend(_render_run(run, include_heading=False))
+    return "\n".join(lines)
+
+
+def write_report_suite(path: Path, runs: Sequence[BenchmarkRun]) -> None:
+    """Write a combined markdown benchmark report to disk."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(summarize_report(runs), encoding="utf-8")
+
+
+def _render_run(run: BenchmarkRun, *, include_heading: bool) -> list[str]:
     if not run.results:
         raise ValueError("benchmark run requires at least one result")
 
@@ -101,7 +127,9 @@ def summarize_results(run: BenchmarkRun) -> str:
         ]
     )
 
-    return "\n".join(lines)
+    if not include_heading:
+        return lines[2:]
+    return lines
 
 
 def write_report(path: Path, run: BenchmarkRun) -> None:

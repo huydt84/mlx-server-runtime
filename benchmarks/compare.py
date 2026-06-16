@@ -20,7 +20,12 @@ from urllib.request import Request, urlopen
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON_DIR = REPO_ROOT / "python"
-DEFAULT_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+DEFAULT_MODELS = [
+    "mlx-community/Qwen2.5-7B-Instruct-4bit",
+    "mlx-community/Qwen3-8B-4bit",
+    "mlx-community/Llama-3.1-Nemotron-Nano-4B-v1.1-bf16",
+    "mlx-community/Qwen3.5-9B-4bit",
+]
 DEFAULT_PROMPT = "Say hello in one short sentence."
 
 if str(PYTHON_DIR) not in sys.path:
@@ -30,7 +35,7 @@ from mlx_worker.benchmarking import (  # noqa: E402
     BenchmarkResult,
     BenchmarkRun,
     now_utc_iso,
-    write_report,
+    write_report_suite,
 )
 
 
@@ -48,7 +53,7 @@ class StreamResult:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", dest="models", action="append")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument(
@@ -64,49 +69,56 @@ def main(argv: list[str] | None = None) -> int:
 
     from mlx_lm import load
 
-    model, tokenizer = load(args.model)
+    models = args.models or DEFAULT_MODELS
+    runs: list[BenchmarkRun] = []
     messages = [{"role": "user", "content": args.prompt}]
-    prompt_input = _build_prompt_input(tokenizer, messages)
-    prompt_tokens = len(_tokenize_prompt(tokenizer, messages))
 
-    raw_result = _benchmark_raw_mlx_lm(
-        model,
-        tokenizer,
-        prompt_input,
-        prompt_tokens,
-        args.max_tokens,
-        args.warmup_trials,
-        args.trials,
-    )
-    server_result = _benchmark_mlx_lm_server(
-        args.model,
-        messages,
-        tokenizer,
-        prompt_tokens,
-        args.max_tokens,
-        args.server_port,
-        args.warmup_trials,
-        args.trials,
-    )
-    project_result = _benchmark_project(
-        args.model,
-        messages,
-        tokenizer,
-        prompt_tokens,
-        args.max_tokens,
-        args.project_port,
-        args.warmup_trials,
-        args.trials,
-    )
+    for model_name in models:
+        model, tokenizer = load(model_name)
+        prompt_input = _build_prompt_input(tokenizer, messages)
+        prompt_tokens = len(_tokenize_prompt(tokenizer, messages))
 
-    run = BenchmarkRun(
-        model=args.model,
-        prompt=args.prompt,
-        max_tokens=args.max_tokens,
-        generated_at=now_utc_iso(),
-        results=(raw_result, server_result, project_result),
-    )
-    write_report(args.report_path, run)
+        raw_result = _benchmark_raw_mlx_lm(
+            model,
+            tokenizer,
+            prompt_input,
+            prompt_tokens,
+            args.max_tokens,
+            args.warmup_trials,
+            args.trials,
+        )
+        server_result = _benchmark_mlx_lm_server(
+            model_name,
+            messages,
+            tokenizer,
+            prompt_tokens,
+            args.max_tokens,
+            args.server_port,
+            args.warmup_trials,
+            args.trials,
+        )
+        project_result = _benchmark_project(
+            model_name,
+            messages,
+            tokenizer,
+            prompt_tokens,
+            args.max_tokens,
+            args.project_port,
+            args.warmup_trials,
+            args.trials,
+        )
+
+        runs.append(
+            BenchmarkRun(
+                model=model_name,
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+                generated_at=now_utc_iso(),
+                results=(raw_result, server_result, project_result),
+            )
+        )
+
+    write_report_suite(args.report_path, runs)
     print(f"report_written={args.report_path}")
     return 0
 
@@ -216,7 +228,7 @@ def _benchmark_project(
 ) -> BenchmarkResult:
     with tempfile.TemporaryDirectory(prefix="mlx-benchmark-project-") as tmpdir_str:
         tmpdir_path = Path(tmpdir_str)
-        config_path = _prepare_project_config(port, config_dir=tmpdir_path)
+        config_path = _prepare_project_config(model, port, config_dir=tmpdir_path)
         command_variants = [
             [
                 "cargo",
@@ -563,7 +575,9 @@ def _merged_env(extra_env: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
-def _prepare_project_config(port: int, config_dir: Path | None = None) -> Path:
+def _prepare_project_config(
+    model: str, port: int, config_dir: Path | None = None
+) -> Path:
     source = REPO_ROOT / "config" / "runtime.toml"
     if config_dir is None:
         temp_dir = Path(tempfile.mkdtemp(prefix="mlx-runtime-config-"))
@@ -572,6 +586,7 @@ def _prepare_project_config(port: int, config_dir: Path | None = None) -> Path:
         temp_dir.mkdir(exist_ok=True)
     target = temp_dir / "runtime.toml"
     text = source.read_text(encoding="utf-8")
+    text = _replace_config_value(text, "model", model)
     text = _replace_config_value(text, "port", str(port))
     text = _replace_config_value(
         text,

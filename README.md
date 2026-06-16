@@ -47,4 +47,4 @@ bash scripts/benchmark.sh
 ```
 
 The report is written to `benchmarks/results/phase_6_report.md` and compares raw
-`mlx-lm`, `mlx_lm.server`, and this project on the same prompt.
+`mlx-lm`, `mlx_lm.server`, and this project across several models on the same prompt.
