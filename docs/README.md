@@ -22,6 +22,5 @@ A lightweight MLX inference runtime for Apple Silicon. Rust control plane + Pyth
 
 ## Quick Links
 
-- [PLAN.md](../PLAN.md) — Project plan and roadmap
 - [protocol/schema.md](../protocol/schema.md) — Protocol schema
 - [config/runtime.toml](../config/runtime.toml) — Default configuration
