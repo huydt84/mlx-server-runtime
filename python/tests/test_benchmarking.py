@@ -9,13 +9,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from benchmarks.compare import (
+    DEFAULT_PROMPT,
+    PromptCase,
     StreamResult,
+    _build_prompt_cases,
+    _default_prompt_suite,
     _extract_port,
     _is_port_free,
+    _percentile,
+    _prompt_summary,
     _reduce_measurements,
     _prepare_project_config,
     _replace_config_value,
     _request_completion,
+    make_long_prompts,
 )
 from mlx_worker.benchmarking import (
     BenchmarkResult,
@@ -213,6 +220,35 @@ def _stream_result(
     )
 
 
+def _prompt_case(prompt_tokens: int = 8) -> PromptCase:
+    return PromptCase(
+        name="prompt-1",
+        messages=[{"role": "user", "content": "hi"}],
+        prompt_input="User: hi\nAssistant:",
+        prompt_tokens=prompt_tokens,
+    )
+
+
+class _SimpleTokenizer:
+    def __init__(self, *, has_chat_template: bool = False) -> None:
+        self.has_chat_template = has_chat_template
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[str]:
+        return text.split()
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> list[int]:
+        assert tokenize is True
+        assert add_generation_prompt is True
+        token_count = sum(len(message["content"].split()) for message in messages)
+        return list(range(token_count + 1))
+
+
 class TestReduceMeasurements:
     def test_single_measurement(self) -> None:
         result = _reduce_measurements("test-backend", [_stream_result()])
@@ -270,6 +306,94 @@ class TestReduceMeasurements:
             ],
         )
         assert results.notes == ()
+
+    def test_distribution_summary_adds_percentile_notes(self) -> None:
+        results = _reduce_measurements(
+            "summary-backend",
+            [
+                _stream_result(ttft_ms=10.0, latency_ms=40.0, notes=("source",)),
+                _stream_result(ttft_ms=20.0, latency_ms=60.0),
+                _stream_result(ttft_ms=30.0, latency_ms=80.0),
+            ],
+            summarize_distribution=True,
+        )
+
+        assert results.notes == (
+            "samples=3",
+            "latency_p50_ms=60.0",
+            "latency_p95_ms=78.0",
+            "ttft_p50_ms=20.0",
+            "ttft_p95_ms=29.0",
+            "source",
+        )
+
+
+class TestPercentile:
+    def test_interpolates_small_samples(self) -> None:
+        assert _percentile([60.0, 40.0], 50) == 50.0
+        assert _percentile([40.0, 60.0], 95) == 59.0
+
+    def test_empty_values_return_zero(self) -> None:
+        assert _percentile([], 50) == 0.0
+
+
+class TestPromptSuites:
+    def test_build_prompt_cases_falls_back_to_default_prompt(self) -> None:
+        cases = _build_prompt_cases(_SimpleTokenizer(), [])
+
+        assert len(cases) == 1
+        assert cases[0].messages == [{"role": "user", "content": DEFAULT_PROMPT}]
+        assert cases[0].prompt_tokens > 0
+
+    def test_build_prompt_cases_uses_chat_template_tokens(self) -> None:
+        cases = _build_prompt_cases(
+            _SimpleTokenizer(has_chat_template=True), ["hello world"]
+        )
+
+        assert cases[0].prompt_input == [0, 1, 2]
+        assert cases[0].prompt_tokens == 3
+
+    def test_default_prompt_suite_limit(self) -> None:
+        prompts = _default_prompt_suite(
+            _SimpleTokenizer(),
+            include_long=False,
+            prompt_limit=3,
+            prefill_step_size=4,
+            long_prompt_multiplier=2,
+        )
+
+        assert len(prompts) == 3
+
+    def test_default_prompt_suite_can_include_long_prompts(self) -> None:
+        short_prompts = _default_prompt_suite(
+            _SimpleTokenizer(),
+            include_long=False,
+            prompt_limit=0,
+            prefill_step_size=4,
+            long_prompt_multiplier=2,
+        )
+        long_prompts = _default_prompt_suite(
+            _SimpleTokenizer(),
+            include_long=True,
+            prompt_limit=0,
+            prefill_step_size=4,
+            long_prompt_multiplier=2,
+        )
+
+        assert len(long_prompts) > len(short_prompts)
+
+    def test_make_long_prompts_meet_target_token_count(self) -> None:
+        tokenizer = _SimpleTokenizer()
+
+        prompts = make_long_prompts(tokenizer, prefill_step_size=4, multiplier=2)
+
+        assert prompts
+        assert all(len(tokenizer.encode(prompt)) >= 40 for prompt in prompts)
+
+    def test_prompt_summary_reports_suite_shape(self) -> None:
+        summary = _prompt_summary([_prompt_case(3), _prompt_case(5)])
+
+        assert summary == "prompt suite: 2 cases, 8 prompt tokens total"
 
 
 # ===========================================================================
@@ -491,7 +615,12 @@ class TestSummarizeReport:
         assert report.count("# Phase 6 Benchmark Report") == 1
         assert "## Model: model-a" in report
         assert "## Model: model-b" in report
-        assert report.count("| backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |") == 2
+        assert (
+            report.count(
+                "| backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |"
+            )
+            == 2
+        )
 
     def test_no_runs_raises(self) -> None:
         with pytest.raises(ValueError, match="at least one run"):
@@ -713,6 +842,27 @@ class TestRequestCompletionSseParsing:
             )
 
         assert result.text == "Fallback content"
+
+    def test_content_delta_via_reasoning_field(self) -> None:
+        """Counts mlx_lm.server reasoning deltas as generated output."""
+        sse_lines = [
+            b'data: {"choices":[{"delta":{"reasoning":"hidden text"}}],"usage":{"completion_tokens":0,"prompt_tokens":3}}\n',
+            b"data: [DONE]\n",
+        ]
+        mock_resp = _MockResponse(sse_lines)
+
+        with patch("benchmarks.compare.urlopen", return_value=mock_resp):
+            result = _request_completion(
+                base_url="http://127.0.0.1:8000",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=16,
+                tokenizer=_SimpleTokenizer(),
+                prompt_tokens=3,
+            )
+
+        assert result.text == "hidden text"
+        assert result.completion_tokens == 2
 
     def test_skips_non_data_lines(self) -> None:
         """Lines not starting with 'data:' are ignored."""
@@ -1011,7 +1161,7 @@ class TestBenchmarkHttpServiceCleanup:
             patch("benchmarks.compare._request_completion", return_value=mock_stream),
             patch(
                 "benchmarks.compare._reduce_measurements",
-                side_effect=lambda name, ms: BenchmarkResult(
+                side_effect=lambda name, ms, **_: BenchmarkResult(
                     backend=name,
                     ttft_ms=5.0,
                     latency_ms=15.0,
@@ -1028,9 +1178,8 @@ class TestBenchmarkHttpServiceCleanup:
                 command_variants=[["/fake/binary", "--arg"]],
                 base_url="http://127.0.0.1:9999",
                 model="m",
-                messages=[{"role": "user", "content": "hi"}],
+                prompt_cases=[_prompt_case()],
                 tokenizer=None,
-                prompt_tokens=8,
                 max_tokens=16,
                 warmup_trials=0,
                 trials=1,
@@ -1078,9 +1227,8 @@ class TestBenchmarkHttpServiceCleanup:
                     command_variants=[["/fake/binary"]],
                     base_url="http://127.0.0.1:9998",
                     model="m",
-                    messages=[{"role": "user", "content": "hi"}],
+                    prompt_cases=[_prompt_case()],
                     tokenizer=None,
-                    prompt_tokens=8,
                     max_tokens=16,
                     warmup_trials=0,
                     trials=1,
@@ -1118,7 +1266,7 @@ class TestBenchmarkHttpServiceCleanup:
             patch("benchmarks.compare._request_completion", return_value=stream),
             patch(
                 "benchmarks.compare._reduce_measurements",
-                side_effect=lambda name, ms: BenchmarkResult(
+                side_effect=lambda name, ms, **_: BenchmarkResult(
                     backend=name,
                     ttft_ms=1.0,
                     latency_ms=2.0,
@@ -1135,9 +1283,8 @@ class TestBenchmarkHttpServiceCleanup:
                 command_variants=[["first"], ["second"]],
                 base_url="http://127.0.0.1:9997",
                 model="m",
-                messages=[{"role": "user", "content": "hi"}],
+                prompt_cases=[_prompt_case(prompt_tokens=3)],
                 tokenizer=None,
-                prompt_tokens=3,
                 max_tokens=16,
                 warmup_trials=0,
                 trials=1,
@@ -1187,9 +1334,8 @@ class TestBenchmarkHttpServiceCleanup:
                     command_variants=[["/fake/binary"]],
                     base_url="http://127.0.0.1:9996",
                     model="m",
-                    messages=[{"role": "user", "content": "hi"}],
+                    prompt_cases=[_prompt_case(prompt_tokens=3)],
                     tokenizer=None,
-                    prompt_tokens=3,
                     max_tokens=16,
                     warmup_trials=0,
                     trials=1,

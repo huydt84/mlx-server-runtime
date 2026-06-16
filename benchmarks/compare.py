@@ -27,6 +27,44 @@ DEFAULT_MODELS = [
     "mlx-community/Qwen3.5-9B-4bit",
 ]
 DEFAULT_PROMPT = "Say hello in one short sentence."
+SHORT_PROMPTS = [
+    "What is the capital of France?",
+    "Explain quantum computing briefly.",
+    "Write a haiku about programming.",
+    "What is 2+2?",
+    "Summarize the theory of relativity.",
+    "Define recursion in programming.",
+    "What is the speed of light?",
+    "What is the boiling point of water?",
+]
+LONG_BASES = [
+    (
+        "Explain the development of transformer models, including self-attention, "
+        "multi-head attention, scaling laws, inference tradeoffs, and deployment."
+    ),
+    (
+        "Describe how modern GPU and Metal-based inference stacks schedule prompt "
+        "processing, decode, KV cache management, batching, and memory movement."
+    ),
+]
+SYSTEM_PREFIX = (
+    "You are an expert AI assistant with deep knowledge in science, engineering, "
+    "history, and mathematics. Give precise, structured answers."
+)
+SHARED_STARTERS = [
+    "User: Explain neural networks.\nAssistant:",
+    "User: How do transformers work?\nAssistant:",
+]
+SHARED_SUFFIXES = [
+    "Compare them to classical methods.",
+    "What are the main limitations?",
+    "Give a practical example.",
+    "Explain the training objective.",
+    "Discuss recent advances.",
+    "What are common misconceptions?",
+    "How is inference optimized?",
+    "What should a beginner read first?",
+]
 
 if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
@@ -51,10 +89,38 @@ class StreamResult:
     notes: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class PromptCase:
+    """One prompt workload case for all compared backends."""
+
+    name: str
+    messages: list[dict[str, str]]
+    prompt_input: str | list[int]
+    prompt_tokens: int
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", dest="models", action="append")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--prompt",
+        dest="prompts",
+        action="append",
+        help="Prompt to benchmark. Repeat for multiple prompts. Defaults to a built-in suite.",
+    )
+    parser.add_argument(
+        "--prompt-limit",
+        type=int,
+        default=8,
+        help="Limit built-in prompt suite size. Use 0 for all built-in prompts.",
+    )
+    parser.add_argument(
+        "--include-long-prompts",
+        action="store_true",
+        help="Include long-prefill prompts in the built-in suite.",
+    )
+    parser.add_argument("--prefill-step-size", type=int, default=2048)
+    parser.add_argument("--long-prompt-multiplier", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument(
         "--report-path",
@@ -71,27 +137,33 @@ def main(argv: list[str] | None = None) -> int:
 
     models = args.models or DEFAULT_MODELS
     runs: list[BenchmarkRun] = []
-    messages = [{"role": "user", "content": args.prompt}]
 
     for model_name in models:
         model, tokenizer = load(model_name)
-        prompt_input = _build_prompt_input(tokenizer, messages)
-        prompt_tokens = len(_tokenize_prompt(tokenizer, messages))
+        prompt_cases = _build_prompt_cases(
+            tokenizer,
+            args.prompts
+            or _default_prompt_suite(
+                tokenizer,
+                include_long=args.include_long_prompts,
+                prompt_limit=args.prompt_limit,
+                prefill_step_size=args.prefill_step_size,
+                long_prompt_multiplier=args.long_prompt_multiplier,
+            ),
+        )
 
         raw_result = _benchmark_raw_mlx_lm(
             model,
             tokenizer,
-            prompt_input,
-            prompt_tokens,
+            prompt_cases,
             args.max_tokens,
             args.warmup_trials,
             args.trials,
         )
         server_result = _benchmark_mlx_lm_server(
             model_name,
-            messages,
+            prompt_cases,
             tokenizer,
-            prompt_tokens,
             args.max_tokens,
             args.server_port,
             args.warmup_trials,
@@ -99,9 +171,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         project_result = _benchmark_project(
             model_name,
-            messages,
+            prompt_cases,
             tokenizer,
-            prompt_tokens,
             args.max_tokens,
             args.project_port,
             args.warmup_trials,
@@ -111,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         runs.append(
             BenchmarkRun(
                 model=model_name,
-                prompt=args.prompt,
+                prompt=_prompt_summary(prompt_cases),
                 max_tokens=args.max_tokens,
                 generated_at=now_utc_iso(),
                 results=(raw_result, server_result, project_result),
@@ -126,8 +197,7 @@ def main(argv: list[str] | None = None) -> int:
 def _benchmark_raw_mlx_lm(
     model: Any,
     tokenizer: Any,
-    prompt_input: str | list[int],
-    prompt_tokens: int,
+    prompt_cases: list[PromptCase],
     max_tokens: int,
     warmup_trials: int,
     trials: int,
@@ -137,22 +207,23 @@ def _benchmark_raw_mlx_lm(
 
     sampler = make_sampler(temp=0.0, top_p=1.0)
     for _ in range(warmup_trials):
-        _ = _stream_generate_once(
-            lambda: stream_generate(
-                model,
+        for prompt_case in prompt_cases:
+            _ = _stream_generate_once(
+                lambda prompt_input=prompt_case.prompt_input: stream_generate(
+                    model,
+                    tokenizer,
+                    prompt_input,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                ),
                 tokenizer,
-                prompt_input,
-                max_tokens=max_tokens,
-                sampler=sampler,
-            ),
-            tokenizer,
-            prompt_tokens,
-            max_tokens,
-        )
+                prompt_case.prompt_tokens,
+                max_tokens,
+            )
 
     measurements = [
         _stream_generate_once(
-            lambda: stream_generate(
+            lambda prompt_input=prompt_case.prompt_input: stream_generate(
                 model,
                 tokenizer,
                 prompt_input,
@@ -160,19 +231,19 @@ def _benchmark_raw_mlx_lm(
                 sampler=sampler,
             ),
             tokenizer,
-            prompt_tokens,
+            prompt_case.prompt_tokens,
             max_tokens,
         )
         for _ in range(trials)
+        for prompt_case in prompt_cases
     ]
-    return _reduce_measurements("raw mlx-lm", measurements)
+    return _reduce_measurements("raw mlx-lm", measurements, summarize_distribution=True)
 
 
 def _benchmark_mlx_lm_server(
     model: str,
-    messages: list[dict[str, str]],
+    prompt_cases: list[PromptCase],
     tokenizer: Any,
-    prompt_tokens: int,
     max_tokens: int,
     port: int,
     warmup_trials: int,
@@ -207,9 +278,8 @@ def _benchmark_mlx_lm_server(
         command_variants,
         f"http://127.0.0.1:{port}",
         model,
-        messages,
+        prompt_cases,
         tokenizer,
-        prompt_tokens,
         max_tokens,
         warmup_trials,
         trials,
@@ -218,9 +288,8 @@ def _benchmark_mlx_lm_server(
 
 def _benchmark_project(
     model: str,
-    messages: list[dict[str, str]],
+    prompt_cases: list[PromptCase],
     tokenizer: Any,
-    prompt_tokens: int,
     max_tokens: int,
     port: int,
     warmup_trials: int,
@@ -243,9 +312,8 @@ def _benchmark_project(
             command_variants,
             f"http://127.0.0.1:{port}",
             model,
-            messages,
+            prompt_cases,
             tokenizer,
-            prompt_tokens,
             max_tokens,
             warmup_trials,
             trials,
@@ -259,9 +327,8 @@ def _benchmark_http_service(
     command_variants: list[list[str]],
     base_url: str,
     model: str,
-    messages: list[dict[str, str]],
+    prompt_cases: list[PromptCase],
     tokenizer: Any,
-    prompt_tokens: int,
     max_tokens: int,
     warmup_trials: int,
     trials: int,
@@ -309,21 +376,41 @@ def _benchmark_http_service(
                     )
                     continue
 
+                readiness_case = prompt_cases[0]
                 _wait_for_service_ready(
-                    base_url, readiness_url, model, messages, max_tokens, timeout_s=300
+                    base_url,
+                    readiness_url,
+                    model,
+                    readiness_case.messages,
+                    max_tokens,
+                    timeout_s=300,
                 )
                 for _ in range(warmup_trials):
-                    _request_completion(
-                        base_url, model, messages, max_tokens, tokenizer, prompt_tokens
-                    )
+                    for prompt_case in prompt_cases:
+                        _request_completion(
+                            base_url,
+                            model,
+                            prompt_case.messages,
+                            max_tokens,
+                            tokenizer,
+                            prompt_case.prompt_tokens,
+                        )
 
                 measurements = [
                     _request_completion(
-                        base_url, model, messages, max_tokens, tokenizer, prompt_tokens
+                        base_url,
+                        model,
+                        prompt_case.messages,
+                        max_tokens,
+                        tokenizer,
+                        prompt_case.prompt_tokens,
                     )
                     for _ in range(trials)
+                    for prompt_case in prompt_cases
                 ]
-                return _reduce_measurements(backend_name, measurements)
+                return _reduce_measurements(
+                    backend_name, measurements, summarize_distribution=True
+                )
             except Exception as exc:
                 last_error = str(exc)
             finally:
@@ -455,7 +542,10 @@ def _request_completion(
             choice = payload["choices"][0]
             delta = choice.get("delta", {})
             content = (
-                delta.get("content") or choice.get("message", {}).get("content") or ""
+                delta.get("content")
+                or delta.get("reasoning")
+                or choice.get("message", {}).get("content")
+                or ""
             )
             if content:
                 final_text_parts.append(content)
@@ -513,7 +603,10 @@ def _stream_generate_once(
 
 
 def _reduce_measurements(
-    backend: str, measurements: Iterable[StreamResult]
+    backend: str,
+    measurements: Iterable[StreamResult],
+    *,
+    summarize_distribution: bool = False,
 ) -> BenchmarkResult:
     measurements = list(measurements)
     if not measurements:
@@ -526,6 +619,15 @@ def _reduce_measurements(
     notes = tuple(
         dict.fromkeys(note for sample in measurements for note in sample.notes)
     )
+    if summarize_distribution:
+        notes = (
+            f"samples={len(measurements)}",
+            f"latency_p50_ms={_percentile([sample.latency_ms for sample in measurements], 50):.1f}",
+            f"latency_p95_ms={_percentile([sample.latency_ms for sample in measurements], 95):.1f}",
+            f"ttft_p50_ms={_percentile([sample.ttft_ms for sample in measurements], 50):.1f}",
+            f"ttft_p95_ms={_percentile([sample.ttft_ms for sample in measurements], 95):.1f}",
+            *notes,
+        )
     return BenchmarkResult(
         backend=backend,
         ttft_ms=ttft,
@@ -534,6 +636,135 @@ def _reduce_measurements(
         completion_tokens=completion_tokens,
         notes=notes,
     )
+
+
+def _percentile(values: Iterable[float], p: float) -> float:
+    values = sorted(values)
+    if not values:
+        return 0.0
+    rank = (len(values) - 1) * (p / 100.0)
+    lower = int(rank)
+    upper = min(lower + 1, len(values) - 1)
+    if lower == upper:
+        return values[lower]
+    weight = rank - lower
+    return values[lower] + (values[upper] - values[lower]) * weight
+
+
+def _default_prompt_suite(
+    tokenizer: Any,
+    *,
+    include_long: bool,
+    prompt_limit: int,
+    prefill_step_size: int,
+    long_prompt_multiplier: int,
+) -> list[str]:
+    prompts = [
+        *SHORT_PROMPTS[:4],
+        *make_shared_prefix_prompts()[:2],
+        *make_partial_prefix_prompts()[:2],
+        *SHORT_PROMPTS[4:],
+        *make_shared_prefix_prompts()[2:],
+        *make_partial_prefix_prompts()[2:],
+    ]
+    if include_long:
+        prompts.extend(
+            make_long_prompts(tokenizer, prefill_step_size, long_prompt_multiplier)
+        )
+    if prompt_limit > 0:
+        return prompts[:prompt_limit]
+    return prompts
+
+
+def make_long_prompts(
+    tokenizer: Any, prefill_step_size: int, multiplier: int
+) -> list[str]:
+    """Build long prompts sized relative to configured prefill step."""
+
+    target = max(2 * prefill_step_size + 32, prefill_step_size * multiplier)
+    prompts = []
+    for base in LONG_BASES:
+        text = base
+        while len(tokenizer.encode(text)) < target:
+            text += " " + base
+        prompts.append(text)
+    return prompts
+
+
+def make_shared_prefix_prompts() -> list[str]:
+    """Build prompts with exact shared prefixes."""
+
+    prompts = []
+    for starter in SHARED_STARTERS:
+        prefix = f"{SYSTEM_PREFIX}\n{starter}"
+        for suffix in SHARED_SUFFIXES:
+            prompts.append(f"{prefix} {suffix}")
+    return prompts
+
+
+def make_partial_prefix_prompts() -> list[str]:
+    """Build prompts with partially shared conversation history."""
+
+    prompts = []
+    base_histories = [
+        [
+            "User: Summarize neural networks.",
+            "Assistant: Neural networks are layered function approximators.",
+            "User: Explain backpropagation.",
+        ],
+        [
+            "User: Explain batching in inference servers.",
+            "Assistant: Batching groups requests to improve throughput.",
+            "User: Describe prefix caching.",
+        ],
+    ]
+    suffixes = [
+        "Give a concrete example.",
+        "What are the main tradeoffs?",
+        "What goes wrong under bursty traffic?",
+        "How would you benchmark this?",
+    ]
+    for history in base_histories:
+        for keep in range(1, len(history) + 1):
+            prefix = "\n".join([SYSTEM_PREFIX, *history[:keep]])
+            for suffix in suffixes:
+                prompts.append(f"{prefix}\nUser: {suffix}\nAssistant:")
+    return prompts
+
+
+def _build_prompt_cases(tokenizer: Any, prompts: list[str]) -> list[PromptCase]:
+    if not prompts:
+        prompts = [DEFAULT_PROMPT]
+    cases = []
+    for index, prompt in enumerate(prompts, start=1):
+        messages = [{"role": "user", "content": prompt}]
+        prompt_input = _build_prompt_input(tokenizer, messages)
+        prompt_tokens = _count_prompt_tokens(tokenizer, prompt_input)
+        cases.append(
+            PromptCase(
+                name=f"prompt-{index}",
+                messages=messages,
+                prompt_input=prompt_input,
+                prompt_tokens=prompt_tokens,
+            )
+        )
+    return cases
+
+
+def _count_prompt_tokens(tokenizer: Any, prompt_input: str | list[int]) -> int:
+    if isinstance(prompt_input, list):
+        return len(prompt_input)
+    tokens = tokenizer.encode(prompt_input, add_special_tokens=False)
+    if hasattr(tokens, "tolist"):
+        tokens = tokens.tolist()
+    return len(tokens)
+
+
+def _prompt_summary(prompt_cases: list[PromptCase]) -> str:
+    if len(prompt_cases) == 1:
+        return prompt_cases[0].messages[-1]["content"]
+    total_prompt_tokens = sum(case.prompt_tokens for case in prompt_cases)
+    return f"prompt suite: {len(prompt_cases)} cases, {total_prompt_tokens} prompt tokens total"
 
 
 def _build_prompt_input(
