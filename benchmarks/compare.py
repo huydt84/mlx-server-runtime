@@ -14,17 +14,16 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, TextIO
 from urllib.request import Request, urlopen
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYTHON_DIR = REPO_ROOT / "python"
 DEFAULT_MODELS = [
-    "mlx-community/Qwen2.5-7B-Instruct-4bit",
-    "mlx-community/Qwen3-8B-4bit",
-    "mlx-community/Llama-3.1-Nemotron-Nano-4B-v1.1-bf16",
-    "mlx-community/Qwen3.5-9B-4bit",
+    "mlx-community/LFM2.5-8B-A1B-MLX-4bit",
+    "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+    "mlx-community/gemma-3-270m-it-qat-8bit",
 ]
 DEFAULT_PROMPT = "Say hello in one short sentence."
 SHORT_PROMPTS = [
@@ -76,6 +75,11 @@ from mlx_worker.benchmarking import (  # noqa: E402
     write_report_suite,
 )
 
+try:
+    from tqdm.auto import tqdm as _tqdm
+except ImportError:  # pragma: no cover - benchmark still works without tqdm
+    _tqdm = None
+
 
 @dataclass(frozen=True)
 class StreamResult:
@@ -97,6 +101,67 @@ class PromptCase:
     messages: list[dict[str, str]]
     prompt_input: str | list[int]
     prompt_tokens: int
+
+
+class _ProgressTracker:
+    """Track benchmark loop progress on stderr without touching timed output."""
+
+    def __init__(
+        self,
+        label: str,
+        total: int,
+        *,
+        stream: TextIO | None = None,
+        use_tqdm: bool | None = None,
+    ) -> None:
+        self.label = label
+        self.total = max(total, 0)
+        self.stream = stream or sys.stderr
+        self.count = 0
+        if use_tqdm is None:
+            use_tqdm = _tqdm is not None and getattr(self.stream, "isatty", lambda: False)()
+        self._bar = (
+            _tqdm(total=self.total, desc=label, unit="step", leave=False, file=self.stream)
+            if use_tqdm and self.total > 0
+            else None
+        )
+        if self._bar is None:
+            if self.total == 0:
+                _log_event(f"{self.label}: nothing to do", stream=self.stream)
+            else:
+                _log_event(f"{self.label}: 0/{self.total}", stream=self.stream)
+
+    def advance(self, detail: str) -> None:
+        """Advance one step and surface the current benchmark case."""
+
+        if self.total == 0:
+            return
+        self.count += 1
+        if self._bar is not None:
+            self._bar.set_postfix_str(detail, refresh=False)
+            self._bar.update(1)
+            return
+        percent = (self.count / self.total) * 100.0
+        _log_event(
+            f"{self.label}: {self.count}/{self.total} ({percent:.0f}%) - {detail}",
+            stream=self.stream,
+        )
+
+    def close(self) -> None:
+        """Close the progress display cleanly."""
+
+        if self._bar is not None:
+            self._bar.close()
+            return
+        if self.total > 0:
+            _log_event(f"{self.label}: completed", stream=self.stream)
+
+
+def _log_event(message: str, *, stream: TextIO | None = None) -> None:
+    """Write a timestamped benchmark status line to stderr."""
+
+    target = stream or sys.stderr
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=target, flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -121,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--long-prompt-multiplier", type=int, default=2)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument(
         "--report-path",
         type=Path,
@@ -137,8 +202,15 @@ def main(argv: list[str] | None = None) -> int:
 
     models = args.models or DEFAULT_MODELS
     runs: list[BenchmarkRun] = []
+    _log_event(
+        "benchmark start: "
+        f"{len(models)} model(s), warmup_trials={args.warmup_trials}, "
+        f"trials={args.trials}, prompt_limit={args.prompt_limit}, "
+        f"include_long_prompts={args.include_long_prompts}, max_tokens={args.max_tokens}"
+    )
 
-    for model_name in models:
+    for model_index, model_name in enumerate(models, start=1):
+        _log_event(f"[model {model_index}/{len(models)}] loading {model_name}")
         model, tokenizer = load(model_name)
         prompt_cases = _build_prompt_cases(
             tokenizer,
@@ -151,6 +223,11 @@ def main(argv: list[str] | None = None) -> int:
                 long_prompt_multiplier=args.long_prompt_multiplier,
             ),
         )
+        _log_event(
+            f"[model {model_index}/{len(models)}] prompt suite ready: "
+            f"{len(prompt_cases)} case(s), "
+            f"{sum(case.prompt_tokens for case in prompt_cases)} prompt tokens total"
+        )
 
         raw_result = _benchmark_raw_mlx_lm(
             model,
@@ -160,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             args.warmup_trials,
             args.trials,
         )
+        _log_event(_result_summary(model_name, raw_result))
         server_result = _benchmark_mlx_lm_server(
             model_name,
             prompt_cases,
@@ -169,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             args.warmup_trials,
             args.trials,
         )
+        _log_event(_result_summary(model_name, server_result))
         project_result = _benchmark_project(
             model_name,
             prompt_cases,
@@ -178,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             args.warmup_trials,
             args.trials,
         )
+        _log_event(_result_summary(model_name, project_result))
 
         runs.append(
             BenchmarkRun(
@@ -190,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     write_report_suite(args.report_path, runs)
+    _log_event(f"report_written={args.report_path}")
     print(f"report_written={args.report_path}")
     return 0
 
@@ -206,7 +287,9 @@ def _benchmark_raw_mlx_lm(
     from mlx_lm.sample_utils import make_sampler
 
     sampler = make_sampler(temp=0.0, top_p=1.0)
-    for _ in range(warmup_trials):
+    warmup_total = warmup_trials * len(prompt_cases)
+    warmup_tracker = _ProgressTracker("raw mlx-lm warmup", warmup_total)
+    for warmup_index in range(1, warmup_trials + 1):
         for prompt_case in prompt_cases:
             _ = _stream_generate_once(
                 lambda prompt_input=prompt_case.prompt_input: stream_generate(
@@ -220,23 +303,38 @@ def _benchmark_raw_mlx_lm(
                 prompt_case.prompt_tokens,
                 max_tokens,
             )
+            warmup_tracker.advance(
+                _progress_detail(
+                    prompt_case, phase_index=warmup_index, phase_total=warmup_trials
+                )
+            )
+    warmup_tracker.close()
 
-    measurements = [
-        _stream_generate_once(
-            lambda prompt_input=prompt_case.prompt_input: stream_generate(
-                model,
-                tokenizer,
-                prompt_input,
-                max_tokens=max_tokens,
-                sampler=sampler,
-            ),
-            tokenizer,
-            prompt_case.prompt_tokens,
-            max_tokens,
-        )
-        for _ in range(trials)
-        for prompt_case in prompt_cases
-    ]
+    trial_total = trials * len(prompt_cases)
+    trial_tracker = _ProgressTracker("raw mlx-lm measured trials", trial_total)
+    measurements: list[StreamResult] = []
+    for trial_index in range(1, trials + 1):
+        for prompt_case in prompt_cases:
+            measurements.append(
+                _stream_generate_once(
+                    lambda prompt_input=prompt_case.prompt_input: stream_generate(
+                        model,
+                        tokenizer,
+                        prompt_input,
+                        max_tokens=max_tokens,
+                        sampler=sampler,
+                    ),
+                    tokenizer,
+                    prompt_case.prompt_tokens,
+                    max_tokens,
+                )
+            )
+            trial_tracker.advance(
+                _progress_detail(
+                    prompt_case, phase_index=trial_index, phase_total=trials
+                )
+            )
+    trial_tracker.close()
     return _reduce_measurements("raw mlx-lm", measurements, summarize_distribution=True)
 
 
@@ -343,9 +441,14 @@ def _benchmark_http_service(
         last_error: str | None = None
         port = _extract_port(base_url)
 
-        for command in command_variants:
+        for variant_index, command in enumerate(command_variants, start=1):
+            _log_event(
+                f"[{backend_name}] launch attempt {variant_index}/{len(command_variants)}: "
+                + " ".join(command)
+            )
             if not _is_port_free("127.0.0.1", port):
                 last_error = f"port {port} already in use before launch"
+                _log_event(f"[{backend_name}] {last_error}")
                 continue
 
             stdout_file = stdout_path.open("w", encoding="utf-8")
@@ -370,10 +473,12 @@ def _benchmark_http_service(
                     "127.0.0.1",
                     port,
                     timeout_s=300,
+                    label=backend_name,
                 ):
                     last_error = _read_process_failure(stderr_path, stdout_path) or (
                         f"timed out waiting for {backend_name} to open its port"
                     )
+                    _log_event(f"[{backend_name}] launch failed: {last_error}")
                     continue
 
                 readiness_case = prompt_cases[0]
@@ -384,8 +489,13 @@ def _benchmark_http_service(
                     readiness_case.messages,
                     max_tokens,
                     timeout_s=300,
+                    label=backend_name,
                 )
-                for _ in range(warmup_trials):
+                warmup_total = warmup_trials * len(prompt_cases)
+                warmup_tracker = _ProgressTracker(
+                    f"{backend_name} warmup", warmup_total
+                )
+                for warmup_index in range(1, warmup_trials + 1):
                     for prompt_case in prompt_cases:
                         _request_completion(
                             base_url,
@@ -395,24 +505,46 @@ def _benchmark_http_service(
                             tokenizer,
                             prompt_case.prompt_tokens,
                         )
+                        warmup_tracker.advance(
+                            _progress_detail(
+                                prompt_case,
+                                phase_index=warmup_index,
+                                phase_total=warmup_trials,
+                            )
+                        )
+                warmup_tracker.close()
 
-                measurements = [
-                    _request_completion(
-                        base_url,
-                        model,
-                        prompt_case.messages,
-                        max_tokens,
-                        tokenizer,
-                        prompt_case.prompt_tokens,
-                    )
-                    for _ in range(trials)
-                    for prompt_case in prompt_cases
-                ]
+                trial_total = trials * len(prompt_cases)
+                trial_tracker = _ProgressTracker(
+                    f"{backend_name} measured trials", trial_total
+                )
+                measurements: list[StreamResult] = []
+                for trial_index in range(1, trials + 1):
+                    for prompt_case in prompt_cases:
+                        measurements.append(
+                            _request_completion(
+                                base_url,
+                                model,
+                                prompt_case.messages,
+                                max_tokens,
+                                tokenizer,
+                                prompt_case.prompt_tokens,
+                            )
+                        )
+                        trial_tracker.advance(
+                            _progress_detail(
+                                prompt_case,
+                                phase_index=trial_index,
+                                phase_total=trials,
+                            )
+                        )
+                trial_tracker.close()
                 return _reduce_measurements(
                     backend_name, measurements, summarize_distribution=True
                 )
             except Exception as exc:
                 last_error = str(exc)
+                _log_event(f"[{backend_name}] benchmark attempt failed: {last_error}")
             finally:
                 pgid = os.getpgid(process.pid)
                 try:
@@ -441,16 +573,24 @@ def _wait_for_process_port(
     port: int,
     *,
     timeout_s: int,
+    label: str,
 ) -> bool:
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
+    now = time.monotonic()
+    next_heartbeat = now
+    while now < deadline:
+        if now >= next_heartbeat:
+            _log_event(f"[{label}] waiting for port {host}:{port} to open")
+            next_heartbeat = now + 5
         if process.poll() is not None:
             return False
         try:
             with socket.create_connection((host, port), timeout=1):
+                _log_event(f"[{label}] port {host}:{port} is open")
                 return True
         except OSError:
             time.sleep(1)
+            now = time.monotonic()
     return False
 
 
@@ -470,15 +610,23 @@ def _wait_for_service_ready(
     max_tokens: int,
     *,
     timeout_s: int,
+    label: str,
 ) -> None:
     deadline = time.monotonic() + timeout_s
     last_error: str | None = None
-    while time.monotonic() < deadline:
+    now = time.monotonic()
+    next_heartbeat = now
+    while now < deadline:
+        if now >= next_heartbeat:
+            _log_event(f"[{label}] waiting for service readiness")
+            next_heartbeat = now + 5
         try:
             if readiness_url:
                 with urlopen(Request(f"{base_url}{readiness_url}"), timeout=10) as resp:
                     if resp.status < 500:
+                        _log_event(f"[{label}] readiness endpoint accepted requests")
                         return
+                    last_error = f"readiness endpoint returned HTTP {resp.status}"
             else:
                 _request_completion(
                     base_url,
@@ -488,10 +636,12 @@ def _wait_for_service_ready(
                     tokenizer=None,
                     prompt_tokens=None,
                 )
+                _log_event(f"[{label}] streaming endpoint accepted requests")
                 return
         except Exception as exc:
             last_error = str(exc)
-            time.sleep(2)
+        time.sleep(2)
+        now = time.monotonic()
     raise RuntimeError(f"service did not become ready: {last_error}")
 
 
@@ -635,6 +785,32 @@ def _reduce_measurements(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         notes=notes,
+    )
+
+
+def _progress_detail(
+    prompt_case: PromptCase, *, phase_index: int, phase_total: int
+) -> str:
+    """Render one concise progress label for warmup or measured trials."""
+
+    return (
+        f"trial {phase_index}/{phase_total}, "
+        f"{prompt_case.name}, prompt_tokens={prompt_case.prompt_tokens}"
+    )
+
+
+def _result_summary(model_name: str, result: BenchmarkResult) -> str:
+    """Render a compact per-backend result line for long benchmark runs."""
+
+    output_tps = 0.0
+    if result.latency_ms > 0:
+        output_tps = result.completion_tokens / (result.latency_ms / 1000.0)
+    return (
+        f"[model {model_name}] {result.backend} done: "
+        f"latency={result.latency_ms:.1f} ms, "
+        f"ttft={result.ttft_ms:.1f} ms, "
+        f"completion_tokens={result.completion_tokens}, "
+        f"output_tps={output_tps:.1f}"
     )
 
 

@@ -1,23 +1,23 @@
 # Phase 6 Benchmark Report
 
-## Model: mlx-community/Qwen2.5-7B-Instruct-4bit
+## Model: mlx-community/LFM2.5-8B-A1B-MLX-4bit
 
-- generated_at: 2026-06-16T00:52:36+00:00
-- model: mlx-community/Qwen2.5-7B-Instruct-4bit
-- max_tokens: 8
-- prompt: prompt suite: 8 cases, 423 prompt tokens total
+- generated_at: 2026-06-16T11:55:54+00:00
+- model: mlx-community/LFM2.5-8B-A1B-MLX-4bit
+- max_tokens: 256
+- prompt: prompt suite: 16 cases, 520 prompt tokens total
 
 ## Results
 
 | backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| raw mlx-lm | 330.3 | 467.2 | 73 | 8 | +0.0 | +0.0 | samples=8; latency_p50_ms=444.9; latency_p95_ms=701.5; ttft_p50_ms=309.1; ttft_p95_ms=560.8 |
-| mlx_lm.server | 202.9 | 335.5 | 73 | 8 | -127.5 | -131.6 | samples=8; latency_p50_ms=315.6; latency_p95_ms=447.2; ttft_p50_ms=182.8; ttft_p95_ms=314.1 |
-| this project | 272.0 | 412.1 | 73 | 8 | -58.3 | -55.1 | samples=8; latency_p50_ms=410.2; latency_p95_ms=457.3; ttft_p50_ms=270.4; ttft_p95_ms=315.7 |
+| raw mlx-lm | 110.2 | 1485.1 | 49 | 256 | +0.0 | +0.0 | samples=32; latency_p50_ms=1599.5; latency_p95_ms=1645.3; ttft_p50_ms=110.1; ttft_p95_ms=133.1 |
+| mlx_lm.server | 131.9 | 1765.9 | 49 | 255 | +21.7 | +280.8 | samples=32; latency_p50_ms=1901.4; latency_p95_ms=1950.6; ttft_p50_ms=141.0; ttft_p95_ms=154.5 |
+| this project | 112.9 | 1497.1 | 49 | 256 | +2.7 | +12.0 | samples=32; latency_p50_ms=1602.1; latency_p95_ms=1673.9; ttft_p50_ms=115.2; ttft_p95_ms=134.3 |
 
 ## Overhead Summary
 
-No backend exceeded the raw mlx-lm baseline in measured latency.
+mlx_lm.server was 280.8 ms slower than raw mlx-lm on total latency and 21.7 ms slower on TTFT.
 
 ## Observability / Control
 
@@ -26,24 +26,24 @@ No backend exceeded the raw mlx-lm baseline in measured latency.
 - this project: Rust HTTP/SSE control plane, `/metrics`, request logs, queueing, cancellation, and worker supervision.
 
 
-## Model: mlx-community/Qwen3-8B-4bit
+## Model: mlx-community/Qwen3-4B-Instruct-2507-4bit
 
-- generated_at: 2026-06-16T00:52:54+00:00
-- model: mlx-community/Qwen3-8B-4bit
-- max_tokens: 8
-- prompt: prompt suite: 8 cases, 255 prompt tokens total
+- generated_at: 2026-06-16T12:01:45+00:00
+- model: mlx-community/Qwen3-4B-Instruct-2507-4bit
+- max_tokens: 256
+- prompt: prompt suite: 16 cases, 500 prompt tokens total
 
 ## Results
 
 | backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| raw mlx-lm | 339.1 | 481.2 | 52 | 8 | +0.0 | +0.0 | samples=8; latency_p50_ms=405.1; latency_p95_ms=957.4; ttft_p50_ms=262.6; ttft_p95_ms=815.1 |
-| mlx_lm.server | 220.9 | 344.7 | 52 | 7 | -118.2 | -136.5 | samples=8; latency_p50_ms=343.9; latency_p95_ms=402.8; ttft_p50_ms=220.8; ttft_p95_ms=278.3 |
-| this project | 220.4 | 368.3 | 52 | 8 | -118.7 | -112.9 | samples=8; latency_p50_ms=370.8; latency_p95_ms=411.3; ttft_p50_ms=220.3; ttft_p95_ms=264.1 |
+| raw mlx-lm | 168.8 | 2325.1 | 47 | 256 | +0.0 | +0.0 | samples=32; latency_p50_ms=3030.5; latency_p95_ms=3144.0; ttft_p50_ms=161.1; ttft_p95_ms=213.9 |
+| mlx_lm.server | 152.0 | 2530.9 | 47 | 256 | -16.7 | +205.8 | samples=32; latency_p50_ms=3312.3; latency_p95_ms=3479.1; ttft_p50_ms=151.0; ttft_p95_ms=164.1 |
+| this project | 167.5 | 2313.4 | 47 | 256 | -1.3 | -11.7 | samples=32; latency_p50_ms=3017.2; latency_p95_ms=3162.1; ttft_p50_ms=169.3; ttft_p95_ms=214.1 |
 
 ## Overhead Summary
 
-No backend exceeded the raw mlx-lm baseline in measured latency.
+mlx_lm.server was 205.8 ms slower than raw mlx-lm on total latency and -16.7 ms slower on TTFT.
 
 ## Observability / Control
 
@@ -52,50 +52,24 @@ No backend exceeded the raw mlx-lm baseline in measured latency.
 - this project: Rust HTTP/SSE control plane, `/metrics`, request logs, queueing, cancellation, and worker supervision.
 
 
-## Model: mlx-community/Llama-3.1-Nemotron-Nano-4B-v1.1-bf16
+## Model: mlx-community/gemma-3-270m-it-qat-8bit
 
-- generated_at: 2026-06-16T00:53:25+00:00
-- model: mlx-community/Llama-3.1-Nemotron-Nano-4B-v1.1-bf16
-- max_tokens: 8
-- prompt: prompt suite: 8 cases, 343 prompt tokens total
-
-## Results
-
-| backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| raw mlx-lm | 428.0 | 684.6 | 63 | 8 | +0.0 | +0.0 | samples=8; latency_p50_ms=463.1; latency_p95_ms=1569.1; ttft_p50_ms=207.0; ttft_p95_ms=1313.7 |
-| mlx_lm.server | 209.8 | 470.1 | 63 | 8 | -218.2 | -214.4 | samples=8; latency_p50_ms=462.1; latency_p95_ms=529.5; ttft_p50_ms=205.9; ttft_p95_ms=268.6 |
-| this project | 198.8 | 460.1 | 63 | 8 | -229.3 | -224.4 | samples=8; latency_p50_ms=461.6; latency_p95_ms=471.1; ttft_p50_ms=197.8; ttft_p95_ms=210.1 |
-
-## Overhead Summary
-
-No backend exceeded the raw mlx-lm baseline in measured latency.
-
-## Observability / Control
-
-- raw mlx-lm: direct execution path with no HTTP serving surface.
-- mlx_lm.server: HTTP serving, but no Rust control plane, queue admission, or gateway metrics in this repository's runtime model.
-- this project: Rust HTTP/SSE control plane, `/metrics`, request logs, queueing, cancellation, and worker supervision.
-
-
-## Model: mlx-community/Qwen3.5-9B-4bit
-
-- generated_at: 2026-06-16T00:55:02+00:00
-- model: mlx-community/Qwen3.5-9B-4bit
-- max_tokens: 8
-- prompt: prompt suite: 8 cases, 281 prompt tokens total
+- generated_at: 2026-06-16T12:02:37+00:00
+- model: mlx-community/gemma-3-270m-it-qat-8bit
+- max_tokens: 256
+- prompt: prompt suite: 16 cases, 527 prompt tokens total
 
 ## Results
 
 | backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| raw mlx-lm | 2091.2 | 2248.5 | 57 | 8 | +0.0 | +0.0 | samples=8; latency_p50_ms=478.1; latency_p95_ms=9804.2; ttft_p50_ms=322.3; ttft_p95_ms=9643.6 |
-| mlx_lm.server | 310.4 | 465.7 | 57 | 8 | -1780.8 | -1782.8 | samples=8; latency_p50_ms=473.3; latency_p95_ms=547.7; ttft_p50_ms=318.4; ttft_p95_ms=392.3 |
-| this project | 288.7 | 456.5 | 57 | 8 | -1802.4 | -1792.0 | samples=8; latency_p50_ms=456.8; latency_p95_ms=507.1; ttft_p50_ms=289.9; ttft_p95_ms=337.0 |
+| raw mlx-lm | 126.1 | 268.8 | 49 | 168 | +0.0 | +0.0 | samples=32; latency_p50_ms=212.5; latency_p95_ms=589.5; ttft_p50_ms=125.1; ttft_p95_ms=133.4 |
+| mlx_lm.server | 140.5 | 374.1 | 49 | 163 | +14.4 | +105.3 | samples=32; latency_p50_ms=276.5; latency_p95_ms=902.6; ttft_p50_ms=139.9; ttft_p95_ms=148.7 |
+| this project | 133.5 | 285.3 | 49 | 167 | +7.4 | +16.5 | samples=32; latency_p50_ms=232.4; latency_p95_ms=609.5; ttft_p50_ms=132.5; ttft_p95_ms=148.4 |
 
 ## Overhead Summary
 
-No backend exceeded the raw mlx-lm baseline in measured latency.
+mlx_lm.server was 105.3 ms slower than raw mlx-lm on total latency and 14.4 ms slower on TTFT.
 
 ## Observability / Control
 

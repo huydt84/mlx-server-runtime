@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import signal
 import subprocess
 import time
@@ -10,6 +11,7 @@ import pytest
 
 from benchmarks.compare import (
     DEFAULT_PROMPT,
+    _ProgressTracker,
     PromptCase,
     StreamResult,
     _build_prompt_cases,
@@ -19,6 +21,8 @@ from benchmarks.compare import (
     _percentile,
     _prompt_summary,
     _reduce_measurements,
+    _result_summary,
+    _progress_detail,
     _prepare_project_config,
     _replace_config_value,
     _request_completion,
@@ -394,6 +398,42 @@ class TestPromptSuites:
         summary = _prompt_summary([_prompt_case(3), _prompt_case(5)])
 
         assert summary == "prompt suite: 2 cases, 8 prompt tokens total"
+
+
+class TestProgressHelpers:
+    def test_progress_tracker_text_mode_logs_updates(self) -> None:
+        stream = io.StringIO()
+        tracker = _ProgressTracker("raw warmup", 2, stream=stream, use_tqdm=False)
+
+        tracker.advance("trial 1/2, prompt-1, prompt_tokens=8")
+        tracker.advance("trial 2/2, prompt-2, prompt_tokens=13")
+        tracker.close()
+
+        output = stream.getvalue()
+        assert "raw warmup: 0/2" in output
+        assert "raw warmup: 1/2 (50%) - trial 1/2, prompt-1, prompt_tokens=8" in output
+        assert "raw warmup: 2/2 (100%) - trial 2/2, prompt-2, prompt_tokens=13" in output
+        assert "raw warmup: completed" in output
+
+    def test_progress_detail_and_result_summary(self) -> None:
+        detail = _progress_detail(_prompt_case(prompt_tokens=21), phase_index=2, phase_total=3)
+        summary = _result_summary(
+            "mlx-community/test-model",
+            BenchmarkResult(
+                backend="raw mlx-lm",
+                ttft_ms=40.0,
+                latency_ms=200.0,
+                prompt_tokens=21,
+                completion_tokens=10,
+                notes=(),
+            ),
+        )
+
+        assert detail == "trial 2/3, prompt-1, prompt_tokens=21"
+        assert "[model mlx-community/test-model] raw mlx-lm done:" in summary
+        assert "latency=200.0 ms" in summary
+        assert "ttft=40.0 ms" in summary
+        assert "output_tps=50.0" in summary
 
 
 # ===========================================================================
@@ -950,6 +990,7 @@ class TestWaitForServiceReady:
                 messages=[],
                 max_tokens=16,
                 timeout_s=10,
+                label="svc",
             )
         # No exception means success
 
@@ -973,6 +1014,7 @@ class TestWaitForServiceReady:
                 messages=[],
                 max_tokens=16,
                 timeout_s=10,
+                label="svc",
             )
         assert mock_urlopen.call_count == 2
 
@@ -998,6 +1040,7 @@ class TestWaitForServiceReady:
                     messages=[],
                     max_tokens=16,
                     timeout_s=10,
+                    label="svc",
                 )
 
     def test_without_readiness_url_success(self) -> None:
@@ -1022,6 +1065,7 @@ class TestWaitForServiceReady:
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=16,
                 timeout_s=10,
+                label="svc",
             )
         mock_req.assert_called_once_with(
             "http://127.0.0.1:8000",
@@ -1058,6 +1102,7 @@ class TestWaitForServiceReady:
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=16,
                 timeout_s=10,
+                label="svc",
             )
         assert mock_req.call_count == 2
 
@@ -1086,6 +1131,7 @@ class TestWaitForServiceReady:
                     messages=[],
                     max_tokens=16,
                     timeout_s=10,
+                    label="svc",
                 )
 
     def test_without_readiness_url_http_error(self) -> None:
@@ -1122,6 +1168,7 @@ class TestWaitForServiceReady:
                     messages=[],
                     max_tokens=16,
                     timeout_s=10,
+                    label="svc",
                 )
 
 

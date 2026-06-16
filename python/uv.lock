@@ -386,6 +386,7 @@ source = { editable = "." }
 dependencies = [
     { name = "mlx" },
     { name = "mlx-lm" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -398,6 +399,7 @@ dev = [
 requires-dist = [
     { name = "mlx", specifier = ">=0.31.2" },
     { name = "mlx-lm", specifier = ">=0.31.3" },
+    { name = "tqdm", specifier = ">=4.68.2" },
 ]
 
 [package.metadata.requires-dev]
