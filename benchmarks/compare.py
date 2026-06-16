@@ -71,7 +71,13 @@ if str(PYTHON_DIR) not in sys.path:
 from mlx_worker.benchmarking import (  # noqa: E402
     BenchmarkResult,
     BenchmarkRun,
+    P95_MIN_SAMPLES,
+    P99_MIN_SAMPLES,
+    calculate_decode_tokens_per_second,
+    calculate_end_to_end_tokens_per_second,
+    mean,
     now_utc_iso,
+    percentile,
     write_report_suite,
 )
 
@@ -85,12 +91,19 @@ except ImportError:  # pragma: no cover - benchmark still works without tqdm
 class StreamResult:
     """Captured latency and token data for a streaming request."""
 
-    ttft_ms: float
-    latency_ms: float
-    prompt_tokens: int
-    completion_tokens: int
+    ttft_ms: float | None
+    latency_ms: float | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
     text: str
+    error: str | None = None
     notes: tuple[str, ...] = ()
+
+    @property
+    def succeeded(self) -> bool:
+        """Return True when the sample should be included in aggregates."""
+
+        return self.error is None
 
 
 @dataclass(frozen=True)
@@ -119,9 +132,13 @@ class _ProgressTracker:
         self.stream = stream or sys.stderr
         self.count = 0
         if use_tqdm is None:
-            use_tqdm = _tqdm is not None and getattr(self.stream, "isatty", lambda: False)()
+            use_tqdm = (
+                _tqdm is not None and getattr(self.stream, "isatty", lambda: False)()
+            )
         self._bar = (
-            _tqdm(total=self.total, desc=label, unit="step", leave=False, file=self.stream)
+            _tqdm(
+                total=self.total, desc=label, unit="step", leave=False, file=self.stream
+            )
             if use_tqdm and self.total > 0
             else None
         )
@@ -197,6 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--warmup-trials", type=int, default=1)
     parser.add_argument("--trials", type=int, default=1)
     args = parser.parse_args(argv)
+    if not args.report_path.is_absolute():
+        args.report_path = REPO_ROOT / args.report_path
 
     from mlx_lm import load
 
@@ -315,20 +334,29 @@ def _benchmark_raw_mlx_lm(
     measurements: list[StreamResult] = []
     for trial_index in range(1, trials + 1):
         for prompt_case in prompt_cases:
-            measurements.append(
-                _stream_generate_once(
-                    lambda prompt_input=prompt_case.prompt_input: stream_generate(
-                        model,
+            try:
+                measurements.append(
+                    _stream_generate_once(
+                        lambda prompt_input=prompt_case.prompt_input: stream_generate(
+                            model,
+                            tokenizer,
+                            prompt_input,
+                            max_tokens=max_tokens,
+                            sampler=sampler,
+                        ),
                         tokenizer,
-                        prompt_input,
-                        max_tokens=max_tokens,
-                        sampler=sampler,
-                    ),
-                    tokenizer,
-                    prompt_case.prompt_tokens,
-                    max_tokens,
+                        prompt_case.prompt_tokens,
+                        max_tokens,
+                    )
                 )
-            )
+            except Exception as exc:
+                measurements.append(
+                    _failed_stream_result(prompt_case.prompt_tokens, exc)
+                )
+                _log_event(
+                    f"[raw mlx-lm] measured request failed for {prompt_case.name}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
             trial_tracker.advance(
                 _progress_detail(
                     prompt_case, phase_index=trial_index, phase_total=trials
@@ -521,16 +549,25 @@ def _benchmark_http_service(
                 measurements: list[StreamResult] = []
                 for trial_index in range(1, trials + 1):
                     for prompt_case in prompt_cases:
-                        measurements.append(
-                            _request_completion(
-                                base_url,
-                                model,
-                                prompt_case.messages,
-                                max_tokens,
-                                tokenizer,
-                                prompt_case.prompt_tokens,
+                        try:
+                            measurements.append(
+                                _request_completion(
+                                    base_url,
+                                    model,
+                                    prompt_case.messages,
+                                    max_tokens,
+                                    tokenizer,
+                                    prompt_case.prompt_tokens,
+                                )
                             )
-                        )
+                        except Exception as exc:
+                            measurements.append(
+                                _failed_stream_result(prompt_case.prompt_tokens, exc)
+                            )
+                            _log_event(
+                                f"[{backend_name}] measured request failed for "
+                                f"{prompt_case.name}: {type(exc).__name__}: {exc}"
+                            )
                         trial_tracker.advance(
                             _progress_detail(
                                 prompt_case,
@@ -752,6 +789,19 @@ def _stream_generate_once(
     )
 
 
+def _failed_stream_result(prompt_tokens: int, exc: BaseException) -> StreamResult:
+    """Build a failed measured sample that is excluded from aggregates."""
+
+    return StreamResult(
+        ttft_ms=None,
+        latency_ms=None,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=None,
+        text="",
+        error=f"{type(exc).__name__}: {exc}",
+    )
+
+
 def _reduce_measurements(
     backend: str,
     measurements: Iterable[StreamResult],
@@ -762,29 +812,117 @@ def _reduce_measurements(
     if not measurements:
         raise ValueError(f"{backend} produced no benchmark measurements")
 
-    ttft = sum(sample.ttft_ms for sample in measurements) / len(measurements)
-    latency = sum(sample.latency_ms for sample in measurements) / len(measurements)
-    prompt_tokens = measurements[-1].prompt_tokens
-    completion_tokens = measurements[-1].completion_tokens
-    notes = tuple(
-        dict.fromkeys(note for sample in measurements for note in sample.notes)
-    )
-    if summarize_distribution:
-        notes = (
-            f"samples={len(measurements)}",
-            f"latency_p50_ms={_percentile([sample.latency_ms for sample in measurements], 50):.1f}",
-            f"latency_p95_ms={_percentile([sample.latency_ms for sample in measurements], 95):.1f}",
-            f"ttft_p50_ms={_percentile([sample.ttft_ms for sample in measurements], 50):.1f}",
-            f"ttft_p95_ms={_percentile([sample.ttft_ms for sample in measurements], 95):.1f}",
-            *notes,
+    successful = [sample for sample in measurements if sample.succeeded]
+    errors = len(measurements) - len(successful)
+    ttft_values = [sample.ttft_ms for sample in successful if sample.ttft_ms is not None]
+    latency_values = [
+        sample.latency_ms for sample in successful if sample.latency_ms is not None
+    ]
+    prompt_token_values = [
+        float(sample.prompt_tokens)
+        for sample in successful
+        if sample.prompt_tokens is not None
+    ]
+    completion_token_values = [
+        float(sample.completion_tokens)
+        for sample in successful
+        if sample.completion_tokens is not None
+    ]
+    total_token_values = [
+        float(sample.prompt_tokens + sample.completion_tokens)
+        for sample in successful
+        if sample.prompt_tokens is not None and sample.completion_tokens is not None
+    ]
+
+    decode_time_values: list[float] = []
+    decode_tps_values: list[float] = []
+    e2e_tps_values: list[float] = []
+    ttft_greater_than_latency = 0
+    decode_tps_unavailable = 0
+    for sample in successful:
+        if sample.ttft_ms is None or sample.latency_ms is None:
+            continue
+        if sample.ttft_ms > sample.latency_ms:
+            ttft_greater_than_latency += 1
+        decode_time_ms = sample.latency_ms - sample.ttft_ms
+        if decode_time_ms > 0:
+            decode_time_values.append(decode_time_ms)
+        completion_tokens = float(sample.completion_tokens or 0)
+        decode_tps = calculate_decode_tokens_per_second(completion_tokens, decode_time_ms)
+        if decode_tps is None:
+            decode_tps_unavailable += 1
+        else:
+            decode_tps_values.append(decode_tps)
+        e2e_tps = calculate_end_to_end_tokens_per_second(
+            completion_tokens, sample.latency_ms
         )
+        if e2e_tps is not None:
+            e2e_tps_values.append(e2e_tps)
+
+    warnings: list[str] = []
+    notes = tuple(dict.fromkeys(note for sample in measurements for note in sample.notes))
+    if errors:
+        warnings.append(f"{errors} measured request(s) failed")
+    if ttft_greater_than_latency:
+        warnings.append(
+            f"{ttft_greater_than_latency} sample(s) had TTFT greater than total latency"
+        )
+    if decode_tps_unavailable:
+        warnings.append(
+            f"decode tokens/sec could not be computed for {decode_tps_unavailable} sample(s)"
+        )
+
+    latency_mean_ms = mean(latency_values)
+    latency_p50_ms = percentile(latency_values, 50)
+    ttft_mean_ms = mean(ttft_values)
+    ttft_p50_ms = percentile(ttft_values, 50)
+    if (
+        latency_mean_ms is not None
+        and latency_p50_ms is not None
+        and latency_mean_ms > 0
+        and abs(latency_mean_ms - latency_p50_ms) / latency_mean_ms > 0.25
+    ):
+        warnings.append(
+            "latency_p50_ms differs materially from latency_mean_ms; distribution may be skewed"
+        )
+    if len(latency_values) < P95_MIN_SAMPLES:
+        warnings.append(
+            f"latency_p95_ms and ttft_p95_ms unavailable with only {len(latency_values)} successful sample(s)"
+        )
+    if len(latency_values) < P99_MIN_SAMPLES:
+        warnings.append(
+            f"latency_p99_ms and ttft_p99_ms unavailable with only {len(latency_values)} successful sample(s)"
+        )
+    if not successful:
+        warnings.append("no successful measured requests; aggregate metrics are unavailable")
+
     return BenchmarkResult(
         backend=backend,
-        ttft_ms=ttft,
-        latency_ms=latency,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        notes=notes,
+        samples=len(successful),
+        errors=errors,
+        error_rate=(errors / len(measurements)) if measurements else 0.0,
+        ttft_mean_ms=ttft_mean_ms,
+        ttft_p50_ms=ttft_p50_ms,
+        ttft_p95_ms=percentile(ttft_values, 95, min_samples=P95_MIN_SAMPLES),
+        ttft_p99_ms=percentile(ttft_values, 99, min_samples=P99_MIN_SAMPLES),
+        latency_mean_ms=latency_mean_ms,
+        latency_p50_ms=latency_p50_ms,
+        latency_p95_ms=percentile(
+            latency_values, 95, min_samples=P95_MIN_SAMPLES
+        ),
+        latency_p99_ms=percentile(
+            latency_values, 99, min_samples=P99_MIN_SAMPLES
+        ),
+        prompt_tokens_mean=mean(prompt_token_values),
+        completion_tokens_mean=mean(completion_token_values),
+        total_tokens_mean=mean(total_token_values),
+        decode_time_mean_ms=mean(decode_time_values),
+        decode_tokens_per_second_mean=mean(decode_tps_values),
+        decode_tokens_per_second_p50=percentile(decode_tps_values, 50),
+        end_to_end_tokens_per_second_mean=mean(e2e_tps_values),
+        end_to_end_tokens_per_second_p50=percentile(e2e_tps_values, 50),
+        notes=notes if summarize_distribution else notes,
+        warnings=tuple(dict.fromkeys(warnings)),
     )
 
 
@@ -803,28 +941,36 @@ def _result_summary(model_name: str, result: BenchmarkResult) -> str:
     """Render a compact per-backend result line for long benchmark runs."""
 
     output_tps = 0.0
-    if result.latency_ms > 0:
-        output_tps = result.completion_tokens / (result.latency_ms / 1000.0)
+    if (
+        result.latency_mean_ms is not None
+        and result.latency_mean_ms > 0
+        and result.completion_tokens_mean is not None
+    ):
+        output_tps = result.completion_tokens_mean / (result.latency_mean_ms / 1000.0)
+    latency_text = (
+        f"{result.latency_mean_ms:.1f} ms"
+        if result.latency_mean_ms is not None
+        else "n/a"
+    )
+    ttft_text = f"{result.ttft_mean_ms:.1f} ms" if result.ttft_mean_ms is not None else "n/a"
+    completion_text = (
+        f"{result.completion_tokens_mean:.1f}"
+        if result.completion_tokens_mean is not None
+        else "n/a"
+    )
     return (
         f"[model {model_name}] {result.backend} done: "
-        f"latency={result.latency_ms:.1f} ms, "
-        f"ttft={result.ttft_ms:.1f} ms, "
-        f"completion_tokens={result.completion_tokens}, "
-        f"output_tps={output_tps:.1f}"
+        f"latency_mean={latency_text}, "
+        f"ttft_mean={ttft_text}, "
+        f"completion_tokens_mean={completion_text}, "
+        f"output_tps_mean={output_tps:.1f}, "
+        f"samples={result.samples}, errors={result.errors}"
     )
 
 
 def _percentile(values: Iterable[float], p: float) -> float:
-    values = sorted(values)
-    if not values:
-        return 0.0
-    rank = (len(values) - 1) * (p / 100.0)
-    lower = int(rank)
-    upper = min(lower + 1, len(values) - 1)
-    if lower == upper:
-        return values[lower]
-    weight = rank - lower
-    return values[lower] + (values[upper] - values[lower]) * weight
+    result = percentile(list(values), p)
+    return 0.0 if result is None else result
 
 
 def _default_prompt_suite(

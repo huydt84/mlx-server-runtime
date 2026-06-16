@@ -233,6 +233,57 @@ def _prompt_case(prompt_tokens: int = 8) -> PromptCase:
     )
 
 
+def _benchmark_result(
+    backend: str,
+    *,
+    samples: int = 1,
+    errors: int = 0,
+    error_rate: float = 0.0,
+    ttft_mean_ms: float | None = 10.0,
+    ttft_p50_ms: float | None = 10.0,
+    ttft_p95_ms: float | None = None,
+    ttft_p99_ms: float | None = None,
+    latency_mean_ms: float | None = 50.0,
+    latency_p50_ms: float | None = 50.0,
+    latency_p95_ms: float | None = None,
+    latency_p99_ms: float | None = None,
+    prompt_tokens_mean: float | None = 8.0,
+    completion_tokens_mean: float | None = 4.0,
+    total_tokens_mean: float | None = 12.0,
+    decode_time_mean_ms: float | None = 40.0,
+    decode_tokens_per_second_mean: float | None = 100.0,
+    decode_tokens_per_second_p50: float | None = 100.0,
+    end_to_end_tokens_per_second_mean: float | None = 80.0,
+    end_to_end_tokens_per_second_p50: float | None = 80.0,
+    notes: tuple[str, ...] = (),
+    warnings: tuple[str, ...] = (),
+) -> BenchmarkResult:
+    return BenchmarkResult(
+        backend=backend,
+        samples=samples,
+        errors=errors,
+        error_rate=error_rate,
+        ttft_mean_ms=ttft_mean_ms,
+        ttft_p50_ms=ttft_p50_ms,
+        ttft_p95_ms=ttft_p95_ms,
+        ttft_p99_ms=ttft_p99_ms,
+        latency_mean_ms=latency_mean_ms,
+        latency_p50_ms=latency_p50_ms,
+        latency_p95_ms=latency_p95_ms,
+        latency_p99_ms=latency_p99_ms,
+        prompt_tokens_mean=prompt_tokens_mean,
+        completion_tokens_mean=completion_tokens_mean,
+        total_tokens_mean=total_tokens_mean,
+        decode_time_mean_ms=decode_time_mean_ms,
+        decode_tokens_per_second_mean=decode_tokens_per_second_mean,
+        decode_tokens_per_second_p50=decode_tokens_per_second_p50,
+        end_to_end_tokens_per_second_mean=end_to_end_tokens_per_second_mean,
+        end_to_end_tokens_per_second_p50=end_to_end_tokens_per_second_p50,
+        notes=notes,
+        warnings=warnings,
+    )
+
+
 class _SimpleTokenizer:
     def __init__(self, *, has_chat_template: bool = False) -> None:
         self.has_chat_template = has_chat_template
@@ -282,9 +333,9 @@ class TestReduceMeasurements:
                 _stream_result(prompt_tokens=8, completion_tokens=6),
             ],
         )
-        # prompt/completion tokens come from last measurement
-        assert results.prompt_tokens == 8
-        assert results.completion_tokens == 6
+        # prompt/completion tokens are suite means across successful samples
+        assert results.prompt_tokens == 6.5
+        assert results.completion_tokens == 4.5
 
     def test_empty_measurements_raises(self) -> None:
         with pytest.raises(ValueError, match="produced no benchmark measurements"):
@@ -322,14 +373,7 @@ class TestReduceMeasurements:
             summarize_distribution=True,
         )
 
-        assert results.notes == (
-            "samples=3",
-            "latency_p50_ms=60.0",
-            "latency_p95_ms=78.0",
-            "ttft_p50_ms=20.0",
-            "ttft_p95_ms=29.0",
-            "source",
-        )
+        assert results.notes == ("source",)
 
 
 class TestPercentile:
@@ -412,28 +456,37 @@ class TestProgressHelpers:
         output = stream.getvalue()
         assert "raw warmup: 0/2" in output
         assert "raw warmup: 1/2 (50%) - trial 1/2, prompt-1, prompt_tokens=8" in output
-        assert "raw warmup: 2/2 (100%) - trial 2/2, prompt-2, prompt_tokens=13" in output
+        assert (
+            "raw warmup: 2/2 (100%) - trial 2/2, prompt-2, prompt_tokens=13" in output
+        )
         assert "raw warmup: completed" in output
 
     def test_progress_detail_and_result_summary(self) -> None:
-        detail = _progress_detail(_prompt_case(prompt_tokens=21), phase_index=2, phase_total=3)
+        detail = _progress_detail(
+            _prompt_case(prompt_tokens=21), phase_index=2, phase_total=3
+        )
         summary = _result_summary(
             "mlx-community/test-model",
-            BenchmarkResult(
-                backend="raw mlx-lm",
-                ttft_ms=40.0,
-                latency_ms=200.0,
-                prompt_tokens=21,
-                completion_tokens=10,
-                notes=(),
+            _benchmark_result(
+                "raw mlx-lm",
+                ttft_mean_ms=40.0,
+                latency_mean_ms=200.0,
+                prompt_tokens_mean=21.0,
+                completion_tokens_mean=10.0,
+                total_tokens_mean=31.0,
+                decode_time_mean_ms=160.0,
+                decode_tokens_per_second_mean=62.5,
+                decode_tokens_per_second_p50=62.5,
+                end_to_end_tokens_per_second_mean=50.0,
+                end_to_end_tokens_per_second_p50=50.0,
             ),
         )
 
         assert detail == "trial 2/3, prompt-1, prompt_tokens=21"
         assert "[model mlx-community/test-model] raw mlx-lm done:" in summary
-        assert "latency=200.0 ms" in summary
-        assert "ttft=40.0 ms" in summary
-        assert "output_tps=50.0" in summary
+        assert "latency_mean=200.0 ms" in summary
+        assert "ttft_mean=40.0 ms" in summary
+        assert "output_tps_mean=50.0" in summary
 
 
 # ===========================================================================
@@ -447,76 +500,53 @@ class TestOverheadSummary:
         assert msg == "Raw mlx-lm baseline was not recorded."
 
     def test_no_slower_backends(self) -> None:
-        raw = BenchmarkResult(
-            backend="raw mlx-lm",
-            ttft_ms=10.0,
-            latency_ms=50.0,
-            prompt_tokens=8,
-            completion_tokens=4,
-        )
-        faster = BenchmarkResult(
-            backend="fast",
-            ttft_ms=5.0,
-            latency_ms=25.0,
-            prompt_tokens=8,
-            completion_tokens=4,
+        raw = _benchmark_result("raw mlx-lm")
+        faster = _benchmark_result(
+            "fast",
+            ttft_mean_ms=5.0,
+            ttft_p50_ms=5.0,
+            latency_mean_ms=25.0,
+            latency_p50_ms=25.0,
+            decode_time_mean_ms=20.0,
+            decode_tokens_per_second_mean=200.0,
+            decode_tokens_per_second_p50=200.0,
+            end_to_end_tokens_per_second_mean=160.0,
+            end_to_end_tokens_per_second_p50=160.0,
         )
         msg = _overhead_summary(raw, [raw, faster])
-        assert msg == "No backend exceeded the raw mlx-lm baseline in measured latency."
+        assert (
+            msg
+            == "No backend exceeded the raw mlx-lm baseline in measured mean latency."
+        )
 
     def test_with_slower_backend(self) -> None:
-        raw = BenchmarkResult(
-            backend="raw mlx-lm",
-            ttft_ms=10.0,
-            latency_ms=50.0,
-            prompt_tokens=8,
-            completion_tokens=4,
-        )
-        slow = BenchmarkResult(
-            backend="slow-backend",
-            ttft_ms=20.0,
-            latency_ms=100.0,
-            prompt_tokens=8,
-            completion_tokens=4,
+        raw = _benchmark_result("raw mlx-lm")
+        slow = _benchmark_result(
+            "slow-backend",
+            ttft_mean_ms=20.0,
+            ttft_p50_ms=20.0,
+            latency_mean_ms=100.0,
+            latency_p50_ms=100.0,
+            decode_time_mean_ms=80.0,
+            decode_tokens_per_second_mean=50.0,
+            decode_tokens_per_second_p50=50.0,
+            end_to_end_tokens_per_second_mean=40.0,
+            end_to_end_tokens_per_second_p50=40.0,
         )
         msg = _overhead_summary(raw, [raw, slow])
         assert "slow-backend was 50.0 ms slower than raw mlx-lm" in msg
-        assert "10.0 ms slower on TTFT" in msg
+        assert "10.0 ms slower on mean TTFT" in msg
 
     def test_worst_backend_selected(self) -> None:
-        raw = BenchmarkResult(
-            backend="raw mlx-lm",
-            ttft_ms=10.0,
-            latency_ms=50.0,
-            prompt_tokens=8,
-            completion_tokens=4,
-        )
-        mid = BenchmarkResult(
-            backend="mid",
-            ttft_ms=15.0,
-            latency_ms=70.0,
-            prompt_tokens=8,
-            completion_tokens=4,
-        )
-        worst = BenchmarkResult(
-            backend="worst",
-            ttft_ms=30.0,
-            latency_ms=120.0,
-            prompt_tokens=8,
-            completion_tokens=4,
-        )
+        raw = _benchmark_result("raw mlx-lm")
+        mid = _benchmark_result("mid", ttft_mean_ms=15.0, latency_mean_ms=70.0)
+        worst = _benchmark_result("worst", ttft_mean_ms=30.0, latency_mean_ms=120.0)
         msg = _overhead_summary(raw, [raw, mid, worst])
         assert "worst" in msg
         assert "70.0 ms slower" in msg  # 120 - 50 = 70
 
     def test_raw_itself_not_counted_as_slower(self) -> None:
-        raw = BenchmarkResult(
-            backend="raw mlx-lm",
-            ttft_ms=10.0,
-            latency_ms=50.0,
-            prompt_tokens=8,
-            completion_tokens=4,
-        )
+        raw = _benchmark_result("raw mlx-lm")
         msg = _overhead_summary(raw, [raw])
         assert "No backend exceeded" in msg
 
@@ -535,17 +565,20 @@ class TestSummarizeResultsEdgeCases:
             max_tokens=16,
             generated_at="2026-06-14T00:00:00+00:00",
             results=(
-                BenchmarkResult(
-                    backend="only-backend",
-                    ttft_ms=15.0,
-                    latency_ms=45.0,
-                    prompt_tokens=8,
-                    completion_tokens=4,
+                _benchmark_result(
+                    "only-backend",
+                    ttft_mean_ms=15.0,
+                    ttft_p50_ms=15.0,
+                    latency_mean_ms=45.0,
+                    latency_p50_ms=45.0,
                 ),
             ),
         )
         report = summarize_results(run)
-        assert "| only-backend | 15.0 | 45.0 | 8 | 4 | - | - | - |" in report
+        assert (
+            "| only-backend | 1 | 0 | 0.0% | 15.0 | 15.0 | - | - | 45.0 | 45.0 | - | - | 8.0 | 4.0 | 12.0 | 40.0 |"
+            in report
+        )
         assert "Raw mlx-lm baseline was not recorded." in report
 
     def test_no_raw_baseline_among_results(self) -> None:
@@ -556,26 +589,35 @@ class TestSummarizeResultsEdgeCases:
             max_tokens=16,
             generated_at="2026-06-14T00:00:00+00:00",
             results=(
-                BenchmarkResult(
-                    backend="backend-a",
-                    ttft_ms=10.0,
-                    latency_ms=30.0,
-                    prompt_tokens=8,
-                    completion_tokens=4,
+                _benchmark_result(
+                    "backend-a",
+                    ttft_mean_ms=10.0,
+                    ttft_p50_ms=10.0,
+                    latency_mean_ms=30.0,
+                    latency_p50_ms=30.0,
+                    decode_time_mean_ms=20.0,
+                    decode_tokens_per_second_mean=200.0,
+                    decode_tokens_per_second_p50=200.0,
+                    end_to_end_tokens_per_second_mean=133.3333333333,
+                    end_to_end_tokens_per_second_p50=133.3333333333,
                 ),
-                BenchmarkResult(
-                    backend="backend-b",
-                    ttft_ms=20.0,
-                    latency_ms=60.0,
-                    prompt_tokens=8,
-                    completion_tokens=4,
+                _benchmark_result(
+                    "backend-b",
+                    ttft_mean_ms=20.0,
+                    ttft_p50_ms=20.0,
+                    latency_mean_ms=60.0,
+                    latency_p50_ms=60.0,
+                    decode_time_mean_ms=40.0,
+                    decode_tokens_per_second_mean=100.0,
+                    decode_tokens_per_second_p50=100.0,
+                    end_to_end_tokens_per_second_mean=66.6666666667,
+                    end_to_end_tokens_per_second_p50=66.6666666667,
                 ),
             ),
         )
         report = summarize_results(run)
-        # Both rows should have '-' for overhead columns
-        assert "| backend-a | 10.0 | 30.0 | 8 | 4 | - | - | - |" in report
-        assert "| backend-b | 20.0 | 60.0 | 8 | 4 | - | - | - |" in report
+        assert "| backend-a | - | - | - | - | - | - | - | - |" in report
+        assert "| backend-b | - | - | - | - | - | - | - | - |" in report
 
     def test_notes_dedup_across_results(self) -> None:
         """Each result's notes are joined with '; ' — duplicate notes per result are kept as-is."""
@@ -585,26 +627,22 @@ class TestSummarizeResultsEdgeCases:
             max_tokens=16,
             generated_at="2026-06-14T00:00:00+00:00",
             results=(
-                BenchmarkResult(
-                    backend="raw mlx-lm",
-                    ttft_ms=10.0,
-                    latency_ms=30.0,
-                    prompt_tokens=8,
-                    completion_tokens=4,
+                _benchmark_result(
+                    "raw mlx-lm", latency_mean_ms=30.0, latency_p50_ms=30.0
                 ),
-                BenchmarkResult(
-                    backend="backend",
-                    ttft_ms=15.0,
-                    latency_ms=45.0,
-                    prompt_tokens=8,
-                    completion_tokens=4,
+                _benchmark_result(
+                    "backend",
+                    ttft_mean_ms=15.0,
+                    ttft_p50_ms=15.0,
+                    latency_mean_ms=45.0,
+                    latency_p50_ms=45.0,
                     notes=("note-a", "note-b", "note-a"),
                 ),
             ),
         )
         report = summarize_results(run)
-        # Notes are joined with '; ' — duplicates in tuple are preserved by user
-        assert "note-a; note-b; note-a" in report
+        assert "- backend: note-a" in report
+        assert "- backend: note-b" in report
 
     def test_empty_results_raises(self) -> None:
         run = BenchmarkRun(
@@ -620,19 +658,27 @@ class TestSummarizeResultsEdgeCases:
 
 class TestSummarizeReport:
     def test_multiple_runs_render_separate_sections(self) -> None:
-        raw = BenchmarkResult(
-            backend="raw mlx-lm",
-            ttft_ms=10.0,
-            latency_ms=30.0,
-            prompt_tokens=8,
-            completion_tokens=4,
+        raw = _benchmark_result(
+            "raw mlx-lm",
+            latency_mean_ms=30.0,
+            latency_p50_ms=30.0,
+            decode_time_mean_ms=20.0,
+            decode_tokens_per_second_mean=200.0,
+            decode_tokens_per_second_p50=200.0,
+            end_to_end_tokens_per_second_mean=133.3333333333,
+            end_to_end_tokens_per_second_p50=133.3333333333,
         )
-        project = BenchmarkResult(
-            backend="this project",
-            ttft_ms=12.0,
-            latency_ms=35.0,
-            prompt_tokens=8,
-            completion_tokens=4,
+        project = _benchmark_result(
+            "this project",
+            ttft_mean_ms=12.0,
+            ttft_p50_ms=12.0,
+            latency_mean_ms=35.0,
+            latency_p50_ms=35.0,
+            decode_time_mean_ms=23.0,
+            decode_tokens_per_second_mean=173.9130434783,
+            decode_tokens_per_second_p50=173.9130434783,
+            end_to_end_tokens_per_second_mean=114.2857142857,
+            end_to_end_tokens_per_second_p50=114.2857142857,
         )
         report = summarize_report(
             [
@@ -657,7 +703,7 @@ class TestSummarizeReport:
         assert "## Model: model-b" in report
         assert (
             report.count(
-                "| backend | ttft_ms | latency_ms | prompt_tokens | completion_tokens | ttft_overhead_ms | latency_overhead_ms | notes |"
+                "| backend | samples | errors | error_rate | ttft_mean_ms | ttft_p50_ms | ttft_p95_ms | ttft_p99_ms | latency_mean_ms | latency_p50_ms | latency_p95_ms | latency_p99_ms | prompt_tokens_mean | completion_tokens_mean | total_tokens_mean | decode_time_mean_ms |"
             )
             == 2
         )
@@ -726,36 +772,42 @@ class TestStreamResultConstruction:
 
 class TestBenchmarkResultConstruction:
     def test_minimal(self) -> None:
-        br = BenchmarkResult(
-            backend="b",
-            ttft_ms=5.0,
-            latency_ms=20.0,
-            prompt_tokens=8,
-            completion_tokens=4,
+        br = _benchmark_result(
+            "b",
+            ttft_mean_ms=5.0,
+            ttft_p50_ms=5.0,
+            latency_mean_ms=20.0,
+            latency_p50_ms=20.0,
+            decode_time_mean_ms=15.0,
+            decode_tokens_per_second_mean=266.6666666667,
+            decode_tokens_per_second_p50=266.6666666667,
+            end_to_end_tokens_per_second_mean=200.0,
+            end_to_end_tokens_per_second_p50=200.0,
         )
         assert br.backend == "b"
         assert br.notes == ()
 
     def test_with_notes(self) -> None:
-        br = BenchmarkResult(
-            backend="b",
-            ttft_ms=5.0,
-            latency_ms=20.0,
-            prompt_tokens=8,
-            completion_tokens=4,
-            notes=("x",),
-        )
+        br = _benchmark_result("b", notes=("x",))
         assert br.notes == ("x",)
 
 
 class TestBenchmarkRunConstruction:
     def test_minimal(self) -> None:
-        br = BenchmarkResult(
-            backend="b",
-            ttft_ms=1.0,
-            latency_ms=2.0,
-            prompt_tokens=3,
-            completion_tokens=4,
+        br = _benchmark_result(
+            "b",
+            ttft_mean_ms=1.0,
+            ttft_p50_ms=1.0,
+            latency_mean_ms=2.0,
+            latency_p50_ms=2.0,
+            prompt_tokens_mean=3.0,
+            completion_tokens_mean=4.0,
+            total_tokens_mean=7.0,
+            decode_time_mean_ms=1.0,
+            decode_tokens_per_second_mean=4000.0,
+            decode_tokens_per_second_p50=4000.0,
+            end_to_end_tokens_per_second_mean=2000.0,
+            end_to_end_tokens_per_second_p50=2000.0,
         )
         run = BenchmarkRun(
             model="m", prompt="p", max_tokens=16, generated_at="now", results=(br,)
@@ -1208,13 +1260,17 @@ class TestBenchmarkHttpServiceCleanup:
             patch("benchmarks.compare._request_completion", return_value=mock_stream),
             patch(
                 "benchmarks.compare._reduce_measurements",
-                side_effect=lambda name, ms, **_: BenchmarkResult(
-                    backend=name,
-                    ttft_ms=5.0,
-                    latency_ms=15.0,
-                    prompt_tokens=8,
-                    completion_tokens=4,
-                    notes=(),
+                side_effect=lambda name, ms, **_: _benchmark_result(
+                    name,
+                    ttft_mean_ms=5.0,
+                    ttft_p50_ms=5.0,
+                    latency_mean_ms=15.0,
+                    latency_p50_ms=15.0,
+                    decode_time_mean_ms=10.0,
+                    decode_tokens_per_second_mean=400.0,
+                    decode_tokens_per_second_p50=400.0,
+                    end_to_end_tokens_per_second_mean=266.6666666667,
+                    end_to_end_tokens_per_second_p50=266.6666666667,
                 ),
             ),
             patch("benchmarks.compare.os.killpg", killpg),
@@ -1313,13 +1369,20 @@ class TestBenchmarkHttpServiceCleanup:
             patch("benchmarks.compare._request_completion", return_value=stream),
             patch(
                 "benchmarks.compare._reduce_measurements",
-                side_effect=lambda name, ms, **_: BenchmarkResult(
-                    backend=name,
-                    ttft_ms=1.0,
-                    latency_ms=2.0,
-                    prompt_tokens=3,
-                    completion_tokens=4,
-                    notes=(),
+                side_effect=lambda name, ms, **_: _benchmark_result(
+                    name,
+                    ttft_mean_ms=1.0,
+                    ttft_p50_ms=1.0,
+                    latency_mean_ms=2.0,
+                    latency_p50_ms=2.0,
+                    prompt_tokens_mean=3.0,
+                    completion_tokens_mean=4.0,
+                    total_tokens_mean=7.0,
+                    decode_time_mean_ms=1.0,
+                    decode_tokens_per_second_mean=4000.0,
+                    decode_tokens_per_second_p50=4000.0,
+                    end_to_end_tokens_per_second_mean=2000.0,
+                    end_to_end_tokens_per_second_p50=2000.0,
                 ),
             ),
             patch("benchmarks.compare.os.killpg", killpg),
