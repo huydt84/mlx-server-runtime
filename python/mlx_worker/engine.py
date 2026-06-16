@@ -140,8 +140,9 @@ class MlxWorkerEngine:
                     prompt_tokens=0,
                     completion_tokens=0,
                 )
-            text_segments.append(response.text)
-            emit_delta(response.text)
+            if response.text:
+                text_segments.append(response.text)
+                emit_delta(response.text)
             final_response = response
             if should_cancel is not None and should_cancel():
                 return ChatCompletionResponse(
