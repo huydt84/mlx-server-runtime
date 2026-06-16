@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--long-prompt-multiplier", type=int, default=2)
-    parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument(
         "--report-path",
         type=Path,
