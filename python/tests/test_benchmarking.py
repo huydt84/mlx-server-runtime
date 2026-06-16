@@ -249,8 +249,12 @@ def _benchmark_result(
     latency_p99_ms: float | None = None,
     prompt_tokens_mean: float | None = 8.0,
     completion_tokens_mean: float | None = 4.0,
+    completion_tokens_p50: float | None = 4.0,
     total_tokens_mean: float | None = 12.0,
     decode_time_mean_ms: float | None = 40.0,
+    latency_per_completion_token_ms: float | None = None,
+    decode_time_per_completion_token_ms: float | None = None,
+    latency_p50_per_completion_token_ms: float | None = None,
     decode_tokens_per_second_mean: float | None = 100.0,
     decode_tokens_per_second_p50: float | None = 100.0,
     end_to_end_tokens_per_second_mean: float | None = 80.0,
@@ -258,6 +262,17 @@ def _benchmark_result(
     notes: tuple[str, ...] = (),
     warnings: tuple[str, ...] = (),
 ) -> BenchmarkResult:
+    if latency_per_completion_token_ms is None:
+        if latency_mean_ms is not None and completion_tokens_mean not in (None, 0):
+            latency_per_completion_token_ms = latency_mean_ms / completion_tokens_mean
+    if decode_time_per_completion_token_ms is None:
+        if decode_time_mean_ms is not None and completion_tokens_mean not in (None, 0):
+            decode_time_per_completion_token_ms = (
+                decode_time_mean_ms / completion_tokens_mean
+            )
+    if latency_p50_per_completion_token_ms is None:
+        if latency_p50_ms is not None and completion_tokens_p50 not in (None, 0):
+            latency_p50_per_completion_token_ms = latency_p50_ms / completion_tokens_p50
     return BenchmarkResult(
         backend=backend,
         samples=samples,
@@ -273,8 +288,12 @@ def _benchmark_result(
         latency_p99_ms=latency_p99_ms,
         prompt_tokens_mean=prompt_tokens_mean,
         completion_tokens_mean=completion_tokens_mean,
+        completion_tokens_p50=completion_tokens_p50,
         total_tokens_mean=total_tokens_mean,
         decode_time_mean_ms=decode_time_mean_ms,
+        latency_per_completion_token_ms=latency_per_completion_token_ms,
+        decode_time_per_completion_token_ms=decode_time_per_completion_token_ms,
+        latency_p50_per_completion_token_ms=latency_p50_per_completion_token_ms,
         decode_tokens_per_second_mean=decode_tokens_per_second_mean,
         decode_tokens_per_second_p50=decode_tokens_per_second_p50,
         end_to_end_tokens_per_second_mean=end_to_end_tokens_per_second_mean,
@@ -336,6 +355,14 @@ class TestReduceMeasurements:
         # prompt/completion tokens are suite means across successful samples
         assert results.prompt_tokens == 6.5
         assert results.completion_tokens == 4.5
+        assert results.completion_tokens_p50 == 4.5
+        assert results.latency_per_completion_token_ms == pytest.approx(11.1111111111)
+        assert results.decode_time_per_completion_token_ms == pytest.approx(
+            8.8888888889
+        )
+        assert results.latency_p50_per_completion_token_ms == pytest.approx(
+            11.1111111111
+        )
 
     def test_empty_measurements_raises(self) -> None:
         with pytest.raises(ValueError, match="produced no benchmark measurements"):
@@ -473,8 +500,12 @@ class TestProgressHelpers:
                 latency_mean_ms=200.0,
                 prompt_tokens_mean=21.0,
                 completion_tokens_mean=10.0,
+                completion_tokens_p50=10.0,
                 total_tokens_mean=31.0,
                 decode_time_mean_ms=160.0,
+                latency_per_completion_token_ms=20.0,
+                decode_time_per_completion_token_ms=16.0,
+                latency_p50_per_completion_token_ms=20.0,
                 decode_tokens_per_second_mean=62.5,
                 decode_tokens_per_second_p50=62.5,
                 end_to_end_tokens_per_second_mean=50.0,
@@ -486,6 +517,7 @@ class TestProgressHelpers:
         assert "[model mlx-community/test-model] raw mlx-lm done:" in summary
         assert "latency_mean=200.0 ms" in summary
         assert "ttft_mean=40.0 ms" in summary
+        assert "completion_tokens_per_request_mean=10.0" in summary
         assert "output_tps_mean=50.0" in summary
 
 
@@ -576,7 +608,7 @@ class TestSummarizeResultsEdgeCases:
         )
         report = summarize_results(run)
         assert (
-            "| only-backend | 1 | 0 | 0.0% | 15.0 | 15.0 | - | - | 45.0 | 45.0 | - | - | 8.0 | 4.0 | 12.0 | 40.0 |"
+            "| only-backend | 1 | 0 | 0.0% | 15.0 | 15.0 | - | - | 45.0 | 45.0 | - | - | 8.0 | 4.0 | 12.0 | 40.0 | 11.2 | 10.0 | 11.2 |"
             in report
         )
         assert "Raw mlx-lm baseline was not recorded." in report
@@ -657,6 +689,34 @@ class TestSummarizeResultsEdgeCases:
 
 
 class TestSummarizeReport:
+    def test_report_uses_normalized_metrics_and_clearer_token_labels(self) -> None:
+        raw = _benchmark_result("raw mlx-lm")
+        project = _benchmark_result(
+            "this project",
+            completion_tokens_mean=4.5,
+            completion_tokens_p50=4.5,
+        )
+        report = summarize_results(
+            BenchmarkRun(
+                model="model-a",
+                prompt="p",
+                max_tokens=16,
+                generated_at="2026-06-14T00:00:00+00:00",
+                results=(raw, project),
+            )
+        )
+
+        assert "prompt_tokens_per_request_mean" in report
+        assert "completion_tokens_per_request_mean" in report
+        assert "total_tokens_per_request_mean" in report
+        assert "latency_per_completion_token_ms" in report
+        assert "decode_time_per_completion_token_ms" in report
+        assert "latency_p50_per_completion_token_ms" in report
+        assert (
+            "suite warning: this project completion_tokens_per_request_mean differs from raw mlx-lm by 12.5%; prefer normalized per-token metrics over raw latency comparisons"
+            in report
+        )
+
     def test_multiple_runs_render_separate_sections(self) -> None:
         raw = _benchmark_result(
             "raw mlx-lm",
@@ -703,7 +763,7 @@ class TestSummarizeReport:
         assert "## Model: model-b" in report
         assert (
             report.count(
-                "| backend | samples | errors | error_rate | ttft_mean_ms | ttft_p50_ms | ttft_p95_ms | ttft_p99_ms | latency_mean_ms | latency_p50_ms | latency_p95_ms | latency_p99_ms | prompt_tokens_mean | completion_tokens_mean | total_tokens_mean | decode_time_mean_ms |"
+                "| backend | samples | errors | error_rate | ttft_mean_ms | ttft_p50_ms | ttft_p95_ms | ttft_p99_ms | latency_mean_ms | latency_p50_ms | latency_p95_ms | latency_p99_ms | prompt_tokens_per_request_mean | completion_tokens_per_request_mean | total_tokens_per_request_mean | decode_time_mean_ms | latency_per_completion_token_ms | decode_time_per_completion_token_ms | latency_p50_per_completion_token_ms |"
             )
             == 2
         )

@@ -75,6 +75,7 @@ from mlx_worker.benchmarking import (  # noqa: E402
     P99_MIN_SAMPLES,
     calculate_decode_tokens_per_second,
     calculate_end_to_end_tokens_per_second,
+    calculate_per_token_latency_ms,
     mean,
     now_utc_iso,
     percentile,
@@ -915,8 +916,21 @@ def _reduce_measurements(
         ),
         prompt_tokens_mean=mean(prompt_token_values),
         completion_tokens_mean=mean(completion_token_values),
+        completion_tokens_p50=percentile(completion_token_values, 50),
         total_tokens_mean=mean(total_token_values),
         decode_time_mean_ms=mean(decode_time_values),
+        latency_per_completion_token_ms=calculate_per_token_latency_ms(
+            latency_mean_ms,
+            mean(completion_token_values),
+        ),
+        decode_time_per_completion_token_ms=calculate_per_token_latency_ms(
+            mean(decode_time_values),
+            mean(completion_token_values),
+        ),
+        latency_p50_per_completion_token_ms=calculate_per_token_latency_ms(
+            latency_p50_ms,
+            percentile(completion_token_values, 50),
+        ),
         decode_tokens_per_second_mean=mean(decode_tps_values),
         decode_tokens_per_second_p50=percentile(decode_tps_values, 50),
         end_to_end_tokens_per_second_mean=mean(e2e_tps_values),
@@ -954,15 +968,15 @@ def _result_summary(model_name: str, result: BenchmarkResult) -> str:
     )
     ttft_text = f"{result.ttft_mean_ms:.1f} ms" if result.ttft_mean_ms is not None else "n/a"
     completion_text = (
-        f"{result.completion_tokens_mean:.1f}"
-        if result.completion_tokens_mean is not None
+        f"{result.completion_tokens_per_request_mean:.1f}"
+        if result.completion_tokens_per_request_mean is not None
         else "n/a"
     )
     return (
         f"[model {model_name}] {result.backend} done: "
         f"latency_mean={latency_text}, "
         f"ttft_mean={ttft_text}, "
-        f"completion_tokens_mean={completion_text}, "
+        f"completion_tokens_per_request_mean={completion_text}, "
         f"output_tps_mean={output_tps:.1f}, "
         f"samples={result.samples}, errors={result.errors}"
     )

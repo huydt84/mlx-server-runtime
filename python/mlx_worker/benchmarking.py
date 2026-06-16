@@ -11,8 +11,7 @@ from typing import Sequence
 P95_MIN_SAMPLES = 20
 P99_MIN_SAMPLES = 100
 MEAN_MEDIAN_WARN_FRACTION = 0.25
-COMPLETION_TOKENS_WARN_FRACTION = 0.10
-COMPLETION_TOKENS_WARN_ABS = 1.0
+COMPLETION_TOKENS_WARN_FRACTION = 0.05
 
 
 @dataclass(frozen=True)
@@ -33,8 +32,12 @@ class BenchmarkResult:
     latency_p99_ms: float | None
     prompt_tokens_mean: float | None
     completion_tokens_mean: float | None
+    completion_tokens_p50: float | None
     total_tokens_mean: float | None
     decode_time_mean_ms: float | None
+    latency_per_completion_token_ms: float | None
+    decode_time_per_completion_token_ms: float | None
+    latency_p50_per_completion_token_ms: float | None
     decode_tokens_per_second_mean: float | None
     decode_tokens_per_second_p50: float | None
     end_to_end_tokens_per_second_mean: float | None
@@ -71,6 +74,24 @@ class BenchmarkResult:
         """Compatibility alias for the old ambiguous field name."""
 
         return self.completion_tokens_mean
+
+    @property
+    def prompt_tokens_per_request_mean(self) -> float | None:
+        """Clearer label for markdown/report output."""
+
+        return self.prompt_tokens_mean
+
+    @property
+    def completion_tokens_per_request_mean(self) -> float | None:
+        """Clearer label for markdown/report output."""
+
+        return self.completion_tokens_mean
+
+    @property
+    def total_tokens_per_request_mean(self) -> float | None:
+        """Clearer label for markdown/report output."""
+
+        return self.total_tokens_mean
 
 
 @dataclass(frozen=True)
@@ -133,6 +154,16 @@ def calculate_end_to_end_tokens_per_second(
     if latency_ms <= 0:
         return None
     return completion_tokens / (latency_ms / 1000.0)
+
+
+def calculate_per_token_latency_ms(
+    latency_ms: float | None, completion_tokens: float | None
+) -> float | None:
+    """Return normalized latency in milliseconds per completion token."""
+
+    if latency_ms is None or completion_tokens is None or completion_tokens <= 0:
+        return None
+    return latency_ms / completion_tokens
 
 
 def calculate_overhead(value: float | None, baseline: float | None) -> float | None:
@@ -217,16 +248,18 @@ def _render_run(run: BenchmarkRun, *, include_heading: bool) -> list[str]:
         "- `decode_time_mean_ms = latency_mean_ms - ttft_mean_ms`.",
         "- `decode_tokens_per_second = completion_tokens / (decode_time_ms / 1000)` when decode time is positive.",
         "- `end_to_end_tokens_per_second = completion_tokens / (latency_ms / 1000)` when latency is positive.",
+        "- `latency_per_completion_token_ms = latency_mean_ms / completion_tokens_per_request_mean`.",
+        "- `decode_time_per_completion_token_ms = decode_time_mean_ms / completion_tokens_per_request_mean`.",
         "- `*_p95` is reported only when at least 20 successful samples exist; `*_p99` requires at least 100 successful samples.",
         "",
         "## Raw Per-Backend Metrics",
         "",
-        "| backend | samples | errors | error_rate | ttft_mean_ms | ttft_p50_ms | ttft_p95_ms | ttft_p99_ms | latency_mean_ms | latency_p50_ms | latency_p95_ms | latency_p99_ms | prompt_tokens_mean | completion_tokens_mean | total_tokens_mean | decode_time_mean_ms |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| backend | samples | errors | error_rate | ttft_mean_ms | ttft_p50_ms | ttft_p95_ms | ttft_p99_ms | latency_mean_ms | latency_p50_ms | latency_p95_ms | latency_p99_ms | prompt_tokens_per_request_mean | completion_tokens_per_request_mean | total_tokens_per_request_mean | decode_time_mean_ms | latency_per_completion_token_ms | decode_time_per_completion_token_ms | latency_p50_per_completion_token_ms |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in run.results:
         lines.append(
-            "| {backend} | {samples} | {errors} | {error_rate} | {ttft_mean_ms} | {ttft_p50_ms} | {ttft_p95_ms} | {ttft_p99_ms} | {latency_mean_ms} | {latency_p50_ms} | {latency_p95_ms} | {latency_p99_ms} | {prompt_tokens_mean} | {completion_tokens_mean} | {total_tokens_mean} | {decode_time_mean_ms} |".format(
+            "| {backend} | {samples} | {errors} | {error_rate} | {ttft_mean_ms} | {ttft_p50_ms} | {ttft_p95_ms} | {ttft_p99_ms} | {latency_mean_ms} | {latency_p50_ms} | {latency_p95_ms} | {latency_p99_ms} | {prompt_tokens_mean} | {completion_tokens_mean} | {total_tokens_mean} | {decode_time_mean_ms} | {latency_per_completion_token_ms} | {decode_time_per_completion_token_ms} | {latency_p50_per_completion_token_ms} |".format(
                 backend=result.backend,
                 samples=result.samples,
                 errors=result.errors,
@@ -239,10 +272,23 @@ def _render_run(run: BenchmarkRun, *, include_heading: bool) -> list[str]:
                 latency_p50_ms=_format_number(result.latency_p50_ms),
                 latency_p95_ms=_format_number(result.latency_p95_ms),
                 latency_p99_ms=_format_number(result.latency_p99_ms),
-                prompt_tokens_mean=_format_number(result.prompt_tokens_mean),
-                completion_tokens_mean=_format_number(result.completion_tokens_mean),
-                total_tokens_mean=_format_number(result.total_tokens_mean),
+                prompt_tokens_mean=_format_number(
+                    result.prompt_tokens_per_request_mean
+                ),
+                completion_tokens_mean=_format_number(
+                    result.completion_tokens_per_request_mean
+                ),
+                total_tokens_mean=_format_number(result.total_tokens_per_request_mean),
                 decode_time_mean_ms=_format_number(result.decode_time_mean_ms),
+                latency_per_completion_token_ms=_format_number(
+                    result.latency_per_completion_token_ms
+                ),
+                decode_time_per_completion_token_ms=_format_number(
+                    result.decode_time_per_completion_token_ms
+                ),
+                latency_p50_per_completion_token_ms=_format_number(
+                    result.latency_p50_per_completion_token_ms
+                ),
             )
         )
 
@@ -376,22 +422,25 @@ def _collect_suite_warnings(
     raw: BenchmarkResult | None, results: Sequence[BenchmarkResult]
 ) -> tuple[str, ...]:
     warnings: list[str] = []
-    if raw and raw.completion_tokens_mean is not None:
+    if raw and raw.completion_tokens_per_request_mean is not None:
         for result in results:
-            if result.backend == raw.backend or result.completion_tokens_mean is None:
+            if (
+                result.backend == raw.backend
+                or result.completion_tokens_per_request_mean is None
+            ):
                 continue
-            delta = abs(result.completion_tokens_mean - raw.completion_tokens_mean)
+            delta = abs(
+                result.completion_tokens_per_request_mean
+                - raw.completion_tokens_per_request_mean
+            )
             ratio = (
-                delta / raw.completion_tokens_mean
-                if raw.completion_tokens_mean > 0
+                delta / raw.completion_tokens_per_request_mean
+                if raw.completion_tokens_per_request_mean > 0
                 else 0.0
             )
-            if (
-                delta > COMPLETION_TOKENS_WARN_ABS
-                and ratio > COMPLETION_TOKENS_WARN_FRACTION
-            ):
+            if ratio > COMPLETION_TOKENS_WARN_FRACTION:
                 warnings.append(
-                    f"{result.backend} completion_tokens_mean differs from raw mlx-lm by {ratio * 100.0:.1f}%"
+                    f"{result.backend} completion_tokens_per_request_mean differs from raw mlx-lm by {ratio * 100.0:.1f}%; prefer normalized per-token metrics over raw latency comparisons"
                 )
     return tuple(warnings)
 
