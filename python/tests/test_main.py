@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from typing import Callable
 from types import SimpleNamespace
 
 from mlx_worker.ipc import (
@@ -378,6 +379,352 @@ def test_main_preserves_stream_when_buffered_frame_is_malformed(monkeypatch) -> 
     assert events[2].code == "INVALID_REQUEST"
 
 
+def test_main_routes_vlm_request_to_vlm_engine(monkeypatch) -> None:
+    """Requests with image content are routed to the VLM engine."""
+    from mlx_worker import main as worker_main
+
+    vlm_calls: list[str] = []
+    vlm_model_ids: list[str] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            vlm_model_ids.append(model_id)
+            self.model_id = model_id
+            self.warmed = False
+
+        def warmup(self):
+            self.warmed = True
+            return SimpleNamespace()
+
+        def complete_chat(
+            self, request, should_cancel: Callable[[], bool] | None = None
+        ):
+            vlm_calls.append(request.request_id)
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm output",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            self.warmed = False
+            self.seen: list[str] = []
+
+        def warmup(self):
+            self.warmed = True
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            self.seen.append(request.request_id)
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text output",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    vlm_request_json = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"vlm-1","model":"vlm-model"'
+        b',"messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"url":"img.jpg","detail":"auto"}}]}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(vlm_request_json))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+        ),
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert vlm_model_ids == ["vlm-model"]
+    assert vlm_calls == ["vlm-1"]
+
+
+def test_main_routes_text_request_to_text_engine_when_vlm_available(
+    monkeypatch,
+) -> None:
+    """Requests targeting text model route to text engine (model-first)."""
+    from mlx_worker import main as worker_main
+
+    text_seen: list[str] = []
+    vlm_seen: list[str] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            vlm_seen.append(request.request_id)
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            text_seen.append(request.request_id)
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    text_request_json = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"text-1","model":"text-model"'
+        b',"messages":[{"role":"user","content":"hello"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(text_request_json))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+        ),
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert text_seen == ["text-1"]
+    assert vlm_seen == []
+
+
+def test_main_rejects_image_request_to_text_model(monkeypatch) -> None:
+    """Text-only model receives image content request → INVALID_REQUEST error."""
+    from mlx_worker import main as worker_main
+
+    text_seen: list[str] = []
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            text_seen.append(request.request_id)
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    image_request_json = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"img-req","model":"text-model"'
+        b',"messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"url":"img.jpg","detail":"auto"}}]}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(image_request_json))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model=None,
+        ),
+    )
+
+    exit_code = worker_main.main(engine_factory=FakeTextEngine)
+
+    assert exit_code == 0
+    # Text engine should NOT have been called.
+    assert text_seen == []
+    events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
+    errors = [e for e in events if isinstance(e, WorkerCommandError)]
+    assert len(errors) >= 1
+    assert errors[0].code == "INVALID_REQUEST"
+    assert "does not support image content" in errors[0].message
+
+
+def test_main_routes_text_only_vlm_request_to_vlm_engine(monkeypatch) -> None:
+    """Text-only request targeting VLM model is routed to VLM engine (model-first)."""
+    from mlx_worker import main as worker_main
+
+    vlm_calls: list[str] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(
+            self, request, should_cancel: Callable[[], bool] | None = None
+        ):
+            vlm_calls.append(request.request_id)
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm output",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    # Text-only request targeting VLM model.
+    text_only_vlm_request = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"vlm-text","model":"vlm-model"'
+        b',"messages":[{"role":"user","content":"hello from text"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(text_only_vlm_request))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+        ),
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert vlm_calls == ["vlm-text"]
+
+
+def test_main_rejects_unknown_model(monkeypatch) -> None:
+    """Request for a model that is neither text nor VLM is rejected."""
+    from mlx_worker import main as worker_main
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    unknown_request_json = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"bad","model":"unknown-model"'
+        b',"messages":[{"role":"user","content":"hello"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(unknown_request_json))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+        ),
+    )
+
+    exit_code = worker_main.main(engine_factory=FakeTextEngine)
+
+    assert exit_code == 0
+    events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
+    errors = [e for e in events if isinstance(e, WorkerCommandError)]
+    assert len(errors) >= 1
+    assert errors[0].code == "INVALID_REQUEST"
+    assert "not served" in errors[0].message
+
+
 def test_main_emits_failure_status_when_warmup_fails(monkeypatch) -> None:
     from mlx_worker import main as worker_main
 
@@ -416,3 +763,439 @@ def test_main_emits_failure_status_when_warmup_fails(monkeypatch) -> None:
         message="warmup failed",
         at=failed_status.last_error.at,
     )
+
+
+def test_main_does_not_construct_vlm_engine_without_vlm_config(
+    monkeypatch,
+) -> None:
+    """Text-only config with no vlm_model does not construct VLM engine."""
+    from mlx_worker import main as worker_main
+
+    vlm_constructed: list[str] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            vlm_constructed.append(model_id)
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    text_request_json = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"text-1","model":"text-model"'
+        b',"messages":[{"role":"user","content":"hello"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(text_request_json))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model=None,
+        ),
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert vlm_constructed == [], "VLM engine should not be constructed"
+
+
+def test_main_vlm_engine_not_warmed_eagerly(monkeypatch) -> None:
+    """VLM engine is NOT constructed or warmed during bootstrap.
+
+    VLM should be initialized lazily on first request targeting the VLM
+    model.
+    """
+    from mlx_worker import main as worker_main
+
+    constructed: list[str] = []
+    warmup_called: list[str] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            constructed.append(model_id)
+
+        def warmup(self):
+            warmup_called.append(self.model_id)
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    # Request targets the text model — VLM should stay uninitialized.
+    text_request_json = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"text-1","model":"text-model"'
+        b',"messages":[{"role":"user","content":"hello"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(text_request_json))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+        ),
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert constructed == [], "VLM engine should not be constructed eagerly"
+    assert warmup_called == [], "VLM engine should not be warmed eagerly"
+
+
+def test_main_default_vlm_engine_lazy_construction(monkeypatch) -> None:
+    """When vlm_model is configured without injection, MlxVlmEngine is
+    lazily constructed on first VLM request, not during bootstrap."""
+    from mlx_worker import main as worker_main
+
+    # Must patch before main() triggers the local import.
+    import mlx_worker.vlm_engine as vlm_mod
+
+    constructed_ids: list[str] = []
+    constructed_engines: list[object] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            constructed_ids.append(model_id)
+            self.model_id = model_id
+            self.max_images_per_request = None
+            constructed_engines.append(self)
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(
+            self, request, should_cancel: Callable[[], bool] | None = None
+        ):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm-default",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    monkeypatch.setattr(vlm_mod, "MlxVlmEngine", FakeVlmEngine)
+
+    vlm_request_json = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"vlm-1","model":"vlm-model"'
+        b',"messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"url":"img.jpg","detail":"auto"}}]}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(vlm_request_json))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+            max_vlm_images=7,
+        ),
+    )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    exit_code = worker_main.main(engine_factory=FakeTextEngine)
+
+    assert exit_code == 0
+    # VLM engine was lazily constructed once on first VLM request.
+    assert constructed_ids == ["vlm-model"], (
+        "VLM engine should be constructed lazily on first VLM request"
+    )
+    assert constructed_engines[0].max_images_per_request == 7
+    # Verify the VLM request actually routed to the VLM engine.
+    events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
+    responses = [e for e in events if isinstance(e, ChatCompletionResponse)]
+    assert len(responses) >= 1
+    assert responses[0].text == "vlm-default"
+
+
+def test_main_vlm_cancel_before_init_skips_initialize(monkeypatch) -> None:
+    """Cancel before first VLM request dispatch skips model load entirely.
+
+    When ``should_cancel`` returns True before the engine calls
+    ``initialize()``, the blocking ``mlx_vlm.load`` must NOT be
+    invoked.  The engine returns a cancelled response immediately.
+    """
+    from mlx_worker import main as worker_main
+
+    init_called: list[bool] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def complete_chat(
+            self, request, should_cancel: Callable[[], bool] | None = None
+        ) -> ChatCompletionResponse:
+            # Simulate the real engine: check cancel before initialize().
+            if should_cancel is not None and should_cancel():
+                return ChatCompletionResponse(
+                    request_id=request.request_id,
+                    model=request.model,
+                    text="",
+                    finish_reason="cancelled",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                )
+            init_called.append(True)
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm output",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    # VLM request followed immediately by cancel for the same request.
+    vlm_request = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"vlm-1","model":"vlm-model"'
+        b',"messages":[{"role":"user","content":"hello"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+    cancel = b'{"type":"cancel_request","request_id":"vlm-1"}\n'
+
+    fake_socket = FakeSocket(io.BytesIO(vlm_request + cancel))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+        ),
+    )
+    # Force select to return readable so should_cancel picks up the cancel.
+    monkeypatch.setattr(
+        worker_main.select, "select", lambda *args, **kwargs: ([fake_socket], [], [])
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert init_called == [], "initialize() should NOT be called when cancelled"
+    events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
+    responses = [e for e in events if isinstance(e, ChatCompletionResponse)]
+    assert len(responses) >= 1
+    assert responses[0].finish_reason == "cancelled"
+    assert responses[0].text == ""
+
+
+def test_main_vlm_non_stream_cancellation(monkeypatch) -> None:
+    """Non-stream VLM request cancelled via cancel_request returns cancelled response."""
+    from mlx_worker import main as worker_main
+
+    vlm_seen: list[str] = []
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            self._initialized = True  # skip deferred init for this test
+
+        @property
+        def is_initialized(self) -> bool:
+            return self._initialized
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(
+            self, request, should_cancel: Callable[[], bool] | None = None
+        ):
+            vlm_seen.append(request.request_id)
+            # Simulate cancellation check inside the engine.
+            if should_cancel is not None and should_cancel():
+                return ChatCompletionResponse(
+                    request_id=request.request_id,
+                    model=request.model,
+                    text="",
+                    finish_reason="cancelled",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                )
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="vlm output",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def complete_chat(self, request):
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="text",
+                finish_reason="stop",
+                prompt_tokens=1,
+                completion_tokens=1,
+            )
+
+    # VLM non-stream request followed by cancel.
+    vlm_request = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"vlm-1","model":"vlm-model"'
+        b',"messages":[{"role":"user","content":"hello"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+    cancel = b'{"type":"cancel_request","request_id":"vlm-1"}\n'
+
+    fake_socket = FakeSocket(io.BytesIO(vlm_request + cancel))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+        ),
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert vlm_seen == ["vlm-1"]
+    events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
+    responses = [e for e in events if isinstance(e, ChatCompletionResponse)]
+    assert len(responses) >= 1
+    # The VLM engine saw cancel and returned cancelled.
+    assert responses[0].finish_reason == "cancelled"
+    assert responses[0].text == ""

@@ -1,4 +1,5 @@
-"""Line-based IPC helpers for bootstrap and Phase 1 inference frames."""
+"""Line-based IPC helpers for bootstrap and Phase 1 inference frames,
+including Phase 8 VLM image content support."""
 
 from __future__ import annotations
 
@@ -75,11 +76,33 @@ class ModelStatus:
 
 
 @dataclass(frozen=True)
+class ImageContent:
+    """An image URL or local path for VLM requests."""
+
+    url: str
+    detail: str = "auto"
+
+
+@dataclass(frozen=True)
+class TextContent:
+    """A text segment within a multi-part message."""
+
+    text: str
+
+
+ContentPart = ImageContent | TextContent
+
+
+@dataclass(frozen=True)
 class ChatMessage:
-    """One chat message from the OpenAI-style request."""
+    """One chat message from the OpenAI-style request.
+
+    For text-only requests, *content* is a plain string (backward compatible).
+    For VLM requests, *content* is a list of ``ContentPart`` items (text or image).
+    """
 
     role: Literal["system", "user", "assistant"]
-    content: str
+    content: str | tuple[ContentPart, ...]
 
 
 @dataclass(frozen=True)
@@ -108,6 +131,9 @@ class ChatCompletionResponse:
     finish_reason: str
     prompt_tokens: int
     completion_tokens: int
+    image_count: int | None = None
+    image_preprocess_latency_ms: int | None = None
+    prompt_template_latency_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -216,7 +242,10 @@ def encode_command(request: ChatCompletionRequest) -> bytes:
             "request_id": request.request_id,
             "model": request.model,
             "messages": [
-                {"role": message.role, "content": message.content}
+                {
+                    "role": message.role,
+                    "content": _encode_content(message.content),
+                }
                 for message in request.messages
             ],
             "max_tokens": request.max_tokens,
@@ -229,6 +258,50 @@ def encode_command(request: ChatCompletionRequest) -> bytes:
         },
     }
     return (json.dumps(payload) + "\n").encode("utf-8")
+
+
+def _decode_content(
+    raw: str | list[dict[str, Any]],
+) -> str | tuple[ContentPart, ...]:
+    """Decode message content that may be plain text or multi-part VLM content."""
+    if isinstance(raw, str):
+        return raw
+    parts: list[ContentPart] = []
+    for item in raw:
+        item_type = item.get("type")
+        if item_type == "text":
+            parts.append(TextContent(text=item["text"]))
+        elif item_type == "image_url":
+            url_data = item["image_url"]
+            parts.append(
+                ImageContent(
+                    url=url_data["url"],
+                    detail=url_data.get("detail", "auto"),
+                )
+            )
+        else:
+            parts.append(TextContent(text=str(item)))
+    return tuple(parts)
+
+
+def _encode_content(
+    content: str | tuple[ContentPart, ...],
+) -> str | list[dict[str, Any]]:
+    """Encode message content for JSON serialization."""
+    if isinstance(content, str):
+        return content
+    serialized: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, TextContent):
+            serialized.append({"type": "text", "text": part.text})
+        elif isinstance(part, ImageContent):
+            serialized.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": part.url, "detail": part.detail},
+                }
+            )
+    return serialized
 
 
 def decode_command(raw_line: bytes) -> ChatCompletionRequest | CancelRequest | None:
@@ -244,7 +317,10 @@ def decode_command(raw_line: bytes) -> ChatCompletionRequest | CancelRequest | N
         request_id=request["request_id"],
         model=request["model"],
         messages=[
-            ChatMessage(role=message["role"], content=message["content"])
+            ChatMessage(
+                role=message["role"],
+                content=_decode_content(message["content"]),
+            )
             for message in request["messages"]
         ],
         max_tokens=request["max_tokens"],
@@ -274,6 +350,9 @@ def encode_event(
                 "prompt_tokens": event.prompt_tokens,
                 "completion_tokens": event.completion_tokens,
             },
+            "image_count": event.image_count,
+            "image_preprocess_latency_ms": event.image_preprocess_latency_ms,
+            "prompt_template_latency_ms": event.prompt_template_latency_ms,
         }
     elif isinstance(event, ChatCompletionDelta):
         payload = {
@@ -316,6 +395,9 @@ def decode_event(
             finish_reason=response["finish_reason"],
             prompt_tokens=response["prompt_tokens"],
             completion_tokens=response["completion_tokens"],
+            image_count=payload.get("image_count"),
+            image_preprocess_latency_ms=payload.get("image_preprocess_latency_ms"),
+            prompt_template_latency_ms=payload.get("prompt_template_latency_ms"),
         )
     if payload.get("type") == "chat_completion_delta":
         delta = payload["delta"]
@@ -330,6 +412,18 @@ def decode_event(
             message=payload["message"],
         )
     return None
+
+
+def has_image_content(content: str | tuple[ContentPart, ...]) -> bool:
+    """Return True when the message content includes at least one image."""
+    if isinstance(content, str):
+        return False
+    return any(isinstance(part, ImageContent) for part in content)
+
+
+def request_has_images(request: ChatCompletionRequest) -> bool:
+    """Return True when any message in the request contains image content."""
+    return any(has_image_content(msg.content) for msg in request.messages)
 
 
 encode_message = encode_bootstrap_message

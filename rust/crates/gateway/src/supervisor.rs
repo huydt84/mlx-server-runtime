@@ -3,7 +3,8 @@ use crate::errors::GatewayError;
 use crate::ipc::WorkerClient;
 use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
-    decode_worker_message, ModelState, ModelStatus, WorkerError, WorkerMessage, WorkerReady,
+    decode_worker_message, ChatCompletionRequest, ChatMessage, MessageContent, MessageRole,
+    ModelState, ModelStatus, WorkerError, WorkerMessage, WorkerReady,
 };
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -20,12 +21,16 @@ pub struct RuntimeState {
     pub started_at: Instant,
     /// Process id for the gateway.
     pub pid: u32,
-    /// Current model lifecycle snapshot.
+    /// Current text model lifecycle snapshot.
     pub model_status: Arc<RwLock<ModelStatus>>,
     /// The active worker client, if the bootstrap handshake completed.
     pub worker_client: Arc<Mutex<Option<Arc<WorkerClient>>>>,
     /// Shared telemetry registry.
     pub metrics: Arc<MetricsRegistry>,
+    /// VLM model name if configured (Phase 8).
+    pub vlm_model_name: Arc<RwLock<Option<String>>>,
+    /// VLM model lifecycle status (Phase 8).
+    pub vlm_status: Arc<RwLock<Option<ModelStatus>>>,
 }
 
 impl RuntimeState {
@@ -42,6 +47,8 @@ impl RuntimeState {
                 metrics.set_kv_cache_bytes(0);
                 metrics
             },
+            vlm_model_name: Arc::new(RwLock::new(None)),
+            vlm_status: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -54,6 +61,8 @@ impl RuntimeState {
             model_status: Arc::new(RwLock::new(ModelStatus::new(model))),
             worker_client: Arc::new(Mutex::new(None)),
             metrics,
+            vlm_model_name: Arc::new(RwLock::new(None)),
+            vlm_status: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -102,6 +111,90 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Initializes VLM model lifecycle tracking.
+    pub fn set_vlm_model(&self, vlm_model: String) {
+        if let Ok(mut name_guard) = self.vlm_model_name.write() {
+            *name_guard = Some(vlm_model.clone());
+        }
+        let status = ModelStatus::new(vlm_model);
+        if let Ok(mut guard) = self.vlm_status.write() {
+            *guard = Some(status);
+        }
+    }
+
+    /// Updates only VLM lifecycle state.
+    pub fn set_vlm_state(&self, state: ModelState) -> Result<(), GatewayError> {
+        let mut guard = self
+            .vlm_status
+            .write()
+            .map_err(|_| GatewayError::Protocol("vlm status lock poisoned".to_string()))?;
+        if let Some(ref mut status) = *guard {
+            let previous_state = status.state;
+            status.set_state(state);
+            if previous_state != state {
+                eprintln!(
+                    "vlm_model_state_transition model={} from={:?} to={:?}",
+                    status.model, previous_state, state
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the VLM model lifecycle snapshot.
+    pub fn snapshot_vlm(&self) -> Result<ModelStatus, GatewayError> {
+        let guard = self
+            .vlm_status
+            .read()
+            .map_err(|_| GatewayError::Protocol("vlm status lock poisoned".to_string()))?;
+        Ok(guard.clone().unwrap_or_else(|| {
+            // VLM not yet initialized: return NotLoaded fallback.
+            let name = self
+                .vlm_model_name
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| "vlm".to_string());
+            ModelStatus::new(name)
+        }))
+    }
+
+    /// Marks the VLM model as ready after warmup.
+    pub fn mark_vlm_ready(&self, warmup_latency_ms: u64) -> Result<(), GatewayError> {
+        let mut guard = self
+            .vlm_status
+            .write()
+            .map_err(|_| GatewayError::Protocol("vlm status lock poisoned".to_string()))?;
+        if let Some(ref mut status) = *guard {
+            status.mark_ready(None, None, warmup_latency_ms);
+        }
+        Ok(())
+    }
+
+    /// Marks the VLM model as failed with a stable error code.
+    pub fn mark_vlm_failed(
+        &self,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), GatewayError> {
+        let mut guard = self
+            .vlm_status
+            .write()
+            .map_err(|_| GatewayError::Protocol("vlm status lock poisoned".to_string()))?;
+        if let Some(ref mut status) = *guard {
+            let previous_state = status.state;
+            status.mark_failed(code, message);
+            if previous_state != status.state {
+                eprintln!(
+                    "vlm_model_state_transition model={} from={:?} to={:?}",
+                    status.model, previous_state, status.state
+                );
+            }
+            self.metrics.increment_vlm_load_errors_total();
+        }
+        Ok(())
+    }
+
     /// Marks the model as failed and updates the bootstrap snapshot.
     pub fn mark_failed(
         &self,
@@ -132,6 +225,12 @@ impl Supervisor {
     /// Starts the worker bootstrap flow on a background thread.
     pub fn start(config: RuntimeConfig) -> Result<RuntimeState, GatewayError> {
         let runtime = RuntimeState::new(config.worker.model.clone());
+
+        // Initialize VLM model lifecycle if configured.
+        if let Some(ref vlm) = config.worker.vlm_model {
+            runtime.set_vlm_model(vlm.clone());
+        }
+
         let bootstrap_runtime = runtime.clone();
 
         thread::spawn(move || {
@@ -225,6 +324,9 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
 
         match decode_worker_message(&line) {
             Some(WorkerMessage::Status(status)) => {
+                // Only update the text model lifecycle from this STATUS.
+                // VLM loads lazily on first VLM request (Phase 8) and must NOT
+                // be marked ready from the generic text bootstrap STATUS.
                 let _ = runtime.set_status(*status);
             }
             Some(WorkerMessage::Ready(WorkerReady)) => {
@@ -235,10 +337,14 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
                 let mut guard = runtime.worker_client.lock().map_err(|_| {
                     GatewayError::Protocol("worker client lock poisoned".to_string())
                 })?;
-                *guard = Some(client);
+                *guard = Some(client.clone());
+                if let Some(vlm_model) = config.worker.vlm_model.clone() {
+                    let warmup_runtime = runtime.clone();
+                    thread::spawn(move || warmup_vlm_model(warmup_runtime, client, vlm_model));
+                }
                 let mut status = runtime.snapshot()?;
                 if !status.ready {
-                    status.mark_ready(None, None, 0);
+                    status.mark_ready(None, None, 1);
                     let _ = runtime.set_status(status);
                 }
                 break;
@@ -263,12 +369,43 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
             *guard = None;
         }
         let _ = runtime.mark_failed("WORKER_EXITED", "worker process exited");
+        let _ = runtime.mark_vlm_failed("WORKER_EXITED", "worker process exited");
         if let Ok(status) = wait_result {
             eprintln!("worker exited: {status}");
         }
     });
 
     Ok(())
+}
+
+fn warmup_vlm_model(runtime: RuntimeState, client: Arc<WorkerClient>, vlm_model: String) {
+    let started = Instant::now();
+    let _ = runtime.set_vlm_state(ModelState::WarmingUp);
+    let request = ChatCompletionRequest {
+        request_id: "vlm-warmup".to_string(),
+        model: vlm_model,
+        messages: vec![ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Text("warmup".to_string()),
+        }],
+        max_tokens: 1,
+        temperature: 0.0,
+        top_p: 1.0,
+        max_prompt_tokens: 64,
+        max_completion_tokens: 64,
+        max_total_tokens_per_request: 128,
+        stream: false,
+    };
+
+    match client.complete_chat(request) {
+        Ok(_) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let _ = runtime.mark_vlm_ready(latency_ms.max(1));
+        }
+        Err(err) => {
+            let _ = runtime.mark_vlm_failed("VLM_WARMUP_FAILED", err.to_string());
+        }
+    }
 }
 
 fn terminate_child(child: &mut Child) {
@@ -283,6 +420,7 @@ fn fail_child(
 ) -> Result<(), GatewayError> {
     terminate_child(child);
     let _ = runtime.mark_failed("WORKER_BOOTSTRAP_FAILED", message.clone());
+    let _ = runtime.mark_vlm_failed("WORKER_BOOTSTRAP_FAILED", message.clone());
     Err(GatewayError::WorkerStartup(message))
 }
 
@@ -293,6 +431,14 @@ fn spawn_worker(config: &RuntimeConfig) -> Result<Child, GatewayError> {
         .arg(&config.worker.module)
         .env("MLX_RUNTIME_SOCKET", &config.worker.ipc_path)
         .env("MLX_RUNTIME_MODEL", &config.worker.model)
+        .env(
+            "MLX_RUNTIME_VLM_MODEL",
+            config.worker.vlm_model.as_deref().unwrap_or(""),
+        )
+        .env(
+            "MLX_RUNTIME_MAX_VLM_IMAGES",
+            config.limits.max_vlm_images.to_string(),
+        )
         .env("PYTHONPATH", "python")
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())

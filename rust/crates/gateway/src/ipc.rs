@@ -127,7 +127,12 @@ impl WorkerClient {
                     }
                     on_delta(delta.delta)?;
                 }
-                WorkerEvent::ChatCompletion { response } => {
+                WorkerEvent::ChatCompletion {
+                    response,
+                    image_count: _image_count,
+                    image_preprocess_latency_ms,
+                    prompt_template_latency_ms,
+                } => {
                     if response.request_id != request_id {
                         stale_count += 1;
                         if stale_count > MAX_STALE_EVENTS {
@@ -140,6 +145,14 @@ impl WorkerClient {
                     self.metrics.record_ipc_roundtrip_latency_ms(
                         roundtrip_started.elapsed().as_millis() as u64,
                     );
+                    if let Some(value_ms) = image_preprocess_latency_ms {
+                        self.metrics
+                            .record_vlm_image_preprocess_latency_ms(value_ms as u64);
+                    }
+                    if let Some(value_ms) = prompt_template_latency_ms {
+                        self.metrics
+                            .record_vlm_prompt_template_latency_ms(value_ms as u64);
+                    }
                     return Ok(response);
                 }
                 WorkerEvent::Error {

@@ -1,4 +1,4 @@
-"""Entry point for the Python MLX worker bootstrap."""
+"""Entry point for the Python MLX worker bootstrap, including Phase 8 VLM dispatch."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from .ipc import (
     decode_command,
     encode_bootstrap_message,
     encode_event,
+    request_has_images,
 )
 
 
@@ -71,6 +72,41 @@ def _read_command_line(
             return None
 
 
+def _make_should_cancel(
+    client: socket.socket,
+    read_buffer: bytearray,
+    pending_lines: list[bytes],
+    request_id: str,
+) -> Callable[[], bool]:
+    """Build a ``should_cancel`` callback for the active request.
+
+    Returns a closure that the engine should call before expensive
+    operations.  Each invocation peeks at the socket without blocking.
+    On a matched ``cancel_request``, EOF, or internal error the closure
+    returns ``True`` and caches the result so subsequent calls stay
+    cancelled.
+    """
+    cancelled: bool = False
+
+    def should_cancel() -> bool:
+        nonlocal cancelled
+        if cancelled:
+            return True
+        pending = _read_command_line(client, read_buffer, block=False)
+        if pending is None:
+            return False
+        if not pending:
+            cancelled = True
+            return True
+        if _is_matching_cancel_request(pending, request_id):
+            cancelled = True
+            return True
+        pending_lines.append(pending)
+        return False
+
+    return should_cancel
+
+
 def _is_matching_cancel_request(raw_line: bytes, request_id: str) -> bool:
     """Return true when raw frame is cancel for active request."""
 
@@ -88,8 +124,9 @@ def _is_matching_cancel_request(raw_line: bytes, request_id: str) -> bool:
 
 def main(
     engine_factory: Callable[[str], object] | None = None,
+    vlm_engine_factory: Callable[[str], object] | None = None,
 ) -> int:
-    """Run the readiness handshake and Phase 1 worker loop."""
+    """Run the readiness handshake and Phase 1 worker loop with VLM routing."""
 
     config = load_config()
     stop = False
@@ -106,10 +143,20 @@ def main(
 
         engine_factory = MlxWorkerEngine
 
+    # Default VLM engine factory when env var is set (production path).
+    # Engine is NOT constructed eagerly — lazy init on first VLM request.
+    if vlm_engine_factory is None:
+        vlm_model = getattr(config, "vlm_model", None)
+        if vlm_model is not None:
+            from .vlm_engine import MlxVlmEngine
+
+            vlm_engine_factory = MlxVlmEngine
+
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.connect(config.socket_path)
         bootstrap_started_at = _now_seconds()
         engine: object | None = None
+        vlm_engine: object | None = None
         try:
             _send_status(
                 client,
@@ -211,32 +258,49 @@ def main(
                     continue
                 else:
                     try:
-                        assert engine is not None
-                        if request.stream:
-                            cancelled = False
-
-                            def should_cancel() -> bool:
-                                nonlocal cancelled
-                                if cancelled:
-                                    return True
-                                pending = _read_command_line(
-                                    client,
-                                    read_buffer,
-                                    block=False,
+                        # Model-first dispatch: route by model name, not image presence.
+                        vlm_model_cfg: str | None = getattr(config, "vlm_model", None)
+                        should_cancel = _make_should_cancel(
+                            client, read_buffer, pending_lines, request.request_id
+                        )
+                        if vlm_model_cfg is not None and request.model == vlm_model_cfg:
+                            # Lazy initialize VLM engine on first request.
+                            if vlm_engine is None:
+                                vlm_engine = vlm_engine_factory(config.vlm_model)
+                                setattr(
+                                    vlm_engine,
+                                    "max_images_per_request",
+                                    getattr(config, "max_vlm_images", 5),
                                 )
-                                if pending is None:
-                                    return False
-                                if not pending:
-                                    cancelled = True
-                                    return True
-                                if _is_matching_cancel_request(
-                                    pending,
-                                    request.request_id,
-                                ):
-                                    cancelled = True
-                                    return True
-                                pending_lines.append(pending)
-                                return False
+                            active_engine: object | None = vlm_engine
+                        elif request.model == config.model:
+                            active_engine = engine
+                        else:
+                            raise ValueError(
+                                f"model '{request.model}' is not served by this worker "
+                                f"(serves text='{config.model}'"
+                                + (
+                                    f", vlm='{vlm_model_cfg}')"
+                                    if vlm_model_cfg
+                                    else ")"
+                                )
+                            )
+
+                        # Text-only engine cannot process image content.
+                        if active_engine is engine and request_has_images(request):
+                            raise ValueError(
+                                f"model '{config.model}' is a text-only model "
+                                "and does not support image content"
+                            )
+
+                        # VLM engine initialization is deferred to
+                        # ``_generate_vlm`` / ``_stream_vlm`` where the
+                        # ``should_cancel`` closure is already available.
+                        # The engine checks cancellation before the blocking
+                        # ``mlx_vlm.load`` call so a cancelled first request
+                        # never blocks on cold-start model loading.
+
+                        if request.stream:
 
                             def emit_delta(delta: str) -> None:
                                 client.sendall(
@@ -248,13 +312,20 @@ def main(
                                     )
                                 )
 
-                            event = engine.stream_chat(  # type: ignore[attr-defined]
+                            event = active_engine.stream_chat(  # type: ignore[attr-defined]
                                 request,
                                 emit_delta,
                                 should_cancel,
                             )
                         else:
-                            event = engine.complete_chat(request)  # type: ignore[attr-defined]
+                            # Non-stream: only VLM engine accepts should_cancel.
+                            # Text engine's complete_chat does not accept it.
+                            kwargs: dict[str, object] = {}
+                            if active_engine is vlm_engine:
+                                kwargs["should_cancel"] = should_cancel
+                            event = active_engine.complete_chat(  # type: ignore[attr-defined]
+                                request, **kwargs
+                            )
                     except Exception as exc:
                         code = (
                             "INVALID_REQUEST"

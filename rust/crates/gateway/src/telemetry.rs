@@ -68,6 +68,12 @@ pub struct MetricsRegistry {
     prefill_tokens_per_second: Mutex<f64>,
     ttft_histogram: Mutex<Histogram>,
     request_latency_histogram: Mutex<Histogram>,
+    // VLM-specific counters (Phase 8)
+    vlm_requests_total: AtomicU64,
+    vlm_image_count_total: AtomicU64,
+    vlm_image_preprocess_latency_ms: AtomicU64,
+    vlm_prompt_template_latency_ms: AtomicU64,
+    vlm_load_errors_total: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -92,6 +98,11 @@ impl MetricsRegistry {
             prefill_tokens_per_second: Mutex::new(0.0),
             ttft_histogram: Mutex::new(Histogram::new(LATENCY_BUCKETS_MS)),
             request_latency_histogram: Mutex::new(Histogram::new(LATENCY_BUCKETS_MS)),
+            vlm_requests_total: AtomicU64::new(0),
+            vlm_image_count_total: AtomicU64::new(0),
+            vlm_image_preprocess_latency_ms: AtomicU64::new(0),
+            vlm_prompt_template_latency_ms: AtomicU64::new(0),
+            vlm_load_errors_total: AtomicU64::new(0),
         }
     }
 
@@ -183,6 +194,36 @@ impl MetricsRegistry {
         if let Ok(mut guard) = self.request_latency_histogram.lock() {
             guard.observe(value_ms);
         }
+    }
+
+    // ── VLM metric methods (Phase 8) ──────────────────────────────────────
+
+    /// Increments the VLM request counter.
+    pub fn increment_vlm_requests_total(&self) {
+        self.vlm_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adds image count for a VLM request.
+    pub fn add_vlm_image_count(&self, count: u64) {
+        self.vlm_image_count_total
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Records VLM image preprocessing latency in milliseconds.
+    pub fn record_vlm_image_preprocess_latency_ms(&self, value_ms: u64) {
+        self.vlm_image_preprocess_latency_ms
+            .store(value_ms, Ordering::Relaxed);
+    }
+
+    /// Records VLM prompt/template construction latency in milliseconds.
+    pub fn record_vlm_prompt_template_latency_ms(&self, value_ms: u64) {
+        self.vlm_prompt_template_latency_ms
+            .store(value_ms, Ordering::Relaxed);
+    }
+
+    /// Increments VLM load error counter.
+    pub fn increment_vlm_load_errors_total(&self) {
+        self.vlm_load_errors_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Renders Prometheus exposition text.
@@ -310,6 +351,37 @@ impl MetricsRegistry {
             "Latest KV cache usage in bytes.",
             self.kv_cache_bytes.load(Ordering::Relaxed),
         );
+        // VLM-specific metrics
+        write_counter(
+            &mut output,
+            "mlx_vlm_requests_total",
+            "Total VLM inference requests.",
+            self.vlm_requests_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut output,
+            "mlx_vlm_image_count_total",
+            "Total images processed by VLM.",
+            self.vlm_image_count_total.load(Ordering::Relaxed),
+        );
+        write_gauge(
+            &mut output,
+            "mlx_vlm_image_preprocess_latency_ms",
+            "Latest VLM image preprocessing latency in milliseconds.",
+            self.vlm_image_preprocess_latency_ms.load(Ordering::Relaxed),
+        );
+        write_gauge(
+            &mut output,
+            "mlx_vlm_prompt_template_latency_ms",
+            "Latest VLM prompt/template construction latency in milliseconds.",
+            self.vlm_prompt_template_latency_ms.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut output,
+            "mlx_vlm_load_errors_total",
+            "Total VLM model load errors.",
+            self.vlm_load_errors_total.load(Ordering::Relaxed),
+        );
         output
     }
 }
@@ -364,6 +436,7 @@ pub struct RequestLog {
 
 impl RequestTracker {
     /// Starts tracking a request.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         metrics: Arc<MetricsRegistry>,
         request_id: impl Into<String>,
@@ -371,9 +444,17 @@ impl RequestTracker {
         max_tokens: u32,
         stream: bool,
         queue_time_ms: u64,
+        is_vlm: bool,
+        image_count: u64,
     ) -> Self {
         metrics.increment_requests_total();
         metrics.increment_requests_active();
+        if is_vlm {
+            metrics.increment_vlm_requests_total();
+            if image_count > 0 {
+                metrics.add_vlm_image_count(image_count);
+            }
+        }
         Self {
             metrics,
             request_id: request_id.into(),
@@ -554,6 +635,12 @@ mod tests {
             "mlx_ipc_roundtrip_latency_ms 0",
             "mlx_worker_memory_bytes 0",
             "mlx_kv_cache_bytes 0",
+            // VLM Phase 8 metrics
+            "mlx_vlm_requests_total 0",
+            "mlx_vlm_image_count_total 0",
+            "mlx_vlm_image_preprocess_latency_ms 0",
+            "mlx_vlm_prompt_template_latency_ms 0",
+            "mlx_vlm_load_errors_total 0",
         ];
 
         for metric in &required {
@@ -564,7 +651,16 @@ mod tests {
     #[test]
     fn request_tracker_finish_idempotent() {
         let metrics = Arc::new(MetricsRegistry::new());
-        let tracker = RequestTracker::new(metrics.clone(), "req-1", "test-model", 16, false, 0);
+        let tracker = RequestTracker::new(
+            metrics.clone(),
+            "req-1",
+            "test-model",
+            16,
+            false,
+            0,
+            false,
+            0,
+        );
 
         tracker.finish(10, 5, Some("stop".to_string()), false, None);
         tracker.finish(10, 5, Some("stop".to_string()), false, None);
@@ -579,8 +675,16 @@ mod tests {
     fn request_tracker_drop_guard_adjusts_active() {
         let metrics = Arc::new(MetricsRegistry::new());
         {
-            let _tracker =
-                RequestTracker::new(metrics.clone(), "req-1", "test-model", 16, false, 0);
+            let _tracker = RequestTracker::new(
+                metrics.clone(),
+                "req-1",
+                "test-model",
+                16,
+                false,
+                0,
+                false,
+                0,
+            );
         }
 
         let output = metrics.render_prometheus(0);

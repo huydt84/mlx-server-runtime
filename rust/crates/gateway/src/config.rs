@@ -18,8 +18,10 @@ pub struct WorkerConfig {
     pub python: String,
     /// Python module entrypoint.
     pub module: String,
-    /// Model identifier.
+    /// Text model identifier.
     pub model: String,
+    /// Optional VLM model identifier (Phase 8).
+    pub vlm_model: Option<String>,
     /// Unix socket path used for bootstrap IPC.
     pub ipc_path: String,
 }
@@ -50,6 +52,8 @@ pub struct RequestLimits {
     pub max_total_tokens_per_request: usize,
     /// Seconds to wait for a slot before returning 429.
     pub request_timeout_seconds: u64,
+    /// Maximum images allowed in a single VLM request (enforced before queue).
+    pub max_vlm_images: usize,
 }
 
 /// Telemetry settings.
@@ -96,6 +100,7 @@ impl Default for RuntimeConfig {
                 python: "python/.venv/bin/python".to_string(),
                 module: "mlx_worker.main".to_string(),
                 model: "mlx-community/Qwen2.5-7B-Instruct-4bit".to_string(),
+                vlm_model: None,
                 ipc_path: "/tmp/mlx-runtime.sock".to_string(),
             },
             generation: GenerationConfig {
@@ -110,6 +115,7 @@ impl Default for RuntimeConfig {
                 max_completion_tokens: 4_096,
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
+                max_vlm_images: 5,
             },
             telemetry: TelemetryConfig {
                 enable_prometheus: true,
@@ -160,6 +166,9 @@ impl RuntimeConfig {
                 ("worker", "python", Value::String(python)) => config.worker.python = python,
                 ("worker", "module", Value::String(module)) => config.worker.module = module,
                 ("worker", "model", Value::String(model)) => config.worker.model = model,
+                ("worker", "vlm_model", Value::String(vlm_model)) => {
+                    config.worker.vlm_model = Some(vlm_model)
+                }
                 ("worker", "ipc_path", Value::String(ipc_path)) => {
                     config.worker.ipc_path = ipc_path
                 }
@@ -221,6 +230,14 @@ impl RuntimeConfig {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             "limits.request_timeout_seconds out of range",
+                        )
+                    })?
+                }
+                ("limits", "max_vlm_images", Value::Integer(value)) => {
+                    config.limits.max_vlm_images = usize::try_from(value).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "limits.max_vlm_images out of range",
                         )
                     })?
                 }
@@ -313,6 +330,7 @@ mod tests {
             python = "/usr/bin/python3"
             module = "mlx_worker.main"
             model = "test-model"
+            vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
             ipc_path = "/tmp/test.sock"
 
             [generation]
@@ -327,6 +345,7 @@ mod tests {
             max_completion_tokens = 256
             max_total_tokens_per_request = 2048
             request_timeout_seconds = 10
+            max_vlm_images = 5
 
             [telemetry]
             enable_prometheus = false
@@ -342,6 +361,10 @@ mod tests {
         assert_eq!(config.server.port, 9000);
         assert_eq!(config.worker.python, "/usr/bin/python3");
         assert_eq!(config.worker.model, "test-model");
+        assert_eq!(
+            config.worker.vlm_model,
+            Some("mlx-community/Qwen3-VL-2B-Instruct-4bit".to_string())
+        );
         assert_eq!(config.worker.ipc_path, "/tmp/test.sock");
         assert_eq!(config.generation.temperature, 0.1);
         assert_eq!(config.generation.top_p, 0.8);
@@ -352,6 +375,7 @@ mod tests {
         assert_eq!(config.limits.max_completion_tokens, 256);
         assert_eq!(config.limits.max_total_tokens_per_request, 2048);
         assert_eq!(config.limits.request_timeout_seconds, 10);
+        assert_eq!(config.limits.max_vlm_images, 5);
         assert!(!config.telemetry.enable_prometheus);
         assert_eq!(config.telemetry.metrics_path, "/custom-metrics");
     }

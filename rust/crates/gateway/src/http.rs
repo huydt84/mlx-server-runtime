@@ -4,12 +4,14 @@ use crate::openai::{ChatCompletionHttpRequest, ChatCompletionHttpResponse};
 use crate::supervisor::RuntimeState;
 use crate::telemetry::RequestTracker;
 use mlx_runtime_protocol::{
-    ChatCompletionRequest, ChatCompletionResponse, ModelState, ModelStatus,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart, MessageContent,
+    ModelState, ModelStatus,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -88,6 +90,7 @@ struct AppState {
     telemetry: crate::config::TelemetryConfig,
     admission: Arc<RequestAdmission>,
     model: String,
+    vlm_model: Option<String>,
     test_backend: Option<Arc<dyn ChatCompletionService>>,
 }
 
@@ -242,6 +245,7 @@ pub fn serve(config: RuntimeConfig, runtime: RuntimeState) -> Result<(), Gateway
                     telemetry: config.telemetry.clone(),
                     admission: admission.clone(),
                     model: config.worker.model.clone(),
+                    vlm_model: config.worker.vlm_model.clone(),
                     test_backend: None,
                 };
                 thread::spawn(move || {
@@ -278,6 +282,20 @@ fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), Gatew
         && request_streams(&body).unwrap_or(false);
     if is_stream {
         stream_chat_completion(&mut stream, &body, &state)?;
+        return Ok(());
+    }
+
+    if request_line.starts_with("POST /v1/chat/completions ") && !is_stream {
+        let disconnect_monitor = DisconnectMonitor::start(stream.try_clone()?)?;
+        let response =
+            handle_chat_completion(&body, &state, Some(disconnect_monitor.disconnected()));
+        drop(disconnect_monitor);
+        write_response(
+            &mut stream,
+            &response.status,
+            response.content_type,
+            &response.body,
+        )?;
         return Ok(());
     }
 
@@ -329,13 +347,13 @@ fn response_for_request(request_line: &str, body: &[u8], state: &AppState) -> Ht
         {
             metrics_response(&state.runtime, &state.admission)
         }
-        ("GET", "/models") => models_response(&state.runtime),
-        ("POST", "/v1/chat/completions") => handle_chat_completion(body, state),
+        ("GET", "/models") => models_response(&state.runtime, state.vlm_model.as_deref()),
+        ("POST", "/v1/chat/completions") => handle_chat_completion(body, state, None),
         _ if method == "GET" && path.starts_with("/models/") && path.ends_with("/status") => {
-            model_status_response(&state.runtime, &path)
+            model_status_response(&state.runtime, &path, state.vlm_model.as_deref())
         }
         _ if method == "GET" && path.starts_with("/models/") && path.ends_with("/ready") => {
-            model_ready_response(&state.runtime, &path)
+            model_ready_response(&state.runtime, &path, state.vlm_model.as_deref())
         }
         _ => not_found_response(),
     }
@@ -453,78 +471,234 @@ fn metrics_response(runtime: &RuntimeState, admission: &Arc<RequestAdmission>) -
     }
 }
 
-fn models_response(runtime: &RuntimeState) -> HttpResponse {
+fn models_response(runtime: &RuntimeState, vlm_model: Option<&str>) -> HttpResponse {
     match runtime.snapshot() {
-        Ok(status) => HttpResponse {
-            status: "200 OK".to_string(),
-            content_type: "application/json",
-            body: json!({
-                "models": [status.summary()],
-            })
-            .to_string(),
-        },
+        Ok(status) => {
+            let mut models = vec![status.summary()];
+            if let Some(vlm) = vlm_model {
+                if vlm != status.model {
+                    let vlm_summary = runtime
+                        .snapshot_vlm()
+                        .ok()
+                        .as_ref()
+                        .map(|s| s.summary())
+                        .unwrap_or(mlx_runtime_protocol::ModelSummary {
+                            name: vlm.to_string(),
+                            state: ModelState::NotLoaded,
+                            ready: false,
+                            revision: Some(vlm.to_string()),
+                        });
+                    models.push(vlm_summary);
+                }
+            }
+            HttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "application/json",
+                body: json!({ "models": models }).to_string(),
+            }
+        }
         Err(err) => internal_error_response(&err.to_string()),
     }
 }
 
-fn model_status_response(runtime: &RuntimeState, path: &str) -> HttpResponse {
+fn model_status_response(
+    runtime: &RuntimeState,
+    path: &str,
+    vlm_model: Option<&str>,
+) -> HttpResponse {
     let model_name = runtime_model_name(runtime);
     match model_path_name(path) {
-        Some(name) if name == model_name => match runtime.snapshot() {
-            Ok(status) => HttpResponse {
-                status: "200 OK".to_string(),
-                content_type: "application/json",
-                body: serde_json::to_string(&status).unwrap_or_else(|_| {
-                    "{\"error\":{\"message\":\"status serialization failed\"}}".to_string()
-                }),
-            },
-            Err(err) => internal_error_response(&err.to_string()),
-        },
+        Some(name) if name == model_name || vlm_model.is_some_and(|v| name == v) => {
+            let is_vlm = vlm_model.is_some_and(|v| name == v);
+            let status = if is_vlm {
+                runtime.snapshot_vlm()
+            } else {
+                runtime.snapshot()
+            };
+            match status {
+                Ok(status) => HttpResponse {
+                    status: "200 OK".to_string(),
+                    content_type: "application/json",
+                    body: serde_json::to_string(&status).unwrap_or_else(|_| {
+                        "{\"error\":{\"message\":\"status serialization failed\"}}".to_string()
+                    }),
+                },
+                Err(err) => internal_error_response(&err.to_string()),
+            }
+        }
         _ => not_found_response(),
     }
 }
 
-fn model_ready_response(runtime: &RuntimeState, path: &str) -> HttpResponse {
+fn model_ready_response(
+    runtime: &RuntimeState,
+    path: &str,
+    vlm_model: Option<&str>,
+) -> HttpResponse {
     let model_name = runtime_model_name(runtime);
     match model_path_name(path) {
-        Some(name) if name == model_name => match runtime.snapshot() {
-            Ok(status) if status.ready => HttpResponse {
-                status: "200 OK".to_string(),
-                content_type: "application/json",
-                body: json!({
-                    "model": status.model,
-                    "ready": true,
-                    "state": status.state,
-                })
-                .to_string(),
-            },
-            Ok(status) => HttpResponse {
-                status: "503 Service Unavailable".to_string(),
-                content_type: "application/json",
-                body: json!({
-                    "model": status.model,
-                    "ready": false,
-                    "state": status.state,
-                    "reason": readiness_reason(&status),
-                })
-                .to_string(),
-            },
-            Err(err) => internal_error_response(&err.to_string()),
-        },
+        Some(name) if name == model_name || vlm_model.is_some_and(|v| name == v) => {
+            let is_vlm = vlm_model.is_some_and(|v| name == v);
+            let status = if is_vlm {
+                runtime.snapshot_vlm()
+            } else {
+                runtime.snapshot()
+            };
+            match status {
+                Ok(status) if status.ready => HttpResponse {
+                    status: "200 OK".to_string(),
+                    content_type: "application/json",
+                    body: json!({
+                        "model": status.model,
+                        "ready": true,
+                        "state": status.state,
+                    })
+                    .to_string(),
+                },
+                Ok(status) => HttpResponse {
+                    status: "503 Service Unavailable".to_string(),
+                    content_type: "application/json",
+                    body: json!({
+                        "model": status.model,
+                        "ready": false,
+                        "state": status.state,
+                        "reason": readiness_reason(&status),
+                    })
+                    .to_string(),
+                },
+                Err(err) => internal_error_response(&err.to_string()),
+            }
+        }
         _ => not_found_response(),
     }
 }
 
-fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
-    let status = match state.runtime.snapshot() {
-        Ok(status) => status,
-        Err(err) => return internal_error_response(&err.to_string()),
+/// Maximum allowed length for an image URL string (matches Python worker).
+const MAX_IMAGE_URL_LENGTH: usize = 4096;
+
+/// Allowed hosts for loopback HTTP image URLs.
+const LOOPBACK_HTTP_HOSTS: &[&str] = &["localhost", "127.0.0.1"];
+
+#[cfg(test)]
+/// Validate all image URLs in a set of messages.
+///
+/// Rejects URLs whose scheme is not supported or whose length exceeds
+/// [`MAX_IMAGE_URL_LENGTH`]. Supports local file paths, HTTPS URLs, and
+/// loopback HTTP URLs for deterministic host validation.
+fn validate_image_urls(messages: &[ChatMessage]) -> Result<(), String> {
+    for msg in messages {
+        if let MessageContent::Parts(parts) = &msg.content {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part {
+                    validate_image_source(&image_url.url)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_image_source(url: &str) -> Result<(), String> {
+    if url.len() > MAX_IMAGE_URL_LENGTH {
+        return Err(format!(
+            "image URL exceeds maximum length of {} characters",
+            MAX_IMAGE_URL_LENGTH
+        ));
+    }
+
+    if url.starts_with("data:") {
+        return Err(
+            "unsupported image URL scheme 'data': must be one of https, http, or a local file path"
+                .to_string(),
+        );
+    }
+
+    let Some((scheme, rest)) = url.split_once("://") else {
+        let path = Path::new(url);
+        if !path.is_file() {
+            return Err(format!(
+                "local image path does not exist or is not a file: {}",
+                url
+            ));
+        }
+        return Ok(());
     };
 
-    if !status.ready {
-        return not_ready_error(&status);
+    match scheme {
+        "https" => Ok(()),
+        "http" => {
+            let host_port = rest.split('/').next().unwrap_or("");
+            let host = host_port.split(':').next().unwrap_or(host_port);
+            if LOOPBACK_HTTP_HOSTS.contains(&host) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "http image URLs must use localhost or 127.0.0.1, got '{}': {}",
+                    host, url
+                ))
+            }
+        }
+        other => Err(format!(
+            "unsupported image URL scheme '{}': must be one of https, http, or a local file path",
+            other
+        )),
+    }
+}
+
+/// Inspect VLM messages in a single pass.
+///
+/// Returns `(has_images, image_count)` after validating image URL scheme/length.
+fn inspect_vlm_messages(messages: &[ChatMessage]) -> Result<(bool, u64), String> {
+    let mut has_images = false;
+    let mut image_count = 0u64;
+
+    for msg in messages {
+        if let MessageContent::Parts(parts) = &msg.content {
+            for part in parts {
+                if let ContentPart::ImageUrl { image_url } = part {
+                    has_images = true;
+                    image_count += 1;
+
+                    validate_image_source(&image_url.url)?;
+                }
+            }
+        }
     }
 
+    Ok((has_images, image_count))
+}
+
+#[cfg(test)]
+/// Returns true if any message contains structured content with an ImageUrl part.
+fn has_vlm_content(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|msg| match &msg.content {
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+        MessageContent::Text(_) => false,
+    })
+}
+
+#[cfg(test)]
+/// Counts ImageUrl parts across all messages.
+fn vlm_image_count(messages: &[ChatMessage]) -> u64 {
+    messages
+        .iter()
+        .map(|msg| match &msg.content {
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter(|p| matches!(p, ContentPart::ImageUrl { .. }))
+                .count() as u64,
+            MessageContent::Text(_) => 0,
+        })
+        .sum()
+}
+
+fn handle_chat_completion(
+    body: &[u8],
+    state: &AppState,
+    disconnected: Option<Arc<AtomicBool>>,
+) -> HttpResponse {
     let request = match serde_json::from_slice::<ChatCompletionHttpRequest>(body) {
         Ok(request) => request,
         Err(err) => {
@@ -536,13 +710,59 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
         }
     };
 
-    let worker_request =
-        match request.into_worker_request(&state.generation, &state.limits, &state.model) {
-            Ok(request) => request,
-            Err(message) => {
-                return json_error_response("400 Bad Request", "INVALID_REQUEST", &message)
-            }
+    // Model-first routing: route based on requested model name, not image content.
+    let (has_images, image_count) = match inspect_vlm_messages(&request.messages) {
+        Ok(result) => result,
+        Err(message) => {
+            return json_error_response("400 Bad Request", "INVALID_IMAGE_URL", &message);
+        }
+    };
+    let is_vlm = state.vlm_model.as_deref() == Some(&request.model);
+
+    let status = match if is_vlm {
+        state.runtime.snapshot_vlm()
+    } else {
+        state.runtime.snapshot()
+    } {
+        Ok(status) => status,
+        Err(err) => return internal_error_response(&err.to_string()),
+    };
+
+    if !status.ready {
+        return not_ready_error(&status);
+    }
+
+    // Validate: images require VLM-capable model
+    if has_images && !is_vlm {
+        let msg = if state.vlm_model.is_some() {
+            "image content requires a VLM-capable model, but requested model is not VLM"
+        } else {
+            "image content requires a VLM-capable model which is not configured"
         };
+        return json_error_response("400 Bad Request", "VLM_NOT_CONFIGURED", msg);
+    }
+
+    // Phase 8: enforce VLM image-count cap before queue admission.
+    if has_images && image_count > state.limits.max_vlm_images as u64 {
+        return json_error_response(
+            "400 Bad Request",
+            "TOO_MANY_IMAGES",
+            &format!(
+                "VLM request contains {} images, maximum allowed is {}",
+                image_count, state.limits.max_vlm_images
+            ),
+        );
+    }
+
+    let worker_request = match request.into_worker_request(
+        &state.generation,
+        &state.limits,
+        &state.model,
+        state.vlm_model.as_deref(),
+    ) {
+        Ok(request) => request,
+        Err(message) => return json_error_response("400 Bad Request", "INVALID_REQUEST", &message),
+    };
 
     let queue_started_at = Instant::now();
     let _permit = match state.admission.acquire() {
@@ -555,13 +775,16 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
         }
     };
     let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
+    let worker_model = worker_request.model.clone();
     let request_tracker = Arc::new(RequestTracker::new(
         state.runtime.metrics.clone(),
         worker_request.request_id.clone(),
-        state.model.clone(),
+        worker_model,
         worker_request.max_tokens,
         false,
         queue_time_ms,
+        is_vlm,
+        image_count,
     ));
 
     let backend = if let Some(backend) = &state.test_backend {
@@ -593,7 +816,13 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
         return not_ready_error(&status);
     };
 
-    match backend.complete(worker_request) {
+    let cancel_on_disconnect = DisconnectCancellation::start(
+        disconnected.clone(),
+        backend.clone(),
+        worker_request.request_id.clone(),
+    );
+
+    let response = match backend.complete(worker_request) {
         Ok(response) => {
             request_tracker.finish(
                 response.prompt_tokens as u64,
@@ -613,10 +842,25 @@ fn handle_chat_completion(body: &[u8], state: &AppState) -> HttpResponse {
             }
         }
         Err(err) => {
+            // VLM request lifecycle: first VLM request failure marks it failed.
+            if is_vlm {
+                track_vlm_lifecycle_failure(&state.runtime, &err);
+            }
             request_tracker.finish(0, 0, None, false, Some(err.to_string()));
             gateway_error_response(&err)
         }
+    };
+
+    drop(cancel_on_disconnect);
+
+    if disconnected
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        request_tracker.finish(0, 0, None, true, None);
     }
+
+    response
 }
 
 fn stream_chat_completion(
@@ -641,20 +885,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     state: &AppState,
     disconnected: Option<Arc<AtomicBool>>,
 ) -> Result<(), GatewayError> {
-    let status = state
-        .runtime
-        .snapshot()
-        .map_err(|err| GatewayError::Protocol(err.to_string()))?;
-    if !status.ready {
-        let response = not_ready_error(&status);
-        return write_response(
-            writer,
-            &response.status,
-            response.content_type,
-            &response.body,
-        );
-    }
-
     let request = match serde_json::from_slice::<ChatCompletionHttpRequest>(body) {
         Ok(request) => request,
         Err(err) => {
@@ -672,19 +902,94 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         }
     };
 
-    let worker_request =
-        match request.into_worker_request(&state.generation, &state.limits, &state.model) {
-            Ok(request) => request,
-            Err(message) => {
-                let response = json_error_response("400 Bad Request", "INVALID_REQUEST", &message);
-                return write_response(
-                    writer,
-                    &response.status,
-                    response.content_type,
-                    &response.body,
-                );
-            }
+    // Model-first routing: route based on requested model name, not image content.
+    let (has_images, image_count) = match inspect_vlm_messages(&request.messages) {
+        Ok(result) => result,
+        Err(message) => {
+            let response = json_error_response("400 Bad Request", "INVALID_IMAGE_URL", &message);
+            return write_response(
+                writer,
+                &response.status,
+                response.content_type,
+                &response.body,
+            );
+        }
+    };
+    let is_vlm = state.vlm_model.as_deref() == Some(&request.model);
+
+    let status = if is_vlm {
+        state
+            .runtime
+            .snapshot_vlm()
+            .map_err(|err| GatewayError::Protocol(err.to_string()))?
+    } else {
+        state
+            .runtime
+            .snapshot()
+            .map_err(|err| GatewayError::Protocol(err.to_string()))?
+    };
+
+    if !status.ready {
+        let response = not_ready_error(&status);
+        return write_response(
+            writer,
+            &response.status,
+            response.content_type,
+            &response.body,
+        );
+    }
+
+    // Validate: images require VLM-capable model
+    if has_images && !is_vlm {
+        let msg = if state.vlm_model.is_some() {
+            "image content requires a VLM-capable model, but requested model is not VLM"
+        } else {
+            "image content requires a VLM-capable model which is not configured"
         };
+        let response = json_error_response("400 Bad Request", "VLM_NOT_CONFIGURED", msg);
+        return write_response(
+            writer,
+            &response.status,
+            response.content_type,
+            &response.body,
+        );
+    }
+
+    // Phase 8: enforce VLM image-count cap before queue admission.
+    if has_images && image_count > state.limits.max_vlm_images as u64 {
+        let response = json_error_response(
+            "400 Bad Request",
+            "TOO_MANY_IMAGES",
+            &format!(
+                "VLM request contains {} images, maximum allowed is {}",
+                image_count, state.limits.max_vlm_images
+            ),
+        );
+        return write_response(
+            writer,
+            &response.status,
+            response.content_type,
+            &response.body,
+        );
+    }
+
+    let worker_request = match request.into_worker_request(
+        &state.generation,
+        &state.limits,
+        &state.model,
+        state.vlm_model.as_deref(),
+    ) {
+        Ok(request) => request,
+        Err(message) => {
+            let response = json_error_response("400 Bad Request", "INVALID_REQUEST", &message);
+            return write_response(
+                writer,
+                &response.status,
+                response.content_type,
+                &response.body,
+            );
+        }
+    };
 
     let queue_started_at = Instant::now();
     let _permit = match state.admission.acquire_until(disconnected.as_deref()) {
@@ -705,13 +1010,19 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         }
     };
     let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
+    let worker_model = worker_request.model.clone();
+    // Save the requested model name before worker_model is moved into
+    // RequestTracker; used for consistent "model" field across all SSE chunks.
+    let sse_model = worker_model.clone();
     let request_tracker = Arc::new(RequestTracker::new(
         state.runtime.metrics.clone(),
         worker_request.request_id.clone(),
-        state.model.clone(),
+        worker_model,
         worker_request.max_tokens,
         true,
         queue_time_ms,
+        is_vlm,
+        image_count,
     ));
 
     let backend = if let Some(backend) = &state.test_backend {
@@ -756,7 +1067,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     };
 
     let created = stream_completion_created();
-    let model = state.model.clone();
+    let model = sse_model;
     let request_id = worker_request.request_id.clone();
     let mut stream_started = false;
     let cancel_on_disconnect =
@@ -797,6 +1108,10 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     let response = match backend.stream(worker_request, &mut on_delta) {
         Ok(response) => response,
         Err(err) => {
+            // VLM request lifecycle: first VLM request failure marks it failed.
+            if is_vlm {
+                track_vlm_lifecycle_failure(&state.runtime, &err);
+            }
             drop(cancel_on_disconnect);
             let _ = backend.cancel(&request_id);
             if disconnected
@@ -858,7 +1173,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         "id": format!("chatcmpl-{}", response.request_id),
         "object": "chat.completion.chunk",
         "created": created,
-        "model": response.model,
+        "model": model,
         "choices": [{
             "index": 0,
             "delta": {},
@@ -1120,6 +1435,18 @@ fn percent_decode(segment: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Track VLM lifecycle: mark VLM as failed after first failed request.
+fn track_vlm_lifecycle_failure(runtime: &RuntimeState, err: &GatewayError) {
+    // Only non-InvalidRequest errors indicate load failure (not bad user input).
+    if !matches!(err, GatewayError::InvalidRequest(_)) {
+        if let Ok(vlm_status) = runtime.snapshot_vlm() {
+            if vlm_status.state == ModelState::NotLoaded {
+                let _ = runtime.mark_vlm_failed("VLM_LOAD_FAILED", err.to_string());
+            }
+        }
+    }
+}
+
 fn not_found_response() -> HttpResponse {
     HttpResponse {
         status: "404 Not Found".to_string(),
@@ -1150,7 +1477,10 @@ mod tests {
     use crate::config::GenerationConfig;
     use crate::supervisor::RuntimeState;
     use crate::telemetry::MetricsRegistry;
-    use mlx_runtime_protocol::{ModelLoadProgress, ModelState, ModelStatus};
+    use mlx_runtime_protocol::{
+        ChatMessage, ContentPart, ImageUrl, MessageContent, MessageRole, ModelLoadProgress,
+        ModelState, ModelStatus,
+    };
     use std::io::Cursor;
     use std::sync::Mutex;
 
@@ -1215,10 +1545,12 @@ mod tests {
                     max_completion_tokens: 4_096,
                     max_total_tokens_per_request: 65_536,
                     request_timeout_seconds: 300,
+                    max_vlm_images: 5,
                 },
                 telemetry: crate::config::TelemetryConfig::default(),
                 admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
+                vlm_model: None,
                 test_backend: Some(Arc::new(FakeService::default())),
             },
         );
@@ -1389,9 +1721,11 @@ mod tests {
                 max_completion_tokens: 4_096,
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
+                max_vlm_images: 5,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             model: "test-model".to_string(),
+            vlm_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
 
@@ -1463,10 +1797,12 @@ mod tests {
                     max_completion_tokens: 4_096,
                     max_total_tokens_per_request: 65_536,
                     request_timeout_seconds: 300,
+                    max_vlm_images: 5,
                 },
                 telemetry: crate::config::TelemetryConfig::default(),
                 admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
+                vlm_model: None,
                 test_backend: Some(Arc::new(FakeService::default())),
             },
         );
@@ -1525,10 +1861,12 @@ mod tests {
                 max_completion_tokens: 4_096,
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
+                max_vlm_images: 5,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(0, 1, Duration::from_secs(300))),
             model: "test-model".to_string(),
+            vlm_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
         let _permit = match state.admission.acquire() {
@@ -1608,6 +1946,15 @@ mod tests {
             "expected headers immediately followed by first data event, got: {:?}",
             &after_headers.chars().take(30).collect::<String>()
         );
+
+        // All SSE data events must use the same model field.
+        let model_ref = "\"model\":\"test-model\"";
+        let model_count = body.matches(model_ref).count();
+        assert!(
+            model_count >= 3,
+            "expected at least 3 occurrences of consistent model field, got {}",
+            model_count
+        );
     }
 
     #[test]
@@ -1679,10 +2026,12 @@ mod tests {
                 max_completion_tokens: 4_096,
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
+                max_vlm_images: 5,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "test-model".to_string(),
+            vlm_model: None,
             test_backend: Some(backend),
         }
     }
@@ -1834,6 +2183,35 @@ mod tests {
         }
     }
 
+    /// Service that fails on first `complete()` call, succeeds on subsequent.
+    /// Used to test VLM lifecycle recovery from transient failure.
+    #[derive(Default)]
+    struct RecoveryService {
+        attempts: Mutex<usize>,
+    }
+
+    impl ChatCompletionService for RecoveryService {
+        fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            let mut attempts = self.attempts.lock().unwrap();
+            *attempts += 1;
+            if *attempts == 1 {
+                Err(GatewayError::Protocol("transient vlm error".to_string()))
+            } else {
+                Ok(ChatCompletionResponse {
+                    request_id: request.request_id,
+                    model: request.model,
+                    text: "recovered".to_string(),
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                })
+            }
+        }
+    }
+
     impl ChatCompletionService for CancellableStreamingService {
         fn complete(
             &self,
@@ -1865,5 +2243,1383 @@ mod tests {
             *self.cancel_calls.lock().unwrap() += 1;
             Ok(())
         }
+    }
+
+    // ── VLM routing tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn has_vlm_content_detects_image_url_parts() {
+        let text_only = vec![ChatMessage {
+            role: MessageRole::User,
+            content: "hello".into(),
+        }];
+        assert!(!has_vlm_content(&text_only));
+
+        let with_image = vec![ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "describe".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,abc".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+        }];
+        assert!(has_vlm_content(&with_image));
+    }
+
+    #[test]
+    fn vlm_image_count_counts_correctly() {
+        let msg = ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "compare".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "img1.jpg".to_string(),
+                        detail: None,
+                    },
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "img2.jpg".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+        };
+        assert_eq!(vlm_image_count(&[msg]), 2);
+    }
+
+    #[test]
+    fn models_endpoint_lists_vlm_model_when_configured() {
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+        let response = response_for_request("GET /models HTTP/1.1\r\n", &[], &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"text-model\""));
+        assert!(response.body.contains("\"vlm-model\""));
+    }
+
+    #[test]
+    fn models_endpoint_single_model_when_no_vlm_configured() {
+        let state = test_state(ModelState::Ready, Arc::new(FakeService::default()));
+        let response = response_for_request("GET /models HTTP/1.1\r\n", &[], &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"test-model\""));
+        // Only one model in the list
+        assert_eq!(response.body.matches("\"name\"").count(), 1);
+    }
+
+    #[test]
+    fn vlm_model_status_endpoint_returns_200() {
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+        let response =
+            response_for_request("GET /models/vlm-model/status HTTP/1.1\r\n", &[], &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"vlm-model\""));
+        assert!(response.body.contains("\"ready\":true"));
+    }
+
+    #[test]
+    fn vlm_model_ready_endpoint_returns_200() {
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+        let response =
+            response_for_request("GET /models/vlm-model/ready HTTP/1.1\r\n", &[], &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"ready\":true"));
+        assert!(response.body.contains("\"vlm-model\""));
+    }
+
+    #[test]
+    fn vlm_model_not_ready_without_explicit_mark() {
+        // VLM model must NOT be marked ready from generic worker READY;
+        // it requires explicit warmup completion.
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+        let response =
+            response_for_request("GET /models/vlm-model/ready HTTP/1.1\r\n", &[], &state);
+        assert_eq!(response.status, "503 Service Unavailable");
+        assert!(response.body.contains("\"ready\":false"));
+        assert!(response.body.contains("\"not_loaded\""));
+    }
+
+    // ── VLM HTTP request handling tests ───────────────────────────────────
+
+    #[test]
+    fn chat_completion_with_vlm_content_returns_200_when_vlm_configured() {
+        // POST with image content, VLM configured → 200 OK
+        let service = Arc::new(FakeService {
+            response: Mutex::new(Some(ChatCompletionResponse {
+                request_id: "req-vlm".to_string(),
+                model: "vlm-model".to_string(),
+                text: "VLM description".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 15,
+                completion_tokens: 8,
+            })),
+        });
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service.clone()),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+                    ]
+                }
+            ],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "top_p": 1.0
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"chat.completion\""));
+        assert!(response.body.contains("\"VLM description\""));
+        assert!(response.body.contains("\"vlm-model\""));
+    }
+
+    #[test]
+    fn chat_completion_with_vlm_content_rejected_when_no_vlm_configured() {
+        // POST with image content, VLM NOT configured → 400 VLM_NOT_CONFIGURED
+        let state = test_state(ModelState::Ready, Arc::new(FakeService::default()));
+
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"VLM_NOT_CONFIGURED\""));
+        assert!(response
+            .body
+            .contains("image content requires a VLM-capable model"));
+    }
+
+    #[test]
+    fn streaming_chat_completion_with_vlm_content_works() {
+        // POST stream=true with VLM content → SSE events
+        let service = Arc::new(StreamingService);
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service.clone()),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what's in this image"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/test.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut buffer = Cursor::new(Vec::new());
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
+
+        let output = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(output.contains("text/event-stream"));
+        assert!(output.contains("chat.completion.chunk"));
+        assert!(output.contains("data: [DONE]"));
+    }
+
+    // ── Model-first routing tests (Phase 8) ────────────────────────────────
+
+    #[test]
+    fn chat_completion_text_only_to_vlm_model_succeeds() {
+        // Text-only request targeting VLM model must reach VLM-capable path.
+        let service = Arc::new(FakeService {
+            response: Mutex::new(Some(ChatCompletionResponse {
+                request_id: "req-vlm-text".to_string(),
+                model: "vlm-model".to_string(),
+                text: "VLM text response".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 3,
+            })),
+        });
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service.clone()),
+        };
+
+        // Text-only request explicitly targeting the VLM model name
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [{"role": "user", "content": "hello from text-only"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"VLM text response\""));
+        assert!(response.body.contains("\"vlm-model\""));
+    }
+
+    // ── Image URL validation tests (Phase 8) ──────────────────────────────
+
+    /// Helper: creates a state with VLM configured and ready.
+    fn vlm_ready_state(vlm_model: &str) -> AppState {
+        let service = Arc::new(FakeService::default());
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model(vlm_model.to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some(vlm_model.to_string()),
+            test_backend: Some(service),
+        }
+    }
+
+    #[test]
+    fn validate_image_urls_rejects_data_uri() {
+        // data: URIs are unsupported image sources.
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,abc123".to_string(),
+                    detail: None,
+                },
+            }]),
+        }]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("unsupported image URL scheme"));
+        assert!(err.contains("must be one of"));
+    }
+
+    #[test]
+    fn validate_image_urls_accepts_loopback_http_scheme() {
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "http://127.0.0.1:8000/img.jpg".to_string(),
+                    detail: None,
+                },
+            }]),
+        }]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_image_urls_rejects_remote_http_scheme() {
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "http://example.com/img.jpg".to_string(),
+                    detail: None,
+                },
+            }]),
+        }]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("localhost or 127.0.0.1"));
+    }
+
+    #[test]
+    fn validate_image_urls_accepts_local_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("phase_8_local_{unique}.ppm"));
+        std::fs::write(&path, "P3\n1 1\n255\n255 0 0\n").unwrap();
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: path.to_string_lossy().into_owned(),
+                    detail: None,
+                },
+            }]),
+        }]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_image_urls_rejects_long_url() {
+        let long_url = "https://example.com/".to_string() + &"x".repeat(4096);
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: long_url,
+                    detail: None,
+                },
+            }]),
+        }]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("exceeds maximum length of 4096"));
+    }
+
+    #[test]
+    fn validate_image_urls_accepts_https_scheme() {
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/img.jpg".to_string(),
+                    detail: None,
+                },
+            }]),
+        }]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_image_urls_accepts_text_only() {
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: "just text".into(),
+        }]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn chat_completion_rejects_data_uri_image_url() {
+        let state = vlm_ready_state("vlm-model");
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"INVALID_IMAGE_URL\""));
+        assert!(response.body.contains("unsupported image URL scheme"));
+    }
+
+    #[test]
+    fn chat_completion_rejects_remote_http_image_url() {
+        let state = vlm_ready_state("vlm-model");
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "http://example.com/img.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"INVALID_IMAGE_URL\""));
+        assert!(response.body.contains("http"));
+    }
+
+    #[test]
+    fn chat_completion_rejects_file_image_url() {
+        let state = vlm_ready_state("vlm-model");
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "file:///tmp/img.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"INVALID_IMAGE_URL\""));
+        assert!(response.body.contains("file"));
+    }
+
+    #[test]
+    fn chat_completion_accepts_https_image_url() {
+        // HTTPS image URLs must be accepted through the full HTTP path.
+        let service = Arc::new(FakeService {
+            response: Mutex::new(Some(ChatCompletionResponse {
+                request_id: "req-https".to_string(),
+                model: "vlm-model".to_string(),
+                text: "valid https image".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 10,
+                completion_tokens: 3,
+            })),
+        });
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"valid https image\""));
+    }
+
+    #[test]
+    fn streaming_chat_completion_rejects_unsupported_image_url() {
+        let state = vlm_ready_state("vlm-model");
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,xyz"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16,
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut buffer = Cursor::new(Vec::new());
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
+
+        let output = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(output.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(output.contains("\"INVALID_IMAGE_URL\""));
+        assert!(output.contains("unsupported image URL scheme"));
+        assert!(!output.contains("text/event-stream"));
+    }
+
+    // ── VLM lifecycle recovery tests (Phase 8) ────────────────────────────
+
+    #[test]
+    fn vlm_lifecycle_recovers_from_transient_failure() {
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        // VLM starts as NotLoaded — deliberately not marking ready yet.
+
+        // Verify initial VLM state is NotLoaded
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::NotLoaded);
+        assert!(!vlm_status.ready);
+
+        // First request fails with a transient (non-InvalidRequest) error →
+        // VLM should transition to Failed
+        track_vlm_lifecycle_failure(
+            &runtime,
+            &GatewayError::Protocol("transient vlm error".to_string()),
+        );
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Failed);
+        assert!(!vlm_status.ready);
+
+        // Explicit warmup completion → VLM should recover to Ready.
+        runtime.mark_vlm_ready(7).unwrap();
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Ready);
+        assert!(vlm_status.ready);
+        assert_eq!(vlm_status.last_warmup_latency_ms, Some(7));
+    }
+
+    #[test]
+    fn vlm_lifecycle_invalid_request_does_not_mark_failed() {
+        // GatewayError::InvalidRequest (bad user input) must NOT mark VLM
+        // as failed; only backend/worker errors indicate VLM load issues.
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+
+        // An InvalidRequest error should NOT trigger VLM failure transition
+        track_vlm_lifecycle_failure(
+            &runtime,
+            &GatewayError::InvalidRequest("bad prompt".to_string()),
+        );
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(
+            vlm_status.state,
+            ModelState::NotLoaded,
+            "InvalidRequest errors must not mark VLM as failed"
+        );
+    }
+
+    #[test]
+    fn vlm_lifecycle_already_ready_stays_ready_on_success() {
+        // Repeating explicit warmup completion when VLM is already Ready
+        // must be a safe no-op (no regression on repeated calls).
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+
+        // Call warmup completion again — should stay Ready, not error.
+        runtime.mark_vlm_ready(3).unwrap();
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Ready);
+        assert!(vlm_status.ready);
+        assert_eq!(vlm_status.last_warmup_latency_ms, Some(3));
+    }
+
+    #[test]
+    fn vlm_lifecycle_already_failed_stays_failed_on_failure() {
+        // Calling track_vlm_lifecycle_failure when VLM is already Failed
+        // must be a safe no-op.
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_failed("VLM_LOAD_FAILED", "first failure");
+
+        // Call failure again — should stay Failed, not error
+        track_vlm_lifecycle_failure(
+            &runtime,
+            &GatewayError::Protocol("another failure".to_string()),
+        );
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Failed);
+        assert!(!vlm_status.ready);
+        // The original error message should be preserved, not overwritten
+        assert_eq!(
+            vlm_status.last_error.as_ref().map(|e| e.message.as_str()),
+            Some("first failure")
+        );
+    }
+
+    #[test]
+    fn vlm_lifecycle_full_http_recovery_from_transient_failure() {
+        // Full HTTP-path test: user request failures do not change explicit
+        // VLM warmup readiness.
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        runtime.mark_vlm_ready(9).unwrap();
+
+        // Backend that fails on first call, succeeds on second.
+        let service = Arc::new(RecoveryService::default());
+
+        let state = AppState {
+            runtime: runtime.clone(),
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service.clone()),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+                    ]
+                }
+            ],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "top_p": 1.0
+        }))
+        .unwrap();
+
+        // First request: fails, but explicit warmup state remains Ready.
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert!(
+            response.status.starts_with("5"),
+            "first VLM request should return 5xx, got: {}",
+            response.status
+        );
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Ready);
+
+        // Second request: succeeds, and readiness still stays Ready.
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"chat.completion\""));
+        assert!(response.body.contains("\"recovered\""));
+
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Ready);
+        assert!(vlm_status.ready);
+        assert_eq!(vlm_status.last_warmup_latency_ms, Some(9));
+    }
+
+    #[test]
+    fn chat_completion_with_images_to_text_model_rejected_when_vlm_configured() {
+        // Image-bearing request targeting text model must fail when VLM configured.
+        let service = Arc::new(FakeService::default());
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service.clone()),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "text-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://example.com/img.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"VLM_NOT_CONFIGURED\""));
+        assert!(response.body.contains("requested model is not VLM"));
+    }
+
+    // ── VLM image-count cap tests (Phase 8) ──────────────────────────────
+
+    #[test]
+    fn vlm_non_streaming_rejects_too_many_images() {
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 3,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/1.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/2.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/3.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/4.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"TOO_MANY_IMAGES\""));
+        assert!(response.body.contains("4 images, maximum allowed is 3"));
+    }
+
+    #[test]
+    fn vlm_non_streaming_accepts_max_images() {
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let service = Arc::new(FakeService {
+            response: Mutex::new(Some(ChatCompletionResponse {
+                request_id: "req-max-img".to_string(),
+                model: "vlm-model".to_string(),
+                text: "described many images".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 20,
+                completion_tokens: 5,
+            })),
+        });
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 3,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/1.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/2.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/3.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"described many images\""));
+    }
+
+    #[test]
+    fn vlm_streaming_rejects_too_many_images() {
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 2,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(Arc::new(FakeService::default())),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/1.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/2.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/3.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16,
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut buffer = Cursor::new(Vec::new());
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
+
+        let output = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(output.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(output.contains("\"TOO_MANY_IMAGES\""));
+        assert!(output.contains("3 images, maximum allowed is 2"));
+        assert!(!output.contains("text/event-stream"));
+    }
+
+    #[test]
+    fn vlm_streaming_accepts_max_images() {
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 3,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(Arc::new(StreamingService)),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/1.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/2.jpg"}},
+                        {"type": "image_url", "image_url": {"url": "https://a.com/3.jpg"}}
+                    ]
+                }
+            ],
+            "max_tokens": 16,
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut buffer = Cursor::new(Vec::new());
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
+
+        let output = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(output.contains("text/event-stream"));
+        assert!(output.contains("chat.completion.chunk"));
+        assert!(output.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn vlm_text_only_path_ignores_image_count_cap() {
+        // Text-only request targeting VLM model must not hit the image cap.
+        let runtime = test_runtime(ModelState::Ready);
+        runtime.set_vlm_model("vlm-model".to_string());
+        let _ = runtime.mark_vlm_ready(1);
+        let service = Arc::new(FakeService {
+            response: Mutex::new(Some(ChatCompletionResponse {
+                request_id: "req-text-vlm".to_string(),
+                model: "vlm-model".to_string(),
+                text: "text-only VLM response".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 3,
+                completion_tokens: 4,
+            })),
+        });
+        let state = AppState {
+            runtime,
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 0,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [{"role": "user", "content": "just text"}],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"text-only VLM response\""));
+    }
+
+    // ── VLM lifecycle cancelled/no-load guard tests ────────────────────────
+
+    /// Service that always returns a cancelled response (finish_reason = "cancelled").
+    /// Used to verify VLM lifecycle does NOT transition to Ready on cancelled/no-load.
+    #[derive(Default)]
+    struct CancelledResponseService;
+
+    impl ChatCompletionService for CancelledResponseService {
+        fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: String::new(),
+                finish_reason: "cancelled".to_string(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            })
+        }
+
+        fn stream(
+            &self,
+            request: ChatCompletionRequest,
+            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            // Emit a delta to confirm streaming started before cancelled finish.
+            on_delta("par".to_string())?;
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: "partial".to_string(),
+                finish_reason: "cancelled".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 1,
+            })
+        }
+    }
+
+    #[test]
+    fn vlm_lifecycle_non_streaming_cancelled_response_does_not_mark_ready() {
+        // Non-streaming cancelled VLM request must not alter warmup readiness.
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        runtime.mark_vlm_ready(5).unwrap();
+
+        let service = Arc::new(CancelledResponseService);
+        let state = AppState {
+            runtime: runtime.clone(),
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+        assert_eq!(response.status, "200 OK");
+
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Ready);
+        assert!(vlm_status.ready);
+        assert_eq!(vlm_status.last_warmup_latency_ms, Some(5));
+    }
+
+    #[test]
+    fn vlm_lifecycle_streaming_cancelled_response_does_not_mark_ready() {
+        // Streaming cancelled VLM request must not alter warmup readiness.
+        let runtime = RuntimeState::new("text-model");
+        let mut status = ModelStatus::new("text-model");
+        status.set_state(ModelState::Ready);
+        runtime.set_status(status).unwrap();
+        runtime.set_vlm_model("vlm-model".to_string());
+        runtime.mark_vlm_ready(6).unwrap();
+
+        let service = Arc::new(CancelledResponseService);
+        let state = AppState {
+            runtime: runtime.clone(),
+            generation: GenerationConfig {
+                temperature: 0.7,
+                top_p: 0.9,
+                max_tokens: 32,
+            },
+            limits: crate::config::RequestLimits {
+                max_pending_requests: 64,
+                max_active_requests: 16,
+                max_prompt_tokens: 32_768,
+                max_completion_tokens: 4_096,
+                max_total_tokens_per_request: 65_536,
+                request_timeout_seconds: 300,
+                max_vlm_images: 5,
+            },
+            telemetry: crate::config::TelemetryConfig::default(),
+            admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
+            model: "text-model".to_string(),
+            vlm_model: Some("vlm-model".to_string()),
+            test_backend: Some(service),
+        };
+
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": true
+        }))
+        .unwrap();
+
+        let mut buffer = Cursor::new(Vec::new());
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
+
+        let vlm_status = runtime.snapshot_vlm().unwrap();
+        assert_eq!(vlm_status.state, ModelState::Ready);
+        assert!(vlm_status.ready);
+        assert_eq!(vlm_status.last_warmup_latency_ms, Some(6));
     }
 }

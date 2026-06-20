@@ -8,18 +8,38 @@ import os
 
 @dataclass(frozen=True)
 class WorkerConfig:
-    """Configuration needed for the worker runtime."""
+    """Configuration needed for the worker runtime.
+
+    Attributes:
+        socket_path: Unix domain socket path for IPC with the Rust gateway.
+        model: Text-only model identifier (e.g. an ``mlx-community`` hub path).
+        vlm_model: Optional VLM model identifier. When ``None`` or empty,
+            no VLM engine is constructed and the worker runs text-only.
+    """
 
     socket_path: str
     model: str
+    vlm_model: str | None = None
+    max_vlm_images: int = 5
 
 
 def load_config() -> WorkerConfig:
-    """Load the worker bootstrap configuration from environment variables."""
+    """Load the worker bootstrap configuration from environment variables.
+
+    Reads ``MLX_RUNTIME_SOCKET``, ``MLX_RUNTIME_MODEL``, and the optional
+    ``MLX_RUNTIME_VLM_MODEL``. An empty VLM model variable is treated the
+    same as unset (no VLM engine).
+    """
+
+    raw_vlm = os.environ.get("MLX_RUNTIME_VLM_MODEL", "")
+    vlm_model: str | None = raw_vlm if raw_vlm.strip() else None
+    max_vlm_images = int(os.environ.get("MLX_RUNTIME_MAX_VLM_IMAGES", "5"))
 
     return WorkerConfig(
         socket_path=os.environ.get("MLX_RUNTIME_SOCKET", "/tmp/mlx-runtime.sock"),
         model=os.environ.get(
             "MLX_RUNTIME_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit"
         ),
+        vlm_model=vlm_model,
+        max_vlm_images=max_vlm_images,
     )

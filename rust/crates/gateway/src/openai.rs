@@ -76,19 +76,28 @@ pub struct Usage {
 
 impl ChatCompletionHttpRequest {
     /// Converts an incoming HTTP request into a worker request using gateway defaults.
+    /// Accepts either the configured text model or an optional VLM model.
     pub fn into_worker_request(
         self,
         generation: &GenerationConfig,
         limits: &RequestLimits,
         configured_model: &str,
+        vlm_model: Option<&str>,
     ) -> Result<WorkerChatCompletionRequest, String> {
         if self.model.trim().is_empty() {
             return Err("model must not be empty".to_string());
         }
-        if self.model != configured_model {
+        let model_match =
+            self.model == configured_model || vlm_model.is_some_and(|vlm| self.model == vlm);
+        if !model_match {
+            let allowed = if let Some(vlm) = vlm_model {
+                format!("'{}' or '{}'", configured_model, vlm)
+            } else {
+                format!("'{}'", configured_model)
+            };
             return Err(format!(
-                "requested model '{}' does not match configured model '{}'",
-                self.model, configured_model
+                "requested model '{}' does not match configured model(s): {}",
+                self.model, allowed
             ));
         }
         if self.messages.is_empty() {
@@ -97,7 +106,7 @@ impl ChatCompletionHttpRequest {
         if self
             .messages
             .iter()
-            .any(|message| message.content.trim().is_empty())
+            .any(|message| !message.content.has_content())
         {
             return Err("message content must not be empty".to_string());
         }
@@ -107,7 +116,7 @@ impl ChatCompletionHttpRequest {
 
         Ok(WorkerChatCompletionRequest {
             request_id: format!("req-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)),
-            model: configured_model.to_string(),
+            model: self.model.clone(),
             messages: self.messages,
             max_tokens: self.max_tokens.unwrap_or(generation.max_tokens),
             temperature: self.temperature.unwrap_or(generation.temperature),
@@ -150,5 +159,173 @@ impl From<ChatCompletionResponse> for ChatCompletionHttpResponse {
                 total_tokens,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{GenerationConfig, RequestLimits};
+
+    fn default_generation() -> GenerationConfig {
+        GenerationConfig {
+            temperature: 0.7,
+            top_p: 0.9,
+            max_tokens: 32,
+        }
+    }
+
+    fn default_limits() -> RequestLimits {
+        RequestLimits {
+            max_pending_requests: 64,
+            max_active_requests: 16,
+            max_prompt_tokens: 32_768,
+            max_completion_tokens: 4_096,
+            max_total_tokens_per_request: 65_536,
+            request_timeout_seconds: 300,
+            max_vlm_images: 5,
+        }
+    }
+
+    #[test]
+    fn into_worker_request_accepts_text_model() {
+        let request = ChatCompletionHttpRequest {
+            model: "text-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "hello".into(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+            top_p: None,
+            stream: Some(false),
+        };
+        let result = request.into_worker_request(
+            &default_generation(),
+            &default_limits(),
+            "text-model",
+            None,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().model, "text-model");
+    }
+
+    #[test]
+    fn into_worker_request_accepts_vlm_model_when_configured() {
+        let request = ChatCompletionHttpRequest {
+            model: "vlm-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "hello".into(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+            top_p: None,
+            stream: Some(false),
+        };
+        let result = request.into_worker_request(
+            &default_generation(),
+            &default_limits(),
+            "text-model",
+            Some("vlm-model"),
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().model, "vlm-model");
+    }
+
+    #[test]
+    fn into_worker_request_rejects_unknown_model() {
+        let request = ChatCompletionHttpRequest {
+            model: "unknown-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "hello".into(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+            top_p: None,
+            stream: Some(false),
+        };
+        let result = request.into_worker_request(
+            &default_generation(),
+            &default_limits(),
+            "text-model",
+            Some("vlm-model"),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not match"));
+    }
+
+    #[test]
+    fn into_worker_request_preserves_user_requested_model() {
+        let request = ChatCompletionHttpRequest {
+            model: "vlm-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "describe this image".into(),
+            }],
+            max_tokens: Some(64),
+            temperature: Some(0.5),
+            top_p: Some(0.8),
+            stream: Some(true),
+        };
+        let worker = request
+            .into_worker_request(
+                &default_generation(),
+                &default_limits(),
+                "text-model",
+                Some("vlm-model"),
+            )
+            .unwrap();
+        assert_eq!(worker.model, "vlm-model");
+        assert_eq!(worker.max_tokens, 64);
+        assert!(worker.stream);
+    }
+
+    #[test]
+    fn into_worker_request_rejects_empty_model() {
+        let request = ChatCompletionHttpRequest {
+            model: "".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "hello".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+        };
+        let result = request.into_worker_request(
+            &default_generation(),
+            &default_limits(),
+            "text-model",
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn into_worker_request_rejects_vlm_without_config() {
+        let request = ChatCompletionHttpRequest {
+            model: "vlm-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "hello".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+        };
+        // No VLM model configured, so "vlm-model" should be rejected
+        let result = request.into_worker_request(
+            &default_generation(),
+            &default_limits(),
+            "text-model",
+            None,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not match"));
     }
 }

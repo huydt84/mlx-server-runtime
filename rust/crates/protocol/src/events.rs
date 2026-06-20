@@ -69,7 +69,15 @@ pub enum WorkerEvent {
     /// A streamed chat completion delta.
     ChatCompletionDelta { delta: ChatCompletionDelta },
     /// A non-streaming chat completion result.
-    ChatCompletion { response: ChatCompletionResponse },
+    ChatCompletion {
+        response: ChatCompletionResponse,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_preprocess_latency_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_template_latency_ms: Option<u32>,
+    },
     /// A worker-side request failure.
     Error {
         /// Machine-readable failure code.
@@ -147,7 +155,7 @@ mod tests {
                 model: "test-model".to_string(),
                 messages: vec![ChatMessage {
                     role: MessageRole::User,
-                    content: "hello".to_string(),
+                    content: "hello".into(),
                 }],
                 max_tokens: 16,
                 temperature: 0.2,
@@ -186,6 +194,9 @@ mod tests {
                 prompt_tokens: 12,
                 completion_tokens: 3,
             },
+            image_count: Some(1),
+            image_preprocess_latency_ms: Some(8),
+            prompt_template_latency_ms: Some(4),
         };
 
         let encoded = encode_worker_event(&event).unwrap();
@@ -204,6 +215,120 @@ mod tests {
         let encoded = encode_worker_event(&event).unwrap();
         let decoded = decode_worker_event(&encoded).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn vlm_gateway_command_round_trip_with_image_parts() {
+        let command = GatewayCommand::ChatCompletion {
+            request: ChatCompletionRequest {
+                request_id: "vlm-req".to_string(),
+                model: "vlm-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: MessageRole::User,
+                    content: crate::request::MessageContent::Parts(vec![
+                        crate::request::ContentPart::Text {
+                            text: "describe".to_string(),
+                        },
+                        crate::request::ContentPart::ImageUrl {
+                            image_url: crate::request::ImageUrl {
+                                url: "data:image/png;base64,abc".to_string(),
+                                detail: None,
+                            },
+                        },
+                    ]),
+                }],
+                max_tokens: 32,
+                temperature: 0.2,
+                top_p: 0.9,
+                max_prompt_tokens: 64,
+                max_completion_tokens: 64,
+                max_total_tokens_per_request: 128,
+                stream: true,
+            },
+        };
+
+        let encoded = encode_gateway_command(&command).unwrap();
+        let decoded = decode_gateway_command(&encoded).unwrap();
+        assert_eq!(decoded, command);
+
+        // Verify the JSON structure has the expected content parts
+        assert!(encoded.contains("\"type\":\"text\""));
+        assert!(encoded.contains("\"type\":\"image_url\""));
+        assert!(encoded.contains("\"image_url\":{\"url\":"));
+    }
+
+    #[test]
+    fn image_url_detail_is_preserved_through_json_round_trip() {
+        let command = GatewayCommand::ChatCompletion {
+            request: ChatCompletionRequest {
+                request_id: "vlm-detail".to_string(),
+                model: "vlm-model".to_string(),
+                messages: vec![ChatMessage {
+                    role: MessageRole::User,
+                    content: crate::request::MessageContent::Parts(vec![
+                        crate::request::ContentPart::ImageUrl {
+                            image_url: crate::request::ImageUrl {
+                                url: "http://example.com/img.jpg".to_string(),
+                                detail: Some("high".to_string()),
+                            },
+                        },
+                    ]),
+                }],
+                max_tokens: 32,
+                temperature: 0.2,
+                top_p: 0.9,
+                max_prompt_tokens: 64,
+                max_completion_tokens: 64,
+                max_total_tokens_per_request: 128,
+                stream: false,
+            },
+        };
+
+        let encoded = encode_gateway_command(&command).unwrap();
+        let decoded = decode_gateway_command(&encoded).unwrap();
+        assert_eq!(decoded, command);
+        assert!(encoded.contains("\"detail\":\"high\""));
+    }
+
+    #[test]
+    fn image_url_detail_is_optional_and_defaults_to_none() {
+        let json = r#"{
+            \"type\": \"chat_completion\",
+            \"request\": {
+                \"request_id\": \"vlm-nodetail\",
+                \"model\": \"vlm-model\",
+                \"messages\": [{
+                    \"role\": \"user\",
+                    \"content\": [{
+                        \"type\": \"image_url\",
+                        \"image_url\": { \"url\": \"http://example.com/img.jpg\" }
+                    }]
+                }],
+                \"max_tokens\": 32,
+                \"temperature\": 0.2,
+                \"top_p\": 0.9,
+                \"max_prompt_tokens\": 64,
+                \"max_completion_tokens\": 64,
+                \"max_total_tokens_per_request\": 128,
+                \"stream\": false
+            }
+        }"#;
+        // Remove the escaped quotes we inserted for readability
+        let clean = json.replace("\\\"", "\"");
+        let decoded = decode_gateway_command(&clean).unwrap();
+        if let GatewayCommand::ChatCompletion { request } = &decoded {
+            if let crate::request::MessageContent::Parts(parts) = &request.messages[0].content {
+                if let crate::request::ContentPart::ImageUrl { image_url } = &parts[0] {
+                    assert_eq!(image_url.detail, None);
+                } else {
+                    panic!("expected ImageUrl content part");
+                }
+            } else {
+                panic!("expected Parts content");
+            }
+        } else {
+            panic!("expected ChatCompletion command");
+        }
     }
 
     #[test]
