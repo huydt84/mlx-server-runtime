@@ -33,10 +33,22 @@ from mlx_worker.benchmarking import (
     BenchmarkRun,
     _format_number,
     _format_overhead,
+    _format_percent,
+    _format_signed_number,
+    _format_signed_percent,
     _overhead_summary,
+    calculate_decode_tokens_per_second,
+    calculate_end_to_end_tokens_per_second,
+    calculate_overhead,
+    calculate_overhead_percent,
+    calculate_per_token_latency_ms,
+    mean,
     now_utc_iso,
+    percentile,
     summarize_report,
     summarize_results,
+    write_report,
+    write_report_suite,
 )
 
 
@@ -199,6 +211,306 @@ class TestFormatOverhead:
 
     def test_large_delta(self) -> None:
         assert _format_overhead(150.0, 42.0) == "+108.0"
+
+
+# ===========================================================================
+# _format_signed_number
+# ===========================================================================
+
+
+class TestFormatSignedNumber:
+    def test_positive(self) -> None:
+        assert _format_signed_number(12.3) == "+12.3"
+
+    def test_negative(self) -> None:
+        assert _format_signed_number(-5.0) == "-5.0"
+
+    def test_zero(self) -> None:
+        assert _format_signed_number(0.0) == "+0.0"
+
+    def test_none(self) -> None:
+        assert _format_signed_number(None) == "-"
+
+
+# ===========================================================================
+# _format_percent
+# ===========================================================================
+
+
+class TestFormatPercent:
+    def test_zero(self) -> None:
+        assert _format_percent(0.0) == "0.0%"
+
+    def test_half(self) -> None:
+        assert _format_percent(0.5) == "50.0%"
+
+    def test_full(self) -> None:
+        assert _format_percent(1.0) == "100.0%"
+
+    def test_none(self) -> None:
+        assert _format_percent(None) == "-"
+
+    def test_small(self) -> None:
+        assert _format_percent(0.001) == "0.1%"
+
+
+# ===========================================================================
+# _format_signed_percent
+# ===========================================================================
+
+
+class TestFormatSignedPercent:
+    def test_positive(self) -> None:
+        assert _format_signed_percent(25.0) == "+25.0%"
+
+    def test_negative(self) -> None:
+        assert _format_signed_percent(-10.0) == "-10.0%"
+
+    def test_zero(self) -> None:
+        assert _format_signed_percent(0.0) == "+0.0%"
+
+    def test_none(self) -> None:
+        assert _format_signed_percent(None) == "-"
+
+    def test_small_positive(self) -> None:
+        assert _format_signed_percent(0.5) == "+0.5%"
+
+
+# ===========================================================================
+# mean
+# ===========================================================================
+
+
+class TestMean:
+    def test_single_value(self) -> None:
+        assert mean([10.0]) == 10.0
+
+    def test_multiple_values(self) -> None:
+        assert mean([10.0, 20.0, 30.0]) == 20.0
+
+    def test_empty_returns_none(self) -> None:
+        assert mean([]) is None
+
+    def test_single_element(self) -> None:
+        assert mean([42.0]) == 42.0
+
+    def test_negative_values(self) -> None:
+        assert mean([-5.0, 5.0]) == 0.0
+
+
+# ===========================================================================
+# percentile
+# ===========================================================================
+
+
+class TestPercentileFunction:
+    """Direct tests for mlx_worker.benchmarking.percentile."""
+
+    def test_p50_even_count(self) -> None:
+        assert percentile([60.0, 40.0], 50) == 50.0
+
+    def test_p95_interpolated(self) -> None:
+        assert percentile([40.0, 60.0], 95) == pytest.approx(59.0)
+
+    def test_p100_single_value(self) -> None:
+        assert percentile([42.0], 100) == 42.0
+
+    def test_p0_single_value(self) -> None:
+        assert percentile([42.0], 0) == 42.0
+
+    def test_p50_odd_count(self) -> None:
+        assert percentile([10.0, 20.0, 30.0], 50) == 20.0
+
+    def test_min_samples_not_met_returns_none(self) -> None:
+        assert percentile([50.0], 95, min_samples=5) is None
+
+    def test_empty_returns_none(self) -> None:
+        assert percentile([], 50) is None
+
+    def test_min_samples_zero(self) -> None:
+        assert percentile([10.0], 50, min_samples=0) == 10.0
+
+    def test_all_identical(self) -> None:
+        assert percentile([5.0, 5.0, 5.0], 50) == 5.0
+
+
+# ===========================================================================
+# calculate_decode_tokens_per_second
+# ===========================================================================
+
+
+class TestCalculateDecodeTokensPerSecond:
+    def test_normal(self) -> None:
+        result = calculate_decode_tokens_per_second(100.0, 2000.0)
+        assert result == pytest.approx(50.0)
+
+    def test_zero_decode_time_returns_none(self) -> None:
+        assert calculate_decode_tokens_per_second(100.0, 0.0) is None
+
+    def test_negative_decode_time_returns_none(self) -> None:
+        assert calculate_decode_tokens_per_second(100.0, -1.0) is None
+
+    def test_zero_tokens(self) -> None:
+        assert calculate_decode_tokens_per_second(0.0, 1000.0) == 0.0
+
+    def test_single_token(self) -> None:
+        result = calculate_decode_tokens_per_second(1.0, 100.0)
+        assert result == pytest.approx(10.0)
+
+
+# ===========================================================================
+# calculate_end_to_end_tokens_per_second
+# ===========================================================================
+
+
+class TestCalculateE2ETokensPerSecond:
+    def test_normal(self) -> None:
+        result = calculate_end_to_end_tokens_per_second(100.0, 5000.0)
+        assert result == pytest.approx(20.0)
+
+    def test_zero_latency_returns_none(self) -> None:
+        assert calculate_end_to_end_tokens_per_second(100.0, 0.0) is None
+
+    def test_negative_latency_returns_none(self) -> None:
+        assert calculate_end_to_end_tokens_per_second(100.0, -1.0) is None
+
+    def test_zero_tokens(self) -> None:
+        assert calculate_end_to_end_tokens_per_second(0.0, 1000.0) == 0.0
+
+
+# ===========================================================================
+# calculate_per_token_latency_ms
+# ===========================================================================
+
+
+class TestCalculatePerTokenLatencyMs:
+    def test_normal(self) -> None:
+        result = calculate_per_token_latency_ms(200.0, 10.0)
+        assert result == 20.0
+
+    def test_none_latency_returns_none(self) -> None:
+        assert calculate_per_token_latency_ms(None, 10.0) is None
+
+    def test_none_tokens_returns_none(self) -> None:
+        assert calculate_per_token_latency_ms(200.0, None) is None
+
+    def test_zero_tokens_returns_none(self) -> None:
+        assert calculate_per_token_latency_ms(200.0, 0.0) is None
+
+    def test_negative_tokens_returns_none(self) -> None:
+        assert calculate_per_token_latency_ms(200.0, -1.0) is None
+
+    def test_single_token(self) -> None:
+        assert calculate_per_token_latency_ms(50.0, 1.0) == 50.0
+
+
+# ===========================================================================
+# calculate_overhead
+# ===========================================================================
+
+
+class TestCalculateOverhead:
+    def test_positive_delta(self) -> None:
+        assert calculate_overhead(20.0, 10.0) == 10.0
+
+    def test_negative_delta(self) -> None:
+        assert calculate_overhead(5.0, 10.0) == -5.0
+
+    def test_zero_delta(self) -> None:
+        assert calculate_overhead(10.0, 10.0) == 0.0
+
+    def test_none_value_returns_none(self) -> None:
+        assert calculate_overhead(None, 10.0) is None
+
+    def test_none_baseline_returns_none(self) -> None:
+        assert calculate_overhead(20.0, None) is None
+
+    def test_both_none_returns_none(self) -> None:
+        assert calculate_overhead(None, None) is None
+
+
+# ===========================================================================
+# calculate_overhead_percent
+# ===========================================================================
+
+
+class TestCalculateOverheadPercent:
+    def test_positive_delta(self) -> None:
+        result = calculate_overhead_percent(20.0, 10.0)
+        assert result == pytest.approx(100.0)
+
+    def test_negative_delta(self) -> None:
+        result = calculate_overhead_percent(5.0, 10.0)
+        assert result == pytest.approx(-50.0)
+
+    def test_zero_baseline_returns_none(self) -> None:
+        assert calculate_overhead_percent(20.0, 0.0) is None
+
+    def test_none_value_returns_none(self) -> None:
+        assert calculate_overhead_percent(None, 10.0) is None
+
+    def test_none_baseline_returns_none(self) -> None:
+        assert calculate_overhead_percent(20.0, None) is None
+
+    def test_no_change(self) -> None:
+        assert calculate_overhead_percent(10.0, 10.0) == 0.0
+
+    def test_doubled(self) -> None:
+        assert calculate_overhead_percent(20.0, 10.0) == 100.0
+
+    def test_halved(self) -> None:
+        assert calculate_overhead_percent(5.0, 10.0) == -50.0
+
+
+# ===========================================================================
+# write_report / write_report_suite
+# ===========================================================================
+
+
+class TestWriteReport:
+    def test_write_report_creates_file(self, tmp_path: Path) -> None:
+        br = _benchmark_result("test-backend")
+        run = BenchmarkRun(
+            model="m",
+            prompt="p",
+            max_tokens=16,
+            generated_at="2026-06-14T00:00:00+00:00",
+            results=(br,),
+        )
+        path = tmp_path / "reports" / "bench.md"
+        write_report(path, run)
+        assert path.exists()
+        content = path.read_text(encoding="utf-8")
+        assert "test-backend" in content
+        assert "Phase 6" in content
+
+    def test_write_report_suite_creates_file(self, tmp_path: Path) -> None:
+        br = _benchmark_result("test-backend")
+        run = BenchmarkRun(
+            model="m",
+            prompt="p",
+            max_tokens=16,
+            generated_at="2026-06-14T00:00:00+00:00",
+            results=(br,),
+        )
+        path = tmp_path / "suite.md"
+        write_report_suite(path, [run])
+        assert path.exists()
+        content = path.read_text(encoding="utf-8")
+        assert "test-backend" in content
+        assert "Model: m" in content
+
+    def test_write_report_empty_run_raises(self, tmp_path: Path) -> None:
+        run = BenchmarkRun(
+            model="m",
+            prompt="p",
+            max_tokens=16,
+            generated_at="now",
+            results=(),
+        )
+        path = tmp_path / "empty.md"
+        with pytest.raises(ValueError, match="at least one result"):
+            write_report(path, run)
 
 
 # ===========================================================================

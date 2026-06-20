@@ -42,6 +42,14 @@ class BenchmarkResult:
     decode_tokens_per_second_p50: float | None
     end_to_end_tokens_per_second_mean: float | None
     end_to_end_tokens_per_second_p50: float | None
+    # VLM-specific fields — None for text-only benchmark runs.
+    image_preprocess_latency_ms_mean: float | None = None
+    """Mean wall-clock time spent on image content extraction (ms)."""
+    image_count_mean: float | None = None
+    """Mean number of images per request across successful samples."""
+    vlm_load_time_ms: float | None = None
+    """VLM model load time (ms) captured on warmup or first request."""
+
     notes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
@@ -506,3 +514,160 @@ def _format_signed_percent(value: float | None) -> str:
         return "-"
     sign = "+" if value >= 0 else ""
     return f"{sign}{value:.1f}%"
+
+
+# ---------------------------------------------------------------------------
+# VLM report helpers — separate from Phase 6 text benchmark report.
+# ---------------------------------------------------------------------------
+
+
+def write_vlm_report(path: Path, runs: Sequence[BenchmarkRun]) -> None:
+    """Write a Phase 9 VLM benchmark report to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_render_vlm_report(runs), encoding="utf-8")
+
+
+def _render_vlm_report(runs: Sequence[BenchmarkRun]) -> str:
+    """Render a markdown VLM benchmark report with fairness notes."""
+    if not runs:
+        raise ValueError("VLM benchmark report requires at least one run")
+
+    lines = [
+        "# Phase 9 — VLM Benchmark Report",
+        "",
+        "## Fairness Notes",
+        "",
+        "This benchmark compares VLM inference throughput across backends. "
+        "Image sizes, prompt templates, and output lengths may differ "
+        "materially across fixtures — do not compare raw latency numbers "
+        "between different fixture categories without normalising.",
+        "",
+        "Backend differences:",
+        "",
+        "- **raw mlx-vlm**: direct Python call; no HTTP, no queue, no IPC.",
+        "- **mlx_vlm.server**: HTTP server with its own queuing.",
+        "- **this project**: Rust control plane with queue, backpressure, "
+        "cancellation, telemetry, and worker supervision.",
+        "",
+        "All backends use `temperature=0.0` and `top_p=1.0`; `max_tokens` "
+        "comes from the benchmark command line.",
+        "",
+    ]
+
+    for run_index, run in enumerate(runs):
+        if run_index:
+            lines.append("")
+        lines.append(f"## Model: {run.model}")
+        lines.append("")
+        lines.append(f"- generated_at: {run.generated_at}")
+        lines.append(f"- max_tokens: {run.max_tokens}")
+        lines.append(f"- prompt_suite: {run.prompt}")
+        lines.append("")
+
+        # Per-backend metrics table.
+        lines.append("### Raw Per-Backend Metrics")
+        lines.append("")
+        lines.append(
+            "| backend | vlm_load_time_ms | samples | errors | error_rate "
+            "| ttft_mean_ms | ttft_p50_ms "
+            "| latency_mean_ms | latency_p50_ms "
+            "| latency_per_completion_token_ms "
+            "| prompt_tokens_mean | completion_tokens_mean "
+            "| image_preprocess_ms_mean "
+            "| decode_tps_mean | e2e_tps_mean |"
+        )
+        lines.append(
+            "| --- | ---: | ---: | ---: | ---: "
+            "| ---: | ---: "
+            "| ---: | ---: "
+            "| ---: "
+            "| ---: | ---: "
+            "| ---: "
+            "| ---: | ---: |"
+        )
+        for result in run.results:
+            lines.append(
+                "| {backend} | {load_time} | {samples} | {errors} | {error_rate} "
+                "| {ttft_mean} | {ttft_p50} "
+                "| {latency_mean} | {latency_p50} "
+                "| {latency_per_token} "
+                "| {prompt_mean} | {completion_mean} "
+                "| {img_preproc} "
+                "| {decode_tps} | {e2e_tps} |".format(
+                    backend=result.backend,
+                    load_time=_format_number(result.vlm_load_time_ms),
+                    samples=result.samples,
+                    errors=result.errors,
+                    error_rate=_format_percent(result.error_rate),
+                    ttft_mean=_format_number(result.ttft_mean_ms),
+                    ttft_p50=_format_number(result.ttft_p50_ms),
+                    latency_mean=_format_number(result.latency_mean_ms),
+                    latency_p50=_format_number(result.latency_p50_ms),
+                    latency_per_token=_format_number(
+                        result.latency_per_completion_token_ms
+                    ),
+                    prompt_mean=_format_number(result.prompt_tokens_mean),
+                    completion_mean=_format_number(result.completion_tokens_mean),
+                    img_preproc=_format_number(result.image_preprocess_latency_ms_mean),
+                    decode_tps=_format_number(result.decode_tokens_per_second_mean),
+                    e2e_tps=_format_number(result.end_to_end_tokens_per_second_mean),
+                )
+            )
+
+        # Overhead vs raw mlx-vlm.
+        raw = next((r for r in run.results if r.backend == "raw mlx-vlm"), None)
+        lines.append("")
+        lines.append("### Overhead Vs Raw MLX-VLM")
+        lines.append("")
+        lines.append(
+            "| backend "
+            "| ttft_mean_delta_ms | latency_mean_delta_ms "
+            "| decode_tps_delta_pct | e2e_tps_delta_pct |"
+        )
+        lines.append("| --- | ---: | ---: | ---: | ---: |")
+        for result in run.results:
+            lines.append(
+                "| {backend} "
+                "| {ttft_delta} | {latency_delta} "
+                "| {decode_tps_pct} | {e2e_tps_pct} |".format(
+                    backend=result.backend,
+                    ttft_delta=_format_signed_number(
+                        calculate_overhead(
+                            result.ttft_mean_ms, raw.ttft_mean_ms if raw else None
+                        )
+                    ),
+                    latency_delta=_format_signed_number(
+                        calculate_overhead(
+                            result.latency_mean_ms,
+                            raw.latency_mean_ms if raw else None,
+                        )
+                    ),
+                    decode_tps_pct=_format_signed_percent(
+                        calculate_overhead_percent(
+                            result.decode_tokens_per_second_mean,
+                            raw.decode_tokens_per_second_mean if raw else None,
+                        )
+                    ),
+                    e2e_tps_pct=_format_signed_percent(
+                        calculate_overhead_percent(
+                            result.end_to_end_tokens_per_second_mean,
+                            raw.end_to_end_tokens_per_second_mean if raw else None,
+                        )
+                    ),
+                )
+            )
+
+        # Notes / warnings.
+        lines.append("")
+        lines.append("### Notes / Warnings")
+        lines.append("")
+        all_warnings: list[str] = []
+        for r in run.results:
+            all_warnings.extend(r.warnings)
+        if all_warnings:
+            for w in dict.fromkeys(all_warnings):
+                lines.append(f"- {w}")
+        else:
+            lines.append("- no warnings")
+
+    return "\n".join(lines) + "\n"
