@@ -59,6 +59,13 @@ pub struct MetricsRegistry {
     worker_restarts_total: AtomicU64,
     prompt_tokens_total: AtomicU64,
     completion_tokens_total: AtomicU64,
+    prompt_cache_hits_total: AtomicU64,
+    prompt_cache_misses_total: AtomicU64,
+    prompt_cache_cached_tokens_total: AtomicU64,
+    prompt_cache_bytes: AtomicU64,
+    active_batch_cache_bytes: AtomicU64,
+    prompt_batch_size: AtomicU64,
+    decode_batch_size: AtomicU64,
     ipc_messages_sent_total: AtomicU64,
     ipc_messages_received_total: AtomicU64,
     ipc_roundtrip_latency_ms: AtomicU64,
@@ -89,6 +96,13 @@ impl MetricsRegistry {
             worker_restarts_total: AtomicU64::new(0),
             prompt_tokens_total: AtomicU64::new(0),
             completion_tokens_total: AtomicU64::new(0),
+            prompt_cache_hits_total: AtomicU64::new(0),
+            prompt_cache_misses_total: AtomicU64::new(0),
+            prompt_cache_cached_tokens_total: AtomicU64::new(0),
+            prompt_cache_bytes: AtomicU64::new(0),
+            active_batch_cache_bytes: AtomicU64::new(0),
+            prompt_batch_size: AtomicU64::new(0),
+            decode_batch_size: AtomicU64::new(0),
             ipc_messages_sent_total: AtomicU64::new(0),
             ipc_messages_received_total: AtomicU64::new(0),
             ipc_roundtrip_latency_ms: AtomicU64::new(0),
@@ -148,6 +162,37 @@ impl MetricsRegistry {
     pub fn add_completion_tokens(&self, tokens: u64) {
         self.completion_tokens_total
             .fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub fn record_prompt_cache_hit(&self, hit: bool) {
+        if hit {
+            self.prompt_cache_hits_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.prompt_cache_misses_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add_prompt_cache_cached_tokens(&self, tokens: u64) {
+        self.prompt_cache_cached_tokens_total
+            .fetch_add(tokens, Ordering::Relaxed);
+    }
+
+    pub fn set_prompt_cache_bytes(&self, value: u64) {
+        self.prompt_cache_bytes.store(value, Ordering::Relaxed);
+    }
+
+    pub fn set_active_batch_cache_bytes(&self, value: u64) {
+        self.active_batch_cache_bytes
+            .store(value, Ordering::Relaxed);
+    }
+
+    pub fn set_prompt_batch_size(&self, value: u64) {
+        self.prompt_batch_size.store(value, Ordering::Relaxed);
+    }
+
+    pub fn set_decode_batch_size(&self, value: u64) {
+        self.decode_batch_size.store(value, Ordering::Relaxed);
     }
 
     pub fn increment_ipc_messages_sent_total(&self) {
@@ -302,6 +347,49 @@ impl MetricsRegistry {
             "mlx_completion_tokens_total",
             "Total completion tokens observed.",
             self.completion_tokens_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut output,
+            "mlx_prompt_cache_hits_total",
+            "Total prompt cache hits observed.",
+            self.prompt_cache_hits_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut output,
+            "mlx_prompt_cache_misses_total",
+            "Total prompt cache misses observed.",
+            self.prompt_cache_misses_total.load(Ordering::Relaxed),
+        );
+        write_counter(
+            &mut output,
+            "mlx_prompt_cache_cached_tokens_total",
+            "Total prompt cache tokens reused.",
+            self.prompt_cache_cached_tokens_total
+                .load(Ordering::Relaxed),
+        );
+        write_gauge(
+            &mut output,
+            "mlx_prompt_cache_bytes",
+            "Latest prompt cache bytes observed.",
+            self.prompt_cache_bytes.load(Ordering::Relaxed),
+        );
+        write_gauge(
+            &mut output,
+            "mlx_active_batch_cache_bytes",
+            "Latest active batch cache bytes observed.",
+            self.active_batch_cache_bytes.load(Ordering::Relaxed),
+        );
+        write_gauge(
+            &mut output,
+            "mlx_prompt_batch_size",
+            "Latest prompt batch size observed.",
+            self.prompt_batch_size.load(Ordering::Relaxed),
+        );
+        write_gauge(
+            &mut output,
+            "mlx_decode_batch_size",
+            "Latest decode batch size observed.",
+            self.decode_batch_size.load(Ordering::Relaxed),
         );
         write_gauge_f64(
             &mut output,
@@ -580,6 +668,8 @@ mod tests {
         assert!(output.contains("mlx_request_latency_ms_bucket"));
         assert!(output.contains("mlx_ipc_messages_sent_total"));
         assert!(output.contains("mlx_kv_cache_bytes"));
+        assert!(output.contains("mlx_prompt_cache_hits_total"));
+        assert!(output.contains("mlx_active_batch_cache_bytes"));
     }
 
     #[test]
@@ -628,6 +718,13 @@ mod tests {
             "mlx_request_latency_ms_count",
             "mlx_prompt_tokens_total 0",
             "mlx_completion_tokens_total 0",
+            "mlx_prompt_cache_hits_total 0",
+            "mlx_prompt_cache_misses_total 0",
+            "mlx_prompt_cache_cached_tokens_total 0",
+            "mlx_prompt_cache_bytes 0",
+            "mlx_active_batch_cache_bytes 0",
+            "mlx_prompt_batch_size 0",
+            "mlx_decode_batch_size 0",
             "mlx_decode_tokens_per_second",
             "mlx_prefill_tokens_per_second",
             "mlx_ipc_messages_sent_total 0",

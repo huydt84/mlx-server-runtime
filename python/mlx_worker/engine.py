@@ -102,6 +102,19 @@ class MlxWorkerEngine:
 
         return self._batch_backend.complete_many(list(requests))
 
+    def batch_context(self) -> BatchBackendContext:
+        """Return batch execution context for continuous batching."""
+
+        return BatchBackendContext(
+            model_id=self.model_id,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt_cache_store=self._prompt_cache_store,
+            build_prompt_tokens=self._build_prompt_tokens,
+            validate_token_limits=self._validate_token_limits,
+            make_sampler=self._make_sampler,
+        )
+
     def stream_chat(
         self,
         request: ChatCompletionRequest,

@@ -7,9 +7,16 @@ import signal
 import socket
 import select
 import time
+import queue
+import threading
 from contextlib import suppress
 from typing import Callable
 
+from .batching import (
+    BatchEventSink,
+    ContinuousBatchScheduler,
+    validate_continuous_batching_backend,
+)
 from .config import load_config
 from .ipc import (
     ChatCompletionResponse,
@@ -189,6 +196,12 @@ def main(
                 ),
             )
             engine.warmup()
+            if getattr(config, "continuous_batching", False):
+                validate_continuous_batching_backend()
+                if getattr(config, "vlm_model", None) is not None:
+                    from .vlm_engine import validate_vlm_continuous_batching_backend
+
+                    validate_vlm_continuous_batching_backend()
             warmup_latency_ms = int((time.perf_counter() - warmup_started) * 1000)
             ready_at = _now_seconds()
             _send_status(
@@ -226,6 +239,16 @@ def main(
             return 1
 
         client.sendall(encode_bootstrap_message(WorkerReady()))
+
+        if getattr(config, "continuous_batching", False):
+            _run_continuous_batch_loop(
+                client,
+                config,
+                engine,
+                vlm_engine_factory,
+            )
+            return 0
+
         read_buffer = bytearray()
         pending_lines: list[bytes] = []
 
@@ -345,6 +368,295 @@ def main(
             client.shutdown(socket.SHUT_RDWR)
 
     return 0
+
+
+def _run_continuous_text_loop(
+    client: socket.socket, config: object, engine: object
+) -> None:
+    """Run the ``mlx_lm.BatchGenerator`` loop for text-only requests."""
+
+    eof_sentinel = object()
+    command_queue: queue.Queue[bytes | object] = queue.Queue()
+    stop = threading.Event()
+
+    def reader() -> None:
+        read_buffer = bytearray()
+        try:
+            while not stop.is_set():
+                raw_line = _read_command_line(client, read_buffer, block=True)
+                if raw_line is None:
+                    continue
+                if not raw_line:
+                    command_queue.put(eof_sentinel)
+                    return
+                command_queue.put(raw_line)
+        finally:
+            command_queue.put(eof_sentinel)
+
+    reader_thread = threading.Thread(
+        target=reader, name="mlx-worker-reader", daemon=True
+    )
+    reader_thread.start()
+
+    def emit_delta(request_id: str, delta: str) -> None:
+        client.sendall(
+            encode_event(ChatCompletionDelta(request_id=request_id, delta=delta))
+        )
+
+    def emit_response(response: ChatCompletionResponse) -> None:
+        client.sendall(encode_event(response))
+
+    def emit_error(request_id: str, code: str, message: str) -> None:
+        client.sendall(
+            encode_event(
+                WorkerCommandError(code=code, request_id=request_id, message=message)
+            )
+        )
+
+    scheduler = ContinuousBatchScheduler(
+        engine.batch_context(),  # type: ignore[attr-defined]
+        BatchEventSink(
+            emit_delta=emit_delta,
+            emit_response=emit_response,
+            emit_error=emit_error,
+        ),
+        prompt_concurrency=getattr(config, "prompt_concurrency", 4),
+        decode_concurrency=getattr(config, "decode_concurrency", 4),
+        prefill_step_size=getattr(config, "prefill_chunk_size", 256),
+    )
+
+    try:
+        pending_stop = False
+        while not stop.is_set():
+            try:
+                timeout = 0.05 if scheduler.idle() else 0.0
+                raw_line = command_queue.get(timeout=timeout)
+            except queue.Empty:
+                raw_line = None
+
+            if raw_line is eof_sentinel:
+                pending_stop = True
+            elif raw_line is None:
+                pending_stop = pending_stop or not reader_thread.is_alive()
+            else:
+                try:
+                    command = decode_command(raw_line)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    emit_error("unknown", "INVALID_REQUEST", str(exc))
+                else:
+                    if command is None:
+                        emit_error(
+                            "unknown", "INVALID_REQUEST", "unsupported worker command"
+                        )
+                    elif isinstance(command, CancelRequest):
+                        scheduler.cancel(command.request_id)
+                    else:
+                        scheduler.submit(command, stream=command.stream)
+
+            scheduler.tick()
+            if pending_stop and scheduler.idle():
+                break
+    finally:
+        stop.set()
+        scheduler.close()
+        with suppress(OSError):
+            client.shutdown(socket.SHUT_RDWR)
+
+
+def _run_continuous_batch_loop(
+    client: socket.socket,
+    config: object,
+    engine: object,
+    vlm_engine_factory: Callable[[str], object] | None,
+) -> None:
+    """Run the shared text and VLM continuous batching loop."""
+
+    from .vlm_engine import VlmContinuousBatchScheduler
+
+    eof_sentinel = object()
+    command_queue: queue.Queue[bytes | object] = queue.Queue()
+    stop = threading.Event()
+    cancelled_request_ids: set[str] = set()
+    cancelled_request_ids_lock = threading.Lock()
+
+    def mark_cancelled_request(request_id: str) -> None:
+        with cancelled_request_ids_lock:
+            cancelled_request_ids.add(request_id)
+
+    def is_request_cancelled(request_id: str) -> bool:
+        with cancelled_request_ids_lock:
+            return request_id in cancelled_request_ids
+
+    def reader() -> None:
+        read_buffer = bytearray()
+        try:
+            while not stop.is_set():
+                raw_line = _read_command_line(client, read_buffer, block=True)
+                if raw_line is None:
+                    continue
+                if not raw_line:
+                    command_queue.put(eof_sentinel)
+                    return
+                try:
+                    command = decode_command(raw_line)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    command = None
+                if isinstance(command, CancelRequest):
+                    mark_cancelled_request(command.request_id)
+                command_queue.put(raw_line)
+        finally:
+            command_queue.put(eof_sentinel)
+
+    reader_thread = threading.Thread(
+        target=reader, name="mlx-worker-reader", daemon=True
+    )
+    reader_thread.start()
+
+    def emit_delta(request_id: str, delta: str) -> None:
+        client.sendall(
+            encode_event(ChatCompletionDelta(request_id=request_id, delta=delta))
+        )
+
+    def emit_response(response: ChatCompletionResponse) -> None:
+        client.sendall(encode_event(response))
+
+    def emit_error(request_id: str, code: str, message: str) -> None:
+        client.sendall(
+            encode_event(
+                WorkerCommandError(code=code, request_id=request_id, message=message)
+            )
+        )
+
+    text_scheduler = ContinuousBatchScheduler(
+        engine.batch_context(),  # type: ignore[attr-defined]
+        BatchEventSink(
+            emit_delta=emit_delta,
+            emit_response=emit_response,
+            emit_error=emit_error,
+        ),
+        prompt_concurrency=getattr(config, "prompt_concurrency", 4),
+        decode_concurrency=getattr(config, "decode_concurrency", 4),
+        prefill_step_size=getattr(config, "prefill_chunk_size", 256),
+    )
+    vlm_scheduler: VlmContinuousBatchScheduler | None = None
+    vlm_engine: object | None = None
+    tick_text_first = True
+
+    def ensure_vlm_scheduler() -> VlmContinuousBatchScheduler:
+        nonlocal vlm_scheduler, vlm_engine
+        if vlm_scheduler is not None:
+            return vlm_scheduler
+        if vlm_engine_factory is None:
+            raise RuntimeError(
+                "VLM continuous batching requested but no VLM factory is available"
+            )
+        vlm_model = getattr(config, "vlm_model", None)
+        if vlm_model is None:
+            raise RuntimeError(
+                "VLM continuous batching requested but no VLM model is configured"
+            )
+        if vlm_engine is None:
+            vlm_engine = vlm_engine_factory(vlm_model)
+            setattr(
+                vlm_engine,
+                "max_images_per_request",
+                getattr(config, "max_vlm_images", 5),
+            )
+        vlm_scheduler = VlmContinuousBatchScheduler(
+            vlm_engine,
+            BatchEventSink(
+                emit_delta=emit_delta,
+                emit_response=emit_response,
+                emit_error=emit_error,
+            ),
+            prompt_concurrency=getattr(config, "prompt_concurrency", 4),
+            decode_concurrency=getattr(config, "decode_concurrency", 4),
+            prefill_step_size=getattr(config, "prefill_chunk_size", 256),
+            request_cancelled=is_request_cancelled,
+        )
+        return vlm_scheduler
+
+    def tick_schedulers() -> None:
+        nonlocal tick_text_first
+        if tick_text_first:
+            text_scheduler.tick()
+            if vlm_scheduler is not None:
+                vlm_scheduler.tick()
+        else:
+            if vlm_scheduler is not None:
+                vlm_scheduler.tick()
+            text_scheduler.tick()
+        tick_text_first = not tick_text_first
+
+    try:
+        pending_stop = False
+        while not stop.is_set():
+            try:
+                timeout = (
+                    0.05
+                    if text_scheduler.idle()
+                    and (vlm_scheduler is None or vlm_scheduler.idle())
+                    else 0.0
+                )
+                raw_line = command_queue.get(timeout=timeout)
+            except queue.Empty:
+                raw_line = None
+
+            if raw_line is eof_sentinel:
+                pending_stop = True
+            elif raw_line is None:
+                pending_stop = pending_stop or not reader_thread.is_alive()
+            else:
+                try:
+                    command = decode_command(raw_line)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    emit_error("unknown", "INVALID_REQUEST", str(exc))
+                else:
+                    if command is None:
+                        emit_error(
+                            "unknown", "INVALID_REQUEST", "unsupported worker command"
+                        )
+                    elif isinstance(command, CancelRequest):
+                        handled = text_scheduler.cancel(command.request_id)
+                        if not handled and vlm_scheduler is not None:
+                            handled = vlm_scheduler.cancel(command.request_id)
+                    else:
+                        vlm_model = getattr(config, "vlm_model", None)
+                        if command.model == getattr(config, "model", None):
+                            if request_has_images(command):
+                                emit_error(
+                                    command.request_id,
+                                    "INVALID_REQUEST",
+                                    f"model '{config.model}' is a text-only model and does not support image content",
+                                )
+                            else:
+                                text_scheduler.submit(command, stream=command.stream)
+                        elif vlm_model is not None and command.model == vlm_model:
+                            ensure_vlm_scheduler().submit(
+                                command, stream=command.stream
+                            )
+                        else:
+                            emit_error(
+                                command.request_id,
+                                "INVALID_REQUEST",
+                                f"model '{command.model}' is not served by this worker (serves text='{config.model}'"
+                                + (f", vlm='{vlm_model}')" if vlm_model else ")"),
+                            )
+
+            tick_schedulers()
+            if (
+                pending_stop
+                and text_scheduler.idle()
+                and (vlm_scheduler is None or vlm_scheduler.idle())
+            ):
+                break
+    finally:
+        stop.set()
+        text_scheduler.close()
+        if vlm_scheduler is not None:
+            vlm_scheduler.close()
+        with suppress(OSError):
+            client.shutdown(socket.SHUT_RDWR)
 
 
 def _status(

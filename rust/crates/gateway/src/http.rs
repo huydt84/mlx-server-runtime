@@ -140,6 +140,7 @@ impl RequestAdmission {
         }
     }
 
+    #[cfg(test)]
     fn acquire(self: &Arc<Self>) -> Result<RequestPermit, HttpResponse> {
         match self.acquire_until(None)? {
             Some(permit) => Ok(permit),
@@ -577,7 +578,7 @@ fn model_ready_response(
 const MAX_IMAGE_URL_LENGTH: usize = 4096;
 
 /// Allowed hosts for loopback HTTP image URLs.
-const LOOPBACK_HTTP_HOSTS: &[&str] = &["localhost", "127.0.0.1"];
+const LOOPBACK_HTTP_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 #[cfg(test)]
 /// Validate all image URLs in a set of messages.
@@ -628,12 +629,16 @@ fn validate_image_source(url: &str) -> Result<(), String> {
         "https" => Ok(()),
         "http" => {
             let host_port = rest.split('/').next().unwrap_or("");
-            let host = host_port.split(':').next().unwrap_or(host_port);
+            let host = if let Some(stripped) = host_port.strip_prefix('[') {
+                stripped.split(']').next().unwrap_or(stripped)
+            } else {
+                host_port.split(':').next().unwrap_or(host_port)
+            };
             if LOOPBACK_HTTP_HOSTS.contains(&host) {
                 Ok(())
             } else {
                 Err(format!(
-                    "http image URLs must use localhost or 127.0.0.1, got '{}': {}",
+                    "http image URLs must use localhost, 127.0.0.1, or ::1, got '{}': {}",
                     host, url
                 ))
             }
@@ -765,8 +770,15 @@ fn handle_chat_completion(
     };
 
     let queue_started_at = Instant::now();
-    let _permit = match state.admission.acquire() {
-        Ok(permit) => permit,
+    let _permit = match state.admission.acquire_until(disconnected.as_deref()) {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            return HttpResponse {
+                status: "499 Client Closed Request".to_string(),
+                content_type: "application/json",
+                body: String::new(),
+            };
+        }
         Err(response) => {
             if response.status.starts_with("429") {
                 state.runtime.metrics.increment_queue_rejected_total();
@@ -1188,17 +1200,17 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     write!(writer, "data: {}\n\n", done_event)?;
     if emit_usage {
         let usage_event = json!({
-            "id": format!("chatcmpl-{}", response.request_id),
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [],
+        "id": format!("chatcmpl-{}", response.request_id),
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
             "usage": {
                 "prompt_tokens": response.prompt_tokens,
                 "completion_tokens": response.completion_tokens,
                 "total_tokens": response.prompt_tokens.saturating_add(response.completion_tokens),
                 "prompt_tokens_details": {
-                    "cached_tokens": 0,
+                "cached_tokens": response.cached_tokens.unwrap_or(0),
                 },
             },
         });
@@ -1651,6 +1663,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 12,
                 completion_tokens: 7,
+                ..Default::default()
             })),
         });
         let state = test_state(ModelState::Ready, service);
@@ -1913,6 +1926,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 10,
                 completion_tokens: 3,
+                ..Default::default()
             })),
         });
         let body = serde_json::to_vec(&json!({
@@ -2134,6 +2148,7 @@ mod tests {
                     finish_reason: "stop".to_string(),
                     prompt_tokens: 1,
                     completion_tokens: 1,
+                    ..Default::default()
                 }))
         }
 
@@ -2152,6 +2167,7 @@ mod tests {
                 finish_reason: response.finish_reason,
                 prompt_tokens: response.prompt_tokens,
                 completion_tokens: response.completion_tokens,
+                ..Default::default()
             })
         }
     }
@@ -2171,6 +2187,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                ..Default::default()
             })
         }
 
@@ -2188,6 +2205,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                ..Default::default()
             })
         }
     }
@@ -2207,6 +2225,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                ..Default::default()
             })
         }
 
@@ -2255,6 +2274,7 @@ mod tests {
                     finish_reason: "stop".to_string(),
                     prompt_tokens: 1,
                     completion_tokens: 1,
+                    ..Default::default()
                 })
             }
         }
@@ -2272,6 +2292,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                ..Default::default()
             })
         }
 
@@ -2516,6 +2537,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 15,
                 completion_tokens: 8,
+                ..Default::default()
             })),
         });
         let runtime = test_runtime(ModelState::Ready);
@@ -2668,6 +2690,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 5,
                 completion_tokens: 3,
+                ..Default::default()
             })),
         });
         let runtime = test_runtime(ModelState::Ready);
@@ -2778,6 +2801,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_image_urls_accepts_ipv6_loopback_http_scheme() {
+        let result = validate_image_urls(&[ChatMessage {
+            role: MessageRole::User,
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "http://[::1]:8000/img.jpg".to_string(),
+                    detail: None,
+                },
+            }]),
+        }]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn validate_image_urls_rejects_remote_http_scheme() {
         let result = validate_image_urls(&[ChatMessage {
             role: MessageRole::User,
@@ -2790,7 +2827,7 @@ mod tests {
         }]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("localhost or 127.0.0.1"));
+        assert!(err.contains("localhost, 127.0.0.1, or ::1"));
     }
 
     #[test]
@@ -2940,6 +2977,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 10,
                 completion_tokens: 3,
+                ..Default::default()
             })),
         });
         let runtime = test_runtime(ModelState::Ready);
@@ -3318,6 +3356,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 20,
                 completion_tokens: 5,
+                ..Default::default()
             })),
         });
         let state = AppState {
@@ -3491,6 +3530,7 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 3,
                 completion_tokens: 4,
+                ..Default::default()
             })),
         });
         let state = AppState {
@@ -3548,6 +3588,7 @@ mod tests {
                 finish_reason: "cancelled".to_string(),
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                ..Default::default()
             })
         }
 
@@ -3565,6 +3606,7 @@ mod tests {
                 finish_reason: "cancelled".to_string(),
                 prompt_tokens: 5,
                 completion_tokens: 1,
+                ..Default::default()
             })
         }
     }

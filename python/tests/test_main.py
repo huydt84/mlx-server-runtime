@@ -379,6 +379,66 @@ def test_main_preserves_stream_when_buffered_frame_is_malformed(monkeypatch) -> 
     assert events[2].code == "INVALID_REQUEST"
 
 
+def test_main_continuous_batching_validates_text_and_vlm_backends(
+    monkeypatch,
+) -> None:
+    from mlx_worker import main as worker_main
+    import mlx_worker.vlm_engine as vlm_mod
+
+    validations: list[str] = []
+
+    monkeypatch.setattr(
+        worker_main,
+        "validate_continuous_batching_backend",
+        lambda: validations.append("text"),
+    )
+    monkeypatch.setattr(
+        vlm_mod,
+        "validate_vlm_continuous_batching_backend",
+        lambda: validations.append("vlm"),
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(b""))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+            continuous_batching=True,
+        ),
+    )
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def batch_context(self):
+            return SimpleNamespace()
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert validations == ["text", "vlm"]
+
+
 def test_main_routes_vlm_request_to_vlm_engine(monkeypatch) -> None:
     """Requests with image content are routed to the VLM engine."""
     from mlx_worker import main as worker_main
@@ -537,6 +597,175 @@ def test_main_routes_text_request_to_text_engine_when_vlm_available(
     assert exit_code == 0
     assert text_seen == ["text-1"]
     assert vlm_seen == []
+
+
+def test_main_routes_text_and_vlm_requests_through_continuous_batch_loop(
+    monkeypatch,
+) -> None:
+    from mlx_worker import main as worker_main
+    import mlx_worker.vlm_engine as vlm_mod
+
+    class FakeTextScheduler:
+        instances: list["FakeTextScheduler"] = []
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.submitted: list[str] = []
+            self.pending: list[tuple[object, bool]] = []
+            self.closed = False
+            FakeTextScheduler.instances.append(self)
+
+        def submit(self, request, stream):
+            self.submitted.append(request.request_id)
+            self.pending.append((request, stream))
+            return True
+
+        def cancel(self, request_id: str) -> bool:
+            return False
+
+        def tick(self) -> None:
+            if not self.pending:
+                return
+            request, stream = self.pending.pop(0)
+            if stream:
+                self_sink.emit_delta(request.request_id, "text-delta")
+            self_sink.emit_response(
+                ChatCompletionResponse(
+                    request_id=request.request_id,
+                    model=request.model,
+                    text=f"text-{request.request_id}",
+                    finish_reason="stop",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                )
+            )
+
+        def idle(self) -> bool:
+            return not self.pending
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeVlmScheduler:
+        instances: list["FakeVlmScheduler"] = []
+
+        def __init__(self, engine, sink, **kwargs) -> None:
+            self.engine = engine
+            self.sink = sink
+            self.submitted: list[str] = []
+            self.pending: list[tuple[object, bool]] = []
+            self.closed = False
+            FakeVlmScheduler.instances.append(self)
+
+        def submit(self, request, stream):
+            self.submitted.append(request.request_id)
+            self.pending.append((request, stream))
+            return True
+
+        def cancel(self, request_id: str) -> bool:
+            return False
+
+        def tick(self) -> None:
+            if not self.pending:
+                return
+            request, stream = self.pending.pop(0)
+            if stream:
+                self_sink.emit_delta(request.request_id, "vlm-delta")
+            self_sink.emit_response(
+                ChatCompletionResponse(
+                    request_id=request.request_id,
+                    model=request.model,
+                    text=f"vlm-{request.request_id}",
+                    finish_reason="stop",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                )
+            )
+
+        def idle(self) -> bool:
+            return not self.pending
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def batch_context(self):
+            return SimpleNamespace()
+
+    class FakeVlmEngine:
+        def __init__(self, model_id: str) -> None:
+            self.model_id = model_id
+            self.max_images_per_request = None
+
+        def warmup(self):
+            return SimpleNamespace()
+
+    text_request = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"text-1","model":"text-model"'
+        b',"messages":[{"role":"user","content":"hello"}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":true}}\n'
+    )
+    vlm_request = (
+        b'{"type":"chat_completion"'
+        b',"request":{"request_id":"vlm-1","model":"vlm-model"'
+        b',"messages":[{"role":"user","content":[{"type":"text","text":"what"},{"type":"image_url","image_url":{"url":"benchmarks/images/fruits.png","detail":"auto"}}]}]'
+        b',"max_tokens":16,"temperature":0.0,"top_p":1.0'
+        b',"max_prompt_tokens":32,"max_completion_tokens":32,"max_total_tokens_per_request":64,"stream":false}}\n'
+    )
+
+    fake_socket = FakeSocket(io.BytesIO(text_request + vlm_request))
+    self_sink = SimpleNamespace()
+    sink_events: list[tuple[str, str, str]] = []
+    self_sink.emit_delta = lambda request_id, delta: sink_events.append(
+        ("delta", request_id, delta)
+    )
+    self_sink.emit_response = lambda response: sink_events.append(
+        ("response", response.request_id, response.text)
+    )
+    self_sink.emit_error = lambda request_id, code, message: sink_events.append(
+        ("error", request_id, f"{code}:{message}")
+    )
+
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            vlm_model="vlm-model",
+            continuous_batching=True,
+            max_vlm_images=5,
+        ),
+    )
+    monkeypatch.setattr(worker_main, "ContinuousBatchScheduler", FakeTextScheduler)
+    monkeypatch.setattr(vlm_mod, "VlmContinuousBatchScheduler", FakeVlmScheduler)
+    monkeypatch.setattr(
+        worker_main, "validate_continuous_batching_backend", lambda: None
+    )
+    monkeypatch.setattr(
+        vlm_mod, "validate_vlm_continuous_batching_backend", lambda: None
+    )
+
+    exit_code = worker_main.main(
+        engine_factory=FakeTextEngine,
+        vlm_engine_factory=FakeVlmEngine,
+    )
+
+    assert exit_code == 0
+    assert FakeTextScheduler.instances[0].submitted == ["text-1"]
+    assert FakeVlmScheduler.instances[0].submitted == ["vlm-1"]
+    assert any(event[0] == "delta" and event[1] == "text-1" for event in sink_events)
+    assert any(event[0] == "response" and event[1] == "vlm-1" for event in sink_events)
 
 
 def test_main_rejects_image_request_to_text_model(monkeypatch) -> None:

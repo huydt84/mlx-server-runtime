@@ -134,6 +134,12 @@ class ChatCompletionResponse:
     image_count: int | None = None
     image_preprocess_latency_ms: int | None = None
     prompt_template_latency_ms: int | None = None
+    prompt_cache_hit: bool | None = None
+    cached_tokens: int | None = None
+    prompt_cache_bytes: int | None = None
+    active_batch_cache_bytes: int | None = None
+    prompt_batch_size: int | None = None
+    decode_batch_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -349,6 +355,12 @@ def encode_event(
                 "finish_reason": event.finish_reason,
                 "prompt_tokens": event.prompt_tokens,
                 "completion_tokens": event.completion_tokens,
+                "prompt_cache_hit": event.prompt_cache_hit,
+                "cached_tokens": event.cached_tokens,
+                "prompt_cache_bytes": event.prompt_cache_bytes,
+                "active_batch_cache_bytes": event.active_batch_cache_bytes,
+                "prompt_batch_size": event.prompt_batch_size,
+                "decode_batch_size": event.decode_batch_size,
             },
             "image_count": event.image_count,
             "image_preprocess_latency_ms": event.image_preprocess_latency_ms,
@@ -395,6 +407,12 @@ def decode_event(
             finish_reason=response["finish_reason"],
             prompt_tokens=response["prompt_tokens"],
             completion_tokens=response["completion_tokens"],
+            prompt_cache_hit=response.get("prompt_cache_hit"),
+            cached_tokens=response.get("cached_tokens"),
+            prompt_cache_bytes=response.get("prompt_cache_bytes"),
+            active_batch_cache_bytes=response.get("active_batch_cache_bytes"),
+            prompt_batch_size=response.get("prompt_batch_size"),
+            decode_batch_size=response.get("decode_batch_size"),
             image_count=payload.get("image_count"),
             image_preprocess_latency_ms=payload.get("image_preprocess_latency_ms"),
             prompt_template_latency_ms=payload.get("prompt_template_latency_ms"),

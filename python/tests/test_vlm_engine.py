@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import field
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
+import threading
 
 import pytest
 
@@ -14,11 +16,25 @@ from mlx_worker.ipc import (
     ImageContent,
     TextContent,
 )
+from mlx_worker.batching import PromptCacheStore
 from mlx_worker.vlm_engine import (
     MlxVlmEngine,
+    VlmContinuousBatchScheduler,
     _MAX_IMAGES_PER_REQUEST,
     _validate_image_source,
+    validate_vlm_continuous_batching_backend,
 )  # fmt: skip
+
+
+@pytest.fixture(autouse=True)
+def _stub_vlm_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep mocked VLM engine tests independent from MLX/Metal imports."""
+
+    monkeypatch.setattr(
+        MlxVlmEngine,
+        "_load_vlm_config",
+        lambda self: None,
+    )
 
 
 class FakeProcessor:
@@ -45,6 +61,22 @@ class FakeProcessor:
 class FakeTokenizer:
     has_chat_template: bool = False
     eos_token_ids: list[int] = field(default_factory=lambda: [0])
+    pad_token: str | None = None
+    eos_token: str = "<eos>"
+    pad_token_id: int = 0
+    eos_token_id: int = 0
+
+    def __call__(
+        self,
+        prompts: str,
+        *,
+        add_special_tokens: bool = False,
+        padding: bool = True,
+        padding_side: str = "left",
+        return_tensors: str = "mlx",
+    ) -> SimpleNamespace:
+        tokens = self.encode(prompts, add_special_tokens=add_special_tokens)
+        return SimpleNamespace(input_ids=[tokens], attention_mask=[[1] * len(tokens)])
 
     def encode(self, prompt: str, add_special_tokens: bool = False) -> list[int]:
         return [ord(char) for char in prompt]
@@ -74,6 +106,119 @@ class FakeGenerationResult:
         self.peak_memory = 1.0
         self.cached_tokens = 0
         self.finish_reason: str | None = finish_reason
+
+
+class FakeEmbeddingOutput:
+    def __init__(self, inputs_embeds: list[list[float]]) -> None:
+        self.inputs_embeds = inputs_embeds
+
+    def to_dict(self) -> dict[str, object]:
+        return {"inputs_embeds": self.inputs_embeds}
+
+
+class FakeVlmBatchGenerator:
+    instances: list["FakeVlmBatchGenerator"] = []
+
+    def __init__(
+        self,
+        model,
+        processor,
+        *,
+        sampler=None,
+        completion_batch_size=None,
+        prefill_batch_size=None,
+        prefill_step_size=None,
+        apc_manager=None,
+        **kwargs,
+    ) -> None:
+        self.model = model
+        self.processor = processor
+        self.sampler = sampler
+        self.completion_batch_size = completion_batch_size
+        self.prefill_batch_size = prefill_batch_size
+        self.prefill_step_size = prefill_step_size
+        self.apc_manager = apc_manager
+        self.kwargs = kwargs
+        self.insert_calls: list[dict[str, object]] = []
+        self.closed = False
+        self._step = 0
+        self.prompt_cache_nbytes = 0
+        FakeVlmBatchGenerator.instances.append(self)
+
+    def insert(self, prompts, *, max_tokens, prompt_kwargs=None) -> list[int]:
+        self.insert_calls.append(
+            {
+                "prompts": prompts,
+                "max_tokens": max_tokens,
+                "prompt_kwargs": prompt_kwargs,
+            }
+        )
+        return [101 + index for index in range(len(prompts))]
+
+    def next(self):
+        if self._step == 0:
+            self._step += 1
+            return (
+                [],
+                [
+                    SimpleNamespace(
+                        uid=101,
+                        token=11,
+                        text="V",
+                        finish_reason=None,
+                        prompt_cache=None,
+                    )
+                ],
+            )
+        if self._step == 1:
+            self._step += 1
+            return (
+                [],
+                [
+                    SimpleNamespace(
+                        uid=101,
+                        token=12,
+                        text="LM",
+                        finish_reason="stop",
+                        prompt_cache=["cache-a"],
+                        prompt_tokens=8,
+                        generation_tokens=2,
+                        all_tokens=[1, 11, 12],
+                    ),
+                    SimpleNamespace(
+                        uid=102,
+                        token=21,
+                        text="joined",
+                        finish_reason="stop",
+                        prompt_cache=["cache-b"],
+                        prompt_tokens=9,
+                        generation_tokens=1,
+                        all_tokens=[2, 21],
+                    ),
+                ],
+            )
+        return ([], [])
+
+    def remove(self, uid) -> None:
+        self.removed_uid = uid
+
+    def stats(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _stats():
+            yield SimpleNamespace(
+                prompt_tokens=0,
+                prompt_tps=0.0,
+                generation_tokens=0,
+                generation_tps=0.0,
+                peak_memory=0.0,
+            )
+
+        return _stats()
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _fake_vlm_load(model_id: str) -> tuple[SimpleNamespace, FakeProcessor]:
@@ -238,6 +383,366 @@ def test_vlm_engine_stream_chat_with_image() -> None:
     assert response.finish_reason == "stop"
     assert response.prompt_tokens == 10
     assert response.completion_tokens == 3
+
+
+def test_vlm_engine_uses_direct_generation_functions() -> None:
+    """VLM requests use injected mlx-vlm functions, not the text batch engine."""
+
+    calls: list[str] = []
+
+    def generate(*args: object, **kwargs: object) -> FakeGenerationResult:
+        calls.append("generate")
+        return FakeGenerationResult(text="direct")
+
+    def stream_generate(*args: object, **kwargs: object):
+        calls.append("stream_generate")
+        yield FakeGenerationResult(text="direct", generation_tokens=1)
+
+    engine = MlxVlmEngine(
+        "vlm-model",
+        vlm_loader=_fake_vlm_load,
+        vlm_generate_fn=generate,
+        vlm_stream_generate_fn=stream_generate,
+    )
+
+    assert engine.complete_chat(_vlm_request()).text == "direct"
+    deltas: list[str] = []
+    assert engine.stream_chat(_vlm_request(), deltas.append).text == "direct"
+    assert calls == ["generate", "stream_generate"]
+    assert deltas == ["direct"]
+
+
+def test_vlm_continuous_batch_generator_contract_can_be_validated_at_startup(
+    monkeypatch,
+) -> None:
+    fake_generate = ModuleType("mlx_vlm.generate")
+    fake_generate.BatchGenerator = FakeVlmBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_vlm", ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate)
+
+    validate_vlm_continuous_batching_backend()
+
+
+def test_vlm_continuous_batch_scheduler_admits_join_while_decoding(
+    monkeypatch, tmp_path
+) -> None:
+    fake_generate = ModuleType("mlx_vlm.generate")
+    fake_generate.BatchGenerator = FakeVlmBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_vlm", ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate)
+
+    fake_sample_utils = ModuleType("mlx_lm.sample_utils")
+    fake_sample_utils.make_sampler = lambda temp, top_p: f"sampler-{temp}-{top_p}"
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", fake_sample_utils)
+
+    fake_vlm_utils = ModuleType("mlx_vlm.utils")
+    fake_vlm_utils.prepare_inputs = lambda processor, **kwargs: {
+        "input_ids": [[1, 2, 3]],
+        "attention_mask": [[1, 1, 1]],
+        **(
+            {"pixel_values": [[[0.0]]], "image_grid_thw": [[1, 1, 1]]}
+            if kwargs.get("images")
+            else {}
+        ),
+    }
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
+
+    FakeVlmBatchGenerator.instances.clear()
+
+    engine = MlxVlmEngine(
+        "vlm-model",
+        vlm_loader=lambda _model_id: (
+            SimpleNamespace(
+                language_model=SimpleNamespace(),
+                get_input_embeddings=lambda input_ids, pixel_values=None, mask=None, **kwargs: (
+                    FakeEmbeddingOutput([[0.0]])
+                ),
+            ),
+            FakeProcessor(),
+        ),
+        vlm_generate_fn=_fake_vlm_generate,
+        vlm_stream_generate_fn=_fake_vlm_stream_generate,
+    )
+    events: list[tuple[str, str, str]] = []
+    scheduler = VlmContinuousBatchScheduler(
+        engine,
+        sink=SimpleNamespace(
+            emit_delta=lambda request_id, delta: events.append(
+                ("delta", request_id, delta)
+            ),
+            emit_response=lambda response: events.append(
+                ("response", response.request_id, response.text)
+            ),
+            emit_error=lambda request_id, code, message: events.append(
+                ("error", request_id, f"{code}:{message}")
+            ),
+        ),
+        prompt_concurrency=2,
+        decode_concurrency=2,
+        prefill_step_size=64,
+    )
+
+    text_request = ChatCompletionRequest(
+        request_id="vlm-text",
+        model="vlm-model",
+        messages=[ChatMessage(role="user", content="hello")],
+        max_tokens=16,
+        temperature=0.0,
+        top_p=1.0,
+        max_prompt_tokens=32,
+        max_completion_tokens=32,
+        max_total_tokens_per_request=64,
+        stream=True,
+    )
+    image_path = tmp_path / "image.ppm"
+    image_path.write_text("P3\n1 1\n255\n255 0 0\n")
+    image_request = ChatCompletionRequest(
+        request_id="vlm-image",
+        model="vlm-model",
+        messages=[
+            ChatMessage(
+                role="user",
+                content=(
+                    TextContent(text="What is in the picture?"),
+                    ImageContent(url=str(image_path)),
+                ),
+            )
+        ],
+        max_tokens=16,
+        temperature=0.0,
+        top_p=1.0,
+        max_prompt_tokens=32,
+        max_completion_tokens=32,
+        max_total_tokens_per_request=64,
+        stream=False,
+    )
+
+    scheduler.submit(text_request, stream=True)
+    scheduler.tick()
+    assert FakeVlmBatchGenerator.instances[-1].insert_calls[0]["prompts"] != []
+    assert FakeVlmBatchGenerator.instances[-1].sampler == "sampler-0.0-1.0"
+
+    scheduler.submit(image_request, stream=False)
+    scheduler.tick()
+    scheduler.tick()
+
+    generator = FakeVlmBatchGenerator.instances[-1]
+    assert len(generator.insert_calls) == 2
+    assert "inputs_embeds" in generator.insert_calls[1]["prompt_kwargs"][0]
+    assert generator.insert_calls[1]["prompt_kwargs"][0]["inputs_embeds"]
+    assert any(event[0] == "delta" and event[1] == "vlm-text" for event in events)
+    assert any(event[0] == "response" and event[1] == "vlm-image" for event in events)
+
+
+def test_vlm_continuous_batch_scheduler_reuses_image_prompt_cache(
+    monkeypatch, tmp_path
+) -> None:
+    fake_generate = ModuleType("mlx_vlm.generate")
+    fake_generate.BatchGenerator = FakeVlmBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_vlm", ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate)
+
+    fake_sample_utils = ModuleType("mlx_lm.sample_utils")
+    fake_sample_utils.make_sampler = lambda temp, top_p: f"sampler-{temp}-{top_p}"
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", fake_sample_utils)
+
+    fake_vlm_utils = ModuleType("mlx_vlm.utils")
+    fake_vlm_utils.prepare_inputs = lambda processor, **kwargs: {
+        "input_ids": [[1, 2, 3]],
+        "attention_mask": [[1, 1, 1]],
+        **(
+            {"pixel_values": [[[0.0]]], "image_grid_thw": [[1, 1, 1]]}
+            if kwargs.get("images")
+            else {}
+        ),
+    }
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
+
+    FakeVlmBatchGenerator.instances.clear()
+
+    engine = MlxVlmEngine(
+        "vlm-model",
+        vlm_loader=lambda _model_id: (
+            SimpleNamespace(
+                language_model=SimpleNamespace(),
+                get_input_embeddings=lambda input_ids, pixel_values=None, mask=None, **kwargs: (
+                    FakeEmbeddingOutput([[0.0]])
+                ),
+            ),
+            FakeProcessor(),
+        ),
+        vlm_generate_fn=_fake_vlm_generate,
+        vlm_stream_generate_fn=_fake_vlm_stream_generate,
+    )
+    engine.initialize()
+    image_path = tmp_path / "image.ppm"
+    image_path.write_text("P3\n1 1\n255\n255 0 0\n")
+
+    request = ChatCompletionRequest(
+        request_id="vlm-cache",
+        model="vlm-model",
+        messages=[
+            ChatMessage(
+                role="user",
+                content=(
+                    TextContent(text="Describe the image."),
+                    ImageContent(url=str(image_path)),
+                ),
+            )
+        ],
+        max_tokens=16,
+        temperature=0.0,
+        top_p=1.0,
+        max_prompt_tokens=32,
+        max_completion_tokens=32,
+        max_total_tokens_per_request=64,
+        stream=False,
+    )
+
+    cache_store = PromptCacheStore(
+        trim_cache=lambda prompt_cache, num_tokens: list(prompt_cache)
+    )
+    scheduler = VlmContinuousBatchScheduler(
+        engine,
+        sink=SimpleNamespace(
+            emit_delta=lambda request_id, delta: None,
+            emit_response=lambda response: None,
+            emit_error=lambda request_id, code, message: None,
+        ),
+        prompt_concurrency=2,
+        decode_concurrency=2,
+        prefill_step_size=64,
+        prompt_cache_store=cache_store,
+    )
+
+    first_job = scheduler._prepare_request(request)
+    assert first_job.cached_prompt is None
+    assert "_apc_image_hash" in first_job.prompt_kwargs
+    cache_store.remember(
+        first_job.full_prompt_tokens,
+        ["cache-a"],
+        cache_key=first_job.prompt_cache_key,
+    )
+
+    second_job = scheduler._prepare_request(request)
+    assert second_job.cached_prompt == ["cache-a"]
+    assert second_job.cached_prefix_tokens
+    assert second_job.prompt_kwargs["prompt_cache"] == ["cache-a"]
+
+
+def test_vlm_continuous_batch_scheduler_cancels_during_preparation(
+    monkeypatch, tmp_path
+) -> None:
+    fake_generate = ModuleType("mlx_vlm.generate")
+    fake_generate.BatchGenerator = FakeVlmBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_vlm", ModuleType("mlx_vlm"))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate)
+
+    fake_sample_utils = ModuleType("mlx_lm.sample_utils")
+    fake_sample_utils.make_sampler = lambda temp, top_p: f"sampler-{temp}-{top_p}"
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils", fake_sample_utils)
+
+    prepare_started = threading.Event()
+    release_prepare = threading.Event()
+
+    def prepare_inputs(processor, **kwargs):
+        return {
+            "input_ids": [[1, 2, 3]],
+            "attention_mask": [[1, 1, 1]],
+            "pixel_values": [[[0.0]]],
+            "image_grid_thw": [[1, 1, 1]],
+        }
+
+    fake_vlm_utils = ModuleType("mlx_vlm.utils")
+    fake_vlm_utils.prepare_inputs = prepare_inputs
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
+
+    FakeVlmBatchGenerator.instances.clear()
+    cancelled_request_ids: set[str] = set()
+
+    def is_request_cancelled(request_id: str) -> bool:
+        return request_id in cancelled_request_ids
+
+    def blocking_get_input_embeddings(
+        input_ids, pixel_values=None, mask=None, **kwargs
+    ):
+        prepare_started.set()
+        assert release_prepare.wait(timeout=5)
+        return FakeEmbeddingOutput([[0.0]])
+
+    engine = MlxVlmEngine(
+        "vlm-model",
+        vlm_loader=lambda _model_id: (
+            SimpleNamespace(
+                language_model=SimpleNamespace(),
+                get_input_embeddings=blocking_get_input_embeddings,
+            ),
+            FakeProcessor(),
+        ),
+        vlm_generate_fn=_fake_vlm_generate,
+        vlm_stream_generate_fn=_fake_vlm_stream_generate,
+    )
+    events: list[tuple[str, str, str]] = []
+    scheduler = VlmContinuousBatchScheduler(
+        engine,
+        sink=SimpleNamespace(
+            emit_delta=lambda request_id, delta: events.append(
+                ("delta", request_id, delta)
+            ),
+            emit_response=lambda response: events.append(
+                ("response", response.request_id, response.finish_reason)
+            ),
+            emit_error=lambda request_id, code, message: events.append(
+                ("error", request_id, f"{code}:{message}")
+            ),
+        ),
+        prompt_concurrency=1,
+        decode_concurrency=1,
+        prefill_step_size=64,
+        request_cancelled=is_request_cancelled,
+    )
+
+    image_path = tmp_path / "image.ppm"
+    image_path.write_text("P3\n1 1\n255\n255 0 0\n")
+    request_id = "vlm-cancel-during-prepare"
+    scheduler.submit(
+        ChatCompletionRequest(
+            request_id=request_id,
+            model="vlm-model",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content=(
+                        TextContent(text="Describe the image."),
+                        ImageContent(url=str(image_path)),
+                    ),
+                )
+            ],
+            max_tokens=16,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=32,
+            max_completion_tokens=32,
+            max_total_tokens_per_request=64,
+            stream=False,
+        ),
+        stream=False,
+    )
+
+    tick_thread = threading.Thread(target=scheduler.tick)
+    tick_thread.start()
+    assert prepare_started.wait(timeout=5)
+    cancelled_request_ids.add(request_id)
+    release_prepare.set()
+    tick_thread.join(timeout=5)
+
+    assert not tick_thread.is_alive()
+    generator = FakeVlmBatchGenerator.instances[-1]
+    assert generator.insert_calls == []
+    assert ("response", request_id, "cancelled") in events
 
 
 def test_vlm_engine_stream_chat_cancelled_in_loop() -> None:
@@ -461,8 +966,6 @@ def test_vlm_engine_last_timings_after_vlm_request() -> None:
 
 def test_vlm_engine_forwards_image_count_to_prompt_template(monkeypatch) -> None:
     """VLM prompt template receives image count so image tokens are added."""
-    import mlx_vlm.prompt_utils as prompt_utils
-
     captured: dict[str, int] = {}
 
     def fake_apply_chat_template(
@@ -474,7 +977,13 @@ def test_vlm_engine_forwards_image_count_to_prompt_template(monkeypatch) -> None
     monkeypatch.setattr(
         MlxVlmEngine, "_load_vlm_config", lambda self: {"model_type": "qwen3_vl"}
     )
-    monkeypatch.setattr(prompt_utils, "apply_chat_template", fake_apply_chat_template)
+    fake_package = ModuleType("mlx_vlm")
+    fake_package.__path__ = []  # type: ignore[attr-defined]
+    fake_prompt_utils = ModuleType("mlx_vlm.prompt_utils")
+    fake_prompt_utils.apply_chat_template = fake_apply_chat_template
+    fake_prompt_utils.get_chat_template = lambda *args, **kwargs: "VLM prompt"
+    monkeypatch.setitem(sys.modules, "mlx_vlm", fake_package)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.prompt_utils", fake_prompt_utils)
 
     engine = MlxVlmEngine(
         "vlm-model",

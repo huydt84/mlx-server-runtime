@@ -231,6 +231,12 @@ class VlmIpcTests(unittest.TestCase):
             image_count=1,
             image_preprocess_latency_ms=8,
             prompt_template_latency_ms=4,
+            prompt_cache_hit=True,
+            cached_tokens=7,
+            prompt_cache_bytes=96,
+            active_batch_cache_bytes=128,
+            prompt_batch_size=2,
+            decode_batch_size=2,
         )
 
         encoded = encode_event(response)

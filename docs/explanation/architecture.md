@@ -59,6 +59,25 @@ The boundary is defined by responsibility, not performance.
 
 Rust never touches a tensor. Python never reads an HTTP header.
 
+## Backend-Specific Generation
+
+The Python worker has two distinct generation paths:
+
+| Backend | Upstream primitive | Scheduling behavior |
+|---------|--------------------|---------------------|
+| Text LLM | `mlx_lm.generate.BatchGenerator` | Continuous batching with persistent prompt/decode state |
+| VLM | `mlx_vlm.generate` or `mlx_vlm.stream_generate` | Single-request generation |
+
+For text LLMs, the runtime owns request admission, multiplexed IPC,
+cancellation, cache policy, API semantics, and compatibility validation.
+`mlx_lm.BatchGenerator` owns MLX-side prompt/decode batch transitions and model
+execution. The dependency is constrained to compatible `mlx-lm` versions and
+checked against the required API surface before the worker reports readiness.
+
+The VLM path does not use `mlx_lm.BatchGenerator`. With only a VLM model
+configured, both model families use the single-request dispatch loop.
+Mixed text+VLM serving does not use continuous batching.
+
 ## IPC Design
 
 The IPC uses a **Unix domain socket** with **newline-delimited JSON frames**.
@@ -136,13 +155,15 @@ Backpressure is implemented at the Rust admission layer, not at the worker.
 
 ### Why Sequential Worker Dispatch?
 
-The current implementation holds a mutex (`request_lock`) in `WorkerClient` that serializes requests to the Python worker. This is intentional for Phase 1:
+The current implementation holds a mutex (`request_lock`) in `WorkerClient` that serializes requests to the Python worker. This is intentional:
 
 1. It simplifies the Python worker — it never needs to handle concurrent IPC reads.
 2. It makes backpressure predictable — the queue is fully visible in Rust.
-3. The worker can still batch internally via `BatchGenerator` even though it receives requests one at a time.
+3. With serialized dispatch, the worker receives one request at a time. The
+   text-only worker loop instead multiplexes requests into a persistent
+   `mlx_lm.BatchGenerator` when no VLM backend is active.
 
-Future phases can move to concurrent IPC dispatch when the worker supports it natively.
+Future iterations can move to concurrent IPC dispatch when the worker supports it natively.
 
 ## Cancellation Semantics
 
@@ -166,7 +187,7 @@ Rust owns the Python worker's lifecycle:
 - **Model loading failure:** If the worker sends `ERROR` or fails to send `READY` within the timeout, Rust kills the process and returns 503 for all requests.
 - **Shutdown:** On `SIGTERM`/`SIGINT`, Rust kills the worker, waits for exit, and cleans up the socket file.
 
-Worker restart is reserved for future phases.
+Worker restart is reserved for future iterations.
 
 ## Telemetry Design
 
@@ -228,7 +249,7 @@ The runtime does not bundle a log collector. Pipe stderr to your preferred colle
 The architecture is designed to evolve without rewrites:
 
 - **Concurrent worker dispatch:** Replace `request_lock` with a concurrent IPC channel when the worker supports it.
-- **Dedicated prefill/decode:** Split the generation step into prefill and decode phases for better scheduling.
+- **Dedicated prefill/decode:** Split the generation step into prefill and decode for better scheduling.
 - **Multiple workers:** Run one Python process per model for multi-model serving.
 - **Rust tokenizer:** Optionally move tokenization to Rust for prompt length estimation before IPC.
 - **Persistent KV cache:** Keep KV cache across requests for session-based applications.

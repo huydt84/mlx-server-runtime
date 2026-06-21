@@ -50,6 +50,21 @@ pub struct ChatCompletionHttpResponse {
     pub choices: Vec<ChatCompletionChoice>,
     /// Token usage stats.
     pub usage: Usage,
+    /// Whether prompt cache reused prompt tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_hit: Option<bool>,
+    /// Cached prompt token count reused for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Prompt cache bytes referenced by this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_bytes: Option<u64>,
+    /// Prompt batch size observed for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_batch_size: Option<u32>,
+    /// Decode batch size observed for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_batch_size: Option<u32>,
 }
 
 /// A single response choice.
@@ -81,6 +96,16 @@ pub struct Usage {
     pub completion_tokens: u32,
     /// Total tokens.
     pub total_tokens: u32,
+    /// Optional prompt-cache token details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokenDetails>,
+}
+
+/// Prompt token usage details.
+#[derive(Debug, Serialize)]
+pub struct PromptTokenDetails {
+    /// Cached prompt token count reused for this request.
+    pub cached_tokens: u32,
 }
 
 impl ChatCompletionHttpRequest {
@@ -166,7 +191,15 @@ impl From<ChatCompletionResponse> for ChatCompletionHttpResponse {
                 prompt_tokens: value.prompt_tokens,
                 completion_tokens: value.completion_tokens,
                 total_tokens,
+                prompt_tokens_details: Some(PromptTokenDetails {
+                    cached_tokens: value.cached_tokens.unwrap_or(0),
+                }),
             },
+            prompt_cache_hit: value.prompt_cache_hit,
+            cached_tokens: value.cached_tokens,
+            prompt_cache_bytes: value.prompt_cache_bytes,
+            prompt_batch_size: value.prompt_batch_size,
+            decode_batch_size: value.decode_batch_size,
         }
     }
 }

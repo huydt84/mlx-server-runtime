@@ -6,9 +6,12 @@ from types import ModuleType, SimpleNamespace
 import sys
 
 from mlx_worker.batching import (
+    BatchEventSink,
     BatchBackendContext,
+    ContinuousBatchScheduler,
     MlxBatchCompletionBackend,
     PromptCacheStore,
+    validate_continuous_batching_backend,
 )
 from mlx_worker.engine import MlxWorkerEngine
 from mlx_worker.ipc import ChatCompletionRequest, ChatMessage, ChatCompletionResponse
@@ -38,12 +41,15 @@ class FakeBatchGenerator:
         self._uids: list[int] = []
         FakeBatchGenerator.instances.append(self)
 
-    def insert(self, prompts, *, max_tokens, caches=None, samplers=None):
+    def insert(
+        self, prompts, *, max_tokens, caches=None, all_tokens=None, samplers=None
+    ):
         self.insert_calls.append(
             {
                 "prompts": prompts,
                 "max_tokens": max_tokens,
                 "caches": caches,
+                "all_tokens": all_tokens,
                 "samplers": samplers,
             }
         )
@@ -74,13 +80,15 @@ class FakeBatchGenerator:
                     uid=7,
                     token=22,
                     finish_reason="length",
-                    prompt_cache=["cache-b"],
+                    prompt_cache=["cache-b"] * 4,
+                    all_tokens=[9, 9, 21, 22],
                 ),
                 SimpleNamespace(
                     uid=42,
                     token=12,
                     finish_reason="stop",
-                    prompt_cache=["cache-a"],
+                    prompt_cache=["cache-a"] * 5,
+                    all_tokens=[1, 2, 3, 11, 12],
                 ),
             ]
         return []
@@ -99,19 +107,93 @@ class FakeBatchGenerator:
         self.closed = True
 
 
+def _install_fake_cache_module(monkeypatch) -> None:
+    fake_models = ModuleType("mlx_lm.models")
+    fake_cache = ModuleType("mlx_lm.models.cache")
+    fake_cache.trim_prompt_cache = lambda prompt_cache, num_tokens: None
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", fake_models)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", fake_cache)
+
+
+def test_continuous_batching_contract_can_be_validated_at_startup(
+    monkeypatch,
+) -> None:
+    class CompatibleBatchGenerator:
+        def __init__(
+            self,
+            model,
+            *,
+            completion_batch_size=None,
+            prefill_batch_size=None,
+            prefill_step_size=None,
+        ) -> None:
+            pass
+
+        def insert(
+            self, prompts, *, max_tokens, caches=None, all_tokens=None, samplers=None
+        ):
+            return []
+
+        def next_generated(self):
+            return []
+
+        def remove(self, uids) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    fake_generate = ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = CompatibleBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+
+    validate_continuous_batching_backend()
+
+
 def test_prompt_cache_store_returns_longest_prefix() -> None:
     store = PromptCacheStore()
-    store.remember([1, 2], ["cache-a"])
-    store.remember([1, 2, 3], ["cache-b"])
+    store.remember([1, 2], ["layer-a"])
+    store.remember([1, 2, 3], ["layer-b-0", "layer-b-1"])
 
     cached = store.lookup([1, 2, 3, 4])
 
     assert cached is not None
     assert cached.tokens == (1, 2, 3)
-    assert cached.prompt_cache == ["cache-b"]
+    assert cached.prompt_cache == ["layer-b-0", "layer-b-1"]
+
+
+def test_prompt_cache_store_trims_longer_cached_prefix() -> None:
+    store = PromptCacheStore(
+        trim_cache=lambda cache, count: [value[:-count] for value in cache]
+    )
+    store.remember([1, 2, 3, 4], ["abcd", "wxyz"])
+
+    cached = store.lookup([1, 2, 9])
+
+    assert cached is not None
+    assert cached.tokens == (1, 2)
+    assert cached.prompt_cache == ["ab", "wx"]
+
+
+def test_prompt_cache_store_uses_cache_namespace() -> None:
+    store = PromptCacheStore()
+    store.remember([1, 2, 3], ["image-cache"], cache_key=["image-a"])
+    store.remember([1, 2, 3], ["text-cache"], cache_key=[])
+
+    image_cached = store.lookup([1, 2, 3, 4], cache_key=["image-a"])
+    text_cached = store.lookup([1, 2, 3, 4], cache_key=[])
+    miss = store.lookup([1, 2, 3, 4], cache_key=["image-b"])
+
+    assert image_cached is not None
+    assert image_cached.prompt_cache == ["image-cache"]
+    assert text_cached is not None
+    assert text_cached.prompt_cache == ["text-cache"]
+    assert miss is None
 
 
 def test_batch_backend_batches_requests_and_reuses_prompt_cache(monkeypatch) -> None:
+    _install_fake_cache_module(monkeypatch)
     fake_generate = ModuleType("mlx_lm.generate")
     fake_generate.BatchGenerator = FakeBatchGenerator
     monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
@@ -119,7 +201,7 @@ def test_batch_backend_batches_requests_and_reuses_prompt_cache(monkeypatch) -> 
     FakeBatchGenerator.instances.clear()
 
     prompt_cache_store = PromptCacheStore()
-    prompt_cache_store.remember([1, 2], ["cached-prefix"])
+    prompt_cache_store.remember([1, 2], ["cached-prefix", "cached-prefix"])
     context = BatchBackendContext(
         model_id="test-model",
         model=SimpleNamespace(),
@@ -166,7 +248,8 @@ def test_batch_backend_batches_requests_and_reuses_prompt_cache(monkeypatch) -> 
         {
             "prompts": [[3], [9, 9]],
             "max_tokens": [2, 2],
-            "caches": [["cached-prefix"], None],
+            "caches": [["cached-prefix", "cached-prefix"], None],
+            "all_tokens": [[1, 2], []],
             "samplers": ["sampler-0.0-1.0", "sampler-0.2-0.8"],
         }
     ]
@@ -178,7 +261,7 @@ def test_batch_backend_batches_requests_and_reuses_prompt_cache(monkeypatch) -> 
     assert responses[1].text == "<21><22>"
     assert responses[1].finish_reason == "length"
     assert responses[1].completion_tokens == 2
-    assert prompt_cache_store.lookup([1, 2, 3, 4]) is not None
+    assert prompt_cache_store.lookup([1, 2, 3, 11, 12, 13]) is not None
 
 
 def test_engine_complete_chat_uses_batch_backend() -> None:
@@ -231,7 +314,9 @@ def test_batch_backend_raises_on_stalled_generator(monkeypatch) -> None:
         def __init__(self, model, stop_tokens=None) -> None:
             pass
 
-        def insert(self, prompts, *, max_tokens, caches=None, samplers=None):
+        def insert(
+            self, prompts, *, max_tokens, caches=None, all_tokens=None, samplers=None
+        ):
             return [10 + index for index in range(len(prompts))]
 
         def next_generated(self):
@@ -293,7 +378,9 @@ def test_batch_backend_recovers_from_transient_empty_polls(monkeypatch) -> None:
         def __init__(self, model, stop_tokens=None) -> None:
             pass
 
-        def insert(self, prompts, *, max_tokens, caches=None, samplers=None):
+        def insert(
+            self, prompts, *, max_tokens, caches=None, all_tokens=None, samplers=None
+        ):
             self._uid_offset = 10
             return [self._uid_offset + index for index in range(len(prompts))]
 
@@ -361,7 +448,9 @@ def test_batch_backend_raises_on_uid_count_mismatch(monkeypatch) -> None:
         def __init__(self, model, stop_tokens=None) -> None:
             pass
 
-        def insert(self, prompts, *, max_tokens, caches=None, samplers=None):
+        def insert(
+            self, prompts, *, max_tokens, caches=None, all_tokens=None, samplers=None
+        ):
             return [1, 2]
 
         def next_generated(self):
@@ -422,7 +511,9 @@ def test_batch_backend_raises_on_duplicate_uids(monkeypatch) -> None:
         def __init__(self, model, stop_tokens=None) -> None:
             pass
 
-        def insert(self, prompts, *, max_tokens, caches=None, samplers=None):
+        def insert(
+            self, prompts, *, max_tokens, caches=None, all_tokens=None, samplers=None
+        ):
             return [42, 42]
 
         def next_generated(self):
@@ -489,3 +580,182 @@ def test_batch_backend_raises_on_duplicate_uids(monkeypatch) -> None:
                 ),
             ]
         )
+
+
+def test_continuous_scheduler_admits_new_request_while_decoding(monkeypatch) -> None:
+    _install_fake_cache_module(monkeypatch)
+    generators: list[object] = []
+
+    class FakeContinuousBatchGenerator:
+        def __init__(
+            self,
+            model,
+            stop_tokens=None,
+            completion_batch_size=None,
+            prefill_batch_size=None,
+            prefill_step_size=None,
+        ) -> None:
+            self.insert_calls: list[dict[str, object]] = []
+            self.config = (
+                completion_batch_size,
+                prefill_batch_size,
+                prefill_step_size,
+            )
+            self._next_uid = 101
+            self._step = 0
+            self.removed: list[list[int]] = []
+            self.prompt_cache_nbytes = 0
+            generators.append(self)
+
+        def insert(
+            self, prompts, *, max_tokens, caches=None, all_tokens=None, samplers=None
+        ):
+            uids = [self._next_uid + index for index in range(len(prompts))]
+            self._next_uid += len(prompts)
+            self.insert_calls.append(
+                {
+                    "prompts": prompts,
+                    "max_tokens": max_tokens,
+                    "caches": caches,
+                    "all_tokens": all_tokens,
+                    "samplers": samplers,
+                    "uids": uids,
+                }
+            )
+            return uids
+
+        def next_generated(self):
+            if self._step == 0:
+                self._step += 1
+                return [
+                    SimpleNamespace(
+                        uid=101,
+                        token=11,
+                        finish_reason=None,
+                        prompt_cache=None,
+                    )
+                ]
+            if self._step == 1:
+                self._step += 1
+                return [
+                    SimpleNamespace(
+                        uid=101,
+                        token=12,
+                        finish_reason="stop",
+                        prompt_cache=["layer-cache-1"],
+                        all_tokens=[1, 11, 12],
+                    ),
+                    SimpleNamespace(
+                        uid=102,
+                        token=21,
+                        finish_reason="stop",
+                        prompt_cache=["layer-cache-2"],
+                        all_tokens=[2, 21],
+                    ),
+                ]
+            return []
+
+        def close(self) -> None:
+            return None
+
+        def remove(self, uids) -> None:
+            self.removed.append(uids)
+
+    fake_generate = ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = FakeContinuousBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+
+    events: list[tuple[str, str, str]] = []
+
+    sink = BatchEventSink(
+        emit_delta=lambda request_id, delta: events.append(
+            ("delta", request_id, delta)
+        ),
+        emit_response=lambda response: events.append(
+            ("response", response.request_id, response.text)
+        ),
+        emit_error=lambda request_id, code, message: events.append(
+            ("error", request_id, f"{code}:{message}")
+        ),
+    )
+
+    prompt_cache_store = PromptCacheStore()
+    scheduler = ContinuousBatchScheduler(
+        BatchBackendContext(
+            model_id="test-model",
+            model=SimpleNamespace(),
+            tokenizer=FakeTokenizer(),
+            prompt_cache_store=prompt_cache_store,
+            build_prompt_tokens=lambda request: (
+                [1] if request.request_id == "req-1" else [2]
+            ),
+            validate_token_limits=lambda request, tokens: None,
+            make_sampler=lambda temp, top_p: f"sampler-{temp}-{top_p}",
+        ),
+        sink,
+        prompt_concurrency=2,
+        decode_concurrency=2,
+        prefill_step_size=64,
+    )
+
+    scheduler.submit(
+        ChatCompletionRequest(
+            request_id="req-1",
+            model="test-model",
+            messages=[ChatMessage(role="user", content="hello")],
+            max_tokens=2,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=32,
+            max_completion_tokens=32,
+            max_total_tokens_per_request=64,
+        ),
+        stream=True,
+    )
+    scheduler.tick()
+    generator = generators[0]
+    assert generator.config == (2, 2, 64)
+    assert generator.insert_calls[0]["all_tokens"] == [[]]
+
+    scheduler.submit(
+        ChatCompletionRequest(
+            request_id="req-2",
+            model="test-model",
+            messages=[ChatMessage(role="user", content="again")],
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=32,
+            max_completion_tokens=32,
+            max_total_tokens_per_request=64,
+        ),
+        stream=False,
+    )
+    scheduler.tick()
+    scheduler.tick()
+
+    assert generator.insert_calls[1]["all_tokens"] == [[]]
+    assert prompt_cache_store.total_bytes > 0
+
+    scheduler.submit(
+        ChatCompletionRequest(
+            request_id="req-3",
+            model="test-model",
+            messages=[ChatMessage(role="user", content="cancel")],
+            max_tokens=8,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=32,
+            max_completion_tokens=32,
+            max_total_tokens_per_request=64,
+        ),
+        stream=True,
+    )
+    scheduler.tick()
+    scheduler.cancel("req-3")
+
+    assert ("delta", "req-1", "<11>") in events
+    assert any(event[0] == "response" and event[1] == "req-1" for event in events)
+    assert any(event[0] == "response" and event[1] == "req-2" for event in events)
+    assert generator.removed == [[103]]

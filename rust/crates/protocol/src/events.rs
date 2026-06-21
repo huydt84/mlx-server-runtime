@@ -77,6 +77,18 @@ pub enum WorkerEvent {
         image_preprocess_latency_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_template_latency_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_hit: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_tokens: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_batch_cache_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_batch_size: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decode_batch_size: Option<u32>,
     },
     /// A worker-side request failure.
     Error {
@@ -193,10 +205,22 @@ mod tests {
                 finish_reason: "stop".to_string(),
                 prompt_tokens: 12,
                 completion_tokens: 3,
+                prompt_cache_hit: Some(true),
+                cached_tokens: Some(8),
+                prompt_cache_bytes: Some(128),
+                active_batch_cache_bytes: Some(256),
+                prompt_batch_size: Some(2),
+                decode_batch_size: Some(2),
             },
             image_count: Some(1),
             image_preprocess_latency_ms: Some(8),
             prompt_template_latency_ms: Some(4),
+            prompt_cache_hit: Some(true),
+            cached_tokens: Some(8),
+            prompt_cache_bytes: Some(128),
+            active_batch_cache_bytes: Some(256),
+            prompt_batch_size: Some(2),
+            decode_batch_size: Some(2),
         };
 
         let encoded = encode_worker_event(&event).unwrap();
