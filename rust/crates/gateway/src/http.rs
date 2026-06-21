@@ -973,6 +973,11 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         );
     }
 
+    let emit_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage);
+
     let worker_request = match request.into_worker_request(
         &state.generation,
         &state.limits,
@@ -1181,6 +1186,24 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         }],
     });
     write!(writer, "data: {}\n\n", done_event)?;
+    if emit_usage {
+        let usage_event = json!({
+            "id": format!("chatcmpl-{}", response.request_id),
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": response.prompt_tokens,
+                "completion_tokens": response.completion_tokens,
+                "total_tokens": response.prompt_tokens.saturating_add(response.completion_tokens),
+                "prompt_tokens_details": {
+                    "cached_tokens": 0,
+                },
+            },
+        });
+        write!(writer, "data: {}\n\n", usage_event)?;
+    }
     write!(writer, "data: [DONE]\n\n")?;
     writer.flush()?;
     Ok(())
@@ -1955,6 +1978,31 @@ mod tests {
             "expected at least 3 occurrences of consistent model field, got {}",
             model_count
         );
+    }
+
+    #[test]
+    fn streaming_chat_completion_emits_usage_chunk_when_requested() {
+        let service = Arc::new(StreamingService);
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+        let state = test_state(ModelState::Ready, service);
+        let mut buffer = Cursor::new(Vec::new());
+
+        stream_chat_completion_with_disconnect(&mut buffer, &body, &state, None).unwrap();
+
+        let body = String::from_utf8(buffer.into_inner()).unwrap();
+        assert!(body.contains("\"choices\":[]"));
+        assert!(body.contains("\"usage\":{"));
+        assert!(body.contains("\"prompt_tokens\":1"));
+        assert!(body.contains("\"completion_tokens\":1"));
     }
 
     #[test]

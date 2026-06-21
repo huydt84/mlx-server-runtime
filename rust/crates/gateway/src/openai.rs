@@ -24,6 +24,15 @@ pub struct ChatCompletionHttpRequest {
     pub top_p: Option<f32>,
     /// Whether the client requested streaming.
     pub stream: Option<bool>,
+    /// Optional streaming controls.
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// OpenAI-compatible streaming options.
+#[derive(Debug, Deserialize)]
+pub struct StreamOptions {
+    /// Whether to emit a final usage-only chunk.
+    pub include_usage: bool,
 }
 
 /// Outgoing non-streaming OpenAI-compatible response.
@@ -199,6 +208,7 @@ mod tests {
             temperature: None,
             top_p: None,
             stream: Some(false),
+            stream_options: None,
         };
         let result = request.into_worker_request(
             &default_generation(),
@@ -222,6 +232,7 @@ mod tests {
             temperature: None,
             top_p: None,
             stream: Some(false),
+            stream_options: None,
         };
         let result = request.into_worker_request(
             &default_generation(),
@@ -245,6 +256,7 @@ mod tests {
             temperature: None,
             top_p: None,
             stream: Some(false),
+            stream_options: None,
         };
         let result = request.into_worker_request(
             &default_generation(),
@@ -268,6 +280,7 @@ mod tests {
             temperature: Some(0.5),
             top_p: Some(0.8),
             stream: Some(true),
+            stream_options: None,
         };
         let worker = request
             .into_worker_request(
@@ -294,6 +307,7 @@ mod tests {
             temperature: None,
             top_p: None,
             stream: None,
+            stream_options: None,
         };
         let result = request.into_worker_request(
             &default_generation(),
@@ -317,6 +331,7 @@ mod tests {
             temperature: None,
             top_p: None,
             stream: None,
+            stream_options: None,
         };
         // No VLM model configured, so "vlm-model" should be rejected
         let result = request.into_worker_request(

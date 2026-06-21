@@ -17,6 +17,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+import struct
 from typing import Callable
 
 
@@ -36,6 +37,30 @@ class VlmFixture:
     prompt_text: str
     image_path: Path | None = None
     tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ImageMetadata:
+    """Basic local image metadata for VLM benchmark normalization."""
+
+    path: Path
+    format: str | None
+    width: int | None
+    height: int | None
+    file_size_bytes: int
+
+    @property
+    def pixels(self) -> int | None:
+        if self.width is None or self.height is None:
+            return None
+        return self.width * self.height
+
+    @property
+    def megapixels(self) -> float | None:
+        pixels = self.pixels
+        if pixels is None:
+            return None
+        return pixels / 1_000_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +154,9 @@ _CHECKED_IN_IMAGES_DIR = Path(__file__).resolve().parent / "images"
 # Fixture definitions
 # ---------------------------------------------------------------------------
 
-_NATURAL_IMAGE_PROMPT = "Describe this natural scene in detail. What colours and shapes do you see?"
+_NATURAL_IMAGE_PROMPT = (
+    "Describe this natural scene in detail. What colours and shapes do you see?"
+)
 _CHART_SCREENSHOT_PROMPT = (
     "Describe the data or structure shown in this chart or table. "
     "What trends or patterns can you identify?"
@@ -172,6 +199,140 @@ def _copy_checked_in_images(image_dir: Path) -> dict[str, Path]:
             shutil.copy2(str(src), str(dest))
             result[src.stem] = dest
     return result
+
+
+def collect_image_metadata(path: Path) -> ImageMetadata:
+    """Return lightweight metadata for supported fixture image formats."""
+
+    file_size_bytes = path.stat().st_size
+    suffix = path.suffix.lower()
+
+    width: int | None = None
+    height: int | None = None
+    image_format: str | None = None
+
+    if suffix == ".png":
+        image_format = "png"
+        width, height = _read_png_size(path)
+    elif suffix in {".jpg", ".jpeg"}:
+        image_format = "jpeg"
+        width, height = _read_jpeg_size(path)
+    elif suffix == ".webp":
+        image_format = "webp"
+        width, height = _read_webp_size(path)
+    elif suffix == ".ppm":
+        image_format = "ppm"
+        width, height = _read_ppm_size(path)
+
+    return ImageMetadata(
+        path=path,
+        format=image_format,
+        width=width,
+        height=height,
+        file_size_bytes=file_size_bytes,
+    )
+
+
+def collect_many_image_metadata(
+    paths: list[Path] | tuple[Path, ...],
+) -> tuple[ImageMetadata, ...]:
+    """Return metadata for each image path in order."""
+
+    return tuple(collect_image_metadata(path) for path in paths)
+
+
+def _read_png_size(path: Path) -> tuple[int | None, int | None]:
+    with path.open("rb") as f:
+        header = f.read(24)
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        return (None, None)
+    return struct.unpack(">II", header[16:24])
+
+
+def _read_ppm_size(path: Path) -> tuple[int | None, int | None]:
+    with path.open("rb") as f:
+        tokens: list[bytes] = []
+        while len(tokens) < 4:
+            line = f.readline()
+            if not line:
+                break
+            stripped = line.strip()
+            if not stripped or stripped.startswith(b"#"):
+                continue
+            tokens.extend(stripped.split())
+    if len(tokens) < 4 or tokens[0] not in {b"P3", b"P6"}:
+        return (None, None)
+    return (int(tokens[1]), int(tokens[2]))
+
+
+def _read_jpeg_size(path: Path) -> tuple[int | None, int | None]:
+    with path.open("rb") as f:
+        if f.read(2) != b"\xff\xd8":
+            return (None, None)
+        while True:
+            marker_prefix = f.read(1)
+            if not marker_prefix:
+                return (None, None)
+            if marker_prefix != b"\xff":
+                continue
+            marker = f.read(1)
+            while marker == b"\xff":
+                marker = f.read(1)
+            if not marker:
+                return (None, None)
+            marker_value = marker[0]
+            if marker_value in {0xD8, 0xD9}:
+                continue
+            segment_length_bytes = f.read(2)
+            if len(segment_length_bytes) != 2:
+                return (None, None)
+            segment_length = struct.unpack(">H", segment_length_bytes)[0]
+            if segment_length < 2:
+                return (None, None)
+            if marker_value in {
+                0xC0,
+                0xC1,
+                0xC2,
+                0xC3,
+                0xC5,
+                0xC6,
+                0xC7,
+                0xC9,
+                0xCA,
+                0xCB,
+                0xCD,
+                0xCE,
+                0xCF,
+            }:
+                data = f.read(5)
+                if len(data) != 5:
+                    return (None, None)
+                height, width = struct.unpack(">HH", data[1:5])
+                return (width, height)
+            f.seek(segment_length - 2, 1)
+
+
+def _read_webp_size(path: Path) -> tuple[int | None, int | None]:
+    with path.open("rb") as f:
+        header = f.read(30)
+    if len(header) < 16 or header[:4] != b"RIFF" or header[8:12] != b"WEBP":
+        return (None, None)
+    chunk = header[12:16]
+    if chunk == b"VP8X" and len(header) >= 30:
+        width = 1 + int.from_bytes(header[24:27], "little")
+        height = 1 + int.from_bytes(header[27:30], "little")
+        return (width, height)
+    if chunk == b"VP8L" and len(header) >= 25:
+        b0, b1, b2, b3 = header[21:25]
+        width = 1 + (((b1 & 0x3F) << 8) | b0)
+        height = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6))
+        return (width, height)
+    if chunk == b"VP8 " and len(header) >= 30:
+        return (
+            int.from_bytes(header[26:28], "little"),
+            int.from_bytes(header[28:30], "little"),
+        )
+    return (None, None)
 
 
 def prepare_fixtures(image_dir: Path, use_checked_in: bool = True) -> list[VlmFixture]:

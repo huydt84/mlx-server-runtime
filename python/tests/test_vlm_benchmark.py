@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import signal
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +14,7 @@ import pytest
 from benchmarks.vlm_fixtures import (
     VlmFixture,
     prepare_fixtures,
+    collect_image_metadata,
     _gradient_ppm,
     _chart_pattern_ppm,
     _text_pattern_ppm,
@@ -22,22 +25,36 @@ from benchmarks.compare_vlm import (
     VlmPromptCase,
     VlmStreamResult,
     NopSampler,
+    RunningService,
     _build_vlm_cases,
     _build_vlm_prompt,
+    _build_backend_orders,
+    _build_baseline_comparison_rows,
+    _collect_fairness_warnings,
+    _discover_raw_stream_generate,
+    _expected_samples_for_scenario,
     _extract_port,
     _failed_vlm_stream_result,
     _is_port_free,
     _prepare_project_config,
+    _raw_vlm_generate_once,
     _reduce_vlm_measurements,
     _replace_config_value,
     _request_vlm_completion,
+    _request_vlm_streaming_completion,
+    _resolve_run_counts,
+    _resolve_scenario_names,
     _result_summary,
+    _run_http_baseline,
     _set_vlm_config,
     _wait_for_vlm_service_ready,
 )
 from mlx_worker.benchmarking import (
     BenchmarkResult,
     BenchmarkRun,
+    VlmComparisonRow,
+    VlmFixtureReportRow,
+    VlmScenarioRun,
     write_vlm_report,
 )
 
@@ -158,6 +175,17 @@ class TestVlmFixtures:
         _ = prepare_fixtures(tmp_path)
         fixtures2 = prepare_fixtures(tmp_path)
         assert len(fixtures2) >= 1
+
+    def test_collect_image_metadata_for_ppm(self, tmp_path: Path) -> None:
+        image_path = _gradient_ppm(tmp_path / "meta.ppm", width=8, height=6)
+
+        metadata = collect_image_metadata(image_path)
+
+        assert metadata.format == "ppm"
+        assert metadata.width == 8
+        assert metadata.height == 6
+        assert metadata.pixels == 48
+        assert metadata.file_size_bytes > 0
 
 
 class TestVlmFixtureDataclass:
@@ -716,9 +744,674 @@ class TestVlmReportWriting:
         assert "Phase 9" in content
         assert "test-vlm" in content
         assert "raw mlx-vlm" in content
-        assert "Fairness Notes" in content
+        assert "Benchmark Configuration" in content
         assert "image_preprocess_ms_mean" in content
         assert "5.0" in content
+
+
+class TestFairnessWarnings:
+    def test_warns_on_material_raw_token_mismatch(self) -> None:
+        raw = BenchmarkResult(
+            backend="raw mlx-vlm",
+            samples=1,
+            errors=0,
+            error_rate=0.0,
+            ttft_mean_ms=1.0,
+            ttft_p50_ms=1.0,
+            ttft_p95_ms=None,
+            ttft_p99_ms=None,
+            latency_mean_ms=2.0,
+            latency_p50_ms=2.0,
+            latency_p95_ms=None,
+            latency_p99_ms=None,
+            prompt_tokens_mean=200.0,
+            completion_tokens_mean=100.0,
+            completion_tokens_p50=100.0,
+            total_tokens_mean=300.0,
+            decode_time_mean_ms=1.0,
+            latency_per_completion_token_ms=0.02,
+            decode_time_per_completion_token_ms=0.01,
+            latency_p50_per_completion_token_ms=0.02,
+            decode_tokens_per_second_mean=100.0,
+            decode_tokens_per_second_p50=100.0,
+            end_to_end_tokens_per_second_mean=50.0,
+            end_to_end_tokens_per_second_p50=50.0,
+        )
+        http = BenchmarkResult(
+            backend="mlx_vlm.server",
+            samples=1,
+            errors=0,
+            error_rate=0.0,
+            ttft_mean_ms=1.0,
+            ttft_p50_ms=1.0,
+            ttft_p95_ms=None,
+            ttft_p99_ms=None,
+            latency_mean_ms=2.0,
+            latency_p50_ms=2.0,
+            latency_p95_ms=None,
+            latency_p99_ms=None,
+            prompt_tokens_mean=100.0,
+            completion_tokens_mean=120.0,
+            completion_tokens_p50=120.0,
+            total_tokens_mean=220.0,
+            decode_time_mean_ms=1.0,
+            latency_per_completion_token_ms=0.02,
+            decode_time_per_completion_token_ms=0.01,
+            latency_p50_per_completion_token_ms=0.02,
+            decode_tokens_per_second_mean=100.0,
+            decode_tokens_per_second_p50=100.0,
+            end_to_end_tokens_per_second_mean=50.0,
+            end_to_end_tokens_per_second_p50=50.0,
+        )
+        row_raw = VlmFixtureReportRow(
+            backend="raw mlx-vlm",
+            fixture_name="single-1-natural",
+            fixture_category="single_image",
+            image_count=1,
+            total_image_pixels=100,
+            total_megapixels=0.0001,
+            widths_summary="10",
+            heights_summary="10",
+            formats_summary="ppm",
+            total_file_size_bytes=64,
+            prompt_preview="raw",
+            prompt_text_source="raw chat template",
+            prompt_tokens_mean=200.0,
+            completion_tokens_mean=100.0,
+            total_tokens_mean=300.0,
+            ttft_mean_ms=1.0,
+            ttft_p50_ms=1.0,
+            latency_mean_ms=2.0,
+            latency_p50_ms=2.0,
+            latency_p95_ms=None,
+            image_load_ms_mean=None,
+            image_decode_ms_mean=None,
+            image_preprocess_ms_mean=None,
+            image_preprocess_ms_p50=None,
+            image_preprocess_ms_p95=None,
+            decode_tps_mean=10.0,
+            e2e_tps_mean=20.0,
+            latency_per_completion_token_ms=0.02,
+            latency_per_image_ms=2.0,
+            latency_per_megapixel_ms=20000.0,
+            samples=1,
+            errors=0,
+            error_rate=0.0,
+            max_tokens=32,
+            temperature=0.0,
+            top_p=1.0,
+            stop_reason_summary="stop",
+        )
+        row_http = VlmFixtureReportRow(
+            backend="mlx_vlm.server",
+            fixture_name="single-1-natural",
+            fixture_category="single_image",
+            image_count=1,
+            total_image_pixels=100,
+            total_megapixels=0.0001,
+            widths_summary="10",
+            heights_summary="10",
+            formats_summary="ppm",
+            total_file_size_bytes=64,
+            prompt_preview="http",
+            prompt_text_source="http request messages",
+            prompt_tokens_mean=100.0,
+            completion_tokens_mean=120.0,
+            total_tokens_mean=220.0,
+            ttft_mean_ms=1.0,
+            ttft_p50_ms=1.0,
+            latency_mean_ms=2.0,
+            latency_p50_ms=2.0,
+            latency_p95_ms=None,
+            image_load_ms_mean=None,
+            image_decode_ms_mean=None,
+            image_preprocess_ms_mean=None,
+            image_preprocess_ms_p50=None,
+            image_preprocess_ms_p95=None,
+            decode_tps_mean=10.0,
+            e2e_tps_mean=20.0,
+            latency_per_completion_token_ms=0.02,
+            latency_per_image_ms=2.0,
+            latency_per_megapixel_ms=20000.0,
+            samples=1,
+            errors=0,
+            error_rate=0.0,
+            max_tokens=32,
+            temperature=0.0,
+            top_p=1.0,
+            stop_reason_summary="stop",
+        )
+
+        warnings = _collect_fairness_warnings([raw, http], (row_raw, row_http))
+
+        assert any("direct-call reference only" in warning for warning in warnings)
+        assert any("fixture single-1-natural" in warning for warning in warnings)
+
+
+class TestBackendOrderControls:
+    def test_explicit_backend_order_is_respected(self) -> None:
+        orders = _build_backend_orders(
+            ("raw", "server", "project"),
+            explicit_order="server,project,raw",
+            randomize=False,
+            seed=None,
+            order_rounds=1,
+            scenario_name="baseline",
+        )
+
+        assert orders == (("server", "project", "raw"),)
+
+    def test_randomized_backend_order_is_deterministic_with_seed(self) -> None:
+        first = _build_backend_orders(
+            ("raw", "server", "project"),
+            explicit_order="raw,server,project",
+            randomize=True,
+            seed=42,
+            order_rounds=1,
+            scenario_name="baseline",
+        )
+        second = _build_backend_orders(
+            ("raw", "server", "project"),
+            explicit_order="raw,server,project",
+            randomize=True,
+            seed=42,
+            order_rounds=1,
+            scenario_name="baseline",
+        )
+
+        assert first == second
+
+    def test_order_rounds_rotate_backend_order(self) -> None:
+        orders = _build_backend_orders(
+            ("raw", "server", "project"),
+            explicit_order="raw,server,project",
+            randomize=False,
+            seed=None,
+            order_rounds=3,
+            scenario_name="baseline",
+        )
+
+        assert orders == (
+            ("raw", "server", "project"),
+            ("server", "project", "raw"),
+            ("project", "raw", "server"),
+        )
+
+
+class TestScenarioHelpers:
+    def test_resolve_scenario_all_expands_to_separate_groups(self) -> None:
+        assert _resolve_scenario_names("all") == (
+            "baseline",
+            "streaming",
+            "cancellation",
+            "concurrency",
+        )
+
+    def test_run_counts_match_smoke_normal_stable(self) -> None:
+        smoke = SimpleNamespace(
+            benchmark_mode="smoke",
+            warmup_runs_per_fixture=None,
+            measured_runs_per_fixture=None,
+            warmup_trials=None,
+            trials=None,
+        )
+        normal = SimpleNamespace(
+            benchmark_mode="normal",
+            warmup_runs_per_fixture=None,
+            measured_runs_per_fixture=None,
+            warmup_trials=None,
+            trials=None,
+        )
+        stable = SimpleNamespace(
+            benchmark_mode="stable",
+            warmup_runs_per_fixture=None,
+            measured_runs_per_fixture=None,
+            warmup_trials=None,
+            trials=None,
+        )
+
+        assert _resolve_run_counts(smoke) == (0, 1)
+        assert _resolve_run_counts(normal) == (1, 3)
+        assert _resolve_run_counts(stable) == (1, 5)
+
+    def test_expected_sample_counts_match_9_fixture_suite(self) -> None:
+        cases = [
+            _make_prompt_case(name=f"case-{index}", image_paths=())
+            for index in range(9)
+        ]
+
+        assert _expected_samples_for_scenario("baseline", cases, 1, order_rounds=1) == 9
+        assert (
+            _expected_samples_for_scenario("baseline", cases, 3, order_rounds=1) == 27
+        )
+        assert (
+            _expected_samples_for_scenario("baseline", cases, 5, order_rounds=1) == 45
+        )
+
+
+class TestRawTtftHandling:
+    def test_raw_non_streaming_ttft_is_none(self) -> None:
+        fake_result = SimpleNamespace(
+            text="done",
+            generation_tokens=4,
+            prompt_tokens=8,
+            finish_reason="stop",
+        )
+        fake_mlx_vlm = SimpleNamespace(generate=lambda *args, **kwargs: fake_result)
+        case = _make_prompt_case(image_paths=())
+
+        with patch.dict(sys.modules, {"mlx_vlm": fake_mlx_vlm}):
+            result = _raw_vlm_generate_once(
+                model=SimpleNamespace(),
+                processor=SimpleNamespace(
+                    apply_chat_template=lambda *args, **kwargs: "user: describe"
+                ),
+                case=case,
+                max_tokens=16,
+            )
+
+        assert result.ttft_ms is None
+        assert "does not expose real TTFT" in result.notes[0]
+
+    def test_raw_streaming_discovery_returns_none_when_api_missing(self) -> None:
+        fake_mlx_vlm = SimpleNamespace()
+        with patch.dict(sys.modules, {"mlx_vlm": fake_mlx_vlm}):
+            assert _discover_raw_stream_generate() is None
+
+
+class TestHttpBaselinePath:
+    def test_baseline_uses_non_streaming_completion(self) -> None:
+        service = RunningService(
+            backend_name="mlx_vlm.server",
+            base_url="http://127.0.0.1:8000",
+            model="test-vlm",
+            readiness_url=None,
+        )
+        measurement = VlmStreamResult(
+            backend="mlx_vlm.server",
+            ttft_ms=None,
+            latency_ms=10.0,
+            prompt_tokens=12,
+            completion_tokens=4,
+            text="done",
+            image_count=0,
+        )
+
+        with (
+            patch(
+                "benchmarks.compare_vlm._request_vlm_non_streaming_completion",
+                return_value=measurement,
+            ) as non_streaming,
+            patch(
+                "benchmarks.compare_vlm._request_vlm_streaming_completion"
+            ) as streaming,
+        ):
+            result, measurements = _run_http_baseline(
+                service,
+                [_make_prompt_case(image_paths=())],
+                16,
+                0,
+                1,
+                120,
+            )
+
+        non_streaming.assert_called_once()
+        streaming.assert_not_called()
+        assert result.samples == 1
+        assert measurements == [measurement]
+
+
+class TestHeadlineFairness:
+    def test_http_backends_with_matching_tokens_are_headline_eligible(self) -> None:
+        rows = _build_baseline_comparison_rows(
+            (
+                BenchmarkResult(
+                    backend="mlx_vlm.server",
+                    samples=45,
+                    errors=0,
+                    error_rate=0.0,
+                    ttft_mean_ms=10.0,
+                    ttft_p50_ms=10.0,
+                    ttft_p95_ms=12.0,
+                    ttft_p99_ms=None,
+                    latency_mean_ms=100.0,
+                    latency_p50_ms=100.0,
+                    latency_p95_ms=110.0,
+                    latency_p99_ms=None,
+                    prompt_tokens_mean=100.0,
+                    completion_tokens_mean=50.0,
+                    completion_tokens_p50=50.0,
+                    total_tokens_mean=150.0,
+                    decode_time_mean_ms=90.0,
+                    latency_per_completion_token_ms=2.0,
+                    decode_time_per_completion_token_ms=1.8,
+                    latency_p50_per_completion_token_ms=2.0,
+                    decode_tokens_per_second_mean=30.0,
+                    decode_tokens_per_second_p50=30.0,
+                    end_to_end_tokens_per_second_mean=20.0,
+                    end_to_end_tokens_per_second_p50=20.0,
+                ),
+                BenchmarkResult(
+                    backend="this project",
+                    samples=45,
+                    errors=0,
+                    error_rate=0.0,
+                    ttft_mean_ms=11.0,
+                    ttft_p50_ms=11.0,
+                    ttft_p95_ms=13.0,
+                    ttft_p99_ms=None,
+                    latency_mean_ms=101.0,
+                    latency_p50_ms=100.0,
+                    latency_p95_ms=111.0,
+                    latency_p99_ms=None,
+                    prompt_tokens_mean=103.0,
+                    completion_tokens_mean=51.0,
+                    completion_tokens_p50=51.0,
+                    total_tokens_mean=154.0,
+                    decode_time_mean_ms=90.0,
+                    latency_per_completion_token_ms=2.0,
+                    decode_time_per_completion_token_ms=1.8,
+                    latency_p50_per_completion_token_ms=2.0,
+                    decode_tokens_per_second_mean=30.0,
+                    decode_tokens_per_second_p50=30.0,
+                    end_to_end_tokens_per_second_mean=20.0,
+                    end_to_end_tokens_per_second_p50=20.0,
+                ),
+            ),
+            benchmark_mode="stable",
+            scenario_name="baseline",
+            fixture_names=("single-1-natural",),
+            max_tokens=128,
+        )
+
+        row = rows[0]
+        assert row.headline_eligible is True
+        assert row.token_equivalent is True
+
+    def test_raw_vs_http_prompt_mismatch_is_not_headline_eligible(self) -> None:
+        rows = _build_baseline_comparison_rows(
+            (
+                BenchmarkResult(
+                    backend="raw mlx-vlm",
+                    samples=45,
+                    errors=0,
+                    error_rate=0.0,
+                    ttft_mean_ms=None,
+                    ttft_p50_ms=None,
+                    ttft_p95_ms=None,
+                    ttft_p99_ms=None,
+                    latency_mean_ms=100.0,
+                    latency_p50_ms=100.0,
+                    latency_p95_ms=110.0,
+                    latency_p99_ms=None,
+                    prompt_tokens_mean=200.0,
+                    completion_tokens_mean=50.0,
+                    completion_tokens_p50=50.0,
+                    total_tokens_mean=250.0,
+                    decode_time_mean_ms=None,
+                    latency_per_completion_token_ms=2.0,
+                    decode_time_per_completion_token_ms=None,
+                    latency_p50_per_completion_token_ms=2.0,
+                    decode_tokens_per_second_mean=None,
+                    decode_tokens_per_second_p50=None,
+                    end_to_end_tokens_per_second_mean=20.0,
+                    end_to_end_tokens_per_second_p50=20.0,
+                ),
+                BenchmarkResult(
+                    backend="this project",
+                    samples=45,
+                    errors=0,
+                    error_rate=0.0,
+                    ttft_mean_ms=11.0,
+                    ttft_p50_ms=11.0,
+                    ttft_p95_ms=13.0,
+                    ttft_p99_ms=None,
+                    latency_mean_ms=101.0,
+                    latency_p50_ms=100.0,
+                    latency_p95_ms=111.0,
+                    latency_p99_ms=None,
+                    prompt_tokens_mean=100.0,
+                    completion_tokens_mean=51.0,
+                    completion_tokens_p50=51.0,
+                    total_tokens_mean=151.0,
+                    decode_time_mean_ms=90.0,
+                    latency_per_completion_token_ms=2.0,
+                    decode_time_per_completion_token_ms=1.8,
+                    latency_p50_per_completion_token_ms=2.0,
+                    decode_tokens_per_second_mean=30.0,
+                    decode_tokens_per_second_p50=30.0,
+                    end_to_end_tokens_per_second_mean=20.0,
+                    end_to_end_tokens_per_second_p50=20.0,
+                ),
+            ),
+            benchmark_mode="stable",
+            scenario_name="baseline",
+            fixture_names=("single-1-natural",),
+            max_tokens=128,
+        )
+
+        row = rows[0]
+        assert row.headline_eligible is False
+        assert any(
+            "prompt token mismatch > 5%" == reason
+            for reason in row.reasons_not_headline_eligible
+        )
+
+    def test_raw_vs_http_token_match_still_not_headline_eligible(self) -> None:
+        rows = _build_baseline_comparison_rows(
+            (
+                BenchmarkResult(
+                    backend="raw mlx-vlm",
+                    samples=45,
+                    errors=0,
+                    error_rate=0.0,
+                    ttft_mean_ms=None,
+                    ttft_p50_ms=None,
+                    ttft_p95_ms=None,
+                    ttft_p99_ms=None,
+                    latency_mean_ms=100.0,
+                    latency_p50_ms=100.0,
+                    latency_p95_ms=110.0,
+                    latency_p99_ms=None,
+                    prompt_tokens_mean=100.0,
+                    completion_tokens_mean=50.0,
+                    completion_tokens_p50=50.0,
+                    total_tokens_mean=150.0,
+                    decode_time_mean_ms=None,
+                    latency_per_completion_token_ms=2.0,
+                    decode_time_per_completion_token_ms=None,
+                    latency_p50_per_completion_token_ms=2.0,
+                    decode_tokens_per_second_mean=None,
+                    decode_tokens_per_second_p50=None,
+                    end_to_end_tokens_per_second_mean=20.0,
+                    end_to_end_tokens_per_second_p50=20.0,
+                ),
+                BenchmarkResult(
+                    backend="this project",
+                    samples=45,
+                    errors=0,
+                    error_rate=0.0,
+                    ttft_mean_ms=None,
+                    ttft_p50_ms=None,
+                    ttft_p95_ms=None,
+                    ttft_p99_ms=None,
+                    latency_mean_ms=101.0,
+                    latency_p50_ms=101.0,
+                    latency_p95_ms=111.0,
+                    latency_p99_ms=None,
+                    prompt_tokens_mean=100.0,
+                    completion_tokens_mean=50.0,
+                    completion_tokens_p50=50.0,
+                    total_tokens_mean=150.0,
+                    decode_time_mean_ms=None,
+                    latency_per_completion_token_ms=2.0,
+                    decode_time_per_completion_token_ms=None,
+                    latency_p50_per_completion_token_ms=2.0,
+                    decode_tokens_per_second_mean=None,
+                    decode_tokens_per_second_p50=None,
+                    end_to_end_tokens_per_second_mean=20.0,
+                    end_to_end_tokens_per_second_p50=20.0,
+                ),
+            ),
+            benchmark_mode="stable",
+            scenario_name="baseline",
+            fixture_names=("single-1-natural",),
+            max_tokens=128,
+        )
+
+        row = rows[0]
+        assert row.token_equivalent is True
+        assert row.headline_eligible is False
+        assert any(
+            "raw direct-call reference is not strict serving headline without model-input parity"
+            == reason
+            for reason in row.reasons_not_headline_eligible
+        )
+
+
+class TestScenarioSeparatedReport:
+    def test_scenario_all_renders_separate_sections(self, tmp_path: Path) -> None:
+        baseline = VlmScenarioRun(
+            scenario="baseline",
+            benchmark_mode="smoke",
+            started_at="2026-06-20T00:00:00+00:00",
+            ended_at="2026-06-20T00:01:00+00:00",
+            fixture_count=9,
+            fixture_names=("single-1-natural",),
+            warmup_runs_per_fixture=0,
+            measured_runs_per_fixture=1,
+            expected_measured_samples_per_backend=9,
+            backend_order=("raw mlx-vlm", "mlx_vlm.server", "this project"),
+            order_rounds=1,
+            order_randomized=False,
+            backend_order_seed=42,
+            aggregated_across_order_rounds=False,
+            order_round_details=(
+                {
+                    "order_round_index": 1,
+                    "backend_order": (
+                        "raw mlx-vlm",
+                        "mlx_vlm.server",
+                        "this project",
+                    ),
+                },
+            ),
+            results=(
+                BenchmarkResult(
+                    backend="raw mlx-vlm",
+                    samples=9,
+                    errors=0,
+                    error_rate=0.0,
+                    ttft_mean_ms=None,
+                    ttft_p50_ms=None,
+                    ttft_p95_ms=None,
+                    ttft_p99_ms=None,
+                    latency_mean_ms=100.0,
+                    latency_p50_ms=100.0,
+                    latency_p95_ms=None,
+                    latency_p99_ms=None,
+                    prompt_tokens_mean=200.0,
+                    completion_tokens_mean=50.0,
+                    completion_tokens_p50=50.0,
+                    total_tokens_mean=250.0,
+                    decode_time_mean_ms=None,
+                    latency_per_completion_token_ms=2.0,
+                    decode_time_per_completion_token_ms=None,
+                    latency_p50_per_completion_token_ms=2.0,
+                    decode_tokens_per_second_mean=None,
+                    decode_tokens_per_second_p50=None,
+                    end_to_end_tokens_per_second_mean=20.0,
+                    end_to_end_tokens_per_second_p50=20.0,
+                    notes=("raw non-streaming generation does not expose real TTFT",),
+                ),
+            ),
+            comparison_rows=(
+                VlmComparisonRow(
+                    scenario="baseline",
+                    backend_a="raw mlx-vlm",
+                    backend_b="this project",
+                    fairness_level="semantic_fairness",
+                    comparison_kind="direct_call_reference",
+                    same_model=True,
+                    same_scenario=True,
+                    same_benchmark_mode=True,
+                    same_fixture_set=True,
+                    same_max_tokens=True,
+                    same_temperature=True,
+                    same_top_p=True,
+                    same_streaming_mode=True,
+                    same_backend_category=False,
+                    prompt_tokens_mean_delta_pct=50.0,
+                    completion_tokens_mean_delta_pct=2.0,
+                    token_equivalent=False,
+                    error_rates_comparable=True,
+                    sufficient_samples=False,
+                    headline_eligible=False,
+                    reasons_not_headline_eligible=(
+                        "prompt token mismatch > 5%",
+                        "backend category differs without proven token equivalence",
+                    ),
+                    latency_mean_delta_ms=1.0,
+                ),
+            ),
+            fairness_warnings=("raw-vs-HTTP stays reference only",),
+            interpretation=("baseline only",),
+        )
+        streaming = VlmScenarioRun(
+            scenario="streaming",
+            benchmark_mode="smoke",
+            started_at="2026-06-20T00:02:00+00:00",
+            ended_at="2026-06-20T00:03:00+00:00",
+            fixture_count=3,
+            fixture_names=("single-1-natural",),
+            warmup_runs_per_fixture=0,
+            measured_runs_per_fixture=1,
+            expected_measured_samples_per_backend=3,
+            backend_order=("raw mlx-vlm", "mlx_vlm.server", "this project"),
+            order_rounds=1,
+            order_randomized=True,
+            backend_order_seed=42,
+            aggregated_across_order_rounds=False,
+            order_round_details=(
+                {
+                    "order_round_index": 1,
+                    "backend_order": (
+                        "raw mlx-vlm",
+                        "mlx_vlm.server",
+                        "this project",
+                    ),
+                },
+            ),
+            streaming_rows=(),
+            fairness_warnings=(
+                "raw mlx-vlm streaming API was not available; raw TTFT is not reported",
+            ),
+            interpretation=("streaming only",),
+        )
+        run = BenchmarkRun(
+            model="test-vlm",
+            prompt="VLM fixtures",
+            max_tokens=128,
+            generated_at="2026-06-20T00:03:00+00:00",
+            results=(),
+            scenario="all",
+            metadata={"scenario_runs": (baseline, streaming)},
+        )
+
+        path = tmp_path / "scenario_all.md"
+        write_vlm_report(path, [run])
+        content = path.read_text(encoding="utf-8")
+
+        assert "### Scenario: baseline" in content
+        assert "### Scenario: streaming" in content
+        assert "Direct-Call Reference vs HTTP Backends" in content
+        assert "raw non-streaming generation does not expose real TTFT" in content
+        assert (
+            "raw mlx-vlm streaming API was not available; raw TTFT is not reported"
+            in content
+        )
+        assert "backend_order_seed: 42" in content
+        assert "cross-scenario winner" in content
 
 
 # ===========================================================================
@@ -822,8 +1515,26 @@ class TestRequestVlmCompletionSseParsing:
         assert result.text == ""
         assert result.ttft_ms >= 0
 
-    def test_usage_absent_fallback(self) -> None:
-        """When no usage in SSE, tokens estimated from text length."""
+    def test_usage_only_chunk_is_parsed(self) -> None:
+        sse_lines = [
+            b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n',
+            b'data: {"choices":[],"usage":{"completion_tokens":2,"prompt_tokens":11}}\n',
+            b"data: [DONE]\n",
+        ]
+        mock_resp = _MockResponse(sse_lines)
+
+        with patch("benchmarks.compare_vlm.urlopen", return_value=mock_resp):
+            result = _request_vlm_completion(
+                base_url="http://127.0.0.1:8000",
+                model="test-vlm",
+                messages=[],
+                max_tokens=16,
+            )
+        assert result.text == "Hi"
+        assert result.prompt_tokens == 11
+        assert result.completion_tokens == 2
+
+    def test_usage_absent_keeps_tokens_unavailable(self) -> None:
         sse_lines = [
             b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n',
             b"data: [DONE]\n",
@@ -838,8 +1549,52 @@ class TestRequestVlmCompletionSseParsing:
                 max_tokens=16,
             )
         assert result.text == "Hi"
-        assert result.prompt_tokens == 256  # default fallback
-        assert result.completion_tokens == 1  # len("Hi") // 4 = 0, max(1,0) = 1
+        assert result.prompt_tokens is None
+        assert result.completion_tokens is None
+        assert any("usage.prompt_tokens unavailable" in note for note in result.notes)
+        assert any(
+            "usage.completion_tokens unavailable" in note for note in result.notes
+        )
+
+    def test_completion_tokens_greater_than_max_tokens_are_ignored(self) -> None:
+        sse_lines = [
+            b'data: {"choices":[{"delta":{"content":"Hi"}}],"usage":{"completion_tokens":99,"prompt_tokens":11}}\n',
+            b"data: [DONE]\n",
+        ]
+        mock_resp = _MockResponse(sse_lines)
+
+        with patch("benchmarks.compare_vlm.urlopen", return_value=mock_resp):
+            result = _request_vlm_completion(
+                base_url="http://127.0.0.1:8000",
+                model="test-vlm",
+                messages=[],
+                max_tokens=16,
+            )
+        assert result.prompt_tokens == 11
+        assert result.completion_tokens is None
+        assert any("greater than max_tokens" in note for note in result.notes)
+
+    def test_streaming_requests_include_usage_option(self) -> None:
+        captured: dict[str, object] = {}
+
+        def _fake_urlopen(request, timeout):  # type: ignore[no-untyped-def]
+            captured["body"] = request.data
+            return _MockResponse([b"data: [DONE]\n"])
+
+        with patch("benchmarks.compare_vlm.urlopen", side_effect=_fake_urlopen):
+            _request_vlm_streaming_completion(
+                "mlx_vlm.server",
+                "http://127.0.0.1:8000",
+                "test-vlm",
+                _make_prompt_case(image_paths=()),
+                16,
+                request_timeout=120,
+            )
+
+        assert captured["body"] is not None
+        payload = json.loads(captured["body"].decode("utf-8"))
+        assert payload["stream"] is True
+        assert payload["stream_options"] == {"include_usage": True}
 
 
 # ===========================================================================
@@ -1093,29 +1848,102 @@ class TestVlmReportFairnessNotes:
             prompt="VLM fixtures",
             max_tokens=128,
             generated_at="2026-06-20T00:00:00+00:00",
-            results=(self._make_result("raw mlx-vlm"),),
+            results=(),
+            metadata={
+                "scenario_runs": (
+                    VlmScenarioRun(
+                        scenario="baseline",
+                        benchmark_mode="smoke",
+                        started_at="2026-06-20T00:00:00+00:00",
+                        ended_at="2026-06-20T00:01:00+00:00",
+                        fixture_count=9,
+                        fixture_names=("single-1-natural",),
+                        warmup_runs_per_fixture=0,
+                        measured_runs_per_fixture=1,
+                        expected_measured_samples_per_backend=9,
+                        backend_order=("raw mlx-vlm",),
+                        order_rounds=1,
+                        order_randomized=False,
+                        backend_order_seed=None,
+                        aggregated_across_order_rounds=False,
+                        order_round_details=(
+                            {
+                                "order_round_index": 1,
+                                "backend_order": ("raw mlx-vlm",),
+                            },
+                        ),
+                        results=(self._make_result("raw mlx-vlm"),),
+                        fairness_warnings=(),
+                        interpretation=("baseline only",),
+                    ),
+                )
+            },
         )
         path = tmp_path / "fairness_report.md"
         write_vlm_report(path, [run])
         content = path.read_text(encoding="utf-8")
-        assert "Fairness Notes" in content
-        assert "Image sizes" in content
-        assert "prompt templates" in content
-        assert "do not compare raw latency" in content
+        assert "Benchmark Configuration" in content
+        assert "Headline Fairness Rule" in content
+        assert "direct Python reference" in content
         assert "raw mlx-vlm" in content
-        assert "max_tokens` comes from the benchmark command line" in content
+        assert "same model" in content
 
     def test_fairness_backend_differences(self, tmp_path: Path) -> None:
+        comparison_rows = _build_baseline_comparison_rows(
+            (
+                self._make_result("raw mlx-vlm"),
+                self._make_result("mlx_vlm.server"),
+                self._make_result("this project"),
+            ),
+            benchmark_mode="stable",
+            scenario_name="baseline",
+            fixture_names=("single-1-natural",),
+            max_tokens=128,
+        )
         run = BenchmarkRun(
             model="test-vlm",
             prompt="VLM fixtures (natural, chart, ocr)",
             max_tokens=128,
             generated_at="2026-06-20T00:00:00+00:00",
-            results=(
-                self._make_result("raw mlx-vlm"),
-                self._make_result("mlx_vlm.server"),
-                self._make_result("this project"),
-            ),
+            results=(),
+            metadata={
+                "scenario_runs": (
+                    VlmScenarioRun(
+                        scenario="baseline",
+                        benchmark_mode="stable",
+                        started_at="2026-06-20T00:00:00+00:00",
+                        ended_at="2026-06-20T00:05:00+00:00",
+                        fixture_count=9,
+                        fixture_names=("single-1-natural",),
+                        warmup_runs_per_fixture=1,
+                        measured_runs_per_fixture=5,
+                        expected_measured_samples_per_backend=45,
+                        backend_order=("raw mlx-vlm", "mlx_vlm.server", "this project"),
+                        order_rounds=1,
+                        order_randomized=False,
+                        backend_order_seed=None,
+                        aggregated_across_order_rounds=False,
+                        order_round_details=(
+                            {
+                                "order_round_index": 1,
+                                "backend_order": (
+                                    "raw mlx-vlm",
+                                    "mlx_vlm.server",
+                                    "this project",
+                                ),
+                            },
+                        ),
+                        results=(
+                            self._make_result("raw mlx-vlm"),
+                            self._make_result("mlx_vlm.server"),
+                            self._make_result("this project"),
+                        ),
+                        comparison_rows=comparison_rows,
+                        fairness_warnings=(),
+                        interpretation=("baseline only",),
+                    ),
+                )
+            },
         )
         path = tmp_path / "backends_report.md"
         write_vlm_report(path, [run])
@@ -1123,6 +1951,7 @@ class TestVlmReportFairnessNotes:
         assert "raw mlx-vlm" in content
         assert "mlx_vlm.server" in content
         assert "this project" in content
+        assert "headline_eligible" in content
 
     def test_report_contains_metric_columns(self, tmp_path: Path) -> None:
         run = BenchmarkRun(
@@ -1154,13 +1983,71 @@ class TestVlmReportFairnessNotes:
             prompt="VLM fixtures",
             max_tokens=128,
             generated_at="2026-06-20T00:00:00+00:00",
-            results=results,
+            results=(),
+            metadata={
+                "scenario_runs": (
+                    VlmScenarioRun(
+                        scenario="baseline",
+                        benchmark_mode="stable",
+                        started_at="2026-06-20T00:00:00+00:00",
+                        ended_at="2026-06-20T00:01:00+00:00",
+                        fixture_count=9,
+                        fixture_names=("single-1-natural",),
+                        warmup_runs_per_fixture=1,
+                        measured_runs_per_fixture=5,
+                        expected_measured_samples_per_backend=45,
+                        backend_order=("raw mlx-vlm", "mlx_vlm.server"),
+                        order_rounds=1,
+                        order_randomized=False,
+                        backend_order_seed=None,
+                        aggregated_across_order_rounds=False,
+                        order_round_details=(
+                            {
+                                "order_round_index": 1,
+                                "backend_order": (
+                                    "raw mlx-vlm",
+                                    "mlx_vlm.server",
+                                ),
+                            },
+                        ),
+                        results=results,
+                        comparison_rows=(
+                            VlmComparisonRow(
+                                scenario="baseline",
+                                backend_a="raw mlx-vlm",
+                                backend_b="mlx_vlm.server",
+                                fairness_level="semantic_fairness",
+                                comparison_kind="direct_call_reference",
+                                same_model=True,
+                                same_scenario=True,
+                                same_benchmark_mode=True,
+                                same_fixture_set=True,
+                                same_max_tokens=True,
+                                same_temperature=True,
+                                same_top_p=True,
+                                same_streaming_mode=True,
+                                same_backend_category=False,
+                                prompt_tokens_mean_delta_pct=20.0,
+                                completion_tokens_mean_delta_pct=1.0,
+                                token_equivalent=False,
+                                error_rates_comparable=True,
+                                sufficient_samples=True,
+                                headline_eligible=False,
+                                reasons_not_headline_eligible=(
+                                    "prompt token mismatch > 5%",
+                                ),
+                                latency_mean_delta_ms=5.0,
+                            ),
+                        ),
+                    ),
+                )
+            },
         )
         path = tmp_path / "overhead_report.md"
         write_vlm_report(path, [run])
         content = path.read_text(encoding="utf-8")
-        assert "Overhead" in content
-        assert "ttft_mean_delta" in content
+        assert "Direct-Call Reference vs HTTP Backends" in content
+        assert "latency_mean_delta_ms" in content
 
 
 # ===========================================================================

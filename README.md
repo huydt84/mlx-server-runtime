@@ -73,11 +73,19 @@ Request logs are structured JSON lines written by the Rust gateway and include:
 
 ## Benchmarks
 
-Generate the phase 6 benchmark report with:
+Benchmark docs live in `docs/how-to/run-benchmarks.md`.
+
+- Phase 6 text-only benchmark: `scripts/benchmark.sh`
+- Phase 9 VLM benchmark: `scripts/benchmark-vlm.sh`
+
+Default reports land in `benchmarks/results/`.
+
+For the full argument list, smoke commands, and full-suite commands, read:
+
+- [`docs/how-to/run-benchmarks.md`](docs/how-to/run-benchmarks.md)
+
+Quick start:
 
 ```bash
 bash scripts/benchmark.sh
 ```
-
-The report is written to `benchmarks/results/phase_6_report.md` and compares raw
-`mlx-lm`, `mlx_lm.server`, and this project across several models on the same prompt.
