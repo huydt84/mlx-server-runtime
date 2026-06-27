@@ -14,7 +14,9 @@ from typing import Callable
 
 from .batching import (
     BatchEventSink,
+    CacheBudgetManager,
     ContinuousBatchScheduler,
+    PromptCacheStore,
     validate_continuous_batching_backend,
 )
 from .config import load_config
@@ -174,7 +176,18 @@ def main(
                     last_transition_at=bootstrap_started_at,
                 ),
             )
-            engine = engine_factory(config.model)
+            try:
+                engine = engine_factory(
+                    config.model,
+                    prompt_cache_max_entries=getattr(
+                        config, "text_cache_max_entries", 32
+                    ),
+                    prompt_cache_max_bytes=getattr(
+                        config, "text_cache_budget_bytes", 8 * 1024 * 1024
+                    ),
+                )
+            except TypeError:
+                engine = engine_factory(config.model)
             runtime_started_at = _now_seconds()
             _send_status(
                 client,
@@ -420,9 +433,12 @@ def _run_continuous_text_loop(
             emit_response=emit_response,
             emit_error=emit_error,
         ),
-        prompt_concurrency=getattr(config, "prompt_concurrency", 4),
-        decode_concurrency=getattr(config, "decode_concurrency", 4),
-        prefill_step_size=getattr(config, "prefill_chunk_size", 256),
+        prompt_concurrency=getattr(config, "text_prompt_concurrency", 4),
+        decode_concurrency=getattr(config, "text_decode_concurrency", 4),
+        prefill_step_size=getattr(config, "text_prefill_chunk_size", 256),
+        cache_budget_manager=CacheBudgetManager(
+            getattr(config, "text_cache_budget_bytes", 8 * 1024 * 1024)
+        ),
     )
 
     try:
@@ -527,6 +543,12 @@ def _run_continuous_batch_loop(
             )
         )
 
+    cache_budget_manager = CacheBudgetManager(
+        getattr(config, "text_cache_budget_bytes", 8 * 1024 * 1024)
+        + getattr(config, "vlm_apc_cache_budget_bytes", 8 * 1024 * 1024)
+        + getattr(config, "vision_feature_cache_budget_bytes", 8 * 1024 * 1024)
+    )
+
     text_scheduler = ContinuousBatchScheduler(
         engine.batch_context(),  # type: ignore[attr-defined]
         BatchEventSink(
@@ -534,13 +556,24 @@ def _run_continuous_batch_loop(
             emit_response=emit_response,
             emit_error=emit_error,
         ),
-        prompt_concurrency=getattr(config, "prompt_concurrency", 4),
-        decode_concurrency=getattr(config, "decode_concurrency", 4),
-        prefill_step_size=getattr(config, "prefill_chunk_size", 256),
+        prompt_concurrency=getattr(config, "text_prompt_concurrency", 4),
+        decode_concurrency=getattr(config, "text_decode_concurrency", 4),
+        prefill_step_size=getattr(config, "text_prefill_chunk_size", 256),
+        cache_budget_manager=cache_budget_manager,
+        configured_prompt_batch_size=getattr(config, "text_prompt_concurrency", 4),
+        configured_decode_batch_size=getattr(config, "text_decode_concurrency", 4),
     )
     vlm_scheduler: VlmContinuousBatchScheduler | None = None
     vlm_engine: object | None = None
+    tick_max_consecutive = 4
+    tick_consecutive = 0
     tick_text_first = True
+    vlm_apc_cache_store = PromptCacheStore(
+        name="vlm_apc",
+        max_entries=getattr(config, "vlm_apc_cache_max_entries", 32),
+        max_bytes=getattr(config, "vlm_apc_cache_budget_bytes", 8 * 1024 * 1024),
+        budget_manager=cache_budget_manager,
+    )
 
     def ensure_vlm_scheduler() -> VlmContinuousBatchScheduler:
         nonlocal vlm_scheduler, vlm_engine
@@ -569,24 +602,54 @@ def _run_continuous_batch_loop(
                 emit_response=emit_response,
                 emit_error=emit_error,
             ),
-            prompt_concurrency=getattr(config, "prompt_concurrency", 4),
-            decode_concurrency=getattr(config, "decode_concurrency", 4),
-            prefill_step_size=getattr(config, "prefill_chunk_size", 256),
+            prompt_concurrency=getattr(config, "vlm_prompt_concurrency", 4),
+            decode_concurrency=getattr(config, "vlm_decode_concurrency", 4),
+            prefill_step_size=getattr(config, "vlm_prefill_chunk_size", 256),
+            prompt_cache_store=vlm_apc_cache_store,
             request_cancelled=is_request_cancelled,
+            cache_budget_manager=cache_budget_manager,
+            configured_prompt_batch_size=getattr(config, "vlm_prompt_concurrency", 4),
+            configured_decode_batch_size=getattr(config, "vlm_decode_concurrency", 4),
+            apc_cache_max_entries=getattr(config, "vlm_apc_cache_max_entries", 32),
+            apc_cache_max_bytes=getattr(config, "vlm_apc_cache_budget_bytes", 8 * 1024 * 1024),
+            vision_feature_cache_max_entries=getattr(
+                config, "vision_feature_cache_max_entries", 20
+            ),
+            vision_feature_cache_max_bytes=getattr(
+                config, "vision_feature_cache_budget_bytes", 8 * 1024 * 1024
+            ),
         )
         return vlm_scheduler
 
     def tick_schedulers() -> None:
-        nonlocal tick_text_first
+        nonlocal tick_text_first, tick_consecutive
+        round_started = time.perf_counter()
+        vlm_ready = vlm_scheduler is not None and not vlm_scheduler.idle()
+        text_ready = not text_scheduler.idle()
         if tick_text_first:
+            text_scheduler.set_arbitration_delay_ms(0)
             text_scheduler.tick()
             if vlm_scheduler is not None:
+                vlm_scheduler.set_arbitration_delay_ms(
+                    int(max(0, (time.perf_counter() - round_started) * 1000.0))
+                )
                 vlm_scheduler.tick()
         else:
             if vlm_scheduler is not None:
+                vlm_scheduler.set_arbitration_delay_ms(0)
                 vlm_scheduler.tick()
+            text_scheduler.set_arbitration_delay_ms(
+                int(max(0, (time.perf_counter() - round_started) * 1000.0))
+            )
             text_scheduler.tick()
-        tick_text_first = not tick_text_first
+        if text_ready and vlm_ready:
+            tick_consecutive += 1
+            if tick_consecutive >= tick_max_consecutive:
+                tick_text_first = not tick_text_first
+                tick_consecutive = 0
+        else:
+            tick_text_first = not tick_text_first
+            tick_consecutive = 0
 
     try:
         pending_stop = False

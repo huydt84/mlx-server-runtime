@@ -89,6 +89,60 @@ pub enum WorkerEvent {
         prompt_batch_size: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         decode_batch_size: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_prompt_batch_size: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_decode_batch_size: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modality: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        apc_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheduler_stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_stage: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_time_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefill_time_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttft_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decode_time_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_time_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheduler_tick_latency_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arbitration_delay_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_cancellation_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_error_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vision_feature_cache_hit: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vision_feature_cache_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vision_feature_cache_entries: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vision_feature_cache_evictions: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vision_encoder_latency_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding_latency_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_entries: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_cache_evictions: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peak_memory_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_height: Option<u32>,
     },
     /// A worker-side request failure.
     Error {
@@ -211,6 +265,33 @@ mod tests {
                 active_batch_cache_bytes: Some(256),
                 prompt_batch_size: Some(2),
                 decode_batch_size: Some(2),
+                configured_prompt_batch_size: Some(2),
+                configured_decode_batch_size: Some(2),
+                backend: Some("vlm".to_string()),
+                modality: Some("vlm".to_string()),
+                apc_mode: Some("apc_manager".to_string()),
+                scheduler_stage: Some("completed".to_string()),
+                cancellation_stage: None,
+                queue_time_ms: Some(3),
+                prefill_time_ms: Some(5),
+                ttft_ms: Some(7),
+                decode_time_ms: Some(11),
+                completion_time_ms: Some(18),
+                scheduler_tick_latency_ms: Some(1),
+                arbitration_delay_ms: Some(2),
+                worker_cancellation_count: Some(3),
+                worker_error_count: Some(1),
+                vision_feature_cache_hit: Some(true),
+                vision_feature_cache_bytes: Some(64),
+                vision_feature_cache_entries: Some(1),
+                vision_feature_cache_evictions: Some(0),
+                vision_encoder_latency_ms: Some(9),
+                embedding_latency_ms: Some(9),
+                prompt_cache_entries: Some(4),
+                prompt_cache_evictions: Some(2),
+                peak_memory_bytes: Some(1024),
+                image_width: Some(640),
+                image_height: Some(480),
             },
             image_count: Some(1),
             image_preprocess_latency_ms: Some(8),
@@ -221,6 +302,33 @@ mod tests {
             active_batch_cache_bytes: Some(256),
             prompt_batch_size: Some(2),
             decode_batch_size: Some(2),
+            configured_prompt_batch_size: Some(2),
+            configured_decode_batch_size: Some(2),
+            backend: Some("vlm".to_string()),
+            modality: Some("vlm".to_string()),
+            apc_mode: Some("apc_manager".to_string()),
+            scheduler_stage: Some("completed".to_string()),
+            cancellation_stage: None,
+            queue_time_ms: Some(3),
+            prefill_time_ms: Some(5),
+            ttft_ms: Some(7),
+            decode_time_ms: Some(11),
+            completion_time_ms: Some(18),
+            scheduler_tick_latency_ms: Some(1),
+            arbitration_delay_ms: Some(2),
+            worker_cancellation_count: Some(3),
+            worker_error_count: Some(1),
+            vision_feature_cache_hit: Some(true),
+            vision_feature_cache_bytes: Some(64),
+            vision_feature_cache_entries: Some(1),
+            vision_feature_cache_evictions: Some(0),
+            vision_encoder_latency_ms: Some(9),
+            embedding_latency_ms: Some(9),
+            prompt_cache_entries: Some(4),
+            prompt_cache_evictions: Some(2),
+            peak_memory_bytes: Some(1024),
+            image_width: Some(640),
+            image_height: Some(480),
         };
 
         let encoded = encode_worker_event(&event).unwrap();

@@ -1069,7 +1069,7 @@ dev = [
 requires-dist = [
     { name = "mlx", specifier = ">=0.31.2" },
     { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
-    { name = "mlx-vlm", specifier = ">=0.6.0" },
+    { name = "mlx-vlm", specifier = ">=0.6.0,<0.7" },
     { name = "tqdm", specifier = ">=4.68.2" },
 ]
 

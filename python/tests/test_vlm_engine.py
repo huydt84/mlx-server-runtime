@@ -419,6 +419,33 @@ def test_vlm_continuous_batch_generator_contract_can_be_validated_at_startup(
     fake_generate.BatchGenerator = FakeVlmBatchGenerator
     monkeypatch.setitem(sys.modules, "mlx_vlm", ModuleType("mlx_vlm"))
     monkeypatch.setitem(sys.modules, "mlx_vlm.generate", fake_generate)
+    fake_apc = ModuleType("mlx_vlm.apc")
+
+    class FakeAPCManager:
+        pass
+
+    fake_apc.APCManager = FakeAPCManager
+    monkeypatch.setitem(sys.modules, "mlx_vlm.apc", fake_apc)
+    fake_vision_cache = ModuleType("mlx_vlm.vision_cache")
+
+    class FakeVisionFeatureCache:
+        def __init__(self, max_size: int) -> None:
+            self.max_size = max_size
+
+        def __len__(self) -> int:
+            return 0
+
+        def clear(self) -> None:
+            pass
+
+        def get(self, key: str):
+            return None
+
+        def put(self, key: str, value) -> None:
+            pass
+
+    fake_vision_cache.VisionFeatureCache = FakeVisionFeatureCache
+    monkeypatch.setitem(sys.modules, "mlx_vlm.vision_cache", fake_vision_cache)
 
     validate_vlm_continuous_batching_backend()
 
@@ -447,6 +474,30 @@ def test_vlm_continuous_batch_scheduler_admits_join_while_decoding(
         ),
     }
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
+    fake_vision_cache = ModuleType("mlx_vlm.vision_cache")
+
+    class FakeVisionFeatureCache:
+        def __init__(self, max_size: int) -> None:
+            self.max_size = max_size
+            self._cache: dict[str, object] = {}
+
+        def __len__(self) -> int:
+            return len(self._cache)
+
+        def __contains__(self, key: str) -> bool:
+            return key in self._cache
+
+        def clear(self) -> None:
+            self._cache.clear()
+
+        def get(self, key: str):
+            return self._cache.get(key)
+
+        def put(self, key: str, value) -> None:
+            self._cache[key] = value
+
+    fake_vision_cache.VisionFeatureCache = FakeVisionFeatureCache
+    monkeypatch.setitem(sys.modules, "mlx_vlm.vision_cache", fake_vision_cache)
 
     FakeVlmBatchGenerator.instances.clear()
 
@@ -559,6 +610,30 @@ def test_vlm_continuous_batch_scheduler_reuses_image_prompt_cache(
         ),
     }
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
+    fake_vision_cache = ModuleType("mlx_vlm.vision_cache")
+
+    class FakeVisionFeatureCache:
+        def __init__(self, max_size: int) -> None:
+            self.max_size = max_size
+            self._cache: dict[str, object] = {}
+
+        def __len__(self) -> int:
+            return len(self._cache)
+
+        def __contains__(self, key: str) -> bool:
+            return key in self._cache
+
+        def clear(self) -> None:
+            self._cache.clear()
+
+        def get(self, key: str):
+            return self._cache.get(key)
+
+        def put(self, key: str, value) -> None:
+            self._cache[key] = value
+
+    fake_vision_cache.VisionFeatureCache = FakeVisionFeatureCache
+    monkeypatch.setitem(sys.modules, "mlx_vlm.vision_cache", fake_vision_cache)
 
     FakeVlmBatchGenerator.instances.clear()
 
@@ -618,17 +693,21 @@ def test_vlm_continuous_batch_scheduler_reuses_image_prompt_cache(
     )
 
     first_job = scheduler._prepare_request(request)
-    assert first_job.cached_prompt is None
+    assert first_job.vision_feature_cache_hit is False
     assert "_apc_image_hash" in first_job.prompt_kwargs
+    assert first_job.prompt_kwargs["inputs_embeds"]
     cache_store.remember(
         first_job.full_prompt_tokens,
         ["cache-a"],
-        cache_key=first_job.prompt_cache_key,
+        cache_key=first_job.apc_cache_key,
     )
 
     second_job = scheduler._prepare_request(request)
-    assert second_job.cached_prompt == ["cache-a"]
-    assert second_job.cached_prefix_tokens
+    assert second_job.vision_feature_cache_hit is True
+    assert second_job.cached_prompt is not None
+    assert second_job.cached_prompt.match_kind == "exact"
+    assert second_job.prompt_kwargs["inputs_embeds"]
+    assert second_job.prompt_kwargs["_apc_tenant"].startswith("vlm-model:")
     assert second_job.prompt_kwargs["prompt_cache"] == ["cache-a"]
 
 
@@ -1029,6 +1108,8 @@ def test_vlm_engine_last_timings_defaults() -> None:
         "image_count": 0,
         "image_preprocess_ms": 0.0,
         "prompt_template_ms": 0.0,
+        "vision_encoder_ms": 0.0,
+        "embedding_ms": 0.0,
     }
 
 

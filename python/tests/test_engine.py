@@ -161,6 +161,19 @@ def test_prompt_cache_store_returns_longest_prefix() -> None:
     assert cached is not None
     assert cached.tokens == (1, 2, 3)
     assert cached.prompt_cache == ["layer-b-0", "layer-b-1"]
+    assert cached.match_kind == "shorter_prefix"
+
+
+def test_prompt_cache_store_exact_hit_uses_full_prompt() -> None:
+    store = PromptCacheStore()
+    store.remember([1, 2, 3], ["exact-cache"])
+
+    cached = store.lookup([1, 2, 3])
+
+    assert cached is not None
+    assert cached.tokens == (1, 2, 3)
+    assert cached.prompt_cache == ["exact-cache"]
+    assert cached.match_kind == "exact"
 
 
 def test_prompt_cache_store_trims_longer_cached_prefix() -> None:
@@ -174,6 +187,7 @@ def test_prompt_cache_store_trims_longer_cached_prefix() -> None:
     assert cached is not None
     assert cached.tokens == (1, 2)
     assert cached.prompt_cache == ["ab", "wx"]
+    assert cached.match_kind == "trimmed_longer_prefix"
 
 
 def test_prompt_cache_store_uses_cache_namespace() -> None:

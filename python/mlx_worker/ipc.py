@@ -140,6 +140,33 @@ class ChatCompletionResponse:
     active_batch_cache_bytes: int | None = None
     prompt_batch_size: int | None = None
     decode_batch_size: int | None = None
+    configured_prompt_batch_size: int | None = None
+    configured_decode_batch_size: int | None = None
+    backend: str | None = None
+    modality: str | None = None
+    apc_mode: str | None = None
+    scheduler_stage: str | None = None
+    cancellation_stage: str | None = None
+    queue_time_ms: int | None = None
+    prefill_time_ms: int | None = None
+    ttft_ms: int | None = None
+    decode_time_ms: int | None = None
+    completion_time_ms: int | None = None
+    scheduler_tick_latency_ms: int | None = None
+    arbitration_delay_ms: int | None = None
+    worker_cancellation_count: int | None = None
+    worker_error_count: int | None = None
+    vision_feature_cache_hit: bool | None = None
+    vision_feature_cache_bytes: int | None = None
+    vision_feature_cache_entries: int | None = None
+    vision_feature_cache_evictions: int | None = None
+    vision_encoder_latency_ms: int | None = None
+    embedding_latency_ms: int | None = None
+    prompt_cache_entries: int | None = None
+    prompt_cache_evictions: int | None = None
+    peak_memory_bytes: int | None = None
+    image_width: int | None = None
+    image_height: int | None = None
 
 
 @dataclass(frozen=True)
@@ -361,6 +388,18 @@ def encode_event(
                 "active_batch_cache_bytes": event.active_batch_cache_bytes,
                 "prompt_batch_size": event.prompt_batch_size,
                 "decode_batch_size": event.decode_batch_size,
+                "backend": event.backend,
+                "scheduler_stage": event.scheduler_stage,
+                "cancellation_stage": event.cancellation_stage,
+                "queue_time_ms": event.queue_time_ms,
+                "prefill_time_ms": event.prefill_time_ms,
+                "ttft_ms": event.ttft_ms,
+                "decode_time_ms": event.decode_time_ms,
+                "completion_time_ms": event.completion_time_ms,
+                "vision_feature_cache_hit": event.vision_feature_cache_hit,
+                "vision_feature_cache_bytes": event.vision_feature_cache_bytes,
+                "vision_encoder_latency_ms": event.vision_encoder_latency_ms,
+                "embedding_latency_ms": event.embedding_latency_ms,
             },
             "image_count": event.image_count,
             "image_preprocess_latency_ms": event.image_preprocess_latency_ms,
@@ -413,6 +452,18 @@ def decode_event(
             active_batch_cache_bytes=response.get("active_batch_cache_bytes"),
             prompt_batch_size=response.get("prompt_batch_size"),
             decode_batch_size=response.get("decode_batch_size"),
+            backend=response.get("backend"),
+            scheduler_stage=response.get("scheduler_stage"),
+            cancellation_stage=response.get("cancellation_stage"),
+            queue_time_ms=response.get("queue_time_ms"),
+            prefill_time_ms=response.get("prefill_time_ms"),
+            ttft_ms=response.get("ttft_ms"),
+            decode_time_ms=response.get("decode_time_ms"),
+            completion_time_ms=response.get("completion_time_ms"),
+            vision_feature_cache_hit=response.get("vision_feature_cache_hit"),
+            vision_feature_cache_bytes=response.get("vision_feature_cache_bytes"),
+            vision_encoder_latency_ms=response.get("vision_encoder_latency_ms"),
+            embedding_latency_ms=response.get("embedding_latency_ms"),
             image_count=payload.get("image_count"),
             image_preprocess_latency_ms=payload.get("image_preprocess_latency_ms"),
             prompt_template_latency_ms=payload.get("prompt_template_latency_ms"),

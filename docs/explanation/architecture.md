@@ -66,7 +66,7 @@ The Python worker has two distinct generation paths:
 | Backend | Upstream primitive | Scheduling behavior |
 |---------|--------------------|---------------------|
 | Text LLM | `mlx_lm.generate.BatchGenerator` | Continuous batching with persistent prompt/decode state |
-| VLM | `mlx_vlm.generate` or `mlx_vlm.stream_generate` | Single-request generation |
+| VLM | `mlx_vlm.generate.BatchGenerator` | Continuous batching with persistent prompt/decode state, real APC reuse, and vision-feature caching |
 
 For text LLMs, the runtime owns request admission, multiplexed IPC,
 cancellation, cache policy, API semantics, and compatibility validation.
@@ -74,9 +74,29 @@ cancellation, cache policy, API semantics, and compatibility validation.
 execution. The dependency is constrained to compatible `mlx-lm` versions and
 checked against the required API surface before the worker reports readiness.
 
-The VLM path does not use `mlx_lm.BatchGenerator`. With only a VLM model
-configured, both model families use the single-request dispatch loop.
-Mixed text+VLM serving does not use continuous batching.
+For VLMs, the runtime now follows vLLM-style serving semantics on Apple Silicon:
+continuous batching, upstream APC reuse, and repeated-image feature caching are
+all exposed through the worker. This is not PagedAttention and not literal
+vLLM parity; it is the closest Apple Silicon implementation of the same serving
+shape. Mixed text+VLM serving uses the same continuous worker, with one text
+generator and one VLM generator sharing the worker thread under bounded
+arbitration.
+
+Worker scheduling and cache behavior are controlled with backend-specific
+environment variables:
+
+- `MLX_RUNTIME_TEXT_PROMPT_CONCURRENCY`
+- `MLX_RUNTIME_TEXT_DECODE_CONCURRENCY`
+- `MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE`
+- `MLX_RUNTIME_VLM_PROMPT_CONCURRENCY`
+- `MLX_RUNTIME_VLM_DECODE_CONCURRENCY`
+- `MLX_RUNTIME_VLM_PREFILL_CHUNK_SIZE`
+- `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES`
+- `MLX_RUNTIME_VLM_APC_BUDGET_BYTES`
+- `MLX_RUNTIME_VISION_FEATURE_CACHE_BUDGET_BYTES`
+
+The old generic prompt/decode/prefill variables remain as compatibility aliases
+when the backend-specific values are unset.
 
 ## IPC Design
 

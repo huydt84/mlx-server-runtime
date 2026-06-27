@@ -44,6 +44,87 @@ pub struct ChatCompletionResponse {
     /// Decode batch size when request was completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_batch_size: Option<u32>,
+    /// Configured prompt batch size for the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_prompt_batch_size: Option<u32>,
+    /// Configured decode batch size for the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_decode_batch_size: Option<u32>,
+    /// Backend family that produced this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Logical modality for the response (text or vlm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<String>,
+    /// APC mode reported by the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apc_mode: Option<String>,
+    /// Final scheduler stage recorded for the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_stage: Option<String>,
+    /// Stage where cancellation occurred, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_stage: Option<String>,
+    /// Time spent waiting before decode started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_time_ms: Option<u32>,
+    /// Time spent in prompt processing before decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_time_ms: Option<u32>,
+    /// Time to first printable token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u32>,
+    /// Time spent in decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_time_ms: Option<u32>,
+    /// End-to-end completion time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_time_ms: Option<u32>,
+    /// Latency for the worker scheduler tick that produced this response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_tick_latency_ms: Option<u32>,
+    /// Delay between the arbitration round start and this backend tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbitration_delay_ms: Option<u32>,
+    /// Worker-side cancellation count at the time of emission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_cancellation_count: Option<u32>,
+    /// Worker-side error count at the time of emission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_error_count: Option<u32>,
+    /// Whether the VLM vision-feature cache hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_hit: Option<bool>,
+    /// Vision-feature cache bytes referenced by this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_bytes: Option<u64>,
+    /// Vision-feature cache entry count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_entries: Option<u32>,
+    /// Vision-feature cache evictions count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_evictions: Option<u32>,
+    /// Vision-encoder latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_encoder_latency_ms: Option<u32>,
+    /// Embedding preparation latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_latency_ms: Option<u32>,
+    /// Prompt-cache entry count for the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_entries: Option<u32>,
+    /// Prompt-cache eviction count for the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_evictions: Option<u32>,
+    /// Peak memory observed by the generator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_memory_bytes: Option<u64>,
+    /// Source image width for VLM requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_width: Option<u32>,
+    /// Source image height for VLM requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_height: Option<u32>,
 }
 
 /// A streamed completion delta emitted by the worker.

@@ -5,12 +5,17 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from contextlib import suppress
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib
+import importlib.metadata
 import inspect
-from typing import Any, Callable, Protocol, Sequence
+import time
+from typing import Any, Callable, Literal, Protocol, Sequence
 
 from .ipc import ChatCompletionRequest, ChatCompletionResponse
+
+
+CacheMatchKind = Literal["exact", "shorter_prefix", "trimmed_longer_prefix"]
 
 
 @dataclass(frozen=True)
@@ -20,6 +25,60 @@ class CachedPrompt:
     tokens: tuple[int, ...]
     prompt_cache: list[Any]
     cache_bytes: int
+    match_kind: CacheMatchKind
+
+
+@dataclass
+class PromptCacheStoreStats:
+    hits: int = 0
+    misses: int = 0
+    exact_hits: int = 0
+    shorter_prefix_hits: int = 0
+    trimmed_longer_prefix_hits: int = 0
+    entries: int = 0
+    evictions: int = 0
+    bytes: int = 0
+
+
+class CacheBudgetManager:
+    """Apply one stored-cache budget across several cache stores."""
+
+    def __init__(self, total_budget_bytes: int) -> None:
+        self._total_budget_bytes = max(0, total_budget_bytes)
+        self._stores: list["PromptCacheStore"] = []
+        self._active_batch_bytes: dict[str, int] = {}
+
+    def register(self, store: "PromptCacheStore") -> None:
+        if store not in self._stores:
+            self._stores.append(store)
+
+    def set_active_batch_bytes(self, backend: str, value: int) -> None:
+        self._active_batch_bytes[backend] = max(0, int(value))
+        self.enforce()
+
+    @property
+    def active_batch_bytes(self) -> int:
+        return sum(self._active_batch_bytes.values())
+
+    @property
+    def stored_cache_target_bytes(self) -> int:
+        return max(0, self._total_budget_bytes - self.active_batch_bytes)
+
+    @property
+    def stored_cache_bytes(self) -> int:
+        return sum(store.total_bytes for store in self._stores)
+
+    def enforce(self) -> None:
+        target = self.stored_cache_target_bytes
+        while self.stored_cache_bytes > target:
+            evicted = False
+            for store in self._stores:
+                if store.evict_oldest():
+                    evicted = True
+                    if self.stored_cache_bytes <= target:
+                        return
+            if not evicted:
+                return
 
 
 class PromptCacheStore:
@@ -27,10 +86,14 @@ class PromptCacheStore:
 
     def __init__(
         self,
+        *,
+        name: str = "prompt_cache",
         max_entries: int = 32,
         max_bytes: int = 8 * 1024 * 1024,
         trim_cache: Callable[[Sequence[Any], int], list[Any] | None] | None = None,
+        budget_manager: CacheBudgetManager | None = None,
     ) -> None:
+        self._name = name
         self._max_entries = max_entries
         self._max_bytes = max_bytes
         self._trim_cache = trim_cache or _trim_mlx_prompt_cache
@@ -38,6 +101,10 @@ class PromptCacheStore:
             tuple[tuple[Any, ...], tuple[int, ...]], CachedPrompt
         ] = OrderedDict()
         self._total_bytes = 0
+        self._stats = PromptCacheStoreStats()
+        self._budget_manager = budget_manager
+        if self._budget_manager is not None:
+            self._budget_manager.register(self)
 
     def lookup(
         self,
@@ -62,16 +129,11 @@ class PromptCacheStore:
                     break
                 common_prefix += 1
             if cached_key == prompt_key:
-                reusable_length = len(prompt_key) - 1
-                if reusable_length <= 0:
-                    continue
-                trimmed_cache = self._trim_cache(cached_prompt.prompt_cache, 1)
-                if trimmed_cache is None:
-                    continue
                 candidate = CachedPrompt(
-                    tokens=prompt_key[:reusable_length],
-                    prompt_cache=trimmed_cache,
-                    cache_bytes=_estimate_cache_bytes(trimmed_cache),
+                    tokens=prompt_key,
+                    prompt_cache=copy.deepcopy(cached_prompt.prompt_cache),
+                    cache_bytes=cached_prompt.cache_bytes,
+                    match_kind="exact",
                 )
             elif len(cached_key) < len(prompt_key):
                 if common_prefix == len(cached_key):
@@ -79,6 +141,7 @@ class PromptCacheStore:
                         tokens=cached_key,
                         prompt_cache=copy.deepcopy(cached_prompt.prompt_cache),
                         cache_bytes=cached_prompt.cache_bytes,
+                        match_kind="shorter_prefix",
                     )
                 else:
                     reusable_length = min(common_prefix, len(prompt_key) - 1)
@@ -94,6 +157,7 @@ class PromptCacheStore:
                         tokens=prompt_key[:reusable_length],
                         prompt_cache=trimmed_cache,
                         cache_bytes=_estimate_cache_bytes(trimmed_cache),
+                        match_kind="trimmed_longer_prefix",
                     )
             else:
                 reusable_length = min(common_prefix, len(prompt_key) - 1)
@@ -109,9 +173,20 @@ class PromptCacheStore:
                     tokens=prompt_key[:reusable_length],
                     prompt_cache=trimmed_cache,
                     cache_bytes=_estimate_cache_bytes(trimmed_cache),
+                    match_kind="trimmed_longer_prefix",
                 )
             if best is None or len(candidate.tokens) > len(best.tokens):
                 best = candidate
+        if best is None:
+            self._stats.misses += 1
+            return None
+        self._stats.hits += 1
+        if best.match_kind == "exact":
+            self._stats.exact_hits += 1
+        elif best.match_kind == "shorter_prefix":
+            self._stats.shorter_prefix_hits += 1
+        else:
+            self._stats.trimmed_longer_prefix_hits += 1
         return best
 
     def remember(
@@ -132,6 +207,7 @@ class PromptCacheStore:
             key[1],
             copy.deepcopy(list(prompt_cache)),
             _estimate_cache_bytes(prompt_cache),
+            "exact",
         )
         if cache.cache_bytes > self._max_bytes:
             return
@@ -143,16 +219,38 @@ class PromptCacheStore:
         self._entries[key] = cache
         self._total_bytes += cache.cache_bytes
         self._entries.move_to_end(key)
-        while (
-            len(self._entries) > self._max_entries
-            or self._total_bytes > self._max_bytes
-        ):
-            _, evicted = self._entries.popitem(last=False)
-            self._total_bytes -= evicted.cache_bytes
+        self._stats.entries = len(self._entries)
+        self._stats.bytes = self._total_bytes
+        while len(self._entries) > self._max_entries or self._total_bytes > self._max_bytes:
+            self.evict_oldest()
+        if self._budget_manager is not None:
+            self._budget_manager.enforce()
+        self._stats.entries = len(self._entries)
+        self._stats.bytes = self._total_bytes
+
+    def evict_oldest(self) -> bool:
+        if not self._entries:
+            return False
+        _, evicted = self._entries.popitem(last=False)
+        self._total_bytes -= evicted.cache_bytes
+        self._stats.evictions += 1
+        self._stats.entries = len(self._entries)
+        self._stats.bytes = self._total_bytes
+        return True
 
     @property
     def total_bytes(self) -> int:
         return self._total_bytes
+
+    @property
+    def total_entries(self) -> int:
+        return len(self._entries)
+
+    @property
+    def stats_snapshot(self) -> PromptCacheStoreStats:
+        self._stats.entries = len(self._entries)
+        self._stats.bytes = self._total_bytes
+        return copy.deepcopy(self._stats)
 
 
 class BatchCompletionBackend(Protocol):
@@ -185,6 +283,20 @@ class BatchEventSink:
     emit_delta: Callable[[str, str], None]
     emit_response: Callable[[ChatCompletionResponse], None]
     emit_error: Callable[[str, str, str], None]
+
+
+@dataclass
+class RequestTiming:
+    admitted_at: float = field(default_factory=time.perf_counter)
+    decode_started_at: float | None = None
+    first_token_at: float | None = None
+    completed_at: float | None = None
+
+
+def _duration_ms(start: float | None, end: float | None) -> int | None:
+    if start is None or end is None or end < start:
+        return None
+    return max(0, int(round((end - start) * 1000.0)))
 
 
 class MlxBatchCompletionBackend:
@@ -280,7 +392,8 @@ class MlxBatchCompletionBackend:
             prompt_caches: dict[int, tuple[Sequence[Any], Sequence[int] | None]] = {}
             pending_uids: set[int] = set(uids)
 
-            with generator.stats():
+            peak_memory_bytes = 0
+            with generator.stats() as stats:
                 empty_polls = 0
                 while pending_uids:
                     responses = generator.next_generated()
@@ -311,6 +424,7 @@ class MlxBatchCompletionBackend:
                                 getattr(response, "all_tokens", None),
                             )
                         pending_uids.discard(uid)
+                peak_memory_bytes = int(getattr(stats, "peak_memory", 0) or 0)
         finally:
             with suppress(Exception):
                 generator.close()
@@ -334,6 +448,14 @@ class MlxBatchCompletionBackend:
                 active_batch_cache_bytes=self._context.prompt_cache_store.total_bytes,
                 prompt_batch_size=len(requests),
                 decode_batch_size=len(requests),
+                configured_prompt_batch_size=len(requests),
+                configured_decode_batch_size=len(requests),
+                backend="text",
+                modality="text",
+                apc_mode="none",
+                peak_memory_bytes=peak_memory_bytes or None,
+                prompt_cache_entries=self._context.prompt_cache_store.total_entries,
+                prompt_cache_evictions=self._context.prompt_cache_store.stats_snapshot.evictions,
             )
             responses.append(response)
 
@@ -380,6 +502,9 @@ class _ScheduledRequest:
     generated_tokens: list[int] = None  # type: ignore[assignment]
     rendered_text: str = ""
     cancelled: bool = False
+    stage: str = "pending"
+    cancelled_stage: str | None = None
+    timing: RequestTiming = field(default_factory=RequestTiming)
 
     def __post_init__(self) -> None:
         if self.generated_tokens is None:
@@ -397,19 +522,36 @@ class ContinuousBatchScheduler:
         prompt_concurrency: int = 4,
         decode_concurrency: int = 4,
         prefill_step_size: int = 256,
+        cache_budget_manager: CacheBudgetManager | None = None,
+        configured_prompt_batch_size: int | None = None,
+        configured_decode_batch_size: int | None = None,
     ) -> None:
         self._context = context
         self._sink = sink
         self._prompt_concurrency = prompt_concurrency
         self._decode_concurrency = decode_concurrency
         self._prefill_step_size = prefill_step_size
+        self._cache_budget_manager = cache_budget_manager
+        self._configured_prompt_batch_size = (
+            configured_prompt_batch_size or prompt_concurrency
+        )
+        self._configured_decode_batch_size = (
+            configured_decode_batch_size or decode_concurrency
+        )
         self._batch_generator_cls: type[Any] | None = None
         self._generator: Any | None = None
+        self._generator_stats_ctx: Any | None = None
+        self._generator_stats: Any | None = None
         self._pending: deque[_ScheduledRequest] = deque()
         self._active: dict[int, _ScheduledRequest] = {}
+        self._worker_cancellation_count = 0
+        self._worker_error_count = 0
+        self._last_tick_latency_ms = 0
+        self._arbitration_delay_ms = 0
 
     def submit(self, request: ChatCompletionRequest, stream: bool) -> None:
         if request.model != self._context.model_id:
+            self._worker_error_count += 1
             self._sink.emit_error(
                 request.request_id,
                 "INVALID_REQUEST",
@@ -421,6 +563,7 @@ class ContinuousBatchScheduler:
             tokens = self._context.build_prompt_tokens(request)
             self._context.validate_token_limits(request, tokens)
         except ValueError as exc:
+            self._worker_error_count += 1
             self._sink.emit_error(request.request_id, "INVALID_REQUEST", str(exc))
             return
 
@@ -438,6 +581,9 @@ class ContinuousBatchScheduler:
             if job.request.request_id != request_id:
                 continue
             self._pending.remove(job)
+            job.cancelled_stage = job.stage
+            job.stage = "cancelled"
+            self._worker_cancellation_count += 1
             self._emit_cancelled(job)
             return True
 
@@ -445,6 +591,9 @@ class ContinuousBatchScheduler:
             if job.request.request_id != request_id:
                 continue
             self._active.pop(uid, None)
+            job.cancelled_stage = job.stage
+            job.stage = "cancelled"
+            self._worker_cancellation_count += 1
             self._emit_cancelled(job)
             self._maybe_cancel_generator(uid)
             return True
@@ -452,13 +601,22 @@ class ContinuousBatchScheduler:
         return False
 
     def tick(self) -> None:
+        started = time.perf_counter()
         if self._generator is None and not self._pending:
             return
 
         if self._active and self._generator is not None:
             self._step_generator()
+            if self._cache_budget_manager is not None:
+                self._cache_budget_manager.set_active_batch_bytes(
+                    "text", self._active_batch_cache_bytes()
+                )
 
         self._admit_pending()
+        self._last_tick_latency_ms = max(0, int(round((time.perf_counter() - started) * 1000.0)))
+
+    def set_arbitration_delay_ms(self, value_ms: int) -> None:
+        self._arbitration_delay_ms = max(0, value_ms)
 
     def idle(self) -> bool:
         return not self._pending and not self._active
@@ -467,7 +625,14 @@ class ContinuousBatchScheduler:
         if self._generator is not None:
             with suppress(Exception):
                 self._generator.close()
+            if self._generator_stats_ctx is not None:
+                with suppress(Exception):
+                    self._generator_stats_ctx.__exit__(None, None, None)
             self._generator = None
+            self._generator_stats_ctx = None
+            self._generator_stats = None
+        if self._cache_budget_manager is not None:
+            self._cache_budget_manager.set_active_batch_bytes("text", 0)
 
     def _step_generator(self) -> None:
         responses = self._generator.next_generated()
@@ -478,6 +643,10 @@ class ContinuousBatchScheduler:
             job = self._active.get(response.uid)
             if job is None:
                 continue
+            if job.timing.decode_started_at is None:
+                now = time.perf_counter()
+                job.timing.decode_started_at = now
+                job.stage = "decoding"
 
             job.decode_batch_size = max(job.decode_batch_size, len(self._active))
             if response.finish_reason is None:
@@ -503,6 +672,11 @@ class ContinuousBatchScheduler:
 
         if self._generator is None:
             self._generator = self._make_batch_generator()
+            stats_factory = getattr(self._generator, "stats", None)
+            if callable(stats_factory):
+                self._generator_stats_ctx = stats_factory()
+                with suppress(Exception):
+                    self._generator_stats = self._generator_stats_ctx.__enter__()
 
         if len(self._active) >= self._decode_concurrency:
             return
@@ -555,7 +729,12 @@ class ContinuousBatchScheduler:
             job.uid = uid
             job.prompt_batch_size = len(batch)
             job.decode_batch_size = len(self._active) + len(batch)
+            job.stage = "prompt_processing"
             self._active[uid] = job
+        if self._cache_budget_manager is not None:
+            self._cache_budget_manager.set_active_batch_bytes(
+                "text", self._active_batch_cache_bytes()
+            )
 
     def _make_batch_generator(self) -> Any:
         batch_generator_cls = self._get_batch_generator_cls()
@@ -588,6 +767,8 @@ class ContinuousBatchScheduler:
         )
         if delta:
             self._sink.emit_delta(job.request.request_id, delta)
+            if job.timing.first_token_at is None:
+                job.timing.first_token_at = time.perf_counter()
         job.rendered_text = decoded
 
     def _finish(
@@ -599,6 +780,11 @@ class ContinuousBatchScheduler:
     ) -> None:
         if not job.stream:
             job.rendered_text = self._context.tokenizer.decode(job.generated_tokens)
+            if job.generated_tokens and job.timing.first_token_at is None:
+                now = time.perf_counter()
+                job.timing.first_token_at = now
+                if job.timing.decode_started_at is None:
+                    job.timing.decode_started_at = now
 
         if prompt_cache is not None:
             cached_prefix_tokens = (
@@ -617,6 +803,8 @@ class ContinuousBatchScheduler:
                 self._context.prompt_cache_store.remember(
                     full_prompt_tokens, cache_value
                 )
+        job.stage = "completed"
+        job.timing.completed_at = time.perf_counter()
 
         self._sink.emit_response(
             ChatCompletionResponse(
@@ -636,10 +824,36 @@ class ContinuousBatchScheduler:
                 active_batch_cache_bytes=self._active_batch_cache_bytes(),
                 prompt_batch_size=job.prompt_batch_size or None,
                 decode_batch_size=job.decode_batch_size or None,
+                configured_prompt_batch_size=self._configured_prompt_batch_size,
+                configured_decode_batch_size=self._configured_decode_batch_size,
+                backend="text",
+                modality="text",
+                apc_mode="none",
+                scheduler_stage=job.stage,
+                cancellation_stage=job.cancelled_stage,
+                queue_time_ms=_duration_ms(job.timing.admitted_at, job.timing.decode_started_at),
+                prefill_time_ms=_duration_ms(
+                    job.timing.admitted_at, job.timing.decode_started_at
+                ),
+                ttft_ms=_duration_ms(job.timing.admitted_at, job.timing.first_token_at),
+                decode_time_ms=_duration_ms(
+                    job.timing.decode_started_at, job.timing.completed_at
+                ),
+                completion_time_ms=_duration_ms(
+                    job.timing.admitted_at, job.timing.completed_at
+                ),
+                scheduler_tick_latency_ms=self._last_tick_latency_ms,
+                arbitration_delay_ms=self._arbitration_delay_ms,
+                worker_cancellation_count=self._worker_cancellation_count,
+                worker_error_count=self._worker_error_count,
+                prompt_cache_entries=self._context.prompt_cache_store.stats_snapshot.entries,
+                prompt_cache_evictions=self._context.prompt_cache_store.stats_snapshot.evictions,
+                peak_memory_bytes=self._peak_memory_bytes(),
             )
         )
 
     def _emit_cancelled(self, job: _ScheduledRequest) -> None:
+        job.timing.completed_at = time.perf_counter()
         self._sink.emit_response(
             ChatCompletionResponse(
                 request_id=job.request.request_id,
@@ -658,6 +872,31 @@ class ContinuousBatchScheduler:
                 active_batch_cache_bytes=self._active_batch_cache_bytes(),
                 prompt_batch_size=job.prompt_batch_size or None,
                 decode_batch_size=job.decode_batch_size or None,
+                configured_prompt_batch_size=self._configured_prompt_batch_size,
+                configured_decode_batch_size=self._configured_decode_batch_size,
+                backend="text",
+                modality="text",
+                apc_mode="none",
+                scheduler_stage=job.stage,
+                cancellation_stage=job.cancelled_stage,
+                queue_time_ms=_duration_ms(job.timing.admitted_at, job.timing.decode_started_at),
+                prefill_time_ms=_duration_ms(
+                    job.timing.admitted_at, job.timing.decode_started_at
+                ),
+                ttft_ms=_duration_ms(job.timing.admitted_at, job.timing.first_token_at),
+                decode_time_ms=_duration_ms(
+                    job.timing.decode_started_at, job.timing.completed_at
+                ),
+                completion_time_ms=_duration_ms(
+                    job.timing.admitted_at, job.timing.completed_at
+                ),
+                scheduler_tick_latency_ms=self._last_tick_latency_ms,
+                arbitration_delay_ms=self._arbitration_delay_ms,
+                worker_cancellation_count=self._worker_cancellation_count,
+                worker_error_count=self._worker_error_count,
+                prompt_cache_entries=self._context.prompt_cache_store.stats_snapshot.entries,
+                prompt_cache_evictions=self._context.prompt_cache_store.stats_snapshot.evictions,
+                peak_memory_bytes=self._peak_memory_bytes(),
             )
         )
 
@@ -675,6 +914,15 @@ class ContinuousBatchScheduler:
             return 0
         value = getattr(self._generator, "prompt_cache_nbytes", 0)
         return value if isinstance(value, int) else 0
+
+    def _peak_memory_bytes(self) -> int:
+        if self._generator_stats is None:
+            return 0
+        value = getattr(self._generator_stats, "peak_memory", 0) or 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
 
 def _trim_mlx_prompt_cache(
@@ -712,6 +960,7 @@ def _prompt_cache_for_prompt_tokens(
 def validate_continuous_batching_backend() -> None:
     """Validate the installed text LLM batching API before worker readiness."""
 
+    _validate_tested_minor_version("mlx-lm", expected_minor_prefix="0.31.")
     _load_batch_generator_cls(continuous=True)
 
 
@@ -772,3 +1021,14 @@ def _estimate_cache_bytes(prompt_cache: Sequence[Any]) -> int:
         if isinstance(item, (bytes, bytearray, memoryview, str, list, tuple)):
             total += len(item)
     return total
+
+
+def _validate_tested_minor_version(
+    package_name: str, *, expected_minor_prefix: str
+) -> None:
+    version = importlib.metadata.version(package_name)
+    if not version.startswith(expected_minor_prefix):
+        raise RuntimeError(
+            f"{package_name} {version} is outside tested minor range "
+            f"{expected_minor_prefix}x"
+        )

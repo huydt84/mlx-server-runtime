@@ -22,7 +22,8 @@
 #   8. Mixed text+VLM overlap proves both families make forward progress together.
 #   9. Cancellation by client disconnect increments request-cancelled metrics and does not block follow-up work.
 #   10. Script records text and VLM p50/p95 TTFT, latency, completion tokens/sec, prompt tokens/sec,
-#       decode tokens/sec, cache metrics, VLM request/image counts, and VLM media-preparation timings.
+#       decode tokens/sec, cache metrics, VLM request/image counts, image dimensions,
+#       APC/vision-feature cache hit rates, and VLM media-preparation timings.
 #
 # Expected verification signal:
 #   - Script exits with status code 0.
@@ -46,6 +47,9 @@ BASELINE_LOG="$TMP_ROOT/baseline-gateway.log"
 CONTINUOUS_LOG="$TMP_ROOT/continuous-gateway.log"
 BASELINE_SUMMARY="$TMP_ROOT/baseline-summary.json"
 CONTINUOUS_SUMMARY="$TMP_ROOT/continuous-summary.json"
+TEXT_CACHE_BUDGET_BYTES=$((64 * 1024 * 1024))
+VLM_APC_CACHE_BUDGET_BYTES=$((64 * 1024 * 1024))
+VISION_FEATURE_CACHE_BUDGET_BYTES=$((64 * 1024 * 1024))
 TEXT_MODEL="${MLX_PHASE10_TEXT_MODEL:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
 VLM_MODEL="${MLX_PHASE10_VLM_MODEL:-mlx-community/Qwen2-VL-2B-Instruct-4bit}"
 VLM_IMAGE_PATH="${MLX_PHASE10_IMAGE_PATH:-$ROOT/benchmarks/images/fruits.png}"
@@ -117,6 +121,9 @@ run_mode() {
     MLX_RUNTIME_PROMPT_CONCURRENCY=4 \
     MLX_RUNTIME_DECODE_CONCURRENCY=4 \
     MLX_RUNTIME_PREFILL_CHUNK_SIZE=256 \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES" \
+    MLX_RUNTIME_VLM_APC_CACHE_BUDGET_BYTES="$VLM_APC_CACHE_BUDGET_BYTES" \
+    MLX_RUNTIME_VISION_FEATURE_CACHE_BUDGET_BYTES="$VISION_FEATURE_CACHE_BUDGET_BYTES" \
     cargo run -p mlx_runtime_gateway >"$log_path" 2>&1 &
     GATEWAY_PID=$!
 
@@ -251,12 +258,10 @@ def request_once(payload, *, first_token_event=None):
         raise RuntimeError(f"unexpected status {resp.status}: {body}")
 
     first_chunk_at = None
+    first_printable_at = None
     usage = None
     text_parts = []
-    prompt_cache_hit = None
-    cached_tokens = None
-    prompt_cache_bytes = None
-    decode_batch_size = None
+    response_fields = {}
     if payload.get("stream", False):
         while True:
             line = resp.readline()
@@ -271,11 +276,54 @@ def request_once(payload, *, first_token_event=None):
             event = json.loads(data.decode("utf-8"))
             if first_chunk_at is None:
                 first_chunk_at = time.perf_counter()
+            for key in (
+                "prompt_cache_hit",
+                "cached_tokens",
+                "prompt_cache_bytes",
+                "decode_batch_size",
+                "prompt_batch_size",
+                "configured_prompt_batch_size",
+                "configured_decode_batch_size",
+                "active_batch_cache_bytes",
+                "modality",
+                "apc_mode",
+                "scheduler_tick_latency_ms",
+                "arbitration_delay_ms",
+                "worker_cancellation_count",
+                "worker_error_count",
+                "vision_feature_cache_hit",
+                "vision_feature_cache_bytes",
+                "vision_feature_cache_entries",
+                "vision_feature_cache_evictions",
+                "vision_encoder_latency_ms",
+                "embedding_latency_ms",
+                "prompt_cache_entries",
+                "prompt_cache_evictions",
+                "peak_memory_bytes",
+                "image_width",
+                "image_height",
+                "backend",
+                "scheduler_stage",
+                "cancellation_stage",
+                "queue_time_ms",
+                "prefill_time_ms",
+                "ttft_ms",
+                "decode_time_ms",
+                "completion_time_ms",
+                "image_count",
+                "image_preprocess_latency_ms",
+                "prompt_template_latency_ms",
+            ):
+                value = event.get(key)
+                if value is not None:
+                    response_fields[key] = value
             choices = event.get("choices", [])
             if choices:
                 delta = choices[0].get("delta", {}).get("content", "")
                 if delta:
                     text_parts.append(delta)
+                    if first_printable_at is None and delta.strip():
+                        first_printable_at = time.perf_counter()
                     if first_token_event is not None:
                         first_token_event.set()
             else:
@@ -284,28 +332,67 @@ def request_once(payload, *, first_token_event=None):
         payload_body = json.loads(resp.read().decode("utf-8"))
         usage = payload_body.get("usage")
         text_parts.append(payload_body["choices"][0]["message"]["content"])
-        prompt_cache_hit = payload_body.get("prompt_cache_hit")
-        cached_tokens = payload_body.get("cached_tokens")
-        prompt_cache_bytes = payload_body.get("prompt_cache_bytes")
-        decode_batch_size = payload_body.get("decode_batch_size")
+        response_fields.update(
+            {
+                key: payload_body.get(key)
+                for key in (
+                    "prompt_cache_hit",
+                    "cached_tokens",
+                    "prompt_cache_bytes",
+                    "decode_batch_size",
+                    "prompt_batch_size",
+                    "configured_prompt_batch_size",
+                    "configured_decode_batch_size",
+                    "active_batch_cache_bytes",
+                    "modality",
+                    "apc_mode",
+                    "scheduler_tick_latency_ms",
+                    "arbitration_delay_ms",
+                    "worker_cancellation_count",
+                    "worker_error_count",
+                    "vision_feature_cache_hit",
+                    "vision_feature_cache_bytes",
+                    "vision_feature_cache_entries",
+                    "vision_feature_cache_evictions",
+                    "vision_encoder_latency_ms",
+                    "embedding_latency_ms",
+                    "prompt_cache_entries",
+                    "prompt_cache_evictions",
+                    "peak_memory_bytes",
+                    "image_width",
+                    "image_height",
+                    "backend",
+                    "scheduler_stage",
+                    "cancellation_stage",
+                    "queue_time_ms",
+                    "prefill_time_ms",
+                    "ttft_ms",
+                    "decode_time_ms",
+                    "completion_time_ms",
+                    "image_count",
+                    "image_preprocess_latency_ms",
+                    "prompt_template_latency_ms",
+                )
+            }
+        )
 
     completed_at = time.perf_counter()
     conn.close()
     return {
         "started_at": started,
-        "ttft_ms": None if first_chunk_at is None else (first_chunk_at - started) * 1000.0,
+        "ttft_ms": (
+            None
+            if first_printable_at is None
+            else (first_printable_at - started) * 1000.0
+        ),
         "latency_ms": (completed_at - started) * 1000.0,
         "first_chunk_at": first_chunk_at,
+        "first_printable_at": first_printable_at,
         "completed_at": completed_at,
         "prompt_tokens": 0 if usage is None else int(usage.get("prompt_tokens", 0)),
         "completion_tokens": 0 if usage is None else int(usage.get("completion_tokens", 0)),
         "text": "".join(text_parts),
-        "prompt_cache_hit": prompt_cache_hit if payload.get("stream", False) else prompt_cache_hit,
-        "cached_tokens": cached_tokens if payload.get("stream", False) else cached_tokens,
-        "prompt_cache_bytes": (
-            prompt_cache_bytes if payload.get("stream", False) else prompt_cache_bytes
-        ),
-        "decode_batch_size": decode_batch_size,
+        **response_fields,
     }
 
 
@@ -389,7 +476,7 @@ def join_while_decoding(first_payload, second_payload):
     }
 
 
-def cancel_by_disconnect(payload):
+def cancel_by_disconnect(payload, *, wait_for_first_printable=False):
     conn = http.client.HTTPConnection(HOST, PORT, timeout=300)
     encoded = json.dumps(payload)
     conn.request(
@@ -401,9 +488,13 @@ def cancel_by_disconnect(payload):
     resp = conn.getresponse()
     if resp.status != 200:
         raise RuntimeError(f"unexpected cancel status {resp.status}")
-    line = resp.readline()
-    if not line:
-        raise RuntimeError("stream produced no chunk before cancel")
+    if wait_for_first_printable:
+        while True:
+            line = resp.readline()
+            if not line:
+                raise RuntimeError("stream produced no chunk before cancel")
+            if line.startswith(b"data: ") and b'"delta"' in line:
+                break
     conn.close()
 
 
@@ -415,6 +506,34 @@ def aggregate_requests(items):
     latency_total_ms = sum(latency_values)
     decode_total_ms = sum(
         item["latency_ms"] - (item["ttft_ms"] or 0.0) for item in items
+    )
+    prompt_cache_hits = sum(1 for item in items if item.get("prompt_cache_hit"))
+    prompt_cache_misses = sum(1 for item in items if item.get("prompt_cache_hit") is False)
+    vision_cache_hits = sum(1 for item in items if item.get("vision_feature_cache_hit"))
+    vision_cache_misses = sum(
+        1 for item in items if item.get("vision_feature_cache_hit") is False
+    )
+    prompt_cache_bytes = max(
+        [int(item.get("prompt_cache_bytes") or 0) for item in items] + [0]
+    )
+    vision_feature_cache_bytes = max(
+        [int(item.get("vision_feature_cache_bytes") or 0) for item in items] + [0]
+    )
+    image_count = sum(int(item.get("image_count") or 0) for item in items)
+    image_width = max([int(item.get("image_width") or 0) for item in items] + [0])
+    image_height = max([int(item.get("image_height") or 0) for item in items] + [0])
+    peak_memory_bytes = max(
+        [int(item.get("peak_memory_bytes") or 0) for item in items] + [0]
+    )
+    worker_cancellations = max(
+        [int(item.get("worker_cancellation_count") or 0) for item in items] + [0]
+    )
+    worker_errors = max([int(item.get("worker_error_count") or 0) for item in items] + [0])
+    scheduler_tick_latency_ms = max(
+        [int(item.get("scheduler_tick_latency_ms") or 0) for item in items] + [0]
+    )
+    arbitration_delay_ms = max(
+        [int(item.get("arbitration_delay_ms") or 0) for item in items] + [0]
     )
     total_latency_sec = max(sum(latency_values) / 1000.0, 0.001)
     decode_total_sec = max(decode_total_ms / 1000.0, 0.001)
@@ -430,12 +549,32 @@ def aggregate_requests(items):
         "prompt_tokens_per_sec": prompt_tokens / total_latency_sec,
         "completion_tokens_per_sec": completion_tokens / total_latency_sec,
         "decode_tokens_per_sec": completion_tokens / decode_total_sec,
+        "prompt_cache_hits": prompt_cache_hits,
+        "prompt_cache_misses": prompt_cache_misses,
+        "prompt_cache_hit_rate": (
+            prompt_cache_hits / max(prompt_cache_hits + prompt_cache_misses, 1)
+        ),
+        "prompt_cache_bytes": prompt_cache_bytes,
+        "vision_cache_hits": vision_cache_hits,
+        "vision_cache_misses": vision_cache_misses,
+        "vision_cache_hit_rate": (
+            vision_cache_hits / max(vision_cache_hits + vision_cache_misses, 1)
+        ),
+        "vision_feature_cache_bytes": vision_feature_cache_bytes,
+        "image_count": image_count,
+        "image_width": image_width,
+        "image_height": image_height,
+        "peak_memory_bytes": peak_memory_bytes,
+        "worker_cancellations": worker_cancellations,
+        "worker_errors": worker_errors,
+        "scheduler_tick_latency_ms": scheduler_tick_latency_ms,
+        "arbitration_delay_ms": arbitration_delay_ms,
     }
 
 
 def run_text_suite():
     started = time.perf_counter()
-    decode_only = request_once(text_payload("Say hello in one short sentence."))
+    decode_only = request_once(text_payload("Say hello in one short sentence.", stream=True))
     short = concurrent_requests(
         [
             text_payload("Short prompt alpha."),
@@ -476,9 +615,18 @@ def run_text_suite():
     )
     cancel_by_disconnect(
         text_payload(
-            "Stream this response and then cancel it after first token.",
-            max_tokens=32,
+            "Stream this response and then cancel it before the first token.",
+            max_tokens=96,
+            stream=True,
         )
+    )
+    cancel_by_disconnect(
+        text_payload(
+            "Stream this response and then cancel it after the first visible token.",
+            max_tokens=128,
+            stream=True,
+        ),
+        wait_for_first_printable=True,
     )
     cancel_followup = request_once(text_payload("Follow-up request after cancellation."))
     cache_pressure = concurrent_requests(
@@ -493,6 +641,7 @@ def run_text_suite():
         text_payload(
             "Count from 1 to 100, writing every number without abbreviating.",
             max_tokens=128,
+            stream=True,
         ),
         vlm_payload(
             "Reply with exactly one sentence about the local image.",
@@ -532,7 +681,7 @@ def run_vlm_suite():
     decode_only = request_once(
         vlm_payload(
             "Describe this local image in one short sentence.",
-            stream=False,
+            stream=True,
             max_tokens=32,
             with_image=True,
         )
@@ -582,9 +731,51 @@ def run_vlm_suite():
     )
     cancel_by_disconnect(
         vlm_payload(
-            "Stream a detailed answer about this image and then cancel after the first token.",
+            "Stream a detailed answer about this image and then cancel before the first token.",
             with_image=True,
             max_tokens=48,
+            stream=True,
+        )
+    )
+    cancel_by_disconnect(
+        vlm_payload(
+            "Stream a detailed answer about this image and then cancel after the first visible token.",
+            with_image=True,
+            max_tokens=64,
+            stream=True,
+        ),
+        wait_for_first_printable=True,
+    )
+    shared_apc = concurrent_requests(
+        [
+            vlm_payload(
+                "Describe the same local image in one sentence.",
+                with_image=True,
+                max_tokens=24,
+                stream=False,
+            ),
+            vlm_payload(
+                "Describe the same local image in one sentence.",
+                with_image=True,
+                max_tokens=24,
+                stream=False,
+            ),
+        ]
+    )
+    repeat_image_seed = request_once(
+        vlm_payload(
+            "Describe the same local image in one sentence.",
+            with_image=True,
+            max_tokens=24,
+            stream=False,
+        )
+    )
+    repeat_image_followup = request_once(
+        vlm_payload(
+            "Describe the same local image in one sentence.",
+            with_image=True,
+            max_tokens=24,
+            stream=False,
         )
     )
     cancel_followup = request_once(
@@ -598,7 +789,8 @@ def run_vlm_suite():
         [decode_only]
         + [dynamic_join["first"], dynamic_join["second"]]
         + mixed_modal
-        + [repeated_image_seed, repeated_image_followup]
+        + shared_apc
+        + [repeat_image_seed, repeat_image_followup]
         + [cancel_followup]
     )
     return {
@@ -607,8 +799,9 @@ def run_vlm_suite():
         "decode_only": decode_only,
         "dynamic_join": dynamic_join,
         "mixed_modal": mixed_modal,
-        "repeated_image_seed": repeated_image_seed,
-        "repeated_image_followup": repeated_image_followup,
+        "shared_apc": shared_apc,
+        "repeated_image_seed": repeat_image_seed,
+        "repeated_image_followup": repeat_image_followup,
         "cancel_followup": cancel_followup,
         **aggregate_requests(all_requests),
     }
@@ -660,8 +853,12 @@ run_mode "continuous" 1 "$CONTINUOUS_LOG" "$CONTINUOUS_SUMMARY"
 echo "continuous_ready=1"
 
 echo "[4/6] Compare summaries"
+TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES" \
+VLM_APC_CACHE_BUDGET_BYTES="$VLM_APC_CACHE_BUDGET_BYTES" \
+VISION_FEATURE_CACHE_BUDGET_BYTES="$VISION_FEATURE_CACHE_BUDGET_BYTES" \
 python3 - "$ROOT" "$BASELINE_SUMMARY" "$CONTINUOUS_SUMMARY" "$VLM_IMAGE_PATH" <<'PY'
 import json
+import os
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -671,6 +868,9 @@ ROOT = Path(sys.argv[1])
 baseline = json.loads(Path(sys.argv[2]).read_text())
 continuous = json.loads(Path(sys.argv[3]).read_text())
 VLM_IMAGE_PATH = str(Path(sys.argv[4]).resolve())
+TEXT_CACHE_BUDGET_BYTES = int(os.environ["TEXT_CACHE_BUDGET_BYTES"])
+VLM_APC_CACHE_BUDGET_BYTES = int(os.environ["VLM_APC_CACHE_BUDGET_BYTES"])
+VISION_FEATURE_CACHE_BUDGET_BYTES = int(os.environ["VISION_FEATURE_CACHE_BUDGET_BYTES"])
 
 sys.path.insert(0, str(ROOT / "python"))
 
@@ -694,13 +894,25 @@ def print_family(mode, label, summary):
     print(
         f"{mode}_{label}_decode_tokens_per_sec={family['decode_tokens_per_sec']:.1f}"
     )
+    print(f"{mode}_{label}_cache_hit_rate={family['prompt_cache_hit_rate']:.3f}")
+    print(f"{mode}_{label}_peak_memory_bytes={family['peak_memory_bytes']:.0f}")
+    print(f"{mode}_{label}_worker_cancellations={family['worker_cancellations']:.0f}")
+    print(f"{mode}_{label}_worker_errors={family['worker_errors']:.0f}")
+    print(f"{mode}_{label}_scheduler_tick_latency_ms={family['scheduler_tick_latency_ms']:.0f}")
+    print(f"{mode}_{label}_arbitration_delay_ms={family['arbitration_delay_ms']:.0f}")
+    if label == "vlm":
+        print(f"{mode}_{label}_apc_hit_rate={family['prompt_cache_hit_rate']:.3f}")
+        print(f"{mode}_{label}_vision_cache_hit_rate={family['vision_cache_hit_rate']:.3f}")
+        print(f"{mode}_{label}_image_count={family['image_count']:.0f}")
+        print(f"{mode}_{label}_image_width={family['image_width']:.0f}")
+        print(f"{mode}_{label}_image_height={family['image_height']:.0f}")
 
 
-def throughput(summary):
-    text = summary["text"]
-    prompt_tokens = text["prompt_tokens"]
-    completion_tokens = text["completion_tokens"]
-    latency_sec = max(text["suite_wall_clock_ms"] / 1000.0, 0.001)
+def throughput(summary, label):
+    family = summary[label]
+    prompt_tokens = family["prompt_tokens"]
+    completion_tokens = family["completion_tokens"]
+    latency_sec = max(family["suite_wall_clock_ms"] / 1000.0, 0.001)
     return {
         "prompt_tokens_per_sec": prompt_tokens / latency_sec,
         "completion_tokens_per_sec": completion_tokens / latency_sec,
@@ -731,100 +943,6 @@ class FakeEmbeddingOutput:
         return {}
 
 
-def image_cache_proof():
-    fake_generate = ModuleType("mlx_vlm.generate")
-
-    class FakeVlmBatchGenerator:
-        def __init__(self, *args, **kwargs):
-            self.prompt_cache_nbytes = 0
-
-    fake_generate.BatchGenerator = FakeVlmBatchGenerator
-    sys.modules["mlx_vlm"] = ModuleType("mlx_vlm")
-    sys.modules["mlx_vlm.generate"] = fake_generate
-
-    fake_sample_utils = ModuleType("mlx_lm.sample_utils")
-    fake_sample_utils.make_sampler = lambda temp, top_p: f"sampler-{temp}-{top_p}"
-    sys.modules["mlx_lm"] = ModuleType("mlx_lm")
-    sys.modules["mlx_lm.sample_utils"] = fake_sample_utils
-
-    fake_vlm_utils = ModuleType("mlx_vlm.utils")
-    fake_vlm_utils.prepare_inputs = lambda processor, **kwargs: {
-        "input_ids": [[1, 2, 3]],
-        "attention_mask": [[1, 1, 1]],
-        **(
-            {"pixel_values": [[[0.0]]], "image_grid_thw": [[1, 1, 1]]}
-            if kwargs.get("images")
-            else {}
-        ),
-    }
-    fake_vlm_utils.load_config = lambda *args, **kwargs: None
-    sys.modules["mlx_vlm.utils"] = fake_vlm_utils
-
-    engine = MlxVlmEngine(
-        "vlm-model",
-        vlm_loader=lambda _model_id: (
-            SimpleNamespace(
-                language_model=SimpleNamespace(),
-                get_input_embeddings=lambda input_ids, pixel_values=None, mask=None, **kwargs: (
-                    FakeEmbeddingOutput()
-                ),
-            ),
-            FakeProcessor(),
-        ),
-        vlm_generate_fn=lambda *args, **kwargs: None,
-        vlm_stream_generate_fn=lambda *args, **kwargs: None,
-    )
-    engine.initialize()
-    cache_store = PromptCacheStore(trim_cache=lambda prompt_cache, num_tokens: list(prompt_cache))
-    scheduler = VlmContinuousBatchScheduler(
-        engine,
-        sink=SimpleNamespace(
-            emit_delta=lambda request_id, delta: None,
-            emit_response=lambda response: None,
-            emit_error=lambda request_id, code, message: None,
-        ),
-        prompt_concurrency=2,
-        decode_concurrency=2,
-        prefill_step_size=64,
-        prompt_cache_store=cache_store,
-    )
-    request = ChatCompletionRequest(
-        request_id="vlm-cache-proof",
-        model="vlm-model",
-        messages=[
-            ChatMessage(
-                role="user",
-                content=(
-                    TextContent(text="Describe the image."),
-                    ImageContent(url=VLM_IMAGE_PATH),
-                ),
-            )
-        ],
-        max_tokens=16,
-        temperature=0.0,
-        top_p=1.0,
-        max_prompt_tokens=32,
-        max_completion_tokens=32,
-        max_total_tokens_per_request=64,
-        stream=False,
-    )
-
-    first_job = scheduler._prepare_request(request)
-    cache_store.remember(
-        first_job.full_prompt_tokens,
-        ["cache-a"],
-        cache_key=first_job.prompt_cache_key,
-    )
-    second_job = scheduler._prepare_request(request)
-    if second_job.cached_prompt != ["cache-a"]:
-        raise SystemExit("deterministic VLM cache proof failed")
-    if not second_job.cached_prefix_tokens:
-        raise SystemExit("deterministic VLM cache proof missed cached tokens")
-
-
-image_cache_proof()
-
-
 for mode, summary in (("baseline", baseline), ("continuous", continuous)):
     print_family(mode, "text", summary)
     print_family(mode, "vlm", summary)
@@ -833,9 +951,10 @@ for mode, summary in (("baseline", baseline), ("continuous", continuous)):
     print(
         f"{mode}_prompt_cache_cached_tokens_total={metrics['prompt_cache_cached_tokens_total']:.0f}"
     )
-    print(f"{mode}_worker_memory_bytes={metrics['worker_memory_bytes']:.0f}")
     print(f"{mode}_vlm_requests_total={metrics['vlm_requests_total']:.0f}")
     print(f"{mode}_vlm_image_count_total={metrics['vlm_image_count_total']:.0f}")
+    print(f"{mode}_vlm_image_width={summary['vlm']['image_width']:.0f}")
+    print(f"{mode}_vlm_image_height={summary['vlm']['image_height']:.0f}")
     print(
         f"{mode}_vlm_image_preprocess_latency_ms={metrics['vlm_image_preprocess_latency_ms']:.0f}"
     )
@@ -878,6 +997,12 @@ if not continuous["vlm"]["repeated_image_followup"].get("prompt_cache_hit"):
     raise SystemExit("repeated image workload did not report a cache hit")
 if continuous["vlm"]["repeated_image_followup"].get("cached_tokens", 0) <= 0:
     raise SystemExit("repeated image workload did not report cached tokens")
+if not continuous["vlm"]["repeated_image_followup"].get("vision_feature_cache_hit"):
+    raise SystemExit("repeated image workload did not report a vision-feature cache hit")
+if continuous["vlm"]["shared_apc"][1].get("prompt_cache_hit") is not True:
+    raise SystemExit("shared text+image APC workload did not report a cache hit")
+if continuous["vlm"]["shared_apc"][1].get("cached_tokens", 0) <= 0:
+    raise SystemExit("shared text+image APC workload did not report cached tokens")
 if continuous["metrics"]["requests_cancelled_total"] <= 0:
     raise SystemExit("continuous cancellation metric missing")
 if continuous["metrics"]["vlm_requests_total"] <= 0:
@@ -886,19 +1011,59 @@ if continuous["metrics"]["vlm_image_count_total"] <= 0:
     raise SystemExit("continuous VLM image-count metric missing")
 if continuous["metrics"]["vlm_load_errors_total"] != 0:
     raise SystemExit("continuous VLM load errors were recorded")
+if continuous["metrics"]["active_batch_cache_bytes"] <= 0:
+    raise SystemExit("combined memory pressure never produced active batch cache usage")
+if continuous["text"]["prompt_cache_bytes"] > TEXT_CACHE_BUDGET_BYTES:
+    raise SystemExit("text prompt cache exceeded its configured budget")
+if continuous["vlm"]["prompt_cache_bytes"] > VLM_APC_CACHE_BUDGET_BYTES:
+    raise SystemExit("VLM APC cache exceeded its configured budget")
+if continuous["vlm"]["vision_feature_cache_bytes"] > VISION_FEATURE_CACHE_BUDGET_BYTES:
+    raise SystemExit("VLM vision-feature cache exceeded its configured budget")
+if continuous["text"]["peak_memory_bytes"] <= 0:
+    raise SystemExit("text peak memory was never populated")
+if continuous["vlm"]["peak_memory_bytes"] <= 0:
+    raise SystemExit("VLM peak memory was never populated")
+if continuous["vlm"]["image_count"] <= 0:
+    raise SystemExit("VLM image count was never populated")
+if continuous["vlm"]["image_width"] <= 0 or continuous["vlm"]["image_height"] <= 0:
+    raise SystemExit("VLM image dimensions were never populated")
 if not continuous["vlm"]["decode_only"]["text"].strip():
     raise SystemExit("continuous VLM decode-only workload returned empty text")
 if continuous["text"]["ttft_p50_ms"] is None or baseline["text"]["ttft_p50_ms"] is None:
     raise SystemExit("text TTFT summary missing")
 if continuous["vlm"]["ttft_p50_ms"] is None or baseline["vlm"]["ttft_p50_ms"] is None:
     raise SystemExit("VLM TTFT summary missing")
+if continuous["text"]["ttft_p95_ms"] is not None and baseline["text"]["ttft_p95_ms"] is not None:
+    if continuous["text"]["ttft_p95_ms"] > baseline["text"]["ttft_p95_ms"] * 1.25:
+        raise SystemExit("text p95 TTFT regressed beyond the allowed threshold")
+if continuous["vlm"]["ttft_p95_ms"] is not None and baseline["vlm"]["ttft_p95_ms"] is not None:
+    if continuous["vlm"]["ttft_p95_ms"] > baseline["vlm"]["ttft_p95_ms"] * 1.25:
+        raise SystemExit("VLM p95 TTFT regressed beyond the allowed threshold")
 
-baseline_throughput = throughput(baseline)
-continuous_throughput = throughput(continuous)
-if continuous_throughput["completion_tokens_per_sec"] < baseline_throughput["completion_tokens_per_sec"]:
-    raise SystemExit("continuous batch throughput did not beat serialized baseline")
-if continuous_throughput["prompt_tokens_per_sec"] < baseline_throughput["prompt_tokens_per_sec"]:
-    raise SystemExit("continuous prompt throughput did not beat serialized baseline")
+baseline_text_throughput = throughput(baseline, "text")
+continuous_text_throughput = throughput(continuous, "text")
+baseline_vlm_throughput = throughput(baseline, "vlm")
+continuous_vlm_throughput = throughput(continuous, "vlm")
+if (
+    continuous_text_throughput["completion_tokens_per_sec"]
+    < baseline_text_throughput["completion_tokens_per_sec"]
+):
+    raise SystemExit("continuous text throughput did not beat serialized baseline")
+if (
+    continuous_text_throughput["prompt_tokens_per_sec"]
+    < baseline_text_throughput["prompt_tokens_per_sec"]
+):
+    raise SystemExit("continuous text prompt throughput did not beat serialized baseline")
+if (
+    continuous_vlm_throughput["completion_tokens_per_sec"]
+    < baseline_vlm_throughput["completion_tokens_per_sec"]
+):
+    raise SystemExit("continuous VLM throughput did not beat serialized baseline")
+if (
+    continuous_vlm_throughput["prompt_tokens_per_sec"]
+    < baseline_vlm_throughput["prompt_tokens_per_sec"]
+):
+    raise SystemExit("continuous VLM prompt throughput did not beat serialized baseline")
 
 print("baseline_metrics_ok=1")
 print("continuous_metrics_ok=1")

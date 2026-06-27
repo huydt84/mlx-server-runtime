@@ -103,7 +103,7 @@ impl WorkerClient {
                     }
                     WorkerEvent::ChatCompletion {
                         response,
-                        image_count: _image_count,
+                        image_count,
                         image_preprocess_latency_ms,
                         prompt_template_latency_ms,
                         prompt_cache_hit,
@@ -112,38 +112,371 @@ impl WorkerClient {
                         active_batch_cache_bytes,
                         prompt_batch_size,
                         decode_batch_size,
+                        configured_prompt_batch_size,
+                        configured_decode_batch_size,
+                        backend,
+                        modality,
+                        apc_mode,
+                        scheduler_stage,
+                        cancellation_stage,
+                        queue_time_ms,
+                        prefill_time_ms,
+                        ttft_ms,
+                        decode_time_ms,
+                        completion_time_ms,
+                        scheduler_tick_latency_ms,
+                        arbitration_delay_ms,
+                        worker_cancellation_count,
+                        worker_error_count,
+                        vision_feature_cache_hit,
+                        vision_feature_cache_bytes,
+                        vision_feature_cache_entries,
+                        vision_feature_cache_evictions,
+                        vision_encoder_latency_ms,
+                        embedding_latency_ms,
+                        prompt_cache_entries,
+                        prompt_cache_evictions,
+                        peak_memory_bytes,
+                        image_width,
+                        image_height,
                     } => {
                         if response.request_id != request_id {
                             continue;
                         }
+                        let backend = backend.as_deref().unwrap_or("unknown");
+                        let modality = modality.as_deref().unwrap_or(backend);
                         self.metrics.record_ipc_roundtrip_latency_ms(
                             roundtrip_started.elapsed().as_millis() as u64,
                         );
+                        if let Some(count) = image_count {
+                            self.metrics.increment_labeled_counter(
+                                "mlx_vlm_image_count_by_backend_total",
+                                &[("backend", backend), ("modality", modality)],
+                                count as u64,
+                            );
+                        }
                         if let Some(value_ms) = image_preprocess_latency_ms {
                             self.metrics
                                 .record_vlm_image_preprocess_latency_ms(value_ms as u64);
+                            self.metrics.set_labeled_gauge(
+                                "mlx_vlm_image_preprocess_latency_by_backend_ms",
+                                &[("backend", backend), ("modality", modality)],
+                                value_ms as u64,
+                            );
                         }
                         if let Some(value_ms) = prompt_template_latency_ms {
                             self.metrics
                                 .record_vlm_prompt_template_latency_ms(value_ms as u64);
+                            self.metrics.set_labeled_gauge(
+                                "mlx_vlm_prompt_template_latency_by_backend_ms",
+                                &[("backend", backend), ("modality", modality)],
+                                value_ms as u64,
+                            );
                         }
                         if let Some(hit) = prompt_cache_hit {
                             self.metrics.record_prompt_cache_hit(hit);
+                            self.metrics.increment_labeled_counter(
+                                if hit {
+                                    "mlx_cache_hits_by_backend_total"
+                                } else {
+                                    "mlx_cache_misses_by_backend_total"
+                                },
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "prompt_kv"),
+                                ],
+                                1,
+                            );
                         }
                         if let Some(tokens) = cached_tokens {
                             self.metrics.add_prompt_cache_cached_tokens(tokens as u64);
+                            self.metrics.increment_labeled_counter(
+                                "mlx_cached_tokens_by_backend_total",
+                                &[("backend", backend), ("modality", modality)],
+                                tokens as u64,
+                            );
                         }
                         if let Some(bytes) = prompt_cache_bytes {
                             self.metrics.set_prompt_cache_bytes(bytes);
+                            self.metrics.set_labeled_gauge(
+                                "mlx_cache_bytes_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "prompt_kv"),
+                                ],
+                                bytes,
+                            );
+                        }
+                        if let Some(entries) = prompt_cache_entries {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_cache_entries_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "prompt_kv"),
+                                ],
+                                entries as u64,
+                            );
+                        }
+                        if let Some(evictions) = prompt_cache_evictions {
+                            self.metrics.increment_labeled_counter(
+                                "mlx_cache_evictions_by_backend_total",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "prompt_kv"),
+                                ],
+                                evictions as u64,
+                            );
                         }
                         if let Some(bytes) = active_batch_cache_bytes {
                             self.metrics.set_active_batch_cache_bytes(bytes);
+                            self.metrics.set_labeled_gauge(
+                                "mlx_cache_bytes_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "active_batch"),
+                                ],
+                                bytes,
+                            );
                         }
                         if let Some(size) = prompt_batch_size {
                             self.metrics.set_prompt_batch_size(size as u64);
+                            self.metrics.set_labeled_gauge(
+                                "mlx_batch_size_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("stage", "prompt"),
+                                ],
+                                size as u64,
+                            );
                         }
                         if let Some(size) = decode_batch_size {
                             self.metrics.set_decode_batch_size(size as u64);
+                            self.metrics.set_labeled_gauge(
+                                "mlx_batch_size_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("stage", "decode"),
+                                ],
+                                size as u64,
+                            );
+                        }
+                        if let Some(size) = configured_prompt_batch_size {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_batch_size_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("stage", "configured_prompt"),
+                                ],
+                                size as u64,
+                            );
+                        }
+                        if let Some(size) = configured_decode_batch_size {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_batch_size_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("stage", "configured_decode"),
+                                ],
+                                size as u64,
+                            );
+                        }
+                        if let Some(stage) = scheduler_stage.as_deref() {
+                            self.metrics.increment_labeled_counter(
+                                "mlx_requests_by_backend_stage_total",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("stage", stage),
+                                ],
+                                1,
+                            );
+                        }
+                        if let Some(stage) = cancellation_stage.as_deref() {
+                            self.metrics.increment_labeled_counter(
+                                "mlx_requests_by_backend_stage_total",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("stage", stage),
+                                ],
+                                1,
+                            );
+                        }
+                        if let Some(value_ms) = queue_time_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "queue"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = prefill_time_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "prefill"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = ttft_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "ttft"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = decode_time_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "decode"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = completion_time_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "completion"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = scheduler_tick_latency_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_scheduler_tick_latency_by_backend_ms",
+                                &[("backend", backend), ("modality", modality)],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = arbitration_delay_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_arbitration_delay_by_backend_ms",
+                                &[("backend", backend), ("modality", modality)],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value) = worker_cancellation_count {
+                            self.metrics.increment_labeled_counter(
+                                "mlx_worker_cancellations_by_backend_total",
+                                &[("backend", backend), ("modality", modality)],
+                                value as u64,
+                            );
+                        }
+                        if let Some(value) = worker_error_count {
+                            self.metrics.increment_labeled_counter(
+                                "mlx_worker_errors_by_backend_total",
+                                &[("backend", backend), ("modality", modality)],
+                                value as u64,
+                            );
+                        }
+                        if let Some(hit) = vision_feature_cache_hit {
+                            self.metrics.increment_labeled_counter(
+                                if hit {
+                                    "mlx_cache_hits_by_backend_total"
+                                } else {
+                                    "mlx_cache_misses_by_backend_total"
+                                },
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "vision_feature"),
+                                ],
+                                1,
+                            );
+                        }
+                        if let Some(bytes) = vision_feature_cache_bytes {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_cache_bytes_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "vision_feature"),
+                                ],
+                                bytes,
+                            );
+                        }
+                        if let Some(entries) = vision_feature_cache_entries {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_cache_entries_by_backend",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "vision_feature"),
+                                ],
+                                entries as u64,
+                            );
+                        }
+                        if let Some(evictions) = vision_feature_cache_evictions {
+                            self.metrics.increment_labeled_counter(
+                                "mlx_cache_evictions_by_backend_total",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("cache_family", "vision_feature"),
+                                ],
+                                evictions as u64,
+                            );
+                        }
+                        if let Some(value_ms) = vision_encoder_latency_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "vision_encoder"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = embedding_latency_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "embedding"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value) = peak_memory_bytes {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_peak_memory_by_backend_bytes",
+                                &[("backend", backend), ("modality", modality)],
+                                value,
+                            );
+                        }
+                        if let Some(mode) = apc_mode.as_deref() {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_apc_mode_by_backend",
+                                &[("backend", backend), ("modality", modality), ("mode", mode)],
+                                1,
+                            );
                         }
                         self.unregister_request(&request_id);
                         return Ok(response);
@@ -367,6 +700,33 @@ mod tests {
                     active_batch_cache_bytes: None,
                     prompt_batch_size: None,
                     decode_batch_size: None,
+                    configured_prompt_batch_size: None,
+                    configured_decode_batch_size: None,
+                    backend: None,
+                    modality: None,
+                    apc_mode: None,
+                    scheduler_stage: None,
+                    cancellation_stage: None,
+                    queue_time_ms: None,
+                    prefill_time_ms: None,
+                    ttft_ms: None,
+                    decode_time_ms: None,
+                    completion_time_ms: None,
+                    scheduler_tick_latency_ms: None,
+                    arbitration_delay_ms: None,
+                    worker_cancellation_count: None,
+                    worker_error_count: None,
+                    vision_feature_cache_hit: None,
+                    vision_feature_cache_bytes: None,
+                    vision_feature_cache_entries: None,
+                    vision_feature_cache_evictions: None,
+                    vision_encoder_latency_ms: None,
+                    embedding_latency_ms: None,
+                    prompt_cache_entries: None,
+                    prompt_cache_evictions: None,
+                    peak_memory_bytes: None,
+                    image_width: None,
+                    image_height: None,
                 },
                 WorkerEvent::ChatCompletion {
                     response: ChatCompletionResponse {
@@ -387,6 +747,33 @@ mod tests {
                     active_batch_cache_bytes: None,
                     prompt_batch_size: None,
                     decode_batch_size: None,
+                    configured_prompt_batch_size: None,
+                    configured_decode_batch_size: None,
+                    backend: None,
+                    modality: None,
+                    apc_mode: None,
+                    scheduler_stage: None,
+                    cancellation_stage: None,
+                    queue_time_ms: None,
+                    prefill_time_ms: None,
+                    ttft_ms: None,
+                    decode_time_ms: None,
+                    completion_time_ms: None,
+                    scheduler_tick_latency_ms: None,
+                    arbitration_delay_ms: None,
+                    worker_cancellation_count: None,
+                    worker_error_count: None,
+                    vision_feature_cache_hit: None,
+                    vision_feature_cache_bytes: None,
+                    vision_feature_cache_entries: None,
+                    vision_feature_cache_evictions: None,
+                    vision_encoder_latency_ms: None,
+                    embedding_latency_ms: None,
+                    prompt_cache_entries: None,
+                    prompt_cache_evictions: None,
+                    peak_memory_bytes: None,
+                    image_width: None,
+                    image_height: None,
                 },
             ];
 

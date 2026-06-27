@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -81,6 +82,8 @@ pub struct MetricsRegistry {
     vlm_image_preprocess_latency_ms: AtomicU64,
     vlm_prompt_template_latency_ms: AtomicU64,
     vlm_load_errors_total: AtomicU64,
+    labeled_counters: Mutex<HashMap<String, u64>>,
+    labeled_gauges: Mutex<HashMap<String, u64>>,
 }
 
 impl MetricsRegistry {
@@ -117,6 +120,8 @@ impl MetricsRegistry {
             vlm_image_preprocess_latency_ms: AtomicU64::new(0),
             vlm_prompt_template_latency_ms: AtomicU64::new(0),
             vlm_load_errors_total: AtomicU64::new(0),
+            labeled_counters: Mutex::new(HashMap::new()),
+            labeled_gauges: Mutex::new(HashMap::new()),
         }
     }
 
@@ -269,6 +274,25 @@ impl MetricsRegistry {
     /// Increments VLM load error counter.
     pub fn increment_vlm_load_errors_total(&self) {
         self.vlm_load_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_labeled_counter(
+        &self,
+        metric_name: &str,
+        labels: &[(&str, &str)],
+        value: u64,
+    ) {
+        if let Ok(mut guard) = self.labeled_counters.lock() {
+            let key = metric_key(metric_name, labels);
+            *guard.entry(key).or_insert(0) += value;
+        }
+    }
+
+    pub fn set_labeled_gauge(&self, metric_name: &str, labels: &[(&str, &str)], value: u64) {
+        if let Ok(mut guard) = self.labeled_gauges.lock() {
+            let key = metric_key(metric_name, labels);
+            guard.insert(key, value);
+        }
     }
 
     /// Renders Prometheus exposition text.
@@ -470,7 +494,127 @@ impl MetricsRegistry {
             "Total VLM model load errors.",
             self.vlm_load_errors_total.load(Ordering::Relaxed),
         );
+        render_labeled_metrics(
+            &mut output,
+            &self.labeled_counters,
+            "counter",
+            &[
+                (
+                    "mlx_requests_by_backend_stage_total",
+                    "Total requests by backend and scheduler stage.",
+                ),
+                (
+                    "mlx_cache_hits_by_backend_total",
+                    "Total cache hits by backend and cache family.",
+                ),
+                (
+                    "mlx_cache_misses_by_backend_total",
+                    "Total cache misses by backend and cache family.",
+                ),
+                (
+                    "mlx_cached_tokens_by_backend_total",
+                    "Total cached tokens by backend.",
+                ),
+                (
+                    "mlx_cache_evictions_by_backend_total",
+                    "Total cache evictions by backend and cache family.",
+                ),
+                (
+                    "mlx_cache_entries_by_backend",
+                    "Latest cache entry counts by backend and cache family.",
+                ),
+                (
+                    "mlx_worker_cancellations_by_backend_total",
+                    "Total worker-side cancellations by backend.",
+                ),
+                (
+                    "mlx_worker_errors_by_backend_total",
+                    "Total worker-side errors by backend.",
+                ),
+                (
+                    "mlx_vlm_image_count_by_backend_total",
+                    "Total VLM images processed by backend.",
+                ),
+                (
+                    "mlx_vlm_load_errors_by_backend_total",
+                    "Total VLM load errors by backend.",
+                ),
+            ],
+        );
+        render_labeled_metrics(
+            &mut output,
+            &self.labeled_gauges,
+            "gauge",
+            &[
+                (
+                    "mlx_batch_size_by_backend",
+                    "Latest batch sizes by backend and stage.",
+                ),
+                (
+                    "mlx_latency_by_backend_ms",
+                    "Latest latency measurements by backend.",
+                ),
+                (
+                    "mlx_cache_bytes_by_backend",
+                    "Latest cache bytes by backend and cache family.",
+                ),
+                (
+                    "mlx_scheduler_tick_latency_by_backend_ms",
+                    "Latest scheduler tick latency by backend.",
+                ),
+                (
+                    "mlx_arbitration_delay_by_backend_ms",
+                    "Latest arbitration delay by backend.",
+                ),
+                (
+                    "mlx_peak_memory_by_backend_bytes",
+                    "Latest peak memory by backend.",
+                ),
+                ("mlx_apc_mode_by_backend", "Latest APC mode by backend."),
+                (
+                    "mlx_vlm_image_preprocess_latency_by_backend_ms",
+                    "Latest VLM image preprocessing latency by backend.",
+                ),
+                (
+                    "mlx_vlm_prompt_template_latency_by_backend_ms",
+                    "Latest VLM prompt/template latency by backend.",
+                ),
+            ],
+        );
         output
+    }
+}
+
+fn metric_key(name: &str, labels: &[(&str, &str)]) -> String {
+    let mut rendered = String::from(name);
+    if !labels.is_empty() {
+        rendered.push('{');
+        for (index, (key, value)) in labels.iter().enumerate() {
+            if index > 0 {
+                rendered.push(',');
+            }
+            let _ = write!(rendered, r#"{key}="{value}""#);
+        }
+        rendered.push('}');
+    }
+    rendered
+}
+
+fn render_labeled_metrics(
+    output: &mut String,
+    store: &Mutex<HashMap<String, u64>>,
+    metric_type: &str,
+    families: &[(&str, &str)],
+) {
+    let Ok(guard) = store.lock() else {
+        return;
+    };
+    for (name, help) in families {
+        let _ = writeln!(output, "# HELP {name} {help}");
+        let _ = writeln!(output, "# TYPE {name} {metric_type}");
+        for (metric_key, value) in guard.iter().filter(|(key, _)| key.starts_with(name)) {
+            let _ = writeln!(output, "{metric_key} {value}");
+        }
     }
 }
 
@@ -725,6 +869,8 @@ mod tests {
             "mlx_active_batch_cache_bytes 0",
             "mlx_prompt_batch_size 0",
             "mlx_decode_batch_size 0",
+            "mlx_cache_entries_by_backend",
+            "mlx_cache_evictions_by_backend_total",
             "mlx_decode_tokens_per_second",
             "mlx_prefill_tokens_per_second",
             "mlx_ipc_messages_sent_total 0",
@@ -732,17 +878,57 @@ mod tests {
             "mlx_ipc_roundtrip_latency_ms 0",
             "mlx_worker_memory_bytes 0",
             "mlx_kv_cache_bytes 0",
+            "mlx_scheduler_tick_latency_by_backend_ms",
+            "mlx_arbitration_delay_by_backend_ms",
+            "mlx_peak_memory_by_backend_bytes",
+            "mlx_apc_mode_by_backend",
+            "mlx_worker_cancellations_by_backend_total",
+            "mlx_worker_errors_by_backend_total",
             // VLM Phase 8 metrics
             "mlx_vlm_requests_total 0",
             "mlx_vlm_image_count_total 0",
             "mlx_vlm_image_preprocess_latency_ms 0",
             "mlx_vlm_prompt_template_latency_ms 0",
             "mlx_vlm_load_errors_total 0",
+            "mlx_vlm_image_count_by_backend_total",
+            "mlx_vlm_load_errors_by_backend_total",
+            "mlx_vlm_image_preprocess_latency_by_backend_ms",
+            "mlx_vlm_prompt_template_latency_by_backend_ms",
         ];
 
         for metric in &required {
             assert!(output.contains(metric), "missing metric: {metric}");
         }
+    }
+
+    #[test]
+    fn render_prometheus_includes_labeled_backend_metrics() {
+        let metrics = MetricsRegistry::new();
+        metrics.increment_labeled_counter(
+            "mlx_requests_by_backend_stage_total",
+            &[("backend", "text"), ("stage", "decoding")],
+            2,
+        );
+        metrics.set_labeled_gauge(
+            "mlx_batch_size_by_backend",
+            &[("backend", "vlm"), ("stage", "prompt_processing")],
+            4,
+        );
+        metrics.set_labeled_gauge(
+            "mlx_cache_bytes_by_backend",
+            &[("backend", "vlm"), ("family", "vision_feature")],
+            128,
+        );
+
+        let output = metrics.render_prometheus(0);
+
+        assert!(output.contains(
+            "mlx_requests_by_backend_stage_total{backend=\"text\",stage=\"decoding\"} 2"
+        ));
+        assert!(output
+            .contains("mlx_batch_size_by_backend{backend=\"vlm\",stage=\"prompt_processing\"} 4"));
+        assert!(output
+            .contains("mlx_cache_bytes_by_backend{backend=\"vlm\",family=\"vision_feature\"} 128"));
     }
 
     #[test]

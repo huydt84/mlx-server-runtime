@@ -22,3 +22,27 @@ def test_load_config_parses_continuous_batching_controls(monkeypatch) -> None:
     assert config.prompt_concurrency == 6
     assert config.decode_concurrency == 3
     assert config.prefill_chunk_size == 128
+    assert config.text_prompt_concurrency == 6
+    assert config.text_decode_concurrency == 3
+    assert config.text_prefill_chunk_size == 128
+    assert config.vlm_prompt_concurrency == 6
+    assert config.vlm_decode_concurrency == 3
+    assert config.vlm_prefill_chunk_size == 128
+
+
+def test_load_config_prefers_backend_specific_controls(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_PROMPT_CONCURRENCY", "6")
+    monkeypatch.setenv("MLX_RUNTIME_TEXT_PROMPT_CONCURRENCY", "2")
+    monkeypatch.setenv("MLX_RUNTIME_VLM_PROMPT_CONCURRENCY", "5")
+    monkeypatch.setenv("MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES", "1024")
+    monkeypatch.setenv("MLX_RUNTIME_VLM_APC_CACHE_BUDGET_BYTES", "2048")
+    monkeypatch.setenv("MLX_RUNTIME_VISION_FEATURE_CACHE_MAX_ENTRIES", "7")
+
+    config = load_config()
+
+    assert config.prompt_concurrency == 6
+    assert config.text_prompt_concurrency == 2
+    assert config.vlm_prompt_concurrency == 5
+    assert config.text_cache_budget_bytes == 1024
+    assert config.vlm_apc_cache_budget_bytes == 2048
+    assert config.vision_feature_cache_max_entries == 7

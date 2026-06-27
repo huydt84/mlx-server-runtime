@@ -53,6 +53,10 @@ class MlxWorkerEngine:
         repr=False,
         compare=False,
     )
+    prompt_cache_max_entries: int = field(default=32, repr=False, compare=False)
+    prompt_cache_max_bytes: int = field(
+        default=8 * 1024 * 1024, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         """Load the configured model and configure batching."""
@@ -71,7 +75,11 @@ class MlxWorkerEngine:
                 self._make_sampler = _noop_sampler
 
         self.model, self.tokenizer = self._model_loader(self.model_id)
-        self._prompt_cache_store = PromptCacheStore()
+        self._prompt_cache_store = PromptCacheStore(
+            name="text_kv",
+            max_entries=self.prompt_cache_max_entries,
+            max_bytes=self.prompt_cache_max_bytes,
+        )
         context = BatchBackendContext(
             model_id=self.model_id,
             model=self.model,
