@@ -33,6 +33,12 @@ READY\n
 ERROR\t<message>\n
 ```
 
+Structured startup failures may also use JSON payloads:
+
+```json
+ERROR\t{"message":"native-mlx startup failed","error":{"code":"UNSUPPORTED_ARCHITECTURE_CLASS","message":"...","at":123,"backend":"native-mlx","stage":"architecture_detection","category":"unsupported_class","detail":"LlamaForCausalLM"}}
+```
+
 **STATUS:**
 
 ```
@@ -58,6 +64,18 @@ Status JSON fields:
 | `warmup_passed` | bool | Warmup result |
 | `last_warmup_at` | int or null | Unix timestamp |
 | `last_warmup_latency_ms` | int or null | Warmup duration |
+
+When `last_error` is present, it may include:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | string | Stable error code |
+| `message` | string | Human-readable error |
+| `at` | int | Unix timestamp |
+| `backend` | string or null | Backend that produced error |
+| `stage` | string or null | Earliest failed startup/runtime stage |
+| `category` | string or null | Triage class such as `unsupported_class` |
+| `detail` | string or null | Stable mismatch detail |
 
 ## Inference Phase
 

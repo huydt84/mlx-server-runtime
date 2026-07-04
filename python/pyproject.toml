@@ -22,4 +22,7 @@ dev = [
 
 [tool.setuptools]
 package-dir = {"" = "."}
-packages = ["mlx_worker"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mlx_worker*"]

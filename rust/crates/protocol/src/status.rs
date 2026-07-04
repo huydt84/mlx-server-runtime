@@ -36,6 +36,14 @@ pub struct ModelError {
     pub message: String,
     /// Unix timestamp for the error event.
     pub at: u64,
+    /// Backend that produced the error, when known.
+    pub backend: Option<String>,
+    /// Earliest startup or runtime stage that failed, when known.
+    pub stage: Option<String>,
+    /// Failure category for operator triage, when known.
+    pub category: Option<String>,
+    /// Stable detail payload for debugging, when known.
+    pub detail: Option<String>,
 }
 
 /// Optional progress information during model loading.
@@ -176,16 +184,25 @@ impl ModelStatus {
 
     /// Marks the model as failed with a stable error code.
     pub fn mark_failed(&mut self, code: impl Into<String>, message: impl Into<String>) {
+        self.mark_failed_with_error(ModelError {
+            code: code.into(),
+            message: message.into(),
+            at: now_unix_seconds(),
+            backend: None,
+            stage: None,
+            category: None,
+            detail: None,
+        });
+    }
+
+    /// Marks the model as failed using a structured error payload.
+    pub fn mark_failed_with_error(&mut self, error: ModelError) {
         let now = now_unix_seconds();
         self.state = ModelState::Failed;
         self.ready = false;
         self.servable = false;
         self.last_transition_at = now;
-        self.last_error = Some(ModelError {
-            code: code.into(),
-            message: message.into(),
-            at: now,
-        });
+        self.last_error = Some(error);
     }
 
     /// Marks a warmup success and transitions to ready.

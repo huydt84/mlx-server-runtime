@@ -10,6 +10,22 @@ def test_load_config_parses_max_vlm_images(monkeypatch) -> None:
     assert config.max_vlm_images == 7
 
 
+def test_load_config_defaults_backend_to_v1(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_BACKEND", raising=False)
+
+    config = load_config()
+
+    assert config.backend == "v1"
+
+
+def test_load_config_parses_native_backend(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_BACKEND", "native-mlx")
+
+    config = load_config()
+
+    assert config.backend == "native-mlx"
+
+
 def test_load_config_parses_continuous_batching_controls(monkeypatch) -> None:
     monkeypatch.setenv("MLX_RUNTIME_CONTINUOUS_BATCHING", "true")
     monkeypatch.setenv("MLX_RUNTIME_PROMPT_CONCURRENCY", "6")

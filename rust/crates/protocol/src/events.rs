@@ -23,7 +23,16 @@ pub fn encode_worker_message(message: &WorkerMessage) -> String {
             Err(_) => "STATUS\t{}".to_string(),
         },
         WorkerMessage::Ready(_) => "READY".to_string(),
-        WorkerMessage::Error(error) => format!("ERROR\t{}", error.message.replace('\n', " ")),
+        WorkerMessage::Error(error) => {
+            if error.error.is_some() {
+                match serde_json::to_string(error) {
+                    Ok(payload) => format!("ERROR\t{payload}"),
+                    Err(_) => format!("ERROR\t{}", error.message.replace('\n', " ")),
+                }
+            } else {
+                format!("ERROR\t{}", error.message.replace('\n', " "))
+            }
+        }
     }
 }
 
@@ -39,9 +48,13 @@ pub fn decode_worker_message(line: &str) -> Option<WorkerMessage> {
         "STATUS" => serde_json::from_str::<ModelStatus>(payload)
             .ok()
             .map(|status| WorkerMessage::Status(Box::new(status))),
-        "ERROR" => Some(WorkerMessage::Error(WorkerError {
-            message: payload.to_string(),
-        })),
+        "ERROR" => match serde_json::from_str::<WorkerError>(payload) {
+            Ok(error) => Some(WorkerMessage::Error(error)),
+            Err(_) => Some(WorkerMessage::Error(WorkerError {
+                message: payload.to_string(),
+                error: None,
+            })),
+        },
         _ => None,
     }
 }
@@ -65,6 +78,10 @@ pub enum GatewayCommand {
 /// Events sent from the worker to the gateway after bootstrap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Protocol enum stays flat to preserve serde wire shape without boxing every response payload."
+)]
 pub enum WorkerEvent {
     /// A streamed chat completion delta.
     ChatCompletionDelta { delta: ChatCompletionDelta },
@@ -193,6 +210,7 @@ mod tests {
     fn encode_and_decode_error_normalizes_newlines() {
         let message = WorkerMessage::Error(WorkerError {
             message: "boom\nmore".to_string(),
+            error: None,
         });
         let encoded = encode_worker_message(&message);
         assert_eq!(encoded, "ERROR\tboom more");
@@ -200,8 +218,29 @@ mod tests {
             decode_worker_message(&encoded),
             Some(WorkerMessage::Error(WorkerError {
                 message: "boom more".to_string(),
+                error: None,
             }))
         );
+    }
+
+    #[test]
+    fn encode_and_decode_structured_error_round_trip() {
+        let message = WorkerMessage::Error(WorkerError {
+            message: "boom".to_string(),
+            error: Some(crate::status::ModelError {
+                code: "UNSUPPORTED_ARCHITECTURE_CLASS".to_string(),
+                message: "boom".to_string(),
+                at: 7,
+                backend: Some("native-mlx".to_string()),
+                stage: Some("architecture_detection".to_string()),
+                category: Some("unsupported_class".to_string()),
+                detail: Some("LlamaForCausalLM".to_string()),
+            }),
+        });
+
+        let encoded = encode_worker_message(&message);
+        assert!(encoded.starts_with("ERROR\t{"));
+        assert_eq!(decode_worker_message(&encoded), Some(message));
     }
 
     #[test]

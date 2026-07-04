@@ -17,7 +17,9 @@ If the config file is missing, all defaults apply.
 |-------|------|---------|-------------|
 | `python` | string | `"python/.venv/bin/python"` | Python interpreter path |
 | `module` | string | `"mlx_worker.main"` | Python module entry point |
+| `backend` | string | `"v1"` | Explicit backend selector: `v1` or experimental `native-mlx` |
 | `model` | string | `"mlx-community/Qwen2.5-7B-Instruct-4bit"` | Hugging Face model ID |
+| `vlm_model` | string or null | `null` | Optional VLM model ID |
 | `ipc_path` | string | `"/tmp/mlx-runtime.sock"` | Unix domain socket path |
 
 ## [generation]
@@ -56,6 +58,7 @@ port = 8000
 [worker]
 python = "python/.venv/bin/python"
 module = "mlx_worker.main"
+backend = "v1"
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 ipc_path = "/tmp/mlx-runtime.sock"
 

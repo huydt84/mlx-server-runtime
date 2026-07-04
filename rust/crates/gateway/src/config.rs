@@ -18,12 +18,44 @@ pub struct WorkerConfig {
     pub python: String,
     /// Python module entrypoint.
     pub module: String,
+    /// Explicit worker backend. `v1` remains default.
+    pub backend: BackendKind,
     /// Text model identifier.
     pub model: String,
     /// Optional VLM model identifier (Phase 8).
     pub vlm_model: Option<String>,
     /// Unix socket path used for bootstrap IPC.
     pub ipc_path: String,
+}
+
+/// Supported worker backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// Existing `mlx_lm` runtime path.
+    V1,
+    /// Experimental native MLX runtime path.
+    NativeMlx,
+}
+
+impl BackendKind {
+    /// Returns config/env string for this backend.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::NativeMlx => "native-mlx",
+        }
+    }
+
+    fn parse(raw: &str) -> io::Result<Self> {
+        match raw {
+            "v1" => Ok(Self::V1),
+            "native-mlx" => Ok(Self::NativeMlx),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported worker.backend: {other}"),
+            )),
+        }
+    }
 }
 
 /// Default generation settings used by the gateway for omitted request fields.
@@ -99,6 +131,7 @@ impl Default for RuntimeConfig {
             worker: WorkerConfig {
                 python: "python/.venv/bin/python".to_string(),
                 module: "mlx_worker.main".to_string(),
+                backend: BackendKind::V1,
                 model: "mlx-community/Qwen2.5-7B-Instruct-4bit".to_string(),
                 vlm_model: None,
                 ipc_path: "/tmp/mlx-runtime.sock".to_string(),
@@ -165,6 +198,9 @@ impl RuntimeConfig {
                 }
                 ("worker", "python", Value::String(python)) => config.worker.python = python,
                 ("worker", "module", Value::String(module)) => config.worker.module = module,
+                ("worker", "backend", Value::String(backend)) => {
+                    config.worker.backend = BackendKind::parse(&backend)?
+                }
                 ("worker", "model", Value::String(model)) => config.worker.model = model,
                 ("worker", "vlm_model", Value::String(vlm_model)) => {
                     config.worker.vlm_model = Some(vlm_model)
@@ -329,6 +365,7 @@ mod tests {
             [worker]
             python = "/usr/bin/python3"
             module = "mlx_worker.main"
+            backend = "native-mlx"
             model = "test-model"
             vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
             ipc_path = "/tmp/test.sock"
@@ -360,6 +397,7 @@ mod tests {
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 9000);
         assert_eq!(config.worker.python, "/usr/bin/python3");
+        assert_eq!(config.worker.backend, BackendKind::NativeMlx);
         assert_eq!(config.worker.model, "test-model");
         assert_eq!(
             config.worker.vlm_model,

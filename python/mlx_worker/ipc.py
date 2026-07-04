@@ -32,6 +32,7 @@ class WorkerError:
     """Worker startup error."""
 
     message: str
+    error: ModelError | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,10 @@ class ModelError:
     code: str
     message: str
     at: int
+    backend: str | None = None
+    stage: str | None = None
+    category: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,8 +206,14 @@ def encode_bootstrap_message(
     if isinstance(message, WorkerReady):
         return b"READY\n"
     if isinstance(message, WorkerError):
-        sanitized = message.message.replace("\n", " ")
-        return f"ERROR\t{sanitized}\n".encode("utf-8")
+        if message.error is None:
+            sanitized = message.message.replace("\n", " ")
+            return f"ERROR\t{sanitized}\n".encode("utf-8")
+        payload = {
+            "message": message.message.replace("\n", " "),
+            "error": asdict(message.error),
+        }
+        return f"ERROR\t{json.dumps(payload)}\n".encode("utf-8")
 
     return f"STATUS\t{json.dumps(asdict(message))}\n".encode("utf-8")
 
@@ -214,6 +225,10 @@ def _model_error_from_dict(data: dict[str, Any] | None) -> ModelError | None:
         code=data["code"],
         message=data["message"],
         at=data["at"],
+        backend=data.get("backend"),
+        stage=data.get("stage"),
+        category=data.get("category"),
+        detail=data.get("detail"),
     )
 
 
@@ -241,7 +256,17 @@ def decode_bootstrap_message(
         return WorkerReady()
 
     if line.startswith("ERROR\t"):
-        return WorkerError(message=line.split("\t", 1)[1])
+        payload = line.split("\t", 1)[1]
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            return WorkerError(message=payload)
+        if not isinstance(decoded, dict):
+            return WorkerError(message=payload)
+        return WorkerError(
+            message=str(decoded.get("message", payload)),
+            error=_model_error_from_dict(decoded.get("error")),
+        )
 
     if line.startswith("STATUS\t"):
         payload = json.loads(line.split("\t", 1)[1])

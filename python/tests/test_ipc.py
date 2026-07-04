@@ -41,6 +41,23 @@ class IpcEncodingTests(unittest.TestCase):
         self.assertEqual(encoded, b"ERROR\tboom more\n")
         self.assertEqual(decode_bootstrap_message(encoded), WorkerError("boom more"))
 
+    def test_encode_structured_error_round_trip(self) -> None:
+        message = WorkerError(
+            "boom",
+            error=ModelError(
+                code="UNSUPPORTED_ARCHITECTURE_CLASS",
+                message="boom",
+                at=3,
+                backend="native-mlx",
+                stage="architecture_detection",
+                category="unsupported_class",
+                detail="LlamaForCausalLM",
+            ),
+        )
+
+        encoded = encode_bootstrap_message(message)
+        self.assertEqual(decode_bootstrap_message(encoded), message)
+
     def test_encode_status_round_trip(self) -> None:
         message = ModelStatus(
             model="test-model",

@@ -5,6 +5,8 @@ port = 8000
 [worker]
 python = "python/.venv/bin/python"
 module = "mlx_worker.main"
+# Experimental backend. Keep v1 default unless explicitly testing native-v2.
+backend = "v1"
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 # Uncomment to enable VLM support (Phase 8):
 # vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"

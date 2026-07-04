@@ -4,7 +4,7 @@ use crate::ipc::WorkerClient;
 use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
     decode_worker_message, ChatCompletionRequest, ChatMessage, MessageContent, MessageRole,
-    ModelState, ModelStatus, WorkerError, WorkerMessage, WorkerReady,
+    ModelError, ModelState, ModelStatus, WorkerError, WorkerMessage, WorkerReady,
 };
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -216,6 +216,24 @@ impl RuntimeState {
         self.metrics.set_worker_up(false);
         Ok(())
     }
+
+    /// Marks the model as failed with a structured worker error.
+    pub fn mark_failed_with_error(&self, error: ModelError) -> Result<(), GatewayError> {
+        let mut guard = self
+            .model_status
+            .write()
+            .map_err(|_| GatewayError::Protocol("model status lock poisoned".to_string()))?;
+        let previous_state = guard.state;
+        guard.mark_failed_with_error(error);
+        if previous_state != guard.state {
+            eprintln!(
+                "model_state_transition model={} from={:?} to={:?}",
+                guard.model, previous_state, guard.state
+            );
+        }
+        self.metrics.set_worker_up(false);
+        Ok(())
+    }
 }
 
 /// Background worker supervision for the current runtime slice.
@@ -263,17 +281,17 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        return fail_child(
+                        return fail_child_message(
                             &mut child,
                             format!("worker exited before ready: {status}"),
                             &runtime,
                         );
                     }
                     Ok(None) => {}
-                    Err(err) => return fail_child(&mut child, err.to_string(), &runtime),
+                    Err(err) => return fail_child_message(&mut child, err.to_string(), &runtime),
                 }
                 if Instant::now() >= deadline {
-                    return fail_child(
+                    return fail_child_message(
                         &mut child,
                         "worker did not become ready in time".to_string(),
                         &runtime,
@@ -281,12 +299,12 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(err) => return fail_child(&mut child, err.to_string(), &runtime),
+            Err(err) => return fail_child_message(&mut child, err.to_string(), &runtime),
         }
     };
 
     if let Err(err) = connection.set_nonblocking(false) {
-        return fail_child(&mut child, err.to_string(), &runtime);
+        return fail_child_message(&mut child, err.to_string(), &runtime);
     }
 
     let remaining = deadline
@@ -295,7 +313,7 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
 
     let reader_stream = connection.try_clone()?;
     if let Err(err) = reader_stream.set_read_timeout(Some(remaining)) {
-        return fail_child(&mut child, err.to_string(), &runtime);
+        return fail_child_message(&mut child, err.to_string(), &runtime);
     }
     let mut reader = BufReader::new(reader_stream);
     let mut line = String::new();
@@ -306,16 +324,16 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return fail_child(
+                return fail_child_message(
                     &mut child,
                     "worker did not become ready in time".to_string(),
                     &runtime,
                 );
             }
-            Err(err) => return fail_child(&mut child, err.to_string(), &runtime),
+            Err(err) => return fail_child_message(&mut child, err.to_string(), &runtime),
         };
         if bytes == 0 {
-            return fail_child(
+            return fail_child_message(
                 &mut child,
                 "worker closed the bootstrap socket".to_string(),
                 &runtime,
@@ -349,11 +367,11 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
                 }
                 break;
             }
-            Some(WorkerMessage::Error(WorkerError { message })) => {
-                return fail_child(&mut child, message, &runtime);
+            Some(WorkerMessage::Error(error)) => {
+                return fail_child(&mut child, error, &runtime);
             }
             None => {
-                return fail_child(
+                return fail_child_message(
                     &mut child,
                     format!("unrecognized bootstrap message: {}", line.trim()),
                     &runtime,
@@ -415,31 +433,62 @@ fn terminate_child(child: &mut Child) {
 
 fn fail_child(
     child: &mut Child,
-    message: String,
+    error: WorkerError,
     runtime: &RuntimeState,
 ) -> Result<(), GatewayError> {
+    let message = error.message.clone();
     terminate_child(child);
-    let _ = runtime.mark_failed("WORKER_BOOTSTRAP_FAILED", message.clone());
+    if let Some(model_error) = error.error {
+        let _ = runtime.mark_failed_with_error(model_error);
+    } else {
+        let _ = runtime.mark_failed("WORKER_BOOTSTRAP_FAILED", message.clone());
+    }
     let _ = runtime.mark_vlm_failed("WORKER_BOOTSTRAP_FAILED", message.clone());
     Err(GatewayError::WorkerStartup(message))
 }
 
-fn spawn_worker(config: &RuntimeConfig) -> Result<Child, GatewayError> {
-    let mut command = Command::new(&config.worker.python);
-    command
-        .arg("-m")
-        .arg(&config.worker.module)
-        .env("MLX_RUNTIME_SOCKET", &config.worker.ipc_path)
-        .env("MLX_RUNTIME_MODEL", &config.worker.model)
-        .env(
+fn fail_child_message(
+    child: &mut Child,
+    message: String,
+    runtime: &RuntimeState,
+) -> Result<(), GatewayError> {
+    fail_child(
+        child,
+        WorkerError {
+            message,
+            error: None,
+        },
+        runtime,
+    )
+}
+
+fn worker_env(config: &RuntimeConfig) -> [(&'static str, String); 6] {
+    [
+        ("MLX_RUNTIME_SOCKET", config.worker.ipc_path.clone()),
+        (
+            "MLX_RUNTIME_BACKEND",
+            config.worker.backend.as_str().to_string(),
+        ),
+        ("MLX_RUNTIME_MODEL", config.worker.model.clone()),
+        (
             "MLX_RUNTIME_VLM_MODEL",
-            config.worker.vlm_model.as_deref().unwrap_or(""),
-        )
-        .env(
+            config.worker.vlm_model.clone().unwrap_or_default(),
+        ),
+        (
             "MLX_RUNTIME_MAX_VLM_IMAGES",
             config.limits.max_vlm_images.to_string(),
-        )
-        .env("PYTHONPATH", "python")
+        ),
+        ("PYTHONPATH", "python".to_string()),
+    ]
+}
+
+fn spawn_worker(config: &RuntimeConfig) -> Result<Child, GatewayError> {
+    let mut command = Command::new(&config.worker.python);
+    command.arg("-m").arg(&config.worker.module);
+    for (key, value) in worker_env(config) {
+        command.env(key, value);
+    }
+    command
         .env("PYTHONUNBUFFERED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -447,4 +496,34 @@ fn spawn_worker(config: &RuntimeConfig) -> Result<Child, GatewayError> {
 
     let child = command.spawn()?;
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BackendKind;
+
+    #[test]
+    fn worker_env_defaults_to_v1_backend() {
+        let config = RuntimeConfig::default();
+        let env = worker_env(&config);
+
+        assert!(
+            env.iter()
+                .any(|(key, value)| *key == "MLX_RUNTIME_BACKEND"
+                    && value == BackendKind::V1.as_str())
+        );
+    }
+
+    #[test]
+    fn worker_env_uses_explicit_native_backend() {
+        let mut config = RuntimeConfig::default();
+        config.worker.backend = BackendKind::NativeMlx;
+
+        let env = worker_env(&config);
+
+        assert!(env.iter().any(|(key, value)| {
+            *key == "MLX_RUNTIME_BACKEND" && value == BackendKind::NativeMlx.as_str()
+        }));
+    }
 }

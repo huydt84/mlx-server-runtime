@@ -134,8 +134,9 @@ def _is_matching_cancel_request(raw_line: bytes, request_id: str) -> bool:
 def main(
     engine_factory: Callable[[str], object] | None = None,
     vlm_engine_factory: Callable[[str], object] | None = None,
+    native_worker_factory: Callable[[object], object] | None = None,
 ) -> int:
-    """Run the readiness handshake and Phase 1 worker loop with VLM routing."""
+    """Run worker bootstrap for selected backend."""
 
     config = load_config()
     stop = False
@@ -163,6 +164,14 @@ def main(
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.connect(config.socket_path)
+        if getattr(config, "backend", "v1") == "native-mlx":
+            from .native_mlx.worker import run_native_worker
+
+            return run_native_worker(
+                client,
+                config,
+                native_worker_factory=native_worker_factory,
+            )
         bootstrap_started_at = _now_seconds()
         engine: object | None = None
         vlm_engine: object | None = None
@@ -611,7 +620,9 @@ def _run_continuous_batch_loop(
             configured_prompt_batch_size=getattr(config, "vlm_prompt_concurrency", 4),
             configured_decode_batch_size=getattr(config, "vlm_decode_concurrency", 4),
             apc_cache_max_entries=getattr(config, "vlm_apc_cache_max_entries", 32),
-            apc_cache_max_bytes=getattr(config, "vlm_apc_cache_budget_bytes", 8 * 1024 * 1024),
+            apc_cache_max_bytes=getattr(
+                config, "vlm_apc_cache_budget_bytes", 8 * 1024 * 1024
+            ),
             vision_feature_cache_max_entries=getattr(
                 config, "vision_feature_cache_max_entries", 20
             ),

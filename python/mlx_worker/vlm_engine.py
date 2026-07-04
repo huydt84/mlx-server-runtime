@@ -260,9 +260,7 @@ class _VlmVisionFeatureCache:
         if self._budget_manager is not None:
             self._budget_manager.register(self)  # type: ignore[arg-type]
 
-    def get(
-        self, cache_key: str, prompt_signature: str
-    ) -> _VisionCacheSnapshot | None:
+    def get(self, cache_key: str, prompt_signature: str) -> _VisionCacheSnapshot | None:
         if self._cache is None:
             self._misses += 1
             return None
@@ -365,10 +363,6 @@ class _VlmVisionFeatureCache:
     @property
     def misses(self) -> int:
         return self._misses
-
-    @property
-    def evictions(self) -> int:
-        return self._evictions
 
 
 def _load_vlm_components() -> tuple[Callable[..., Any], Callable[..., Any]]:
@@ -1046,7 +1040,9 @@ class VlmContinuousBatchScheduler:
                     configured_decode_batch_size=self._configured_decode_batch_size,
                     backend="vlm",
                     modality="vlm",
-                    apc_mode="apc_manager" if self._apc_manager is not None else "disabled",
+                    apc_mode="apc_manager"
+                    if self._apc_manager is not None
+                    else "disabled",
                     scheduler_stage="cancelled",
                     cancellation_stage="pending",
                     completion_time_ms=0,
@@ -1084,7 +1080,9 @@ class VlmContinuousBatchScheduler:
                     image_count=len(job.image_paths),
                     backend="vlm",
                     modality="vlm",
-                    apc_mode="apc_manager" if self._apc_manager is not None else "disabled",
+                    apc_mode="apc_manager"
+                    if self._apc_manager is not None
+                    else "disabled",
                     scheduler_stage=job.stage,
                     cancellation_stage=job.cancelled_stage,
                     queue_time_ms=_duration_ms(
@@ -1181,7 +1179,10 @@ class VlmContinuousBatchScheduler:
                 if job is None:
                     continue
                 job.stage = "prompt_processing"
-                if job.cached_prompt is None and getattr(progress, "prompt_cache", None) is not None:
+                if (
+                    job.cached_prompt is None
+                    and getattr(progress, "prompt_cache", None) is not None
+                ):
                     job.cached_prompt = CachedPrompt(
                         tokens=tuple(job.full_prompt_tokens),
                         prompt_cache=copy.deepcopy(list(progress.prompt_cache)),
@@ -1422,7 +1423,9 @@ class VlmContinuousBatchScheduler:
                 )
             self._engine._last_embedding_ms = self._engine._last_vision_encoder_ms
         if cached_prompt is not None:
-            prompt_kwargs.setdefault("prompt_cache", copy.deepcopy(cached_prompt.prompt_cache))
+            prompt_kwargs.setdefault(
+                "prompt_cache", copy.deepcopy(cached_prompt.prompt_cache)
+            )
             prompt_kwargs.setdefault("all_tokens", list(cached_prompt.tokens))
         prompt_kwargs["inputs_embeds"] = inputs_embeds
         prompt_kwargs["_apc_image_hash"] = apc_image_hash
@@ -1541,7 +1544,10 @@ class VlmContinuousBatchScheduler:
             )
 
         if getattr(response, "prompt_cache", None) is not None:
-            sequence_tokens = list(getattr(response, "all_tokens", None) or job.full_prompt_tokens + job.generated_tokens)
+            sequence_tokens = list(
+                getattr(response, "all_tokens", None)
+                or job.full_prompt_tokens + job.generated_tokens
+            )
             cache_value = _prompt_cache_for_prompt_tokens(
                 response.prompt_cache,
                 sequence_tokens,
@@ -1599,9 +1605,7 @@ class VlmContinuousBatchScheduler:
                 prefill_time_ms=_duration_ms(
                     job.timing.admitted_at, job.timing.decode_started_at
                 ),
-                ttft_ms=_duration_ms(
-                    job.timing.admitted_at, job.timing.first_token_at
-                ),
+                ttft_ms=_duration_ms(job.timing.admitted_at, job.timing.first_token_at),
                 decode_time_ms=_duration_ms(
                     job.timing.decode_started_at, job.timing.completed_at
                 ),
@@ -1619,9 +1623,7 @@ class VlmContinuousBatchScheduler:
                 vision_encoder_latency_ms=max(
                     1, math.ceil(self._engine._last_vision_encoder_ms)
                 ),
-                embedding_latency_ms=max(
-                    1, math.ceil(self._engine._last_embedding_ms)
-                ),
+                embedding_latency_ms=max(1, math.ceil(self._engine._last_embedding_ms)),
                 prompt_cache_entries=self._prompt_cache_store.total_entries,
                 prompt_cache_evictions=self._prompt_cache_store.stats_snapshot.evictions,
                 peak_memory_bytes=self._peak_memory_bytes(),

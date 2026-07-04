@@ -95,6 +95,35 @@ def test_main_emits_statuses_before_ready(monkeypatch) -> None:
     assert fake_socket.shutdown_called
 
 
+def test_main_uses_native_backend_factory_only_when_selected(monkeypatch) -> None:
+    from mlx_worker import main as worker_main
+
+    fake_socket = FakeSocket(io.BytesIO(b""))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            backend="native-mlx",
+            model="native-model",
+        ),
+    )
+
+    called: list[str] = []
+
+    def fake_native_factory(config) -> object:
+        called.append(config.model)
+        raise RuntimeError("native seam hit")
+
+    exit_code = worker_main.main(native_worker_factory=fake_native_factory)
+
+    assert exit_code == 1
+    assert called == ["native-model"]
+
+
 def test_main_streams_deltas_before_final_response(monkeypatch) -> None:
     from mlx_worker import main as worker_main
 
@@ -639,6 +668,9 @@ def test_main_routes_text_and_vlm_requests_through_continuous_batch_loop(
                 )
             )
 
+        def set_arbitration_delay_ms(self, delay_ms: int) -> None:
+            self.delay_ms = delay_ms
+
         def idle(self) -> bool:
             return not self.pending
 
@@ -680,6 +712,9 @@ def test_main_routes_text_and_vlm_requests_through_continuous_batch_loop(
                     completion_tokens=1,
                 )
             )
+
+        def set_arbitration_delay_ms(self, delay_ms: int) -> None:
+            self.delay_ms = delay_ms
 
         def idle(self) -> bool:
             return not self.pending

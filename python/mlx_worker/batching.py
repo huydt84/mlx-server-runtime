@@ -221,7 +221,10 @@ class PromptCacheStore:
         self._entries.move_to_end(key)
         self._stats.entries = len(self._entries)
         self._stats.bytes = self._total_bytes
-        while len(self._entries) > self._max_entries or self._total_bytes > self._max_bytes:
+        while (
+            len(self._entries) > self._max_entries
+            or self._total_bytes > self._max_bytes
+        ):
             self.evict_oldest()
         if self._budget_manager is not None:
             self._budget_manager.enforce()
@@ -613,7 +616,9 @@ class ContinuousBatchScheduler:
                 )
 
         self._admit_pending()
-        self._last_tick_latency_ms = max(0, int(round((time.perf_counter() - started) * 1000.0)))
+        self._last_tick_latency_ms = max(
+            0, int(round((time.perf_counter() - started) * 1000.0))
+        )
 
     def set_arbitration_delay_ms(self, value_ms: int) -> None:
         self._arbitration_delay_ms = max(0, value_ms)
@@ -831,7 +836,9 @@ class ContinuousBatchScheduler:
                 apc_mode="none",
                 scheduler_stage=job.stage,
                 cancellation_stage=job.cancelled_stage,
-                queue_time_ms=_duration_ms(job.timing.admitted_at, job.timing.decode_started_at),
+                queue_time_ms=_duration_ms(
+                    job.timing.admitted_at, job.timing.decode_started_at
+                ),
                 prefill_time_ms=_duration_ms(
                     job.timing.admitted_at, job.timing.decode_started_at
                 ),
@@ -879,7 +886,9 @@ class ContinuousBatchScheduler:
                 apc_mode="none",
                 scheduler_stage=job.stage,
                 cancellation_stage=job.cancelled_stage,
-                queue_time_ms=_duration_ms(job.timing.admitted_at, job.timing.decode_started_at),
+                queue_time_ms=_duration_ms(
+                    job.timing.admitted_at, job.timing.decode_started_at
+                ),
                 prefill_time_ms=_duration_ms(
                     job.timing.admitted_at, job.timing.decode_started_at
                 ),

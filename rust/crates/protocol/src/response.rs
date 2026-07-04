@@ -1,3 +1,4 @@
+use crate::status::ModelError;
 use serde::{Deserialize, Serialize};
 
 /// Bootstrap success acknowledgment from the worker.
@@ -9,6 +10,9 @@ pub struct WorkerReady;
 pub struct WorkerError {
     /// Human-readable failure reason.
     pub message: String,
+    /// Structured startup failure details, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ModelError>,
 }
 
 /// A single non-streaming completion result returned from the worker.

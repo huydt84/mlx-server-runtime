@@ -137,8 +137,8 @@ impl WorkerClient {
                         prompt_cache_entries,
                         prompt_cache_evictions,
                         peak_memory_bytes,
-                        image_width,
-                        image_height,
+                        image_width: _,
+                        image_height: _,
                     } => {
                         if response.request_id != request_id {
                             continue;

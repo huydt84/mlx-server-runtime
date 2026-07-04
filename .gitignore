@@ -109,3 +109,4 @@ benchmarks/results/
 # Project design and agent rules — tracked separately, not in git
 AGENTS.md
 PLAN.md
+plan/
