@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+import mlx.core as mx
+
 
 class WeightArtifactValidationError(ValueError):
     """Raised when checkpoint weight artifacts are missing or malformed."""
@@ -54,6 +56,32 @@ class WeightMappingAdapter(Protocol):
 
     def build_plan(self, index: WeightIndex) -> WeightMappingPlan:
         """Build canonical mapping plan from raw checkpoint metadata."""
+
+
+def load_mapped_weights(
+    index: WeightIndex,
+    plan: WeightMappingPlan,
+) -> list[tuple[str, mx.array]]:
+    """Load a validated mapping plan without architecture-specific I/O code."""
+
+    by_file: dict[str, list[WeightMappingEntry]] = {}
+    for entry in plan.entries:
+        by_file.setdefault(entry.source_file, []).append(entry)
+    loaded: list[tuple[str, mx.array]] = []
+    for source_file, entries in by_file.items():
+        try:
+            tensors = mx.load(str(index.model_path / source_file))
+        except Exception as exc:
+            raise WeightArtifactValidationError(
+                f"could not load native weights from {source_file}: {exc}"
+            ) from exc
+        for entry in entries:
+            if entry.source_name not in tensors:
+                raise WeightArtifactValidationError(
+                    f"missing tensor {entry.source_name!r} in {source_file}"
+                )
+            loaded.append((entry.canonical_name, tensors[entry.source_name]))
+    return loaded
 
 
 def load_weight_index(model_path: Path) -> WeightIndex:

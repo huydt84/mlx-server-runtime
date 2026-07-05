@@ -5,15 +5,15 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from mlx_worker.native_mlx.models.Qwen2ForCausalLM.cache import Qwen2LayerCache
-from mlx_worker.native_mlx.models.Qwen2ForCausalLM.config import Qwen2ModelConfig
-from mlx_worker.native_mlx.models.Qwen2ForCausalLM.debug_trace import (
+from mlx_worker.native_mlx.cache import DenseLayerCache
+from mlx_worker.native_mlx.interfaces import ForwardBatch
+from mlx_worker.native_mlx.models.qwen2 import Qwen2ForCausalLM, Qwen2ModelConfig
+from mlx_worker.native_mlx.trace import (
     TraceCheckpoint,
     compare_trace_runs,
-    trace_qwen2_run,
+    trace_model_run,
     write_trace_artifacts,
 )
-from mlx_worker.native_mlx.models.Qwen2ForCausalLM.model import Qwen2ForCausalLm
 from mlx_worker.native_mlx.worker import build_prompt_fingerprint
 
 
@@ -81,6 +81,21 @@ def _reference_qwen2_model(config: Qwen2ModelConfig):
     )
 
 
+def _native_forward(model: Qwen2ForCausalLM, token_ids: tuple[int, ...]) -> mx.array:
+    inputs = mx.array([list(token_ids)], dtype=mx.int32)
+    positions = mx.array([list(range(len(token_ids)))], dtype=mx.int32)
+    return model(
+        inputs,
+        positions,
+        ForwardBatch(
+            token_lengths=(len(token_ids),),
+            cache_lengths=(0,),
+            attention_mask="causal",
+            layer_caches=(),
+        ),
+    )
+
+
 def test_build_prompt_fingerprint_is_stable_and_prompt_sensitive() -> None:
     messages = [{"role": "user", "content": "ping"}]
 
@@ -95,15 +110,15 @@ def test_build_prompt_fingerprint_is_stable_and_prompt_sensitive() -> None:
 def test_qwen2_trace_run_covers_required_checkpoints_and_bounds_samples() -> None:
     config = _tiny_qwen2_config()
     mx.random.seed(0)
-    native_model = Qwen2ForCausalLm(config)
+    native_model = Qwen2ForCausalLM(config)
 
-    run = trace_qwen2_run(
+    run = trace_model_run(
         model=native_model,
         model_config=config,
         backend="native-mlx",
         prompt_token_ids=(1, 2, 3),
         prompt_fingerprint="prompt-fingerprint",
-        cache=[Qwen2LayerCache() for _ in range(config.num_hidden_layers)],
+        cache=[DenseLayerCache() for _ in range(config.num_hidden_layers)],
         decode_input_token_ids=(7,),
         sample_size=3,
         selected_dumps=("prefill.step0.layer0.attention.hidden_states",),
@@ -138,15 +153,15 @@ def test_qwen2_trace_run_covers_required_checkpoints_and_bounds_samples() -> Non
 def test_qwen2_trace_run_covers_many_layers_and_decode_steps() -> None:
     config = _tiny_qwen2_config(num_hidden_layers=4)
     mx.random.seed(0)
-    native_model = Qwen2ForCausalLm(config)
+    native_model = Qwen2ForCausalLM(config)
 
-    run = trace_qwen2_run(
+    run = trace_model_run(
         model=native_model,
         model_config=config,
         backend="native-mlx",
         prompt_token_ids=(1, 2, 3, 4),
         prompt_fingerprint="prompt-fingerprint",
-        cache=[Qwen2LayerCache() for _ in range(config.num_hidden_layers)],
+        cache=[DenseLayerCache() for _ in range(config.num_hidden_layers)],
         decode_input_token_ids=(9, 10, 11),
     )
 
@@ -184,18 +199,17 @@ def test_qwen2_trace_run_covers_many_layers_and_decode_steps() -> None:
 def test_qwen2_trace_prefill_logits_match_direct_model_forward() -> None:
     config = _tiny_qwen2_config()
     mx.random.seed(0)
-    native_model = Qwen2ForCausalLm(config)
-    inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
-    direct_logits = native_model(inputs)
+    native_model = Qwen2ForCausalLM(config)
+    direct_logits = _native_forward(native_model, (1, 2, 3))
     mx.eval(direct_logits)
 
-    run = trace_qwen2_run(
+    run = trace_model_run(
         model=native_model,
         model_config=config,
         backend="native-mlx",
         prompt_token_ids=(1, 2, 3),
         prompt_fingerprint="prompt-fingerprint",
-        cache=[Qwen2LayerCache() for _ in range(config.num_hidden_layers)],
+        cache=[DenseLayerCache() for _ in range(config.num_hidden_layers)],
     )
 
     logits_checkpoint = next(
@@ -217,7 +231,7 @@ def test_reference_qwen2_trace_prefill_logits_match_direct_model_forward() -> No
     direct_logits = reference_model(inputs, cache=make_prompt_cache(reference_model))
     mx.eval(direct_logits)
 
-    run = trace_qwen2_run(
+    run = trace_model_run(
         model=reference_model,
         model_config=config,
         backend="mlx-lm",
@@ -243,11 +257,11 @@ def test_native_and_reference_trace_align_across_many_layers_and_decode_steps() 
     prompt_fingerprint = "prompt-fingerprint"
 
     mx.random.seed(0)
-    native_model = Qwen2ForCausalLm(config)
+    native_model = Qwen2ForCausalLM(config)
     mx.random.seed(0)
     reference_model = _reference_qwen2_model(config)
 
-    reference_run = trace_qwen2_run(
+    reference_run = trace_model_run(
         model=reference_model,
         model_config=config,
         backend="mlx-lm",
@@ -256,13 +270,13 @@ def test_native_and_reference_trace_align_across_many_layers_and_decode_steps() 
         cache=make_prompt_cache(reference_model),
         decode_steps=3,
     )
-    native_run = trace_qwen2_run(
+    native_run = trace_model_run(
         model=native_model,
         model_config=config,
         backend="native-mlx",
         prompt_token_ids=prompt_token_ids,
         prompt_fingerprint=prompt_fingerprint,
-        cache=[Qwen2LayerCache() for _ in range(config.num_hidden_layers)],
+        cache=[DenseLayerCache() for _ in range(config.num_hidden_layers)],
         decode_input_token_ids=reference_run.decode_input_token_ids,
     )
 
@@ -285,17 +299,17 @@ def test_trace_comparison_distinguishes_missing_and_numeric_mismatches(
 ) -> None:
     config = _tiny_qwen2_config()
     mx.random.seed(0)
-    native_model = Qwen2ForCausalLm(config)
+    native_model = Qwen2ForCausalLM(config)
     prompt_token_ids = (1, 2, 3)
     prompt_fingerprint = "prompt-fingerprint"
 
-    native_run = trace_qwen2_run(
+    native_run = trace_model_run(
         model=native_model,
         model_config=config,
         backend="native-mlx",
         prompt_token_ids=prompt_token_ids,
         prompt_fingerprint=prompt_fingerprint,
-        cache=[Qwen2LayerCache() for _ in range(config.num_hidden_layers)],
+        cache=[DenseLayerCache() for _ in range(config.num_hidden_layers)],
         decode_input_token_ids=(4,),
     )
 

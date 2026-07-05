@@ -68,23 +68,22 @@ from __future__ import annotations
 
 import sys
 
-from mlx_lm.utils import hf_repo_to_path
-
-from mlx_worker.native_mlx.worker import (
+from mlx_worker.native_mlx.bootstrap import (
+    build_native_artifacts,
     build_finalized_token_ids,
+)
+from mlx_worker.native_mlx.diagnostics import (
     compare_native_to_mlx_lm,
-    create_native_worker,
 )
 
 checkpoint = sys.argv[1]
-scheduler = create_native_worker(type("Cfg", (), {"model": checkpoint})())
-executor = scheduler._executor
-model_path = hf_repo_to_path(checkpoint)
+artifacts = build_native_artifacts(checkpoint)
+model_path = artifacts.architecture.model_path
 token_ids = build_finalized_token_ids(
     model_path,
     [{"role": "user", "content": "ping"}],
 )
-parity = compare_native_to_mlx_lm(checkpoint, executor, token_ids)
+parity = compare_native_to_mlx_lm(checkpoint, artifacts.diagnostics, token_ids)
 
 print(f"checkpoint={parity.checkpoint}")
 print(f"token_ids={list(parity.token_ids)}")

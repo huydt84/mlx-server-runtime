@@ -74,12 +74,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-from mlx_worker.native_mlx.interfaces import ExecutionBatch, ExecutionRequest
-from mlx_worker.native_mlx.worker import (
+from mlx_worker.native_mlx.bootstrap import (
+    build_native_artifacts,
     build_finalized_token_ids,
+)
+from mlx_worker.native_mlx.diagnostics import (
     build_prompt_fingerprint,
-    create_native_worker,
     trace_native_debug_to_mlx_lm,
+)
+from mlx_worker.native_mlx.interfaces import (
+    ExecutionBatch,
+    ExecutionRequest,
+    SamplingParams,
 )
 
 checkpoint = sys.argv[1]
@@ -88,15 +94,15 @@ trace_dir = Path(tempfile.mkdtemp(prefix="v2-phase5-trace-"))
 no_trace_dir = Path(tempfile.mkdtemp(prefix="v2-phase5-no-trace-"))
 
 try:
-    scheduler = create_native_worker(type("Cfg", (), {"model": checkpoint})())
-    executor = scheduler._executor
-    model_path = scheduler._model_path
+    runtime_artifacts = build_native_artifacts(checkpoint)
+    executor = runtime_artifacts.executor
+    model_path = runtime_artifacts.architecture.model_path
     prompt_token_ids = build_finalized_token_ids(model_path, messages)
     prompt_fingerprint = build_prompt_fingerprint(messages)
 
     artifacts = trace_native_debug_to_mlx_lm(
         checkpoint,
-        executor,
+        runtime_artifacts.diagnostics,
         prompt_token_ids,
         prompt_fingerprint=prompt_fingerprint,
         output_dir=trace_dir,
@@ -121,9 +127,7 @@ try:
                         token_ids=tuple(prompt_token_ids),
                         positions=tuple(range(len(prompt_token_ids))),
                         cache_handle=handle,
-                        max_new_tokens=1,
-                        temperature=0.0,
-                        top_p=1.0,
+                        sampling=SamplingParams(),
                     ),
                 ),
             )
@@ -138,9 +142,7 @@ try:
                         token_ids=(decode_input,),
                         positions=(executor.cache_len(handle),),
                         cache_handle=handle,
-                        max_new_tokens=1,
-                        temperature=0.0,
-                        top_p=1.0,
+                        sampling=SamplingParams(),
                     ),
                 ),
             )

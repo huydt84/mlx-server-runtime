@@ -61,26 +61,27 @@ Rust never touches a tensor. Python never reads an HTTP header.
 
 ## Backend-Specific Generation
 
-The Python worker has two distinct generation paths:
+The Python worker now has two serving paths with different ownership splits:
 
-| Backend | Upstream primitive | Scheduling behavior |
-|---------|--------------------|---------------------|
-| Text LLM | `mlx_lm.generate.BatchGenerator` | Continuous batching with persistent prompt/decode state |
-| VLM | `mlx_vlm.generate.BatchGenerator` | Continuous batching with persistent prompt/decode state, real APC reuse, and vision-feature caching |
+| Backend | Execution primitive | Scheduling behavior |
+|---------|---------------------|---------------------|
+| Text LLM (`native-mlx`) | Repo-owned native runtime, scheduler, executor, and Qwen2 MLX graph | Iteration-level continuous batching with chunked prefill and decode-first scheduling |
+| VLM | `mlx_vlm.generate.BatchGenerator` plus repo-owned worker lifecycle/cache policy | Continuous batching with APC reuse and vision-feature caching |
 
-For text LLMs, the runtime owns request admission, multiplexed IPC,
-cancellation, cache policy, API semantics, and compatibility validation.
-`mlx_lm.BatchGenerator` owns MLX-side prompt/decode batch transitions and model
-execution. The dependency is constrained to compatible `mlx-lm` versions and
-checked against the required API surface before the worker reports readiness.
+For native text serving, Rust still owns HTTP/SSE, outer admission, worker
+supervision, and telemetry projection. Python owns prompt construction,
+tokenization, request lifecycle, scheduling, KV cache lifecycle policy,
+executor batch preparation, and native MLX model execution. The Qwen2 tensor
+graph, config, and weight rules live in one `models/qwen2.py` module. Shared
+batch packing, sampling, dense KV management, diagnostics orchestration, and
+request lifecycle remain outside `models/`, so another compatible model does
+not require another executor or scheduler.
 
-For VLMs, the runtime now follows vLLM-style serving semantics on Apple Silicon:
-continuous batching, upstream APC reuse, and repeated-image feature caching are
-all exposed through the worker. This is not PagedAttention and not literal
-vLLM parity; it is the closest Apple Silicon implementation of the same serving
-shape. Mixed text+VLM serving uses the same continuous worker, with one text
-generator and one VLM generator sharing the worker thread under bounded
-arbitration.
+For VLMs, the runtime still exposes continuous batching, upstream APC reuse,
+and repeated-image feature caching through the worker. This is not
+PagedAttention and not literal vLLM parity; it is the closest Apple Silicon
+implementation of the same serving shape. Mixed text+VLM serving uses the same
+worker process under bounded arbitration.
 
 Worker scheduling and cache behavior are controlled with backend-specific
 environment variables:
@@ -179,9 +180,10 @@ The current implementation holds a mutex (`request_lock`) in `WorkerClient` that
 
 1. It simplifies the Python worker — it never needs to handle concurrent IPC reads.
 2. It makes backpressure predictable — the queue is fully visible in Rust.
-3. With serialized dispatch, the worker receives one request at a time. The
-   text-only worker loop instead multiplexes requests into a persistent
-   `mlx_lm.BatchGenerator` when no VLM backend is active.
+3. With serialized dispatch, the worker receives one IPC command at a time. The
+   native text runtime then multiplexes accepted requests inside Python with a
+   long-lived scheduler and batched executor steps; VLM continues using its
+   backend-specific generator path.
 
 Future iterations can move to concurrent IPC dispatch when the worker supports it natively.
 
@@ -269,7 +271,9 @@ The runtime does not bundle a log collector. Pipe stderr to your preferred colle
 The architecture is designed to evolve without rewrites:
 
 - **Concurrent worker dispatch:** Replace `request_lock` with a concurrent IPC channel when the worker supports it.
-- **Dedicated prefill/decode:** Split the generation step into prefill and decode for better scheduling.
+- **Additional native models:** Add one architecture module and one registry
+  entry while reusing the native runtime, scheduler, executor, cache backend,
+  and diagnostics.
 - **Multiple workers:** Run one Python process per model for multi-model serving.
 - **Rust tokenizer:** Optionally move tokenization to Rust for prompt length estimation before IPC.
 - **Persistent KV cache:** Keep KV cache across requests for session-based applications.

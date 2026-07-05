@@ -3,10 +3,52 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
+
+import mlx.core as mx
+
+from .cache import LayerKVCache
+
+if TYPE_CHECKING:
+    from ..ipc import ChatCompletionRequest
 
 
 ExecutionPhase = Literal["prefill", "decode"]
+
+
+@dataclass(frozen=True)
+class SamplingParams:
+    """Executor-visible sampling parameters."""
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+
+
+@dataclass(frozen=True)
+class ForwardBatch:
+    """Model-facing metadata for one physical tensor invocation."""
+
+    token_lengths: tuple[int, ...]
+    cache_lengths: tuple[int, ...]
+    attention_mask: mx.array | str | None
+    layer_caches: tuple[LayerKVCache, ...]
+
+
+class NativeModel(Protocol):
+    """Architecture model: token tensors and metadata in, logits out."""
+
+    num_layers: int
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        positions: mx.array,
+        forward_batch: ForwardBatch,
+    ) -> mx.array: ...
+
+    def load_weights(
+        self, weights: Sequence[tuple[str, mx.array]], *, strict: bool = True
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -21,10 +63,7 @@ class ExecutionRequest:
     token_ids: tuple[int, ...]
     positions: tuple[int, ...]
     cache_handle: str | None
-    max_new_tokens: int
-    temperature: float
-    top_p: float
-    trace_enabled: bool = False
+    sampling: SamplingParams = SamplingParams()
 
 
 @dataclass(frozen=True)
@@ -41,11 +80,10 @@ class StepRequestResult:
 
     request_id: str
     token_ids: tuple[int, ...]
-    logits: Any | None
     cache_handle: str | None
     cache_length: int
-    finished: bool
     next_token_id: int | None = None
+    model_terminal: bool = False
     error_code: str | None = None
 
 
@@ -88,30 +126,117 @@ class NativeMlxExecutor(Protocol):
         """Release per-request cache resources."""
 
 
-class NativeScheduler(Protocol):
-    """Runtime-owned scheduling boundary for native MLX."""
+class NativeMlxDiagnostics(Protocol):
+    """Explicit diagnostics surface for parity and tracing."""
 
-    def warmup(self) -> None:
-        """Validate startup path before readiness."""
+    def forward_token_ids(self, token_ids: Sequence[int]) -> Any:
+        """Run direct model forward on finalized token IDs."""
 
-    def submit(
+    def prefill_then_decode_tokens(
+        self, prompt_token_ids: Sequence[int], decode_steps: int
+    ) -> tuple[list[int], list[int], int]:
+        """Run deterministic prefill plus decode parity helper."""
+
+    def trace_to_mlx_lm(
         self,
-        request: Any,
-        emit_delta: Any,
-    ) -> None:
-        """Queue one request for scheduler-owned execution."""
+        checkpoint: str,
+        token_ids: Sequence[int],
+        *,
+        prompt_fingerprint: str,
+        output_dir: Any,
+        decode_steps: int,
+        tolerance_atol: float = 2e-2,
+        tolerance_rtol: float = 2e-2,
+        sample_size: int = 8,
+        selected_dumps: Sequence[str] = (),
+        stop_on_first_divergence: bool = True,
+    ) -> Any:
+        """Trace native and reference checkpoints through explicit adapter."""
 
-    def cancel(self, request_id: str) -> bool:
-        """Cancel one waiting or running request."""
 
-    def tick(self) -> None:
-        """Run one scheduler iteration."""
+class NativeScheduler(Protocol):
+    """Token-level scheduler boundary for native MLX."""
 
-    def idle(self) -> bool:
-        """Return true when no waiting or running work remains."""
+    def submit(self, request: "SchedulableRequest") -> None:
+        """Queue typed token work."""
 
-    def close(self) -> None:
-        """Release all scheduler-owned resources."""
+    def cancel(self, request_id: str) -> bool: ...
+
+    def finish(self, request_id: str) -> None:
+        """Release scheduler-owned state and cache for a terminal request."""
+
+    def tick(self) -> tuple["SchedulerEvent", ...]: ...
+
+    def idle(self) -> bool: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class RuntimeRequest:
+    """Normalized public request owned by the native runtime."""
+
+    request_id: str
+    model: str
+    prompt_token_ids: tuple[int, ...]
+    max_tokens: int
+    stop: tuple[str, ...]
+    sampling: SamplingParams
+
+
+@dataclass(frozen=True)
+class SchedulableRequest:
+    """Model-independent token work accepted by the scheduler."""
+
+    request_id: str
+    prompt_token_ids: tuple[int, ...]
+    sampling: SamplingParams
+    enqueued_at: float
+
+
+SchedulerEventKind = Literal[
+    "token", "cancelled", "execution_error", "metrics", "prefill_progress"
+]
+
+
+@dataclass(frozen=True)
+class SchedulerEvent:
+    """Typed scheduler output consumed by the runtime."""
+
+    kind: SchedulerEventKind
+    request_id: str | None = None
+    token_id: int | None = None
+    cache_length: int | None = None
+    phase: ExecutionPhase | None = None
+    error_code: str | None = None
+    message: str | None = None
+    metrics: Any | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeEvent:
+    """Typed runtime output transported by the worker."""
+
+    kind: Literal["delta", "response", "error", "metrics"]
+    payload: Any
+
+
+class NativeRuntime(Protocol):
+    """Public-request lifecycle seam driven by worker transport."""
+
+    last_warmup_latency_ms: int
+
+    def warmup(self) -> None: ...
+
+    def submit(self, request: ChatCompletionRequest) -> None: ...
+
+    def cancel(self, request_id: str) -> bool: ...
+
+    def tick(self) -> tuple[RuntimeEvent, ...]: ...
+
+    def idle(self) -> bool: ...
+
+    def close(self) -> None: ...
 
 
 def execution_batch_field_names() -> tuple[str, ...]:

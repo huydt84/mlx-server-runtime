@@ -24,8 +24,8 @@
 # Expected success signals:
 #   - `mlx_import_ok=1`
 #   - `mlx_lm_import_ok=1`
-#   - `native_batch_grow_ok=1`
-#   - `native_batch_shrink_ok=1`
+#   - `native_batch_grow_ok=1` (scheduler batch membership)
+#   - `native_batch_shrink_ok=1` (scheduler batch membership)
 #   - `native_independent_finish_ok=1`
 #   - `native_cancel_isolated_ok=1`
 #   - `native_scheduler_metrics_ok=1`
@@ -43,8 +43,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 CHECKPOINT="mlx-community/Qwen2.5-7B-Instruct-4bit"
-NATIVE_PORT=18080
-V1_PORT=18081
+NATIVE_PORT=18180
+V1_PORT=18181
 NATIVE_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-7-native.log"
 V1_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-7-v1.log"
 HEALTH_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-7-health.txt"
@@ -54,6 +54,7 @@ NATIVE_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-7-native.toml"
 V1_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-7-v1.toml"
 OVERLAP_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-7-overlap.json"
 METRICS_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-7-metrics.txt"
+GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 mkdir -p "$REQUEST_DIR"
 
 GATEWAY_PID=""
@@ -71,14 +72,14 @@ wait_healthy() {
     local port="$2"
     rm -f "$HEALTH_CAPTURE"
     for _ in $(seq 1 300); do
+        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
+            echo "gateway exited unexpectedly; inspect $log_path" >&2
+            return 1
+        fi
         if curl -fsS "http://127.0.0.1:${port}/health" >"$HEALTH_CAPTURE"; then
             if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
                 return 0
             fi
-        fi
-        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
-            echo "gateway exited unexpectedly; inspect $log_path" >&2
-            return 1
         fi
         sleep 1
     done
@@ -91,10 +92,14 @@ start_gateway() {
     local port="$2"
     shift
     shift
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "gateway port $port is already in use" >&2
+        return 1
+    fi
     rm -f "$log_path"
     (
         cd "$ROOT"
-        env "$@" cargo run -p mlx_runtime_gateway
+        exec env "$@" "$GATEWAY_BIN"
     ) >"$log_path" 2>&1 &
     GATEWAY_PID=$!
     wait_healthy "$log_path" "$port"
@@ -134,6 +139,7 @@ PY
 echo "[1/6] Sync Python dev environment"
 cd "$PYTHON_DIR"
 uv sync --group dev
+cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
 
 echo "[2/6] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'
@@ -173,12 +179,18 @@ native_target.write_text(
     ).replace(
         'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
         f'model = "{checkpoint}"',
+    ).replace(
+        'ipc_path = "/tmp/mlx-runtime.sock"',
+        f'ipc_path = "/tmp/mlx-runtime-phase7-native-{native_port}.sock"',
     )
 )
 v1_target.write_text(
     source.replace('port = 8000', f'port = {v1_port}').replace(
         'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
         f'model = "{checkpoint}"',
+    ).replace(
+        'ipc_path = "/tmp/mlx-runtime.sock"',
+        f'ipc_path = "/tmp/mlx-runtime-phase7-v1-{v1_port}.sock"',
     )
 )
 PY

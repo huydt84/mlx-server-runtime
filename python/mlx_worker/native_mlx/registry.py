@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
-from .interfaces import NativeMlxExecutor
-from .mapping import WeightIndex, WeightMappingAdapter, WeightMappingPlan
-from .models.Qwen2ForCausalLM.config import Qwen2ModelConfig, parse_qwen2_config
-from .models.Qwen2ForCausalLM.model import Qwen2NativeMlxExecutor
-from .models.Qwen2ForCausalLM.weights import Qwen2WeightAdapter
+from .cache import DenseKVCacheBackend, KVCacheBackend
+from .interfaces import NativeModel
+from .mapping import WeightMappingAdapter
+from .models.qwen2 import (
+    Qwen2ModelConfig,
+    Qwen2WeightAdapter,
+    build_qwen2_model,
+    parse_qwen2_config,
+)
 
 
 @dataclass(frozen=True)
@@ -25,16 +28,15 @@ class CompatibilityProbe:
 
 @dataclass(frozen=True)
 class ArchitectureSpec:
-    """Registry entry for one explicitly implemented architecture class."""
+    """Architecture-specific construction plugged into shared execution."""
 
     architecture_class: str
     known_good_checkpoint: str
     compatibility_probes: tuple[CompatibilityProbe, ...]
     parse_config: Callable[[dict[str, Any]], Any]
     create_weight_adapter: Callable[[], WeightMappingAdapter]
-    create_executor: Callable[
-        [Path, Any, WeightMappingPlan, WeightIndex], NativeMlxExecutor
-    ]
+    create_model: Callable[[Any, list[tuple[str, Any]]], NativeModel]
+    create_cache_backend: Callable[[Any], KVCacheBackend]
 
 
 _REGISTRY: dict[str, ArchitectureSpec] = {
@@ -57,26 +59,22 @@ _REGISTRY: dict[str, ArchitectureSpec] = {
         ),
         parse_config=parse_qwen2_config,
         create_weight_adapter=Qwen2WeightAdapter,
-        create_executor=lambda model_path, model_config, weight_plan, weight_index: (
-            Qwen2NativeMlxExecutor(
-                model_path=model_path,
-                model_config=model_config,
-                weight_plan=weight_plan,
-                weight_index=weight_index,
-            )
+        create_model=build_qwen2_model,
+        create_cache_backend=lambda config: DenseKVCacheBackend(
+            num_layers=int(config.num_hidden_layers)
         ),
     )
 }
 
 
 def get_architecture_spec(architecture_class: str) -> ArchitectureSpec | None:
-    """Return registry entry for architecture class, if supported."""
+    """Return the registered architecture specification."""
 
     return _REGISTRY.get(architecture_class)
 
 
 def qwen2_spec() -> ArchitectureSpec:
-    """Return typed spec for ``Qwen2ForCausalLM``."""
+    """Return the Qwen2 specification."""
 
     return _REGISTRY["Qwen2ForCausalLM"]
 

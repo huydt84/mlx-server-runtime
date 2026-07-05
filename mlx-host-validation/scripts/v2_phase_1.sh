@@ -35,6 +35,7 @@ GATEWAY_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-1-gateway.log"
 HEALTH_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-1-health.txt"
 CHAT_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-1-chat.json"
 REQUEST_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-1-request.json"
+GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 
 cleanup() {
     if [[ -n "${GATEWAY_PID:-}" ]]; then
@@ -48,6 +49,7 @@ trap cleanup EXIT
 echo "[1/5] Sync Python dev environment"
 cd "$PYTHON_DIR"
 uv sync --group dev
+cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
 
 echo "[2/5] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'
@@ -173,11 +175,11 @@ def run_probe(
 
 
 run_probe(
-    label="supported-class-placeholder",
+    label="malformed-supported-class-config",
     architecture_class="Qwen2ForCausalLM",
-    expected_category="supported_class_bug",
-    expected_stage="native_executor_construction",
-    expected_code="NATIVE_EXECUTOR_NOT_IMPLEMENTED",
+    expected_category="malformed_checkpoint",
+    expected_stage="artifact_validation",
+    expected_code="INVALID_NATIVE_CONFIG",
 )
 run_probe(
     label="unsupported-class-rejection",
@@ -213,7 +215,7 @@ path.write_text(
 )
 PY
 
-cargo run -p mlx_runtime_gateway >"$GATEWAY_LOG" 2>&1 &
+"$GATEWAY_BIN" >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
 
 for _ in $(seq 1 300); do

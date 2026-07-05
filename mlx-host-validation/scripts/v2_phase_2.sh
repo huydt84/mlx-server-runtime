@@ -119,7 +119,15 @@ def write_local_probe(root: Path, architecture_class: str, *, missing_tokenizer:
     return str(model_dir)
 
 
-def run_probe(label: str, model_ref: str, expected_category: str, expected_stage: str, expected_statuses: list[str]) -> None:
+def run_probe(
+    label: str,
+    model_ref: str,
+    expected_category: str | None,
+    expected_stage: str | None,
+    expected_statuses: list[str],
+    *,
+    expected_ready: bool = False,
+) -> None:
     with tempfile.TemporaryDirectory(prefix=f"phase2-{label}-") as temp_dir:
         root = Path(temp_dir)
         socket_path = root / "worker.sock"
@@ -159,23 +167,38 @@ def run_probe(label: str, model_ref: str, expected_category: str, expected_stage
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         if line:
-                            decoded.append(decode_bootstrap_message(line + b"\n"))
+                            item = decode_bootstrap_message(line + b"\n")
+                            decoded.append(item)
+                            if isinstance(item, WorkerReady):
+                                break
+                    if any(isinstance(item, WorkerReady) for item in decoded):
+                        break
 
             rc = proc.wait(timeout=60)
-            if rc != 1:
-                raise SystemExit(f"{label}: expected exit 1, saw {rc}; inspect {log_path}")
+            expected_rc = 0 if expected_ready else 1
+            if rc != expected_rc:
+                raise SystemExit(
+                    f"{label}: expected exit {expected_rc}, saw {rc}; inspect {log_path}"
+                )
 
-        if any(isinstance(item, WorkerReady) for item in decoded):
-            raise SystemExit(f"{label}: worker reported READY unexpectedly; inspect {log_path}")
+        ready = any(isinstance(item, WorkerReady) for item in decoded)
+        if ready != expected_ready:
+            raise SystemExit(
+                f"{label}: expected ready={expected_ready}, saw {ready}; inspect {log_path}"
+            )
 
         statuses = [item for item in decoded if isinstance(item, ModelStatus)]
         stages = [status.progress.current_phase for status in statuses if status.progress]
         if stages != expected_statuses:
             raise SystemExit(f"{label}: expected stages {expected_statuses}, saw {stages}")
 
-        failed_status = next(
-            item for item in statuses if item.state == "failed"
-        )
+        if expected_ready:
+            print(f"probe={label}")
+            print(f"stages={','.join(stages)}")
+            print("ready=1")
+            return
+
+        failed_status = next(item for item in statuses if item.state == "failed")
         if failed_status.last_error is None:
             raise SystemExit(f"{label}: missing last_error; inspect {log_path}")
 
@@ -214,8 +237,8 @@ with tempfile.TemporaryDirectory(prefix="phase2-local-probes-") as probe_root:
     run_probe(
         label="known_good",
         model_ref="mlx-community/Qwen2.5-7B-Instruct-4bit",
-        expected_category="supported_class_bug",
-        expected_stage="deterministic_warmup",
+        expected_category=None,
+        expected_stage=None,
         expected_statuses=[
             "architecture_detection",
             "artifact_validation",
@@ -223,7 +246,9 @@ with tempfile.TemporaryDirectory(prefix="phase2-local-probes-") as probe_root:
             "native_executor_construction",
             "prompt_tokenizer_readiness",
             "deterministic_warmup",
+            "deterministic_warmup",
         ],
+        expected_ready=True,
     )
     run_probe(
         label="unsupported",
@@ -236,15 +261,12 @@ with tempfile.TemporaryDirectory(prefix="phase2-local-probes-") as probe_root:
         label="malformed",
         model_ref=malformed_model,
         expected_category="malformed_checkpoint",
-        expected_stage="prompt_tokenizer_readiness",
+        expected_stage="artifact_validation",
         expected_statuses=[
             "architecture_detection",
             "artifact_validation",
-            "weight_mapping",
-            "native_executor_construction",
-            "prompt_tokenizer_readiness",
         ],
     )
 
-print("no_ready_claim=1")
+print("phase_2_startup_validation_ok=1")
 PY

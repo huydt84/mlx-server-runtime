@@ -28,6 +28,9 @@
 #   - `chunk_32_decode_metric_ok=1`
 #   - `chunk_32_interleave_ok=1`
 #   - `chunk_32_outputs_ok=1`
+#   - `native_phase8_physical_batch_observed=1`
+#   - `native_phase8_single_forward_per_batch_ok=1`
+#   - `native_phase8_unequal_lengths_ok=1`
 #   - `chunk_96_prefill_metric_ok=1`
 #   - `chunk_96_decode_metric_ok=1`
 #   - `chunk_96_interleave_ok=1`
@@ -76,14 +79,14 @@ wait_healthy() {
     local port="$2"
     rm -f "$HEALTH_CAPTURE"
     for _ in $(seq 1 300); do
+        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
+            echo "gateway exited unexpectedly; inspect $log_path" >&2
+            return 1
+        fi
         if curl -fsS "http://127.0.0.1:${port}/health" >"$HEALTH_CAPTURE"; then
             if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
                 return 0
             fi
-        fi
-        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
-            echo "gateway exited unexpectedly; inspect $log_path" >&2
-            return 1
         fi
         sleep 1
     done
@@ -96,10 +99,14 @@ start_gateway() {
     local port="$2"
     local config_path="$3"
     local chunk_size="$4"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "gateway port $port is already in use" >&2
+        return 1
+    fi
     rm -f "$log_path"
     (
         cd "$ROOT"
-        env \
+        exec env \
             MLX_RUNTIME_CONFIG="$config_path" \
             MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$chunk_size" \
             "$GATEWAY_BIN"
@@ -111,10 +118,14 @@ start_gateway() {
 start_v1_gateway() {
     local log_path="$1"
     local port="$2"
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "gateway port $port is already in use" >&2
+        return 1
+    fi
     rm -f "$log_path"
     (
         cd "$ROOT"
-        env MLX_RUNTIME_CONFIG="$V1_CONFIG" "$GATEWAY_BIN"
+        exec env MLX_RUNTIME_CONFIG="$V1_CONFIG" "$GATEWAY_BIN"
     ) >"$log_path" 2>&1 &
     GATEWAY_PID=$!
     wait_healthy "$log_path" "$port"
@@ -128,13 +139,13 @@ stop_gateway() {
     GATEWAY_PID=""
 }
 
-echo "[1/6] Sync Python dev environment and build gateway"
+echo "[1/7] Sync Python dev environment and build gateway"
 cd "$PYTHON_DIR"
 uv sync --group dev
 cd "$ROOT"
 cargo build -p mlx_runtime_gateway
 
-echo "[2/6] Verify Apple Silicon, mlx, and mlx_lm imports"
+echo "[2/7] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv --directory "$PYTHON_DIR" run python - <<'PY'
 import platform
 
@@ -153,7 +164,7 @@ values = (mx.array([1.0, 2.0, 3.0]) * 2).tolist()
 print(f"mlx_compute_ok={values}")
 PY
 
-echo "[3/6] Build runtime configs and request fixtures"
+echo "[3/7] Build runtime configs and request fixtures"
 uv --directory "$PYTHON_DIR" run python - <<'PY' "$ROOT/config/runtime.toml" "$NATIVE_CONFIG" "$V1_CONFIG" "$CHECKPOINT" "$NATIVE_PORT_BASE" "$V1_PORT" "$REQUEST_DIR"
 from __future__ import annotations
 
@@ -161,7 +172,10 @@ import json
 import pathlib
 import sys
 
-from mlx_worker.native_mlx.worker import _resolve_model_path, build_finalized_token_ids
+from mlx_worker.native_mlx.bootstrap import (
+    build_finalized_token_ids,
+    resolve_model_path,
+)
 
 source = pathlib.Path(sys.argv[1]).read_text()
 native_target = pathlib.Path(sys.argv[2])
@@ -187,7 +201,7 @@ v1_target.write_text(
     )
 )
 
-model_path = _resolve_model_path(checkpoint)
+model_path = resolve_model_path(checkpoint)
 long_words: list[str] = []
 while True:
     start = len(long_words)
@@ -247,7 +261,7 @@ probe_chunk_size() {
     local capture_metrics="$TMP_ROOT/chunk-${chunk_size}.metrics.txt"
     local config_path="$TMP_ROOT/runtime-native-${chunk_size}.toml"
 
-    echo "[4/6] Probe native-mlx chunk size ${chunk_size}"
+    echo "[5/7] Probe native-mlx chunk size ${chunk_size}"
     uv --directory "$PYTHON_DIR" run python - <<'PY' "$NATIVE_CONFIG" "$config_path" "$port" "$chunk_size"
 from __future__ import annotations
 
@@ -485,10 +499,211 @@ if payload["long"].get("mean_itl_ms") is None and len(payload["long"]["delta_tim
 PY
 }
 
+echo "[4/7] Prove real executor physical batching on unequal lengths"
+uv --directory "$PYTHON_DIR" run python - <<'PY' "$CHECKPOINT"
+from __future__ import annotations
+
+import sys
+
+import mlx.core as mx
+
+from mlx_worker.native_mlx.bootstrap import (
+    build_finalized_token_ids,
+    build_native_artifacts,
+    resolve_model_path,
+)
+from mlx_worker.native_mlx.interfaces import (
+    ExecutionBatch,
+    ExecutionRequest,
+    SamplingParams,
+)
+
+
+class RecordingModel:
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.calls = 0
+        self.batch_sizes: list[int] = []
+
+    def __call__(self, inputs, *args, **kwargs):
+        self.calls += 1
+        self.batch_sizes.append(int(inputs.shape[0]))
+        return self.inner(inputs, *args, **kwargs)
+
+
+def prompt_ids(model_path, prefix: str, min_tokens: int) -> tuple[int, ...]:
+    words: list[str] = []
+    while True:
+        start = len(words)
+        words.extend(f"{prefix}_{index:04d}" for index in range(start, start + 64))
+        candidate = tuple(
+            build_finalized_token_ids(
+                model_path,
+                [{"role": "user", "content": " ".join(words)}],
+            )
+        )
+        if len(candidate) >= min_tokens:
+            return candidate[:min_tokens]
+
+
+def prefill_request(request_id: str, tokens: tuple[int, ...], handle: str) -> ExecutionRequest:
+    return ExecutionRequest(
+        request_id=request_id,
+        token_ids=tokens,
+        positions=tuple(range(len(tokens))),
+        cache_handle=handle,
+        sampling=SamplingParams(),
+    )
+
+
+def decode_request(request_id: str, token_id: int, position: int, handle: str) -> ExecutionRequest:
+    return ExecutionRequest(
+        request_id=request_id,
+        token_ids=(token_id,),
+        positions=(position,),
+        cache_handle=handle,
+        sampling=SamplingParams(),
+    )
+
+
+def result_pair_ok(batched, single, atol: float) -> bool:
+    return (
+        batched.next_token_id == single.next_token_id
+        and batched.cache_length == single.cache_length
+    )
+
+
+checkpoint = sys.argv[1]
+model_path = resolve_model_path(checkpoint)
+artifacts = build_native_artifacts(checkpoint)
+executor = artifacts.executor
+prompt_a = prompt_ids(model_path, "phase8a", 3)
+prompt_b = prompt_ids(model_path, "phase8b", 1)
+
+handle_a = executor.create_cache("phase8-a")
+handle_b = executor.create_cache("phase8-b")
+ind_a = executor.create_cache("phase8-ind-a")
+ind_b = executor.create_cache("phase8-ind-b")
+try:
+    recorder = RecordingModel(executor.model)
+    executor.model = recorder
+    prefill = executor.prefill_batch(
+        ExecutionBatch(
+            phase="prefill",
+            requests=(
+                prefill_request("phase8-a", prompt_a, handle_a),
+                prefill_request("phase8-b", prompt_b, handle_b),
+            ),
+        )
+    )
+    prefill_calls = recorder.calls
+    prefill_batch_size = max(recorder.batch_sizes)
+
+    independent_prefill_a = executor.prefill_batch(
+        ExecutionBatch(
+            phase="prefill",
+            requests=(prefill_request("phase8-ind-a", prompt_a, ind_a),),
+        )
+    )
+    independent_prefill_b = executor.prefill_batch(
+        ExecutionBatch(
+            phase="prefill",
+            requests=(prefill_request("phase8-ind-b", prompt_b, ind_b),),
+        )
+    )
+
+    executor.model = RecordingModel(recorder.inner)
+    decode = executor.decode_batch(
+        ExecutionBatch(
+            phase="decode",
+            requests=(
+                decode_request(
+                    "phase8-a",
+                    int(prefill.results[0].next_token_id),
+                    executor.cache_len(handle_a),
+                    handle_a,
+                ),
+                decode_request(
+                    "phase8-b",
+                    int(prefill.results[1].next_token_id),
+                    executor.cache_len(handle_b),
+                    handle_b,
+                ),
+            ),
+        )
+    )
+    decode_calls = executor.model.calls
+    decode_batch_size = max(executor.model.batch_sizes)
+
+    independent_decode_a = executor.decode_batch(
+        ExecutionBatch(
+            phase="decode",
+            requests=(
+                decode_request(
+                    "phase8-ind-a",
+                    int(independent_prefill_a.results[0].next_token_id),
+                    executor.cache_len(ind_a),
+                    ind_a,
+                ),
+            ),
+        )
+    )
+    independent_decode_b = executor.decode_batch(
+        ExecutionBatch(
+            phase="decode",
+            requests=(
+                decode_request(
+                    "phase8-ind-b",
+                    int(independent_prefill_b.results[0].next_token_id),
+                    executor.cache_len(ind_b),
+                    ind_b,
+                ),
+            ),
+        )
+    )
+
+    physical_batch_observed = prefill_batch_size == 2 and decode_batch_size == 2
+    single_forward_per_batch_ok = prefill_calls == 1 and decode_calls == 1
+    unequal_lengths_ok = (
+        prefill.results[0].cache_length != prefill.results[1].cache_length
+        and decode.results[0].cache_length != decode.results[1].cache_length
+    )
+    parity_ok = all(
+        result_pair_ok(batched, single, atol=0.5)
+        for batched, single in zip(
+            prefill.results,
+            (independent_prefill_a.results[0], independent_prefill_b.results[0]),
+            strict=True,
+        )
+    ) and all(
+        result_pair_ok(batched, single, atol=0.5)
+        for batched, single in zip(
+            decode.results,
+            (independent_decode_a.results[0], independent_decode_b.results[0]),
+            strict=True,
+        )
+    )
+
+    print(f"native_phase8_physical_batch_observed={int(physical_batch_observed)}")
+    print(f"native_phase8_single_forward_per_batch_ok={int(single_forward_per_batch_ok)}")
+    print(f"native_phase8_unequal_lengths_ok={int(unequal_lengths_ok and parity_ok)}")
+    if not physical_batch_observed:
+        raise SystemExit("phase 8 physical batch size proof failed")
+    if not single_forward_per_batch_ok:
+        raise SystemExit("phase 8 single-forward proof failed")
+    if not unequal_lengths_ok or not parity_ok:
+        raise SystemExit("phase 8 unequal-length physical batching proof failed")
+finally:
+    executor.release(handle_a)
+    executor.release(handle_b)
+    executor.release(ind_a)
+    executor.release(ind_b)
+PY
+
 probe_chunk_size 32 18082
 probe_chunk_size 96 18084
 
-echo "[5/6] Run default v1 non-regression request"
+echo "[6/7] Run default v1 non-regression request"
 start_v1_gateway "$V1_LOG" "$V1_PORT"
 V1_STATUS=$(curl -sS -o "$V1_CAPTURE" -w '%{http_code}' \
     -X POST "http://127.0.0.1:${V1_PORT}/v1/chat/completions" \
@@ -500,7 +715,7 @@ if [[ "$V1_STATUS" != "200" ]]; then
 fi
 stop_gateway
 
-echo "[6/6] Validate v1 response"
+echo "[7/7] Validate v1 response"
 uv --directory "$PYTHON_DIR" run python - <<'PY' "$V1_CAPTURE"
 from __future__ import annotations
 

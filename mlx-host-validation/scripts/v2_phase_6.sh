@@ -56,6 +56,7 @@ METRICS_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-metrics.txt"
 V1_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-v1.json"
 REQUEST_DIR="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-requests"
 NATIVE_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-native.toml"
+GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 mkdir -p "$REQUEST_DIR"
 
 GATEWAY_PID=""
@@ -77,14 +78,14 @@ wait_healthy() {
     local log_path="$1"
     rm -f "$HEALTH_CAPTURE"
     for _ in $(seq 1 300); do
+        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
+            echo "gateway exited unexpectedly; inspect $log_path" >&2
+            return 1
+        fi
         if curl -fsS http://127.0.0.1:8000/health >"$HEALTH_CAPTURE"; then
             if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
                 return 0
             fi
-        fi
-        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
-            echo "gateway exited unexpectedly; inspect $log_path" >&2
-            return 1
         fi
         sleep 1
     done
@@ -95,10 +96,14 @@ wait_healthy() {
 start_gateway() {
     local log_path="$1"
     shift
+    if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "gateway port 8000 is already in use" >&2
+        return 1
+    fi
     rm -f "$log_path"
     (
         cd "$ROOT"
-        env "$@" cargo run -p mlx_runtime_gateway
+        exec env "$@" "$GATEWAY_BIN"
     ) >"$log_path" 2>&1 &
     GATEWAY_PID=$!
     wait_healthy "$log_path"
@@ -141,6 +146,7 @@ PY
 echo "[1/6] Sync Python dev environment"
 cd "$PYTHON_DIR"
 uv sync --group dev
+cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
 
 echo "[2/6] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'

@@ -1,4 +1,4 @@
-"""Qwen2 semantic debug tracing for native-v2 Phase 5."""
+"""Semantic model tracing primitives for native MLX diagnostics."""
 
 from __future__ import annotations
 
@@ -12,8 +12,7 @@ from typing import Any, Sequence
 import mlx.core as mx
 import numpy as np
 
-from .cache import Qwen2LayerCache
-from .config import Qwen2ModelConfig
+from .cache import DenseLayerCache
 
 REQUIRED_TRACE_OPERATIONS = (
     "embedding",
@@ -63,7 +62,7 @@ class TraceCheckpoint:
 
 
 @dataclass(frozen=True)
-class Qwen2TraceRun:
+class ModelTraceRun:
     """Trace output for one backend run."""
 
     backend: str
@@ -116,10 +115,10 @@ class TraceArtifacts:
     comparison: TraceComparison
 
 
-def trace_qwen2_run(
+def trace_model_run(
     *,
     model: Any,
-    model_config: Qwen2ModelConfig,
+    model_config: Any,
     backend: str,
     prompt_token_ids: Sequence[int],
     prompt_fingerprint: str,
@@ -128,12 +127,12 @@ def trace_qwen2_run(
     decode_input_token_ids: Sequence[int] | None = None,
     sample_size: int = 8,
     selected_dumps: Sequence[str] = (),
-) -> Qwen2TraceRun:
-    """Trace semantic Qwen2 checkpoints for one backend.
+) -> ModelTraceRun:
+    """Trace semantic decoder-model checkpoints for one backend.
 
     Args:
-        model: Native or reference Qwen2 model object.
-        model_config: Parsed Qwen2 config.
+        model: Native or reference decoder model object.
+        model_config: Parsed architecture config.
         backend: Backend label written to records.
         prompt_token_ids: Finalized prompt token IDs.
         prompt_fingerprint: Stable prompt fingerprint from runtime-owned input.
@@ -144,11 +143,11 @@ def trace_qwen2_run(
         selected_dumps: Checkpoint IDs that should carry full tensor dumps.
 
     Returns:
-        Qwen2TraceRun: Bounded checkpoint stream and generated tokens.
+        ModelTraceRun: Bounded checkpoint stream and generated tokens.
     """
 
     if cache and len(cache) != model_config.num_hidden_layers:
-        raise ValueError("trace cache layer count does not match Qwen2 config")
+        raise ValueError("trace cache layer count does not match model config")
 
     collector = _TraceCollector(
         backend=backend,
@@ -156,7 +155,7 @@ def trace_qwen2_run(
         sample_size=sample_size,
         selected_dumps=frozenset(selected_dumps),
     )
-    prefill_logits, prefill_records = trace_qwen2_step(
+    prefill_logits, prefill_records = trace_model_step(
         model=model,
         model_config=model_config,
         token_ids=tuple(int(token_id) for token_id in prompt_token_ids),
@@ -173,7 +172,7 @@ def trace_qwen2_run(
         next_decode_input = generated_token_ids[0]
         for step_index in range(decode_steps):
             forced_decode_inputs.append(next_decode_input)
-            decode_logits, decode_records = trace_qwen2_step(
+            decode_logits, decode_records = trace_model_step(
                 model=model,
                 model_config=model_config,
                 token_ids=(next_decode_input,),
@@ -196,7 +195,7 @@ def trace_qwen2_run(
                 "decode_steps does not match forced decode_input_token_ids"
             )
         for step_index, decode_input_token_id in enumerate(decode_input_token_ids):
-            decode_logits, decode_records = trace_qwen2_step(
+            decode_logits, decode_records = trace_model_step(
                 model=model,
                 model_config=model_config,
                 token_ids=(decode_input_token_id,),
@@ -209,7 +208,7 @@ def trace_qwen2_run(
             collector.decode_records.extend(decode_records)
             generated_token_ids.append(int(np.asarray(decode_logits)[0, -1].argmax()))
 
-    run = Qwen2TraceRun(
+    run = ModelTraceRun(
         backend=backend,
         architecture_class=model_config.architecture_class,
         prompt_fingerprint=prompt_fingerprint,
@@ -225,10 +224,10 @@ def trace_qwen2_run(
     return run
 
 
-def trace_qwen2_step(
+def trace_model_step(
     *,
     model: Any,
-    model_config: Qwen2ModelConfig,
+    model_config: Any,
     token_ids: Sequence[int],
     cache: list[Any],
     backend: str,
@@ -254,9 +253,15 @@ def trace_qwen2_step(
 
     for layer_index, (layer, layer_cache) in enumerate(zip(model.model.layers, cache)):
         attn_input = layer.input_layernorm(hidden)
+        cache_offset = _cache_length(layer_cache)
+        positions = mx.array(
+            [list(range(cache_offset, cache_offset + len(token_ids)))],
+            dtype=mx.int32,
+        )
         attn_output = _call_attention_for_trace(
             layer.self_attn,
             attn_input,
+            positions=positions,
             mask=mask,
             cache=layer_cache,
         )
@@ -340,8 +345,8 @@ def trace_qwen2_step(
 
 
 def compare_trace_runs(
-    native_run: Qwen2TraceRun,
-    reference_run: Qwen2TraceRun,
+    native_run: ModelTraceRun,
+    reference_run: ModelTraceRun,
     *,
     tolerance_atol: float,
     tolerance_rtol: float,
@@ -422,8 +427,8 @@ def write_trace_artifacts(
     *,
     output_dir: Path,
     checkpoint: str,
-    native_run: Qwen2TraceRun,
-    reference_run: Qwen2TraceRun,
+    native_run: ModelTraceRun,
+    reference_run: ModelTraceRun,
     comparison: TraceComparison,
     tolerance_atol: float,
     tolerance_rtol: float,
@@ -579,12 +584,15 @@ def _call_attention_for_trace(
     attention: Any,
     hidden: Any,
     *,
+    positions: Any,
     mask: Any | None,
     cache: Any,
 ) -> Any:
     parameters = inspect.signature(attention.__call__).parameters
     if "mask" in parameters:
         return attention(hidden, mask=mask, cache=cache)
+    if "positions" in parameters:
+        return attention(hidden, positions=positions, cache=cache)
     return attention(hidden, cache=cache)
 
 
@@ -602,7 +610,15 @@ def _normalized_cache_state(layer_cache: Any) -> tuple[Any, Any, int]:
     return keys[:, :, :cache_length, :], values[:, :, :cache_length, :], cache_length
 
 
-def _validate_trace_coverage(run: Qwen2TraceRun, num_layers: int) -> None:
+def _cache_length(layer_cache: Any) -> int:
+    offset = getattr(layer_cache, "offset", 0) or 0
+    if offset:
+        return int(offset)
+    size = getattr(layer_cache, "size", 0)
+    return int(size() if callable(size) else size or 0)
+
+
+def _validate_trace_coverage(run: ModelTraceRun, num_layers: int) -> None:
     for phase_name, checkpoints in (("prefill", run.prefill), ("decode", run.decode)):
         if phase_name == "decode" and not checkpoints:
             continue
@@ -692,8 +708,8 @@ def _write_markdown_summary(
     path: Path,
     *,
     checkpoint: str,
-    native_run: Qwen2TraceRun,
-    reference_run: Qwen2TraceRun,
+    native_run: ModelTraceRun,
+    reference_run: ModelTraceRun,
     comparison: TraceComparison,
     tolerance_atol: float,
     tolerance_rtol: float,
@@ -791,14 +807,14 @@ def _summary_stat(values: np.ndarray, fn: Any) -> float | None:
 
 
 __all__ = [
-    "Qwen2LayerCache",
-    "Qwen2TraceRun",
+    "DenseLayerCache",
+    "ModelTraceRun",
     "TraceArtifacts",
     "TraceComparison",
     "TraceMismatch",
     "TraceRecord",
     "compare_trace_runs",
-    "trace_qwen2_run",
-    "trace_qwen2_step",
+    "trace_model_run",
+    "trace_model_step",
     "write_trace_artifacts",
 ]
