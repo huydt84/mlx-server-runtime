@@ -563,6 +563,14 @@ impl MetricsRegistry {
                     "Latest scheduler tick latency by backend.",
                 ),
                 (
+                    "mlx_scheduler_requests_by_backend",
+                    "Latest waiting and running request counts by backend.",
+                ),
+                (
+                    "mlx_scheduled_tokens_by_backend",
+                    "Latest scheduled token counts by backend and phase.",
+                ),
+                (
                     "mlx_arbitration_delay_by_backend_ms",
                     "Latest arbitration delay by backend.",
                 ),

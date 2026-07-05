@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 
-from mlx_worker.ipc import ModelStatus, WorkerError, decode_bootstrap_message
+from mlx_worker.ipc import (
+    ChatCompletionResponse,
+    ModelStatus,
+    SchedulerMetricsEvent,
+    WorkerReady,
+    decode_bootstrap_message,
+    decode_event,
+)
 from mlx_worker.native_mlx.interfaces import (
     ExecutionBatch,
     ExecutionRequest,
+    StepRequestResult,
+    StepResult,
     execution_batch_field_names,
     execution_request_field_names,
 )
@@ -27,11 +37,15 @@ from mlx_worker.native_mlx.worker import create_native_worker, run_native_worker
 
 
 class FakeSocket:
-    def __init__(self) -> None:
+    def __init__(self, payload: bytes = b"") -> None:
         self.sent: list[bytes] = []
+        self._reader = io.BytesIO(payload)
 
     def sendall(self, data: bytes) -> None:
         self.sent.append(data)
+
+    def recv(self, size: int) -> bytes:
+        return self._reader.read(size)
 
 
 def _write_config_json(tmp_path: Path, payload: dict[str, object]) -> str:
@@ -101,6 +115,21 @@ def _tiny_qwen2_config() -> Qwen2ModelConfig:
     )
 
 
+def _native_request(model_path: str, request_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id=request_id,
+        model=model_path,
+        messages=[SimpleNamespace(role="user", content=f"hello {request_id}")],
+        max_tokens=3,
+        temperature=0.0,
+        top_p=1.0,
+        max_prompt_tokens=32,
+        max_completion_tokens=32,
+        max_total_tokens_per_request=64,
+        stop=(),
+    )
+
+
 def test_execution_boundaries_exclude_http_prompt_and_sse_fields() -> None:
     request_fields = set(execution_request_field_names())
     assert "request_id" in request_fields
@@ -161,82 +190,111 @@ def test_create_native_worker_rejects_malformed_checkpoint(tmp_path: Path) -> No
     assert error.code == "MISSING_ARCHITECTURES"
 
 
-def test_run_native_worker_reports_supported_class_bug(tmp_path: Path) -> None:
+def test_run_native_worker_reports_ready_and_serves_native_completion(
+    tmp_path: Path,
+) -> None:
     model_path = _write_valid_qwen2_model_dir(tmp_path)
-    fake_socket = FakeSocket()
+    fake_socket = FakeSocket(
+        b'{"type":"chat_completion","request":{"request_id":"req-1","model":"'
+        + model_path.encode("utf-8")
+        + b'","messages":[{"role":"user","content":"hello"}],"max_tokens":2,'
+        + b'"temperature":0.0,"top_p":1.0,"max_prompt_tokens":32,'
+        + b'"max_completion_tokens":32,"max_total_tokens_per_request":64,'
+        + b'"stop":["LO"],"stream":false}}\n'
+    )
     config = type("Cfg", (), {"model": model_path})()
 
+    class FakeRawTokenizer:
+        chat_template = "tmpl"
+        eos_token_id = 99
+
+        def apply_chat_template(self, _messages, **_kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+        def decode(self, token_ids, **_kwargs):
+            mapping = {7: "HE", 8: "LLO", 99: ""}
+            return "".join(mapping[token] for token in token_ids)
+
     def fake_tokenizer_loader(_model_path: Path):
-        return SimpleNamespace(tokenizer=SimpleNamespace(chat_template="tmpl"))
-
-    def fake_build_token_ids(_model_path: Path, _messages):
-        return [1, 2, 3]
-
-    def fake_compare(_checkpoint: str, _executor, token_ids, **_kwargs):
-        return SimpleNamespace(
-            checkpoint=_checkpoint,
-            token_ids=tuple(token_ids),
-            prefill_logits_shape=(1, len(token_ids), 4),
-            prefill_logits_dtype="float32",
-            prefill_max_abs_diff=0.0,
-            decode_max_abs_diff=0.0,
-            tolerance_atol=0.02,
-            tolerance_rtol=0.02,
-            tolerance_ok=True,
-            native_tokens=(7, 7, 7),
-            reference_tokens=(7, 7, 7),
-            cache_lengths=(len(token_ids), len(token_ids) + 1, len(token_ids) + 2),
-            prefill_time_ms=1,
-            token_ok=True,
-        )
+        return SimpleNamespace(tokenizer=FakeRawTokenizer())
 
     class FakeExecutor:
+        def __init__(self) -> None:
+            self.cache_lengths: dict[str, int] = {}
+
         def load(self, options):
             self.options = options
 
         def create_cache(self, request_id):
-            return f"cache-{request_id}"
+            handle = f"cache-{request_id}"
+            self.cache_lengths[handle] = 0
+            return handle
 
-        def prefill_batch(self, batch):  # pragma: no cover - startup test only.
-            raise NotImplementedError
+        def prefill_batch(self, batch):
+            request = batch.requests[0]
+            self.cache_lengths[request.cache_handle] = len(request.token_ids)
+            return StepResult(
+                phase="prefill",
+                results=(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=len(request.token_ids),
+                        finished=False,
+                        next_token_id=7,
+                    ),
+                ),
+                step_time_ms=1,
+            )
 
-        def decode_batch(self, batch):  # pragma: no cover - startup test only.
-            raise NotImplementedError
+        def decode_batch(self, batch):
+            request = batch.requests[0]
+            self.cache_lengths[request.cache_handle] = (
+                self.cache_lengths[request.cache_handle] + 1
+            )
+            return StepResult(
+                phase="decode",
+                results=(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=self.cache_lengths[request.cache_handle],
+                        finished=False,
+                        next_token_id=8,
+                    ),
+                ),
+                step_time_ms=1,
+            )
+
+        def cache_len(self, cache_handle):
+            return self.cache_lengths.get(cache_handle, 0)
 
         def release(self, cache_handle):
+            self.cache_lengths.pop(cache_handle, None)
             return None
-
-        def forward_token_ids(self, token_ids):
-            return mx.array([[[0.0, 1.0, 2.0, 3.0]]], dtype=mx.float32)
-
-        def prefill_then_decode_tokens(self, token_ids, decode_steps):
-            return (
-                [7] * (decode_steps + 1),
-                [len(token_ids) + i for i in range(decode_steps + 1)],
-                1,
-            )
 
     import mlx_worker.native_mlx.worker as native_worker
 
     original_loader = native_worker._load_tokenizer_wrapper
-    original_build = native_worker.build_finalized_token_ids
-    original_compare = native_worker.compare_native_prefill_decode_to_mlx_lm
     original_executor = native_worker.build_native_executor
+    original_select = native_worker.select.select
     native_worker._load_tokenizer_wrapper = fake_tokenizer_loader
-    native_worker.build_finalized_token_ids = fake_build_token_ids
-    native_worker.compare_native_prefill_decode_to_mlx_lm = fake_compare
     native_worker.build_native_executor = (
         lambda architecture, model_config, weight_index, weight_plan: FakeExecutor()
     )
+    native_worker.select.select = lambda *args, **kwargs: ([], [], [])
     try:
         exit_code = run_native_worker(fake_socket, config)
     finally:
         native_worker._load_tokenizer_wrapper = original_loader
-        native_worker.build_finalized_token_ids = original_build
-        native_worker.compare_native_prefill_decode_to_mlx_lm = original_compare
         native_worker.build_native_executor = original_executor
+        native_worker.select.select = original_select
 
-    assert exit_code == 1
+    assert exit_code == 0
     decoded = [decode_bootstrap_message(chunk) for chunk in fake_socket.sent]
     statuses = [item for item in decoded if isinstance(item, ModelStatus)]
     assert [
@@ -248,20 +306,379 @@ def test_run_native_worker_reports_supported_class_bug(tmp_path: Path) -> None:
         "native_executor_construction",
         "prompt_tokenizer_readiness",
         "deterministic_warmup",
+        "deterministic_warmup",
     ]
-    failed_status = next(
-        item
-        for item in decoded
-        if isinstance(item, ModelStatus) and item.state == "failed"
+    assert statuses[-1].state == "ready"
+    assert any(isinstance(item, WorkerReady) for item in decoded)
+    responses = []
+    for chunk in fake_socket.sent:
+        try:
+            item = decode_event(chunk)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, ChatCompletionResponse):
+            responses.append(item)
+    response = responses[-1]
+    assert isinstance(response, ChatCompletionResponse)
+    assert response.backend == "native-mlx"
+    assert response.text == "HEL"
+    assert response.finish_reason == "stop"
+
+
+def test_native_scheduler_allows_request_to_join_active_decode_batch(
+    tmp_path: Path,
+) -> None:
+    model_path = _write_valid_qwen2_model_dir(tmp_path)
+
+    class FakeRawTokenizer:
+        chat_template = "tmpl"
+        eos_token_id = 99
+
+        def apply_chat_template(self, _messages, **_kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+        def decode(self, token_ids, **_kwargs):
+            mapping = {7: "A", 8: "B", 99: ""}
+            return "".join(mapping[token] for token in token_ids)
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.cache_lengths: dict[str, int] = {}
+            self.prefill_calls: list[tuple[str, ...]] = []
+            self.decode_calls: list[tuple[str, ...]] = []
+
+        def load(self, _options):
+            return None
+
+        def create_cache(self, request_id):
+            handle = f"cache-{request_id}"
+            self.cache_lengths[handle] = 0
+            return handle
+
+        def prefill_batch(self, batch):
+            self.prefill_calls.append(tuple(item.request_id for item in batch.requests))
+            results = []
+            for request in batch.requests:
+                self.cache_lengths[request.cache_handle] = len(request.token_ids)
+                results.append(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=len(request.token_ids),
+                        finished=False,
+                        next_token_id=7,
+                    )
+                )
+            return StepResult(
+                phase="prefill",
+                results=tuple(results),
+                step_time_ms=1,
+            )
+
+        def decode_batch(self, batch):
+            self.decode_calls.append(tuple(item.request_id for item in batch.requests))
+            results = []
+            for request in batch.requests:
+                self.cache_lengths[request.cache_handle] = (
+                    self.cache_lengths[request.cache_handle] + 1
+                )
+                next_token_id = (
+                    8 if self.cache_lengths[request.cache_handle] == 4 else 99
+                )
+                results.append(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=self.cache_lengths[request.cache_handle],
+                        finished=False,
+                        next_token_id=next_token_id,
+                    )
+                )
+            return StepResult(
+                phase="decode",
+                results=tuple(results),
+                step_time_ms=1,
+            )
+
+        def cache_len(self, cache_handle):
+            return self.cache_lengths.get(cache_handle, 0)
+
+        def release(self, cache_handle):
+            self.cache_lengths.pop(cache_handle, None)
+            return None
+
+    import mlx_worker.native_mlx.worker as native_worker
+
+    original_loader = native_worker._load_tokenizer_wrapper
+    native_worker._load_tokenizer_wrapper = lambda _path: SimpleNamespace(
+        tokenizer=FakeRawTokenizer()
     )
-    assert failed_status.last_error is not None
-    assert failed_status.last_error.category == "supported_class_bug"
-    assert failed_status.last_error.stage == "deterministic_warmup"
-    assert failed_status.last_error.code == "NATIVE_PUBLIC_SERVING_NOT_IMPLEMENTED"
-    worker_error = decoded[-1]
-    assert isinstance(worker_error, WorkerError)
-    assert worker_error.error is not None
-    assert worker_error.error.category == "supported_class_bug"
+    try:
+        responses: list[ChatCompletionResponse] = []
+        metrics: list[SchedulerMetricsEvent] = []
+        executor = FakeExecutor()
+        scheduler = native_worker.NativeContinuousScheduler(
+            executor=executor,
+            options=SimpleNamespace(
+                model=model_path, architecture_class="Qwen2ForCausalLM"
+            ),
+            model_path=Path(model_path),
+            model_ref=model_path,
+            stage_callback=None,
+            emit_response=responses.append,
+            emit_error=lambda error: (_ for _ in ()).throw(AssertionError(str(error))),
+            emit_metrics=metrics.append,
+        )
+        scheduler.warmup()
+        emitted_1: list[str] = []
+        emitted_2: list[str] = []
+        scheduler.submit(_native_request(model_path, "req-1"), emitted_1.append)
+        scheduler.tick()
+        scheduler.submit(_native_request(model_path, "req-2"), emitted_2.append)
+        while not scheduler.idle():
+            scheduler.tick()
+    finally:
+        native_worker._load_tokenizer_wrapper = original_loader
+
+    assert executor.prefill_calls == [("warmup",), ("req-1",), ("req-2",)]
+    assert ("req-1", "req-2") in executor.decode_calls
+    assert emitted_1 == ["A", "B"]
+    assert emitted_2 == ["A", "B"]
+    assert [response.request_id for response in responses] == ["req-1", "req-2"]
+    assert any(
+        event.phase == "decode"
+        and event.batch_size == 2
+        and event.running_requests == 1
+        for event in metrics
+    )
+    assert scheduler._executor.cache_lengths == {}
+
+
+def test_native_scheduler_cancels_running_request_and_keeps_other_request_progressing(
+    tmp_path: Path,
+) -> None:
+    model_path = _write_valid_qwen2_model_dir(tmp_path)
+
+    class FakeRawTokenizer:
+        chat_template = "tmpl"
+        eos_token_id = 99
+
+        def apply_chat_template(self, _messages, **_kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+        def decode(self, token_ids, **_kwargs):
+            mapping = {7: "A", 8: "B", 99: ""}
+            return "".join(mapping[token] for token in token_ids)
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.cache_lengths: dict[str, int] = {}
+            self.decode_calls: list[tuple[str, ...]] = []
+
+        def load(self, _options):
+            return None
+
+        def create_cache(self, request_id):
+            handle = f"cache-{request_id}"
+            self.cache_lengths[handle] = 0
+            return handle
+
+        def prefill_batch(self, batch):
+            return StepResult(
+                phase="prefill",
+                results=tuple(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=len(request.token_ids),
+                        finished=False,
+                        next_token_id=7,
+                    )
+                    for request in batch.requests
+                ),
+                step_time_ms=1,
+            )
+
+        def decode_batch(self, batch):
+            self.decode_calls.append(tuple(item.request_id for item in batch.requests))
+            return StepResult(
+                phase="decode",
+                results=tuple(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=len(request.token_ids) + 1,
+                        finished=False,
+                        next_token_id=99 if request.request_id == "req-1" else 8,
+                    )
+                    for request in batch.requests
+                ),
+                step_time_ms=1,
+            )
+
+        def cache_len(self, cache_handle):
+            return self.cache_lengths.get(cache_handle, 0)
+
+        def release(self, cache_handle):
+            self.cache_lengths.pop(cache_handle, None)
+
+    import mlx_worker.native_mlx.worker as native_worker
+
+    original_loader = native_worker._load_tokenizer_wrapper
+    native_worker._load_tokenizer_wrapper = lambda _path: SimpleNamespace(
+        tokenizer=FakeRawTokenizer()
+    )
+    try:
+        responses: list[ChatCompletionResponse] = []
+        executor = FakeExecutor()
+        scheduler = native_worker.NativeContinuousScheduler(
+            executor=executor,
+            options=SimpleNamespace(
+                model=model_path, architecture_class="Qwen2ForCausalLM"
+            ),
+            model_path=Path(model_path),
+            model_ref=model_path,
+            stage_callback=None,
+            emit_response=responses.append,
+            emit_error=lambda error: (_ for _ in ()).throw(AssertionError(str(error))),
+            emit_metrics=lambda _metrics: None,
+        )
+        scheduler.warmup()
+        scheduler.submit(_native_request(model_path, "req-1"), None)
+        scheduler.submit(_native_request(model_path, "req-2"), None)
+        scheduler.tick()
+        assert scheduler.cancel("req-2")
+        while not scheduler.idle():
+            scheduler.tick()
+    finally:
+        native_worker._load_tokenizer_wrapper = original_loader
+
+    assert executor.decode_calls == [("req-1",)]
+    assert [
+        (response.request_id, response.finish_reason) for response in responses
+    ] == [
+        ("req-2", "cancelled"),
+        ("req-1", "stop"),
+    ]
+    assert scheduler._executor.cache_lengths == {}
+
+
+def test_native_scheduler_cleans_up_request_error_without_leaking_other_state(
+    tmp_path: Path,
+) -> None:
+    model_path = _write_valid_qwen2_model_dir(tmp_path)
+
+    class FakeRawTokenizer:
+        chat_template = "tmpl"
+        eos_token_id = 99
+
+        def apply_chat_template(self, _messages, **_kwargs):
+            return {"input_ids": [1, 2, 3]}
+
+        def decode(self, token_ids, **_kwargs):
+            mapping = {7: "A", 99: ""}
+            return "".join(mapping[token] for token in token_ids)
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.cache_lengths: dict[str, int] = {}
+
+        def load(self, _options):
+            return None
+
+        def create_cache(self, request_id):
+            handle = f"cache-{request_id}"
+            self.cache_lengths[handle] = 0
+            return handle
+
+        def prefill_batch(self, batch):
+            return StepResult(
+                phase="prefill",
+                results=tuple(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=len(request.token_ids),
+                        finished=False,
+                        next_token_id=7 if request.request_id == "req-1" else None,
+                        error_code=None
+                        if request.request_id == "req-1"
+                        else "KV_EXHAUSTED",
+                    )
+                    for request in batch.requests
+                ),
+                step_time_ms=1,
+            )
+
+        def decode_batch(self, batch):
+            return StepResult(
+                phase="decode",
+                results=tuple(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=len(request.token_ids) + 1,
+                        finished=False,
+                        next_token_id=99,
+                    )
+                    for request in batch.requests
+                ),
+                step_time_ms=1,
+            )
+
+        def cache_len(self, cache_handle):
+            return self.cache_lengths.get(cache_handle, 0)
+
+        def release(self, cache_handle):
+            self.cache_lengths.pop(cache_handle, None)
+
+    import mlx_worker.native_mlx.worker as native_worker
+
+    original_loader = native_worker._load_tokenizer_wrapper
+    native_worker._load_tokenizer_wrapper = lambda _path: SimpleNamespace(
+        tokenizer=FakeRawTokenizer()
+    )
+    try:
+        responses: list[ChatCompletionResponse] = []
+        errors: list[tuple[str, str]] = []
+        executor = FakeExecutor()
+        scheduler = native_worker.NativeContinuousScheduler(
+            executor=executor,
+            options=SimpleNamespace(
+                model=model_path, architecture_class="Qwen2ForCausalLM"
+            ),
+            model_path=Path(model_path),
+            model_ref=model_path,
+            stage_callback=None,
+            emit_response=responses.append,
+            emit_error=lambda error: errors.append((error.request_id, error.code)),
+            emit_metrics=lambda _metrics: None,
+        )
+        scheduler.warmup()
+        scheduler.submit(_native_request(model_path, "req-1"), None)
+        scheduler.submit(_native_request(model_path, "req-2"), None)
+        while not scheduler.idle():
+            scheduler.tick()
+    finally:
+        native_worker._load_tokenizer_wrapper = original_loader
+
+    assert errors == [("req-2", "KV_EXHAUSTED")]
+    assert [
+        (response.request_id, response.finish_reason) for response in responses
+    ] == [("req-1", "stop")]
+    assert scheduler._executor.cache_lengths == {}
 
 
 def test_run_native_worker_rejects_missing_tokenizer_assets(tmp_path: Path) -> None:

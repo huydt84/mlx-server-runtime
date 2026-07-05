@@ -1,5 +1,7 @@
 use super::request::ChatCompletionRequest;
-use super::response::{ChatCompletionDelta, ChatCompletionResponse, WorkerError, WorkerReady};
+use super::response::{
+    ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent, WorkerError, WorkerReady,
+};
 use super::status::ModelStatus;
 use core::fmt;
 use serde::{Deserialize, Serialize};
@@ -83,6 +85,8 @@ pub enum GatewayCommand {
     reason = "Protocol enum stays flat to preserve serde wire shape without boxing every response payload."
 )]
 pub enum WorkerEvent {
+    /// Per-step scheduler metrics not tied to one request id.
+    SchedulerMetrics { metrics: SchedulerMetricsEvent },
     /// A streamed chat completion delta.
     ChatCompletionDelta { delta: ChatCompletionDelta },
     /// A non-streaming chat completion result.
@@ -268,6 +272,7 @@ mod tests {
                 max_prompt_tokens: 10,
                 max_completion_tokens: 10,
                 max_total_tokens_per_request: 20,
+                stop: vec!["END".to_string()],
                 stream: false,
             },
         };
@@ -275,6 +280,26 @@ mod tests {
         let encoded = encode_gateway_command(&command).unwrap();
         let decoded = decode_gateway_command(&encoded).unwrap();
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn scheduler_metrics_event_round_trip() {
+        let event = WorkerEvent::SchedulerMetrics {
+            metrics: SchedulerMetricsEvent {
+                backend: "native-mlx".to_string(),
+                modality: "text".to_string(),
+                phase: "decode".to_string(),
+                scheduled_tokens: 2,
+                batch_size: 2,
+                waiting_requests: 1,
+                running_requests: 2,
+                scheduler_tick_latency_ms: 3,
+            },
+        };
+
+        let encoded = encode_worker_event(&event).unwrap();
+        let decoded = decode_worker_event(&encoded).unwrap();
+        assert_eq!(decoded, event);
     }
 
     #[test]
@@ -414,6 +439,7 @@ mod tests {
                 max_prompt_tokens: 64,
                 max_completion_tokens: 64,
                 max_total_tokens_per_request: 128,
+                stop: vec![],
                 stream: true,
             },
         };
@@ -451,6 +477,7 @@ mod tests {
                 max_prompt_tokens: 64,
                 max_completion_tokens: 64,
                 max_total_tokens_per_request: 128,
+                stop: vec![],
                 stream: false,
             },
         };

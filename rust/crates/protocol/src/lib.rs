@@ -13,5 +13,7 @@ pub use request::{
     ChatCompletionRequest, ChatMessage, ContentPart, HealthCheck, ImageUrl, MessageContent,
     MessageRole,
 };
-pub use response::{ChatCompletionDelta, ChatCompletionResponse, WorkerError, WorkerReady};
+pub use response::{
+    ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent, WorkerError, WorkerReady,
+};
 pub use status::{ModelError, ModelLoadProgress, ModelState, ModelStatus, ModelSummary};

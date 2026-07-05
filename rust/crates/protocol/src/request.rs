@@ -113,6 +113,9 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: u32,
     /// Maximum total tokens allowed for this request.
     pub max_total_tokens_per_request: u32,
+    /// User-visible stop strings enforced by runtime.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
     /// Whether the request should stream token deltas.
     #[serde(default)]
     pub stream: bool,

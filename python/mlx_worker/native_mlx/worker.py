@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import select
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from socket import socket
@@ -14,13 +16,25 @@ import mlx.core as mx
 
 from ..config import WorkerConfig
 from ..ipc import (
+    CancelRequest,
+    ChatCompletionDelta,
+    ChatMessage,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
     ModelError,
     ModelLoadProgress,
     ModelStatus,
+    SchedulerMetricsEvent,
+    WorkerCommandError,
+    WorkerReady,
     WorkerError,
+    decode_command,
     encode_bootstrap_message,
+    encode_event,
 )
 from .interfaces import (
+    ExecutionBatch,
+    ExecutionRequest,
     NativeBackendOptions,
     NativeMlxExecutor,
     NativeScheduler,
@@ -101,8 +115,83 @@ class NativeBootstrapFailure(RuntimeError):
         self.error = error
 
 
-class SkeletonNativeScheduler:
-    """Phase 3 scheduler seam with startup-only parity warmup."""
+@dataclass
+class _StopTextAssembler:
+    stop_sequences: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        self._pending = ""
+        self._emitted: list[str] = []
+        self._hold_back = max((len(value) for value in self.stop_sequences), default=0)
+
+    def push(self, text: str) -> tuple[str, bool]:
+        if not text:
+            return "", False
+        self._pending += text
+        match_index = self._first_match_index()
+        if match_index is not None:
+            emit = self._pending[:match_index]
+            if emit:
+                self._emitted.append(emit)
+            self._pending = ""
+            return emit, True
+        if self._hold_back <= 1:
+            emit = self._pending
+            if emit:
+                self._emitted.append(emit)
+            self._pending = ""
+            return emit, False
+        safe_length = max(0, len(self._pending) - self._hold_back + 1)
+        emit = self._pending[:safe_length]
+        if emit:
+            self._emitted.append(emit)
+            self._pending = self._pending[safe_length:]
+        return emit, False
+
+    def finish(self) -> str:
+        emit = self._pending
+        if emit:
+            self._emitted.append(emit)
+        self._pending = ""
+        return emit
+
+    def text(self) -> str:
+        return "".join(self._emitted) + self._pending
+
+    def _first_match_index(self) -> int | None:
+        first_index: int | None = None
+        for stop_sequence in self.stop_sequences:
+            index = self._pending.find(stop_sequence)
+            if index < 0:
+                continue
+            if first_index is None or index < first_index:
+                first_index = index
+        return first_index
+
+
+@dataclass
+class _NativePendingRequest:
+    request: ChatCompletionRequest
+    prompt_token_ids: tuple[int, ...]
+    emit_delta: Callable[[str], None] | None
+    enqueued_at: float
+    stop_assembler: _StopTextAssembler
+    completion_token_ids: list[int]
+    decoded_prefix: str = ""
+    cache_handle: str | None = None
+    cache_length: int = 0
+    prefill_time_ms: int = 0
+    decode_time_ms: int = 0
+    ttft_ms: int | None = None
+    prompt_batch_size: int | None = None
+    decode_batch_size: int | None = None
+    running_started_at: float | None = None
+    cancel_requested: bool = False
+    cancellation_stage: str | None = None
+
+
+class NativeContinuousScheduler:
+    """Phase 7 long-lived native scheduler with iteration-level batching."""
 
     def __init__(
         self,
@@ -111,71 +200,539 @@ class SkeletonNativeScheduler:
         model_path: Path,
         model_ref: str,
         stage_callback: Callable[[str, str], None] | None,
+        emit_response: Callable[[ChatCompletionResponse], None],
+        emit_error: Callable[[WorkerCommandError], None],
+        emit_metrics: Callable[[SchedulerMetricsEvent], None],
     ) -> None:
         self._executor = executor
         self._options = options
         self._model_path = model_path
         self._model_ref = model_ref
         self._stage_callback = stage_callback
+        self._tokenizer_wrapper: Any | None = None
+        self._raw_tokenizer: Any | None = None
+        self._decode_target: Any | None = None
+        self._eos_token_ids: tuple[int, ...] = ()
+        self._emit_response = emit_response
+        self._emit_error = emit_error
+        self._emit_metrics = emit_metrics
+        self._cancellation_count = 0
+        self._error_count = 0
+        self._last_warmup_latency_ms = 0
+        self._waiting: OrderedDict[str, _NativePendingRequest] = OrderedDict()
+        self._running: OrderedDict[str, _NativePendingRequest] = OrderedDict()
 
     def warmup(self) -> None:
+        warmup_started = time.perf_counter()
         self._executor.load(self._options)
         if self._stage_callback is not None:
             self._stage_callback("prompt_tokenizer_readiness", "initializing_runtime")
         validate_tokenizer_assets(self._model_path)
+        self._load_tokenizer_state()
         if self._stage_callback is not None:
             self._stage_callback("deterministic_warmup", "warming_up")
 
-        token_ids = build_finalized_token_ids(
-            self._model_path,
-            [{"role": "user", "content": "ping"}],
+        request = ChatCompletionRequest(
+            request_id="warmup",
+            model=self._model_ref,
+            messages=[ChatMessage(role="user", content="ping")],
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=64,
+            max_completion_tokens=64,
+            max_total_tokens_per_request=128,
         )
-        parity = compare_native_prefill_decode_to_mlx_lm(
-            self._model_ref,
-            self._executor,
-            token_ids,
-            decode_steps=2,
+        self._run_warmup_request(request)
+        self._last_warmup_latency_ms = max(
+            1, int((time.perf_counter() - warmup_started) * 1000)
         )
-        if not parity.tolerance_ok:
-            raise NativeBootstrapFailure(
-                _startup_error(
-                    code="NATIVE_LOGITS_PARITY_FAILED",
-                    message=(
-                        "native-mlx prefill/decode parity failed during deterministic warmup "
-                        f"with prefill_max_abs_diff={parity.prefill_max_abs_diff:.6f} "
-                        f"decode_max_abs_diff={parity.decode_max_abs_diff:.6f}"
-                    ),
-                    stage="deterministic_warmup",
-                    category="supported_class_bug",
-                    detail=self._model_ref,
-                )
+
+    def submit(
+        self,
+        request: ChatCompletionRequest,
+        emit_delta: Callable[[str], None] | None,
+    ) -> None:
+        prompt_token_ids = self._build_prompt_token_ids(request)
+        self._validate_request(request, prompt_token_ids)
+        self._waiting[request.request_id] = _NativePendingRequest(
+            request=request,
+            prompt_token_ids=tuple(prompt_token_ids),
+            emit_delta=emit_delta,
+            enqueued_at=time.perf_counter(),
+            stop_assembler=_StopTextAssembler(
+                tuple(value for value in request.stop if value)
+            ),
+            completion_token_ids=[],
+        )
+
+    def cancel(self, request_id: str) -> bool:
+        waiting = self._waiting.pop(request_id, None)
+        if waiting is not None:
+            self._cancellation_count += 1
+            waiting.cancellation_stage = "waiting"
+            self._finish_request(waiting, "cancelled")
+            self._emit_queue_counts()
+            return True
+
+        running = self._running.get(request_id)
+        if running is None:
+            return False
+        running.cancel_requested = True
+        running.cancellation_stage = (
+            "decode" if running.completion_token_ids else "prefill"
+        )
+        return True
+
+    def tick(self) -> None:
+        self._reap_cancelled_running()
+        if self._running:
+            self._run_decode_step()
+            self._reap_cancelled_running()
+        if self._waiting:
+            self._run_prefill_step()
+            self._reap_cancelled_running()
+
+    def idle(self) -> bool:
+        return not self._waiting and not self._running
+
+    def close(self) -> None:
+        for request in list(self._waiting.values()):
+            if request.cache_handle is not None:
+                self._executor.release(request.cache_handle)
+        for request in list(self._running.values()):
+            if request.cache_handle is not None:
+                self._executor.release(request.cache_handle)
+        self._waiting.clear()
+        self._running.clear()
+
+    def _run_warmup_request(self, request: ChatCompletionRequest) -> None:
+        emit_response = self._emit_response
+        emit_error = self._emit_error
+        emit_metrics = self._emit_metrics
+        try:
+            self._emit_response = lambda _response: None
+            self._emit_error = lambda _error: None
+            self._emit_metrics = lambda _metrics: None
+            self.submit(request, lambda _delta: None)
+            while not self.idle():
+                self.tick()
+        finally:
+            self._emit_response = emit_response
+            self._emit_error = emit_error
+            self._emit_metrics = emit_metrics
+
+    def _run_prefill_step(self) -> None:
+        started = time.perf_counter()
+        requests = list(self._waiting.values())
+        for request in requests:
+            self._waiting.pop(request.request.request_id, None)
+            request.cache_handle = self._executor.create_cache(
+                request.request.request_id
             )
-        if not parity.token_ok:
-            raise NativeBootstrapFailure(
-                _startup_error(
-                    code="NATIVE_GREEDY_PARITY_FAILED",
-                    message=(
-                        "native-mlx prefill/decode token parity failed during deterministic warmup "
-                        f"(native={parity.native_tokens}, mlx_lm={parity.reference_tokens})"
-                    ),
-                    stage="deterministic_warmup",
-                    category="supported_class_bug",
-                    detail=self._model_ref,
+            request.running_started_at = time.perf_counter()
+            self._running[request.request.request_id] = request
+
+        batch = ExecutionBatch(
+            phase="prefill",
+            requests=tuple(
+                ExecutionRequest(
+                    request_id=request.request.request_id,
+                    token_ids=request.prompt_token_ids,
+                    positions=tuple(range(len(request.prompt_token_ids))),
+                    cache_handle=request.cache_handle,
+                    max_new_tokens=request.request.max_tokens,
+                    temperature=request.request.temperature,
+                    top_p=request.request.top_p,
                 )
+                for request in requests
+            ),
+        )
+        try:
+            result = self._executor.prefill_batch(batch)
+        except Exception as exc:
+            self._fail_batch(requests, "WORKER_ERROR", str(exc))
+            return
+        self._apply_step_result(requests, result, "prefill", started)
+
+    def _run_decode_step(self) -> None:
+        started = time.perf_counter()
+        requests = [
+            request
+            for request in self._running.values()
+            if not request.cancel_requested and request.completion_token_ids
+        ]
+        if not requests:
+            return
+        batch = ExecutionBatch(
+            phase="decode",
+            requests=tuple(
+                ExecutionRequest(
+                    request_id=request.request.request_id,
+                    token_ids=(request.completion_token_ids[-1],),
+                    positions=(request.cache_length,),
+                    cache_handle=request.cache_handle,
+                    max_new_tokens=request.request.max_tokens,
+                    temperature=request.request.temperature,
+                    top_p=request.request.top_p,
+                )
+                for request in requests
+            ),
+        )
+        try:
+            result = self._executor.decode_batch(batch)
+        except Exception as exc:
+            self._fail_batch(requests, "WORKER_ERROR", str(exc))
+            return
+        self._apply_step_result(requests, result, "decode", started)
+
+    def _apply_step_result(
+        self,
+        requests: list[_NativePendingRequest],
+        result: Any,
+        phase: str,
+        started: float,
+    ) -> None:
+        results_by_id = {item.request_id: item for item in result.results}
+        for request in requests:
+            item = results_by_id.get(request.request.request_id)
+            if item is None:
+                self._fail_request(
+                    request,
+                    "WORKER_ERROR",
+                    f"native-mlx {phase} missing result for {request.request.request_id}",
+                )
+                continue
+            if item.error_code is not None:
+                self._fail_request(request, item.error_code, item.error_code)
+                continue
+            request.cache_handle = item.cache_handle
+            request.cache_length = item.cache_length
+            if phase == "prefill":
+                request.prefill_time_ms += result.step_time_ms
+                request.prompt_batch_size = len(requests)
+            else:
+                request.decode_time_ms += result.step_time_ms
+                request.decode_batch_size = len(requests)
+            if item.next_token_id is None:
+                self._finish_request(request, "stop")
+                continue
+            self._accept_generated_token(request, int(item.next_token_id))
+        self._emit_step_metrics(
+            phase=phase,
+            batch_size=len(requests),
+            scheduled_tokens=sum(
+                len(request.prompt_token_ids) if phase == "prefill" else 1
+                for request in requests
+            ),
+            scheduler_tick_latency_ms=max(
+                1, int((time.perf_counter() - started) * 1000)
+            ),
+        )
+
+    def _accept_generated_token(
+        self,
+        request: _NativePendingRequest,
+        token_id: int,
+    ) -> None:
+        request.completion_token_ids.append(token_id)
+        if token_id in self._eos_token_ids:
+            self._finish_request(request, "stop")
+            return
+
+        current_text = self._decode_tokens(request.completion_token_ids)
+        delta_text = (
+            current_text[len(request.decoded_prefix) :]
+            if current_text.startswith(request.decoded_prefix)
+            else current_text
+        )
+        request.decoded_prefix = current_text
+        emitted_text, stop_hit = request.stop_assembler.push(delta_text)
+        if emitted_text:
+            if request.ttft_ms is None and request.running_started_at is not None:
+                request.ttft_ms = max(
+                    1,
+                    int((time.perf_counter() - request.enqueued_at) * 1000),
+                )
+            if request.emit_delta is not None:
+                request.emit_delta(emitted_text)
+        if stop_hit:
+            self._finish_request(request, "stop")
+            return
+        if len(request.completion_token_ids) >= request.request.max_tokens:
+            self._finish_request(request, "length")
+
+    def _finish_request(
+        self,
+        request: _NativePendingRequest,
+        finish_reason: str,
+    ) -> None:
+        if finish_reason != "cancelled":
+            trailing_text = request.stop_assembler.finish()
+            if trailing_text and request.emit_delta is not None:
+                if request.ttft_ms is None:
+                    request.ttft_ms = max(
+                        1,
+                        int((time.perf_counter() - request.enqueued_at) * 1000),
+                    )
+                request.emit_delta(trailing_text)
+        self._running.pop(request.request.request_id, None)
+        self._waiting.pop(request.request.request_id, None)
+        completion_time_ms = max(
+            1, int((time.perf_counter() - request.enqueued_at) * 1000)
+        )
+        queue_time_ms = 0
+        if request.running_started_at is not None:
+            queue_time_ms = max(
+                0, int((request.running_started_at - request.enqueued_at) * 1000)
+            )
+        self._emit_response(
+            ChatCompletionResponse(
+                request_id=request.request.request_id,
+                model=self._model_ref,
+                text=request.stop_assembler.text(),
+                finish_reason=finish_reason,
+                prompt_tokens=len(request.prompt_token_ids),
+                completion_tokens=len(request.completion_token_ids),
+                prompt_batch_size=request.prompt_batch_size,
+                decode_batch_size=request.decode_batch_size,
+                backend="native-mlx",
+                modality="text",
+                scheduler_stage="cancelled"
+                if finish_reason == "cancelled"
+                else "completed",
+                cancellation_stage=request.cancellation_stage,
+                queue_time_ms=queue_time_ms,
+                prefill_time_ms=request.prefill_time_ms,
+                ttft_ms=request.ttft_ms,
+                decode_time_ms=request.decode_time_ms,
+                completion_time_ms=completion_time_ms,
+                worker_cancellation_count=self._cancellation_count,
+                worker_error_count=self._error_count,
+            )
+        )
+        if request.cache_handle is not None:
+            self._executor.release(request.cache_handle)
+
+    def _fail_batch(
+        self,
+        requests: list[_NativePendingRequest],
+        code: str,
+        message: str,
+    ) -> None:
+        for request in requests:
+            self._fail_request(request, code, message)
+
+    def _fail_request(
+        self,
+        request: _NativePendingRequest,
+        code: str,
+        message: str,
+    ) -> None:
+        self._error_count += 1
+        self._running.pop(request.request.request_id, None)
+        self._waiting.pop(request.request.request_id, None)
+        if request.cache_handle is not None:
+            self._executor.release(request.cache_handle)
+        self._emit_error(
+            WorkerCommandError(
+                code=code,
+                request_id=request.request.request_id,
+                message=message,
+            )
+        )
+
+    def _reap_cancelled_running(self) -> None:
+        cancelled = False
+        for request_id, request in list(self._running.items()):
+            if not request.cancel_requested:
+                continue
+            self._cancellation_count += 1
+            self._finish_request(request, "cancelled")
+            cancelled = True
+        if cancelled:
+            self._emit_queue_counts()
+
+    def _emit_step_metrics(
+        self,
+        *,
+        phase: str,
+        batch_size: int,
+        scheduled_tokens: int,
+        scheduler_tick_latency_ms: int,
+    ) -> None:
+        self._emit_metrics(
+            SchedulerMetricsEvent(
+                backend="native-mlx",
+                modality="text",
+                phase=phase,
+                scheduled_tokens=scheduled_tokens,
+                batch_size=batch_size,
+                waiting_requests=len(self._waiting),
+                running_requests=len(self._running),
+                scheduler_tick_latency_ms=scheduler_tick_latency_ms,
+            )
+        )
+
+    def _emit_queue_counts(self) -> None:
+        self._emit_metrics(
+            SchedulerMetricsEvent(
+                backend="native-mlx",
+                modality="text",
+                phase="decode",
+                scheduled_tokens=0,
+                batch_size=0,
+                waiting_requests=len(self._waiting),
+                running_requests=len(self._running),
+                scheduler_tick_latency_ms=0,
+            )
+        )
+
+    def _build_prompt_token_ids(self, request: ChatCompletionRequest) -> list[int]:
+        messages: list[dict[str, str]] = []
+        for message in request.messages:
+            if not isinstance(message.content, str):
+                raise ValueError(
+                    "native-mlx text backend does not support image content"
+                )
+            messages.append({"role": message.role, "content": message.content})
+        return build_finalized_token_ids(self._model_path, messages)
+
+    def _validate_request(
+        self, request: ChatCompletionRequest, prompt_token_ids: Sequence[int]
+    ) -> None:
+        if request.model != self._model_ref:
+            raise ValueError(
+                f"requested model '{request.model}' does not match loaded model '{self._model_ref}'"
+            )
+        if request.temperature != 0.0 or request.top_p != 1.0:
+            raise ValueError(
+                "native-mlx Phase 6 only supports greedy decoding (temperature=0.0, top_p=1.0)"
+            )
+        if any(not value for value in request.stop):
+            raise ValueError("stop sequences must not be empty")
+        prompt_tokens = len(prompt_token_ids)
+        completion_tokens = request.max_tokens
+        total_tokens = prompt_tokens + completion_tokens
+        if prompt_tokens > request.max_prompt_tokens:
+            raise ValueError(
+                f"prompt too long: {prompt_tokens} tokens exceeds max_prompt_tokens {request.max_prompt_tokens}"
+            )
+        if completion_tokens > request.max_completion_tokens:
+            raise ValueError(
+                f"completion too long: {completion_tokens} tokens exceeds max_completion_tokens {request.max_completion_tokens}"
+            )
+        if total_tokens > request.max_total_tokens_per_request:
+            raise ValueError(
+                f"request too large: {total_tokens} tokens exceeds max_total_tokens_per_request {request.max_total_tokens_per_request}"
             )
 
-        raise NativeBootstrapFailure(
-            _startup_error(
-                code="NATIVE_PUBLIC_SERVING_NOT_IMPLEMENTED",
-                message=(
-                    "native-mlx deterministic prefill/decode parity passed, "
-                    "but public native serving is not implemented yet"
-                ),
-                stage="deterministic_warmup",
-                category="supported_class_bug",
-                detail=self._model_ref,
-            )
+    def _load_tokenizer_state(self) -> None:
+        tokenizer_wrapper = _load_tokenizer_wrapper(self._model_path)
+        raw_tokenizer = getattr(tokenizer_wrapper, "_tokenizer", None) or getattr(
+            tokenizer_wrapper, "tokenizer", None
         )
+        decode_target = raw_tokenizer or tokenizer_wrapper
+        if not hasattr(decode_target, "decode"):
+            raise NativeBootstrapFailure(
+                _startup_error(
+                    code="TOKENIZER_DECODE_UNAVAILABLE",
+                    message="native-mlx tokenizer does not expose decode()",
+                    stage="prompt_tokenizer_readiness",
+                    category="malformed_checkpoint",
+                    detail=str(self._model_path),
+                )
+            )
+        eos_value = getattr(raw_tokenizer, "eos_token_ids", None)
+        if eos_value is None:
+            single_eos = getattr(raw_tokenizer, "eos_token_id", None)
+            eos_value = [] if single_eos is None else [single_eos]
+        elif isinstance(eos_value, int):
+            eos_value = [eos_value]
+        self._tokenizer_wrapper = tokenizer_wrapper
+        self._raw_tokenizer = raw_tokenizer
+        self._decode_target = decode_target
+        self._eos_token_ids = tuple(int(value) for value in eos_value)
+
+    def _decode_tokens(self, token_ids: Sequence[int]) -> str:
+        decoded = self._decode_target.decode(list(token_ids), skip_special_tokens=False)
+        return str(decoded)
+
+
+def _pop_buffered_line(read_buffer: bytearray) -> bytes | None:
+    newline = read_buffer.find(b"\n")
+    if newline < 0:
+        return None
+    line = bytes(read_buffer[: newline + 1])
+    del read_buffer[: newline + 1]
+    return line
+
+
+def _read_command_line(
+    client: socket,
+    read_buffer: bytearray,
+    *,
+    block: bool,
+) -> bytes | None:
+    line = _pop_buffered_line(read_buffer)
+    if line is not None:
+        return line
+
+    while True:
+        if not block and not select.select([client], [], [], 0)[0]:
+            return None
+
+        chunk = client.recv(4096)
+        if not chunk:
+            return b""
+
+        read_buffer.extend(chunk)
+        line = _pop_buffered_line(read_buffer)
+        if line is not None:
+            return line
+
+        if not block:
+            return None
+
+
+def _make_should_cancel(
+    client: socket,
+    read_buffer: bytearray,
+    pending_lines: list[bytes],
+    request_id: str,
+) -> Callable[[], bool]:
+    cancelled = False
+
+    def should_cancel() -> bool:
+        nonlocal cancelled
+        if cancelled:
+            return True
+        pending = _read_command_line(client, read_buffer, block=False)
+        if pending is None:
+            return False
+        if not pending:
+            cancelled = True
+            return True
+        if _is_matching_cancel_request(pending, request_id):
+            cancelled = True
+            return True
+        pending_lines.append(pending)
+        return False
+
+    return should_cancel
+
+
+def _is_matching_cancel_request(raw_line: bytes, request_id: str) -> bool:
+    try:
+        payload = json.loads(raw_line)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("type") == "cancel_request"
+        and payload.get("request_id") == request_id
+    )
 
 
 def run_native_worker(
@@ -193,9 +750,24 @@ def run_native_worker(
     if native_worker_factory is None:
         native_worker_factory = create_native_worker
 
+    def emit_response(response: ChatCompletionResponse) -> None:
+        client.sendall(encode_event(response))
+
+    def emit_error(error: WorkerCommandError) -> None:
+        client.sendall(encode_event(error))
+
+    def emit_metrics(event: SchedulerMetricsEvent) -> None:
+        client.sendall(encode_event(event))
+
     try:
         try:
-            scheduler = native_worker_factory(config, stage_callback=stage_emitter)
+            scheduler = native_worker_factory(
+                config,
+                stage_callback=stage_emitter,
+                emit_response=emit_response,
+                emit_error=emit_error,
+                emit_metrics=emit_metrics,
+            )
         except TypeError:
             scheduler = native_worker_factory(config)
         scheduler.warmup()
@@ -213,21 +785,98 @@ def run_native_worker(
         _emit_failure(client, config.model, bootstrap_started_at, error)
         return 1
 
-    error = _startup_error(
-        code="NATIVE_STARTUP_UNEXPECTED_READY",
-        message="native-mlx Phase 3 must not report readiness before serving implementation",
-        stage="deterministic_warmup",
-        category="supported_class_bug",
-        detail=config.model,
+    ready_at = _now_seconds()
+    _send_status(
+        client,
+        _ready_status(
+            model=config.model,
+            started_loading_at=bootstrap_started_at,
+            loaded_at=ready_at,
+            last_transition_at=ready_at,
+            warmup_latency_ms=getattr(scheduler, "_last_warmup_latency_ms", 1),
+        ),
     )
-    _emit_failure(client, config.model, bootstrap_started_at, error)
-    return 1
+    client.sendall(encode_bootstrap_message(WorkerReady()))
+
+    read_buffer = bytearray()
+    worker_closed = False
+    while True:
+        raw_line = _read_command_line(client, read_buffer, block=scheduler.idle())
+        while raw_line is not None:
+            if not raw_line:
+                worker_closed = True
+                break
+
+            try:
+                command = decode_command(raw_line)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                emit_error(
+                    WorkerCommandError(
+                        code="INVALID_REQUEST",
+                        request_id="unknown",
+                        message=str(exc),
+                    )
+                )
+            else:
+                if command is None:
+                    emit_error(
+                        WorkerCommandError(
+                            code="INVALID_REQUEST",
+                            request_id="unknown",
+                            message="unsupported worker command",
+                        )
+                    )
+                elif isinstance(command, CancelRequest):
+                    scheduler.cancel(command.request_id)
+                else:
+                    try:
+                        emit_delta = None
+                        if command.stream:
+
+                            def emit_delta(
+                                delta: str, request_id: str = command.request_id
+                            ) -> None:
+                                client.sendall(
+                                    encode_event(
+                                        ChatCompletionDelta(
+                                            request_id=request_id,
+                                            delta=delta,
+                                        )
+                                    )
+                                )
+
+                        scheduler.submit(command, emit_delta)
+                    except Exception as exc:
+                        emit_error(
+                            WorkerCommandError(
+                                code=(
+                                    "INVALID_REQUEST"
+                                    if isinstance(exc, ValueError)
+                                    else "WORKER_ERROR"
+                                ),
+                                request_id=command.request_id,
+                                message=str(exc),
+                            )
+                        )
+
+            raw_line = _read_command_line(client, read_buffer, block=False)
+
+        if worker_closed:
+            break
+        if not scheduler.idle():
+            scheduler.tick()
+
+    scheduler.close()
+    return 0
 
 
 def create_native_worker(
     config: WorkerConfig,
     *,
     stage_callback: Callable[[str, str], None] | None = None,
+    emit_response: Callable[[ChatCompletionResponse], None] | None = None,
+    emit_error: Callable[[WorkerCommandError], None] | None = None,
+    emit_metrics: Callable[[SchedulerMetricsEvent], None] | None = None,
 ) -> NativeScheduler:
     """Create native scheduler and executor seams for selected model."""
 
@@ -253,12 +902,15 @@ def create_native_worker(
     if stage_callback is not None:
         stage_callback("native_executor_construction", "initializing_runtime")
 
-    return SkeletonNativeScheduler(
+    return NativeContinuousScheduler(
         executor=executor,
         options=options,
         model_path=architecture.model_path,
         model_ref=architecture.model,
         stage_callback=stage_callback,
+        emit_response=emit_response or (lambda _response: None),
+        emit_error=emit_error or (lambda _error: None),
+        emit_metrics=emit_metrics or (lambda _metrics: None),
     )
 
 
@@ -847,6 +1499,33 @@ def _status(
         warmup_passed=False,
         last_warmup_at=None,
         last_warmup_latency_ms=None,
+    )
+
+
+def _ready_status(
+    *,
+    model: str,
+    started_loading_at: int,
+    loaded_at: int,
+    last_transition_at: int,
+    warmup_latency_ms: int,
+) -> ModelStatus:
+    return ModelStatus(
+        model=model,
+        revision=model,
+        state="ready",
+        ready=True,
+        servable=True,
+        progress=ModelLoadProgress(current_phase="deterministic_warmup"),
+        device="mps",
+        dtype="float16",
+        loaded_at=loaded_at,
+        started_loading_at=started_loading_at,
+        last_transition_at=last_transition_at,
+        last_error=None,
+        warmup_passed=True,
+        last_warmup_at=loaded_at,
+        last_warmup_latency_ms=warmup_latency_ms,
     )
 
 

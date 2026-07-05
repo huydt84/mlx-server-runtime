@@ -22,6 +22,8 @@ pub struct ChatCompletionHttpRequest {
     pub temperature: Option<f32>,
     /// Optional override for top-p.
     pub top_p: Option<f32>,
+    /// Optional stop sequence or sequences.
+    pub stop: Option<StopSequences>,
     /// Whether the client requested streaming.
     pub stream: Option<bool>,
     /// Optional streaming controls.
@@ -33,6 +35,23 @@ pub struct ChatCompletionHttpRequest {
 pub struct StreamOptions {
     /// Whether to emit a final usage-only chunk.
     pub include_usage: bool,
+}
+
+/// OpenAI-compatible stop sequence input.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StopSequences {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl StopSequences {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Single(value) => vec![value],
+            Self::Multiple(values) => values,
+        }
+    }
 }
 
 /// Outgoing non-streaming OpenAI-compatible response.
@@ -147,6 +166,10 @@ impl ChatCompletionHttpRequest {
         if self.max_tokens == Some(0) {
             return Err("max_tokens must be positive".to_string());
         }
+        let stop = self.stop.map(StopSequences::into_vec).unwrap_or_default();
+        if stop.iter().any(|value| value.is_empty()) {
+            return Err("stop sequences must not be empty".to_string());
+        }
 
         Ok(WorkerChatCompletionRequest {
             request_id: format!("req-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)),
@@ -161,6 +184,7 @@ impl ChatCompletionHttpRequest {
                 .map_err(|_| "max_completion_tokens out of range".to_string())?,
             max_total_tokens_per_request: u32::try_from(limits.max_total_tokens_per_request)
                 .map_err(|_| "max_total_tokens_per_request out of range".to_string())?,
+            stop,
             stream: self.stream.unwrap_or(false),
         })
     }
@@ -240,6 +264,7 @@ mod tests {
             max_tokens: Some(16),
             temperature: None,
             top_p: None,
+            stop: None,
             stream: Some(false),
             stream_options: None,
         };
@@ -264,6 +289,7 @@ mod tests {
             max_tokens: Some(16),
             temperature: None,
             top_p: None,
+            stop: None,
             stream: Some(false),
             stream_options: None,
         };
@@ -288,6 +314,7 @@ mod tests {
             max_tokens: Some(16),
             temperature: None,
             top_p: None,
+            stop: None,
             stream: Some(false),
             stream_options: None,
         };
@@ -312,6 +339,7 @@ mod tests {
             max_tokens: Some(64),
             temperature: Some(0.5),
             top_p: Some(0.8),
+            stop: None,
             stream: Some(true),
             stream_options: None,
         };
@@ -339,6 +367,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             top_p: None,
+            stop: None,
             stream: None,
             stream_options: None,
         };
@@ -363,6 +392,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             top_p: None,
+            stop: None,
             stream: None,
             stream_options: None,
         };
@@ -375,5 +405,28 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not match"));
+    }
+
+    #[test]
+    fn into_worker_request_normalizes_stop_sequences() {
+        let request = ChatCompletionHttpRequest {
+            model: "text-model".to_string(),
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: "hello".into(),
+            }],
+            max_tokens: Some(16),
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            stop: Some(StopSequences::Single("END".to_string())),
+            stream: Some(false),
+            stream_options: None,
+        };
+
+        let worker = request
+            .into_worker_request(&default_generation(), &default_limits(), "text-model", None)
+            .unwrap();
+
+        assert_eq!(worker.stop, vec!["END".to_string()]);
     }
 }

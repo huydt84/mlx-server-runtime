@@ -13,6 +13,7 @@ from mlx_worker.ipc import (
     ModelError,
     ModelLoadProgress,
     ModelStatus,
+    SchedulerMetricsEvent,
     TextContent,
     WorkerCommandError,
     WorkerError,
@@ -97,6 +98,7 @@ class IpcEncodingTests(unittest.TestCase):
             max_prompt_tokens=32,
             max_completion_tokens=32,
             max_total_tokens_per_request=64,
+            stop=("END",),
             stream=True,
         )
 
@@ -133,6 +135,21 @@ class IpcEncodingTests(unittest.TestCase):
                 code="WORKER_ERROR", request_id="req-1", message="boom more"
             ),
         )
+
+    def test_scheduler_metrics_event_round_trip(self) -> None:
+        event = SchedulerMetricsEvent(
+            backend="native-mlx",
+            modality="text",
+            phase="decode",
+            scheduled_tokens=2,
+            batch_size=2,
+            waiting_requests=1,
+            running_requests=2,
+            scheduler_tick_latency_ms=3,
+        )
+
+        encoded = encode_event(event)
+        self.assertEqual(decode_event(encoded), event)
 
     def test_cancel_command_round_trip(self) -> None:
         encoded = b'{"type":"cancel_request","request_id":"req-1"}\n'

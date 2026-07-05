@@ -123,6 +123,7 @@ class ChatCompletionRequest:
     max_prompt_tokens: int
     max_completion_tokens: int
     max_total_tokens_per_request: int
+    stop: tuple[str, ...] = ()
     stream: bool = False
 
 
@@ -196,6 +197,20 @@ class WorkerCommandError:
     code: str
     request_id: str
     message: str
+
+
+@dataclass(frozen=True)
+class SchedulerMetricsEvent:
+    """Per-step native scheduler metrics event."""
+
+    backend: str
+    modality: str
+    phase: Literal["prefill", "decode"]
+    scheduled_tokens: int
+    batch_size: int
+    waiting_requests: int
+    running_requests: int
+    scheduler_tick_latency_ms: int
 
 
 def encode_bootstrap_message(
@@ -312,6 +327,7 @@ def encode_command(request: ChatCompletionRequest) -> bytes:
             "max_prompt_tokens": request.max_prompt_tokens,
             "max_completion_tokens": request.max_completion_tokens,
             "max_total_tokens_per_request": request.max_total_tokens_per_request,
+            "stop": list(request.stop),
             "stream": request.stream,
         },
     }
@@ -387,12 +403,18 @@ def decode_command(raw_line: bytes) -> ChatCompletionRequest | CancelRequest | N
         max_prompt_tokens=request["max_prompt_tokens"],
         max_completion_tokens=request["max_completion_tokens"],
         max_total_tokens_per_request=request["max_total_tokens_per_request"],
+        stop=tuple(str(item) for item in request.get("stop", [])),
         stream=request.get("stream", False),
     )
 
 
 def encode_event(
-    event: ChatCompletionResponse | ChatCompletionDelta | WorkerCommandError,
+    event: (
+        ChatCompletionResponse
+        | ChatCompletionDelta
+        | WorkerCommandError
+        | SchedulerMetricsEvent
+    ),
 ) -> bytes:
     """Encode a Phase 1 worker event."""
 
@@ -429,6 +451,39 @@ def encode_event(
             "image_count": event.image_count,
             "image_preprocess_latency_ms": event.image_preprocess_latency_ms,
             "prompt_template_latency_ms": event.prompt_template_latency_ms,
+            "prompt_cache_hit": event.prompt_cache_hit,
+            "cached_tokens": event.cached_tokens,
+            "prompt_cache_bytes": event.prompt_cache_bytes,
+            "active_batch_cache_bytes": event.active_batch_cache_bytes,
+            "prompt_batch_size": event.prompt_batch_size,
+            "decode_batch_size": event.decode_batch_size,
+            "configured_prompt_batch_size": event.configured_prompt_batch_size,
+            "configured_decode_batch_size": event.configured_decode_batch_size,
+            "backend": event.backend,
+            "modality": event.modality,
+            "apc_mode": event.apc_mode,
+            "scheduler_stage": event.scheduler_stage,
+            "cancellation_stage": event.cancellation_stage,
+            "queue_time_ms": event.queue_time_ms,
+            "prefill_time_ms": event.prefill_time_ms,
+            "ttft_ms": event.ttft_ms,
+            "decode_time_ms": event.decode_time_ms,
+            "completion_time_ms": event.completion_time_ms,
+            "scheduler_tick_latency_ms": event.scheduler_tick_latency_ms,
+            "arbitration_delay_ms": event.arbitration_delay_ms,
+            "worker_cancellation_count": event.worker_cancellation_count,
+            "worker_error_count": event.worker_error_count,
+            "vision_feature_cache_hit": event.vision_feature_cache_hit,
+            "vision_feature_cache_bytes": event.vision_feature_cache_bytes,
+            "vision_feature_cache_entries": event.vision_feature_cache_entries,
+            "vision_feature_cache_evictions": event.vision_feature_cache_evictions,
+            "vision_encoder_latency_ms": event.vision_encoder_latency_ms,
+            "embedding_latency_ms": event.embedding_latency_ms,
+            "prompt_cache_entries": event.prompt_cache_entries,
+            "prompt_cache_evictions": event.prompt_cache_evictions,
+            "peak_memory_bytes": event.peak_memory_bytes,
+            "image_width": event.image_width,
+            "image_height": event.image_height,
         }
     elif isinstance(event, ChatCompletionDelta):
         payload = {
@@ -438,12 +493,17 @@ def encode_event(
                 "delta": event.delta,
             },
         }
-    else:
+    elif isinstance(event, WorkerCommandError):
         payload = {
             "type": "error",
             "code": event.code,
             "request_id": event.request_id,
             "message": event.message.replace("\n", " "),
+        }
+    else:
+        payload = {
+            "type": "scheduler_metrics",
+            "metrics": asdict(event),
         }
 
     return (json.dumps(payload) + "\n").encode("utf-8")
@@ -458,7 +518,13 @@ def encode_cancel_request(request_id: str) -> bytes:
 
 def decode_event(
     raw_line: bytes,
-) -> ChatCompletionResponse | ChatCompletionDelta | WorkerCommandError | None:
+) -> (
+    ChatCompletionResponse
+    | ChatCompletionDelta
+    | WorkerCommandError
+    | SchedulerMetricsEvent
+    | None
+):
     """Decode a Phase 1 worker event."""
 
     payload = json.loads(raw_line.decode("utf-8"))
@@ -504,6 +570,18 @@ def decode_event(
             code=payload["code"],
             request_id=payload["request_id"],
             message=payload["message"],
+        )
+    if payload.get("type") == "scheduler_metrics":
+        metrics = payload["metrics"]
+        return SchedulerMetricsEvent(
+            backend=metrics["backend"],
+            modality=metrics["modality"],
+            phase=metrics["phase"],
+            scheduled_tokens=metrics["scheduled_tokens"],
+            batch_size=metrics["batch_size"],
+            waiting_requests=metrics["waiting_requests"],
+            running_requests=metrics["running_requests"],
+            scheduler_tick_latency_ms=metrics["scheduler_tick_latency_ms"],
         )
     return None
 

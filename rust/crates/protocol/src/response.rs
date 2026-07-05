@@ -139,3 +139,24 @@ pub struct ChatCompletionDelta {
     /// The streamed text delta.
     pub delta: String,
 }
+
+/// Per-step scheduler metrics emitted independently from request terminals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerMetricsEvent {
+    /// Backend family that emitted metrics.
+    pub backend: String,
+    /// Logical modality for metrics ownership.
+    pub modality: String,
+    /// Scheduler phase that produced this step.
+    pub phase: String,
+    /// Tokens scheduled in this step.
+    pub scheduled_tokens: u32,
+    /// Batch size for this step.
+    pub batch_size: u32,
+    /// Current waiting-request count.
+    pub waiting_requests: u32,
+    /// Current running-request count.
+    pub running_requests: u32,
+    /// End-to-end tick latency in milliseconds.
+    pub scheduler_tick_latency_ms: u32,
+}

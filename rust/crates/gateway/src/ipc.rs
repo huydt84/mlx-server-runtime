@@ -89,6 +89,7 @@ impl WorkerClient {
                     return Err(GatewayError::Protocol(message));
                 }
                 Ok(RoutedWorkerEvent::Event(event)) => match *event {
+                    WorkerEvent::SchedulerMetrics { .. } => continue,
                     WorkerEvent::ChatCompletionDelta { delta } => {
                         if !stream {
                             self.unregister_request(&request_id);
@@ -580,7 +581,56 @@ impl WorkerClient {
                     }
                 };
 
+                if let WorkerEvent::SchedulerMetrics { metrics: scheduler } = &event {
+                    metrics.set_labeled_gauge(
+                        "mlx_batch_size_by_backend",
+                        &[
+                            ("backend", scheduler.backend.as_str()),
+                            ("modality", scheduler.modality.as_str()),
+                            ("stage", scheduler.phase.as_str()),
+                        ],
+                        scheduler.batch_size as u64,
+                    );
+                    metrics.set_labeled_gauge(
+                        "mlx_scheduled_tokens_by_backend",
+                        &[
+                            ("backend", scheduler.backend.as_str()),
+                            ("modality", scheduler.modality.as_str()),
+                            ("phase", scheduler.phase.as_str()),
+                        ],
+                        scheduler.scheduled_tokens as u64,
+                    );
+                    metrics.set_labeled_gauge(
+                        "mlx_scheduler_requests_by_backend",
+                        &[
+                            ("backend", scheduler.backend.as_str()),
+                            ("modality", scheduler.modality.as_str()),
+                            ("state", "waiting"),
+                        ],
+                        scheduler.waiting_requests as u64,
+                    );
+                    metrics.set_labeled_gauge(
+                        "mlx_scheduler_requests_by_backend",
+                        &[
+                            ("backend", scheduler.backend.as_str()),
+                            ("modality", scheduler.modality.as_str()),
+                            ("state", "running"),
+                        ],
+                        scheduler.running_requests as u64,
+                    );
+                    metrics.set_labeled_gauge(
+                        "mlx_scheduler_tick_latency_by_backend_ms",
+                        &[
+                            ("backend", scheduler.backend.as_str()),
+                            ("modality", scheduler.modality.as_str()),
+                        ],
+                        scheduler.scheduler_tick_latency_ms as u64,
+                    );
+                    continue;
+                }
+
                 let request_id = match &event {
+                    WorkerEvent::SchedulerMetrics { .. } => unreachable!(),
                     WorkerEvent::ChatCompletionDelta { delta } => delta.request_id.clone(),
                     WorkerEvent::ChatCompletion { response, .. } => response.request_id.clone(),
                     WorkerEvent::Error { request_id, .. } => request_id.clone(),
@@ -644,6 +694,7 @@ mod tests {
             max_prompt_tokens: 16,
             max_completion_tokens: 16,
             max_total_tokens_per_request: 32,
+            stop: vec![],
             stream: false,
         }
     }
@@ -818,5 +869,94 @@ mod tests {
         assert!(
             matches!(result, Err(GatewayError::Protocol(message)) if message.contains("closed the inference socket"))
         );
+    }
+
+    #[test]
+    fn scheduler_metrics_events_update_gauges_without_blocking_response_routing() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let metrics = Arc::new(MetricsRegistry::new());
+        let worker = WorkerClient::new(client, Arc::clone(&metrics)).unwrap();
+
+        let server_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let mut line = String::new();
+            let bytes = reader.read_line(&mut line).unwrap();
+            assert!(bytes > 0);
+
+            let metrics_event = WorkerEvent::SchedulerMetrics {
+                metrics: mlx_runtime_protocol::SchedulerMetricsEvent {
+                    backend: "native-mlx".to_string(),
+                    modality: "text".to_string(),
+                    phase: "decode".to_string(),
+                    scheduled_tokens: 2,
+                    batch_size: 2,
+                    waiting_requests: 1,
+                    running_requests: 2,
+                    scheduler_tick_latency_ms: 3,
+                },
+            };
+            let response_event = WorkerEvent::ChatCompletion {
+                response: ChatCompletionResponse {
+                    request_id: "req-1".to_string(),
+                    model: "test-model".to_string(),
+                    text: "ok".to_string(),
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens: 4,
+                    completion_tokens: 1,
+                    ..Default::default()
+                },
+                image_count: None,
+                image_preprocess_latency_ms: None,
+                prompt_template_latency_ms: None,
+                prompt_cache_hit: None,
+                cached_tokens: None,
+                prompt_cache_bytes: None,
+                active_batch_cache_bytes: None,
+                prompt_batch_size: None,
+                decode_batch_size: None,
+                configured_prompt_batch_size: None,
+                configured_decode_batch_size: None,
+                backend: Some("v1".to_string()),
+                modality: Some("text".to_string()),
+                apc_mode: None,
+                scheduler_stage: None,
+                cancellation_stage: None,
+                queue_time_ms: None,
+                prefill_time_ms: None,
+                ttft_ms: None,
+                decode_time_ms: None,
+                completion_time_ms: None,
+                scheduler_tick_latency_ms: None,
+                arbitration_delay_ms: None,
+                worker_cancellation_count: None,
+                worker_error_count: None,
+                vision_feature_cache_hit: None,
+                vision_feature_cache_bytes: None,
+                vision_feature_cache_entries: None,
+                vision_feature_cache_evictions: None,
+                vision_encoder_latency_ms: None,
+                embedding_latency_ms: None,
+                prompt_cache_entries: None,
+                prompt_cache_evictions: None,
+                peak_memory_bytes: None,
+                image_width: None,
+                image_height: None,
+            };
+
+            for event in [metrics_event, response_event] {
+                let encoded = encode_worker_event(&event).unwrap();
+                writeln!(writer, "{encoded}").unwrap();
+                writer.flush().unwrap();
+            }
+        });
+
+        let response = worker.complete_chat(request("req-1")).unwrap();
+        server_thread.join().unwrap();
+
+        assert_eq!(response.text, "ok");
+        let rendered = metrics.render_prometheus(0);
+        assert!(rendered.contains("mlx_scheduler_requests_by_backend{backend=\"native-mlx\",modality=\"text\",state=\"running\"} 2"));
+        assert!(rendered.contains("mlx_scheduled_tokens_by_backend{backend=\"native-mlx\",modality=\"text\",phase=\"decode\"} 2"));
     }
 }

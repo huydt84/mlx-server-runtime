@@ -94,6 +94,25 @@ class NativeScheduler(Protocol):
     def warmup(self) -> None:
         """Validate startup path before readiness."""
 
+    def submit(
+        self,
+        request: Any,
+        emit_delta: Any,
+    ) -> None:
+        """Queue one request for scheduler-owned execution."""
+
+    def cancel(self, request_id: str) -> bool:
+        """Cancel one waiting or running request."""
+
+    def tick(self) -> None:
+        """Run one scheduler iteration."""
+
+    def idle(self) -> bool:
+        """Return true when no waiting or running work remains."""
+
+    def close(self) -> None:
+        """Release all scheduler-owned resources."""
+
 
 def execution_batch_field_names() -> tuple[str, ...]:
     """Expose field names for boundary tests."""

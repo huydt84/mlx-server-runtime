@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -289,6 +290,49 @@ impl RuntimeConfig {
 
         Ok(config)
     }
+
+    /// Renders startup configuration for logs.
+    pub fn startup_log(&self, config_path: &str) -> String {
+        let mut rendered = String::new();
+        let _ = writeln!(rendered, "runtime_config path={config_path}");
+        let _ = writeln!(
+            rendered,
+            "server host={} port={}",
+            self.server.host, self.server.port
+        );
+        let _ = writeln!(
+            rendered,
+            "worker python={} module={} backend={} model={} vlm_model={} ipc_path={}",
+            self.worker.python,
+            self.worker.module,
+            self.worker.backend.as_str(),
+            self.worker.model,
+            self.worker.vlm_model.as_deref().unwrap_or("<none>"),
+            self.worker.ipc_path
+        );
+        let _ = writeln!(
+            rendered,
+            "generation temperature={} top_p={} max_tokens={}",
+            self.generation.temperature, self.generation.top_p, self.generation.max_tokens
+        );
+        let _ = writeln!(
+            rendered,
+            "limits max_pending_requests={} max_active_requests={} max_prompt_tokens={} max_completion_tokens={} max_total_tokens_per_request={} request_timeout_seconds={} max_vlm_images={}",
+            self.limits.max_pending_requests,
+            self.limits.max_active_requests,
+            self.limits.max_prompt_tokens,
+            self.limits.max_completion_tokens,
+            self.limits.max_total_tokens_per_request,
+            self.limits.request_timeout_seconds,
+            self.limits.max_vlm_images
+        );
+        let _ = write!(
+            rendered,
+            "telemetry enable_prometheus={} metrics_path={}",
+            self.telemetry.enable_prometheus, self.telemetry.metrics_path
+        );
+        rendered
+    }
 }
 
 fn strip_comment(line: &str) -> &str {
@@ -416,5 +460,22 @@ mod tests {
         assert_eq!(config.limits.max_vlm_images, 5);
         assert!(!config.telemetry.enable_prometheus);
         assert_eq!(config.telemetry.metrics_path, "/custom-metrics");
+    }
+
+    #[test]
+    fn startup_log_includes_loaded_backend_and_paths() {
+        let mut config = RuntimeConfig::default();
+        config.worker.backend = BackendKind::NativeMlx;
+        config.worker.model = "native-model".to_string();
+        config.worker.vlm_model = Some("vlm-model".to_string());
+        config.worker.ipc_path = "/tmp/native.sock".to_string();
+
+        let rendered = config.startup_log("/tmp/runtime.toml");
+
+        assert!(rendered.contains("runtime_config path=/tmp/runtime.toml"));
+        assert!(rendered.contains("backend=native-mlx"));
+        assert!(rendered.contains("model=native-model"));
+        assert!(rendered.contains("vlm_model=vlm-model"));
+        assert!(rendered.contains("ipc_path=/tmp/native.sock"));
     }
 }

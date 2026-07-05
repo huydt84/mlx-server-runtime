@@ -412,6 +412,7 @@ fn warmup_vlm_model(runtime: RuntimeState, client: Arc<WorkerClient>, vlm_model:
         max_prompt_tokens: 64,
         max_completion_tokens: 64,
         max_total_tokens_per_request: 128,
+        stop: vec![],
         stream: false,
     };
 

@@ -1089,6 +1089,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     let mut stream_started = false;
     let cancel_on_disconnect =
         DisconnectCancellation::start(disconnected.clone(), backend.clone(), request_id.clone());
+    let disconnect_on_write = disconnected.clone();
 
     let mut on_delta = |delta: String| -> Result<(), GatewayError> {
         request_tracker.record_first_delta();
@@ -1106,7 +1107,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
                 "finish_reason": null,
             }],
         });
-        if !stream_started {
+        let write_result = if !stream_started {
             // First delta: combine SSE headers + data into a single write
             // to save one write(2) syscall and avoid split TCP segments.
             stream_started = true;
@@ -1114,11 +1115,24 @@ fn stream_chat_completion_with_disconnect<W: Write>(
                 writer,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\ndata: {}\n\n",
                 event
-            )?;
+            )
         } else {
-            write!(writer, "data: {}\n\n", event)?;
+            write!(writer, "data: {}\n\n", event)
+        };
+        if let Err(err) = write_result {
+            if let Some(flag) = disconnect_on_write.as_ref() {
+                flag.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+            return Err(GatewayError::Io(err));
         }
-        writer.flush()?;
+        if let Err(err) = writer.flush() {
+            if let Some(flag) = disconnect_on_write.as_ref() {
+                flag.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+            return Err(GatewayError::Io(err));
+        }
         Ok(())
     };
 
@@ -2072,6 +2086,35 @@ mod tests {
         assert_eq!(String::from_utf8(buffer.into_inner()).unwrap(), "");
     }
 
+    #[test]
+    fn streaming_chat_completion_drains_worker_after_disconnect_during_stream() {
+        let service = Arc::new(DelayedCancellableStreamingService::default());
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": true
+        }))
+        .unwrap();
+        let state = test_state(ModelState::Ready, service.clone());
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let mut writer = FailAfterFirstStreamChunk::default();
+
+        stream_chat_completion_with_disconnect(
+            &mut writer,
+            &body,
+            &state,
+            Some(disconnected.clone()),
+        )
+        .unwrap();
+
+        assert!(disconnected.load(Ordering::Relaxed));
+        assert_eq!(service.cancel_count(), 1);
+        assert!(!writer.buffer.is_empty());
+    }
+
     fn test_state(state: ModelState, backend: Arc<dyn ChatCompletionService>) -> AppState {
         let runtime = test_runtime(state);
         AppState {
@@ -2310,6 +2353,86 @@ mod tests {
         fn cancel(&self, _request_id: &str) -> Result<(), GatewayError> {
             self.cancelled.store(true, Ordering::Relaxed);
             *self.cancel_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default, Clone)]
+    struct DelayedCancellableStreamingService {
+        cancelled: Arc<AtomicBool>,
+        cancel_calls: Arc<Mutex<usize>>,
+    }
+
+    impl DelayedCancellableStreamingService {
+        fn cancel_count(&self) -> usize {
+            *self.cancel_calls.lock().unwrap()
+        }
+    }
+
+    impl ChatCompletionService for DelayedCancellableStreamingService {
+        fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: "hello".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                ..Default::default()
+            })
+        }
+
+        fn stream(
+            &self,
+            request: ChatCompletionRequest,
+            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            on_delta("A".to_string())?;
+            on_delta("B".to_string())?;
+            while !self.cancelled.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(ChatCompletionResponse {
+                request_id: request.request_id,
+                model: request.model,
+                text: "A".to_string(),
+                finish_reason: "cancelled".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                ..Default::default()
+            })
+        }
+
+        fn cancel(&self, _request_id: &str) -> Result<(), GatewayError> {
+            self.cancelled.store(true, Ordering::Relaxed);
+            *self.cancel_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailAfterFirstStreamChunk {
+        buffer: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for FailAfterFirstStreamChunk {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes >= 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client disconnected",
+                ));
+            }
+            self.buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
