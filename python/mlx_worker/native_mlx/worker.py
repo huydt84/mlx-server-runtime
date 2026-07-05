@@ -177,6 +177,7 @@ class _NativePendingRequest:
     enqueued_at: float
     stop_assembler: _StopTextAssembler
     completion_token_ids: list[int]
+    prompt_cursor: int = 0
     decoded_prefix: str = ""
     cache_handle: str | None = None
     cache_length: int = 0
@@ -191,7 +192,7 @@ class _NativePendingRequest:
 
 
 class NativeContinuousScheduler:
-    """Phase 7 long-lived native scheduler with iteration-level batching."""
+    """Phase 8 long-lived native scheduler with chunked prefill."""
 
     def __init__(
         self,
@@ -203,11 +204,15 @@ class NativeContinuousScheduler:
         emit_response: Callable[[ChatCompletionResponse], None],
         emit_error: Callable[[WorkerCommandError], None],
         emit_metrics: Callable[[SchedulerMetricsEvent], None],
+        prefill_step_size: int = 256,
     ) -> None:
+        if prefill_step_size <= 0:
+            raise ValueError("native-mlx prefill chunk size must be positive")
         self._executor = executor
         self._options = options
         self._model_path = model_path
         self._model_ref = model_ref
+        self._prefill_step_size = int(prefill_step_size)
         self._stage_callback = stage_callback
         self._tokenizer_wrapper: Any | None = None
         self._raw_tokenizer: Any | None = None
@@ -289,7 +294,7 @@ class NativeContinuousScheduler:
         if self._running:
             self._run_decode_step()
             self._reap_cancelled_running()
-        if self._waiting:
+        if self._has_prefill_work():
             self._run_prefill_step()
             self._reap_cancelled_running()
 
@@ -324,36 +329,55 @@ class NativeContinuousScheduler:
 
     def _run_prefill_step(self) -> None:
         started = time.perf_counter()
-        requests = list(self._waiting.values())
-        for request in requests:
-            self._waiting.pop(request.request.request_id, None)
-            request.cache_handle = self._executor.create_cache(
-                request.request.request_id
-            )
-            request.running_started_at = time.perf_counter()
-            self._running[request.request.request_id] = request
+        requests = self._prefill_requests()
+        if not requests:
+            return
 
-        batch = ExecutionBatch(
-            phase="prefill",
-            requests=tuple(
+        chunk_lengths: dict[str, int] = {}
+        execution_requests: list[ExecutionRequest] = []
+        for request in requests:
+            if request.cache_handle is None:
+                self._waiting.pop(request.request.request_id, None)
+                request.cache_handle = self._executor.create_cache(
+                    request.request.request_id
+                )
+                request.running_started_at = time.perf_counter()
+                self._running[request.request.request_id] = request
+            chunk_start = request.prompt_cursor
+            chunk_end = min(
+                len(request.prompt_token_ids),
+                chunk_start + self._prefill_step_size,
+            )
+            chunk_token_ids = request.prompt_token_ids[chunk_start:chunk_end]
+            chunk_lengths[request.request.request_id] = len(chunk_token_ids)
+            execution_requests.append(
                 ExecutionRequest(
                     request_id=request.request.request_id,
-                    token_ids=request.prompt_token_ids,
-                    positions=tuple(range(len(request.prompt_token_ids))),
+                    token_ids=chunk_token_ids,
+                    positions=tuple(range(chunk_start, chunk_end)),
                     cache_handle=request.cache_handle,
                     max_new_tokens=request.request.max_tokens,
                     temperature=request.request.temperature,
                     top_p=request.request.top_p,
                 )
-                for request in requests
-            ),
+            )
+
+        batch = ExecutionBatch(
+            phase="prefill",
+            requests=tuple(execution_requests),
         )
         try:
             result = self._executor.prefill_batch(batch)
         except Exception as exc:
             self._fail_batch(requests, "WORKER_ERROR", str(exc))
             return
-        self._apply_step_result(requests, result, "prefill", started)
+        self._apply_step_result(
+            requests,
+            result,
+            "prefill",
+            started,
+            scheduled_tokens_by_request=chunk_lengths,
+        )
 
     def _run_decode_step(self) -> None:
         started = time.perf_counter()
@@ -392,6 +416,8 @@ class NativeContinuousScheduler:
         result: Any,
         phase: str,
         started: float,
+        *,
+        scheduled_tokens_by_request: dict[str, int] | None = None,
     ) -> None:
         results_by_id = {item.request_id: item for item in result.results}
         for request in requests:
@@ -411,24 +437,72 @@ class NativeContinuousScheduler:
             if phase == "prefill":
                 request.prefill_time_ms += result.step_time_ms
                 request.prompt_batch_size = len(requests)
+                request.prompt_cursor += int(
+                    (scheduled_tokens_by_request or {}).get(
+                        request.request.request_id,
+                        0,
+                    )
+                )
+                if request.cache_length != request.prompt_cursor:
+                    self._fail_request(
+                        request,
+                        "WORKER_ERROR",
+                        (
+                            "native-mlx prefill cache length mismatch for "
+                            f"{request.request.request_id}"
+                        ),
+                    )
+                    continue
+                if request.prompt_cursor < len(request.prompt_token_ids):
+                    continue
             else:
                 request.decode_time_ms += result.step_time_ms
                 request.decode_batch_size = len(requests)
             if item.next_token_id is None:
-                self._finish_request(request, "stop")
+                if phase == "prefill":
+                    self._fail_request(
+                        request,
+                        "WORKER_ERROR",
+                        (
+                            "native-mlx prefill did not yield next token for "
+                            f"{request.request.request_id}"
+                        ),
+                    )
+                else:
+                    self._finish_request(request, "stop")
                 continue
             self._accept_generated_token(request, int(item.next_token_id))
         self._emit_step_metrics(
             phase=phase,
             batch_size=len(requests),
-            scheduled_tokens=sum(
-                len(request.prompt_token_ids) if phase == "prefill" else 1
-                for request in requests
+            scheduled_tokens=(
+                sum((scheduled_tokens_by_request or {}).values())
+                if phase == "prefill"
+                else len(requests)
             ),
             scheduler_tick_latency_ms=max(
                 1, int((time.perf_counter() - started) * 1000)
             ),
         )
+
+    def _has_prefill_work(self) -> bool:
+        if self._waiting:
+            return True
+        return any(
+            not request.cancel_requested
+            and request.prompt_cursor < len(request.prompt_token_ids)
+            for request in self._running.values()
+        )
+
+    def _prefill_requests(self) -> list[_NativePendingRequest]:
+        requests = [
+            request
+            for request in self._running.values()
+            if not request.cancel_requested
+            and request.prompt_cursor < len(request.prompt_token_ids)
+        ]
+        requests.extend(self._waiting.values())
+        return requests
 
     def _accept_generated_token(
         self,
@@ -607,7 +681,7 @@ class NativeContinuousScheduler:
             )
         if request.temperature != 0.0 or request.top_p != 1.0:
             raise ValueError(
-                "native-mlx Phase 6 only supports greedy decoding (temperature=0.0, top_p=1.0)"
+                "native-mlx only supports greedy decoding (temperature=0.0, top_p=1.0)"
             )
         if any(not value for value in request.stop):
             raise ValueError("stop sequences must not be empty")
@@ -911,6 +985,11 @@ def create_native_worker(
         emit_response=emit_response or (lambda _response: None),
         emit_error=emit_error or (lambda _error: None),
         emit_metrics=emit_metrics or (lambda _metrics: None),
+        prefill_step_size=getattr(
+            config,
+            "text_prefill_chunk_size",
+            getattr(config, "prefill_chunk_size", 256),
+        ),
     )
 
 

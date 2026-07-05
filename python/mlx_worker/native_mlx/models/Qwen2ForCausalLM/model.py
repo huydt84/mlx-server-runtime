@@ -205,13 +205,17 @@ class Qwen2NativeMlxExecutor:
         try:
             for request in batch.requests:
                 cache = self._validated_cache(request)
-                if cache.size() != 0:
-                    raise ValueError("prefill requires empty cache")
-                self._validate_positions(request, expected_offset=0)
+                expected_offset = cache.size()
+                if len(request.token_ids) == 0:
+                    raise ValueError("prefill requires at least one token per request")
+                self._validate_positions(request, expected_offset=expected_offset)
                 inputs = mx.array([list(request.token_ids)], dtype=mx.int32)
                 logits = self.model(inputs, cache=cache.layers)
                 mx.eval(logits)
-                self._validate_cache(cache, expected_length=len(request.token_ids))
+                self._validate_cache(
+                    cache,
+                    expected_length=expected_offset + len(request.token_ids),
+                )
                 request_logits = logits[0]
                 next_token = int(mx.argmax(request_logits[-1], axis=-1).item())
                 results.append(

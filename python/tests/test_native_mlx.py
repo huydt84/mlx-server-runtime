@@ -458,6 +458,193 @@ def test_native_scheduler_allows_request_to_join_active_decode_batch(
     assert scheduler._executor.cache_lengths == {}
 
 
+def test_native_scheduler_rejects_non_positive_prefill_chunk_size() -> None:
+    try:
+        __import__(
+            "mlx_worker.native_mlx.worker", fromlist=["NativeContinuousScheduler"]
+        ).NativeContinuousScheduler(
+            executor=SimpleNamespace(),
+            options=SimpleNamespace(
+                model="test-model", architecture_class="Qwen2ForCausalLM"
+            ),
+            model_path=Path("/tmp/model"),
+            model_ref="test-model",
+            stage_callback=None,
+            emit_response=lambda _response: None,
+            emit_error=lambda _error: None,
+            emit_metrics=lambda _metrics: None,
+            prefill_step_size=0,
+        )
+    except ValueError as exc:
+        assert str(exc) == "native-mlx prefill chunk size must be positive"
+    else:  # pragma: no cover
+        raise AssertionError("expected invalid prefill chunk size failure")
+
+
+def test_native_scheduler_interleaves_decode_before_long_prefill_chunks(
+    tmp_path: Path,
+) -> None:
+    model_path = _write_valid_qwen2_model_dir(tmp_path)
+
+    def native_request(request_id: str, content: str) -> SimpleNamespace:
+        request = _native_request(model_path, request_id)
+        request.messages = [SimpleNamespace(role="user", content=content)]
+        return request
+
+    class FakeRawTokenizer:
+        chat_template = "tmpl"
+        eos_token_id = 99
+
+        def apply_chat_template(self, messages, **_kwargs):
+            content = messages[0]["content"]
+            if content == "ping":
+                return {"input_ids": [0]}
+            if content == "long":
+                return {"input_ids": [1, 2, 3, 4, 5]}
+            if content == "short":
+                return {"input_ids": [9]}
+            return {"input_ids": [1, 2, 3]}
+
+        def decode(self, token_ids, **_kwargs):
+            mapping = {7: "A", 8: "B", 99: ""}
+            return "".join(mapping[token] for token in token_ids)
+
+    class FakeExecutor:
+        def __init__(self) -> None:
+            self.cache_lengths: dict[str, int] = {}
+            self.call_order: list[
+                tuple[str, tuple[str, ...], tuple[tuple[int, ...], ...]]
+            ] = []
+
+        def load(self, _options):
+            return None
+
+        def create_cache(self, request_id):
+            handle = f"cache-{request_id}"
+            self.cache_lengths[handle] = 0
+            return handle
+
+        def prefill_batch(self, batch):
+            self.call_order.append(
+                (
+                    "prefill",
+                    tuple(item.request_id for item in batch.requests),
+                    tuple(item.token_ids for item in batch.requests),
+                )
+            )
+            results = []
+            for request in batch.requests:
+                self.cache_lengths[request.cache_handle] += len(request.token_ids)
+                results.append(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=self.cache_lengths[request.cache_handle],
+                        finished=False,
+                        next_token_id=7,
+                    )
+                )
+            return StepResult(
+                phase="prefill",
+                results=tuple(results),
+                step_time_ms=1,
+            )
+
+        def decode_batch(self, batch):
+            self.call_order.append(
+                (
+                    "decode",
+                    tuple(item.request_id for item in batch.requests),
+                    tuple(item.token_ids for item in batch.requests),
+                )
+            )
+            results = []
+            for request in batch.requests:
+                self.cache_lengths[request.cache_handle] += 1
+                next_token_id = (
+                    99
+                    if request.request_id == "req-short"
+                    or self.cache_lengths[request.cache_handle] >= 7
+                    else 8
+                )
+                results.append(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        token_ids=request.token_ids,
+                        logits=None,
+                        cache_handle=request.cache_handle,
+                        cache_length=self.cache_lengths[request.cache_handle],
+                        finished=False,
+                        next_token_id=next_token_id,
+                    )
+                )
+            return StepResult(
+                phase="decode",
+                results=tuple(results),
+                step_time_ms=1,
+            )
+
+        def cache_len(self, cache_handle):
+            return self.cache_lengths.get(cache_handle, 0)
+
+        def release(self, cache_handle):
+            self.cache_lengths.pop(cache_handle, None)
+            return None
+
+    import mlx_worker.native_mlx.worker as native_worker
+
+    original_loader = native_worker._load_tokenizer_wrapper
+    native_worker._load_tokenizer_wrapper = lambda _path: SimpleNamespace(
+        tokenizer=FakeRawTokenizer()
+    )
+    try:
+        responses: list[ChatCompletionResponse] = []
+        metrics: list[SchedulerMetricsEvent] = []
+        executor = FakeExecutor()
+        scheduler = native_worker.NativeContinuousScheduler(
+            executor=executor,
+            options=SimpleNamespace(
+                model=model_path, architecture_class="Qwen2ForCausalLM"
+            ),
+            model_path=Path(model_path),
+            model_ref=model_path,
+            stage_callback=None,
+            emit_response=responses.append,
+            emit_error=lambda error: (_ for _ in ()).throw(AssertionError(str(error))),
+            emit_metrics=metrics.append,
+            prefill_step_size=2,
+        )
+        scheduler.warmup()
+        executor.call_order.clear()
+        metrics.clear()
+
+        scheduler.submit(native_request("req-long", "long"), None)
+        scheduler.tick()
+        scheduler.submit(native_request("req-short", "short"), None)
+        while not scheduler.idle():
+            scheduler.tick()
+    finally:
+        native_worker._load_tokenizer_wrapper = original_loader
+
+    assert executor.call_order[:4] == [
+        ("prefill", ("req-long",), ((1, 2),)),
+        ("prefill", ("req-long", "req-short"), ((3, 4), (9,))),
+        ("decode", ("req-short",), ((7,),)),
+        ("prefill", ("req-long",), ((5,),)),
+    ]
+    assert [event.phase for event in metrics[:4]] == [
+        "prefill",
+        "prefill",
+        "decode",
+        "prefill",
+    ]
+    assert [event.scheduled_tokens for event in metrics[:4]] == [2, 3, 1, 1]
+    assert [response.request_id for response in responses] == ["req-short", "req-long"]
+    assert scheduler._executor.cache_lengths == {}
+
+
 def test_native_scheduler_cancels_running_request_and_keeps_other_request_progressing(
     tmp_path: Path,
 ) -> None:
@@ -881,6 +1068,127 @@ def test_qwen2_executor_decode_appends_one_token_without_recomputing_prompt() ->
     assert decode.results[0].cache_length == 4
     assert executor.cache_len(cache_handle) == 4
     assert decode.results[0].next_token_id is not None
+
+
+def test_qwen2_executor_prefill_resumes_cache_across_chunks() -> None:
+    config = _tiny_qwen2_config()
+    executor = Qwen2NativeMlxExecutor.__new__(Qwen2NativeMlxExecutor)
+    executor.model_path = Path("/tmp")
+    executor.model_config = config
+    executor.weight_plan = SimpleNamespace(entries=(), source_files=())
+    executor.weight_index = SimpleNamespace(model_path=Path("/tmp"))
+    executor._request_caches = {}
+    mx.random.seed(0)
+    executor.model = Qwen2ForCausalLm(config)
+
+    full_handle = executor.create_cache("full")
+    chunked_handle = executor.create_cache("chunked")
+    try:
+        full_prefill = executor.prefill_batch(
+            ExecutionBatch(
+                phase="prefill",
+                requests=(
+                    ExecutionRequest(
+                        request_id="full",
+                        token_ids=(1, 2, 3, 4),
+                        positions=(0, 1, 2, 3),
+                        cache_handle=full_handle,
+                        max_new_tokens=1,
+                        temperature=0.0,
+                        top_p=1.0,
+                    ),
+                ),
+            )
+        )
+        first_chunk = executor.prefill_batch(
+            ExecutionBatch(
+                phase="prefill",
+                requests=(
+                    ExecutionRequest(
+                        request_id="chunked",
+                        token_ids=(1, 2),
+                        positions=(0, 1),
+                        cache_handle=chunked_handle,
+                        max_new_tokens=1,
+                        temperature=0.0,
+                        top_p=1.0,
+                    ),
+                ),
+            )
+        )
+        second_chunk = executor.prefill_batch(
+            ExecutionBatch(
+                phase="prefill",
+                requests=(
+                    ExecutionRequest(
+                        request_id="chunked",
+                        token_ids=(3, 4),
+                        positions=(2, 3),
+                        cache_handle=chunked_handle,
+                        max_new_tokens=1,
+                        temperature=0.0,
+                        top_p=1.0,
+                    ),
+                ),
+            )
+        )
+
+        full_next = int(full_prefill.results[0].next_token_id)
+        chunked_next = int(second_chunk.results[0].next_token_id)
+        assert first_chunk.results[0].cache_length == 2
+        assert second_chunk.results[0].cache_length == 4
+        assert chunked_next == full_next
+        assert bool(
+            mx.allclose(
+                second_chunk.results[0].logits[-1],
+                full_prefill.results[0].logits[-1],
+                atol=1e-5,
+                rtol=1e-5,
+            ).item()
+        )
+
+        full_decode = executor.decode_batch(
+            ExecutionBatch(
+                phase="decode",
+                requests=(
+                    ExecutionRequest(
+                        request_id="full",
+                        token_ids=(full_next,),
+                        positions=(4,),
+                        cache_handle=full_handle,
+                        max_new_tokens=1,
+                        temperature=0.0,
+                        top_p=1.0,
+                    ),
+                ),
+            )
+        )
+        chunked_decode = executor.decode_batch(
+            ExecutionBatch(
+                phase="decode",
+                requests=(
+                    ExecutionRequest(
+                        request_id="chunked",
+                        token_ids=(chunked_next,),
+                        positions=(4,),
+                        cache_handle=chunked_handle,
+                        max_new_tokens=1,
+                        temperature=0.0,
+                        top_p=1.0,
+                    ),
+                ),
+            )
+        )
+
+        assert (
+            full_decode.results[0].next_token_id
+            == chunked_decode.results[0].next_token_id
+        )
+        assert chunked_decode.results[0].cache_length == 5
+        assert executor.cache_len(chunked_handle) == 5
+    finally:
+        executor.release(full_handle)
+        executor.release(chunked_handle)
 
 
 def test_qwen2_executor_rejects_cross_request_cache_handle() -> None:
