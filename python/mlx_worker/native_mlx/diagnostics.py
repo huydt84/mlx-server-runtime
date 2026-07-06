@@ -16,6 +16,7 @@ from .interfaces import (
     ExecutionBatch,
     ExecutionRequest,
     ForwardBatch,
+    ForwardMode,
     NativeMlxDiagnostics,
     NativeMlxExecutor,
     NativeModel,
@@ -35,6 +36,7 @@ class ModelDiagnostics:
         inputs = mx.array([list(token_ids)], dtype=mx.int32)
         positions = mx.array([list(range(len(token_ids)))], dtype=mx.int32)
         batch = ForwardBatch(
+            forward_mode=ForwardMode.PREFILL,
             token_lengths=(len(token_ids),),
             cache_lengths=(0,),
             attention_mask="causal",
@@ -53,12 +55,12 @@ class ModelDiagnostics:
         handle = self.executor.create_cache(request_id)
         try:
             started = time.perf_counter()
-            prefill = self.executor.prefill_batch(
+            prefill = self.executor.execute_batch(
                 ExecutionBatch(
-                    phase="prefill",
                     requests=(
                         ExecutionRequest(
                             request_id=request_id,
+                            phase="prefill",
                             token_ids=tuple(int(token) for token in prompt_token_ids),
                             positions=tuple(range(len(prompt_token_ids))),
                             cache_handle=handle,
@@ -71,12 +73,12 @@ class ModelDiagnostics:
             lengths = [prefill.results[0].cache_length]
             prefill_ms = max(1, int((time.perf_counter() - started) * 1000))
             for _ in range(decode_steps):
-                result = self.executor.decode_batch(
+                result = self.executor.execute_batch(
                     ExecutionBatch(
-                        phase="decode",
                         requests=(
                             ExecutionRequest(
                                 request_id=request_id,
+                                phase="decode",
                                 token_ids=(tokens[-1],),
                                 positions=(self.executor.cache_len(handle),),
                                 cache_handle=handle,

@@ -6,7 +6,7 @@ from pathlib import Path
 import mlx.core as mx
 
 from mlx_worker.native_mlx.cache import DenseLayerCache
-from mlx_worker.native_mlx.interfaces import ForwardBatch
+from mlx_worker.native_mlx.interfaces import ForwardBatch, ForwardMode
 from mlx_worker.native_mlx.models.qwen2 import Qwen2ForCausalLM, Qwen2ModelConfig
 from mlx_worker.native_mlx.trace import (
     TraceCheckpoint,
@@ -88,6 +88,7 @@ def _native_forward(model: Qwen2ForCausalLM, token_ids: tuple[int, ...]) -> mx.a
         inputs,
         positions,
         ForwardBatch(
+            forward_mode=ForwardMode.PREFILL,
             token_lengths=(len(token_ids),),
             cache_lengths=(0,),
             attention_mask="causal",

@@ -20,9 +20,11 @@ from mlx_worker.native_mlx.bootstrap import (
 from mlx_worker.native_mlx.cache import DenseKVCacheBackend
 from mlx_worker.native_mlx.executor import MlxGenerationExecutor
 from mlx_worker.native_mlx.interfaces import (
+    BatchExecutionError,
     ExecutionBatch,
     ExecutionRequest,
     ForwardBatch,
+    ForwardMode,
     RuntimeEvent,
     SamplingParams,
     SchedulableRequest,
@@ -65,9 +67,12 @@ def _request(
     token_ids: tuple[int, ...],
     positions: tuple[int, ...],
     cache_handle: str,
+    *,
+    phase: str = "prefill",
 ) -> ExecutionRequest:
     return ExecutionRequest(
         request_id=request_id,
+        phase=phase,  # type: ignore[arg-type]
         token_ids=token_ids,
         positions=positions,
         cache_handle=cache_handle,
@@ -194,9 +199,8 @@ def test_executor_physically_batches_unequal_prefill_rows() -> None:
     first = executor.create_cache("first")
     second = executor.create_cache("second")
 
-    result = executor.prefill_batch(
+    result = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 _request("first", (1, 2, 3), (0, 1, 2), first),
                 _request("second", (4,), (0,), second),
@@ -214,9 +218,8 @@ def test_executor_physically_batches_decode_with_different_cache_lengths() -> No
     executor = _executor(model)
     first = executor.create_cache("first")
     second = executor.create_cache("second")
-    executor.prefill_batch(
+    executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 _request("first", (1, 2), (0, 1), first),
                 _request("second", (3,), (0,), second),
@@ -225,12 +228,11 @@ def test_executor_physically_batches_decode_with_different_cache_lengths() -> No
     )
     model.calls.clear()
 
-    result = executor.decode_batch(
+    result = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
-                _request("first", (7,), (2,), first),
-                _request("second", (8,), (1,), second),
+                _request("first", (7,), (2,), first, phase="decode"),
+                _request("second", (8,), (1,), second, phase="decode"),
             ),
         )
     )
@@ -245,10 +247,9 @@ def test_executor_failure_does_not_commit_or_release_request_caches() -> None:
     first = executor.create_cache("first")
     second = executor.create_cache("second")
 
-    with pytest.raises(RuntimeError, match="model failed"):
-        executor.prefill_batch(
+    with pytest.raises(BatchExecutionError, match="model failed") as caught:
+        executor.execute_batch(
             ExecutionBatch(
-                phase="prefill",
                 requests=(
                     _request("first", (1,), (0,), first),
                     _request("second", (2,), (0,), second),
@@ -256,10 +257,97 @@ def test_executor_failure_does_not_commit_or_release_request_caches() -> None:
             )
         )
 
+    assert caught.value.code == "MODEL_EXECUTION_FAILED"
     assert executor.cache_len(first) == 0
     assert executor.cache_len(second) == 0
     assert executor.cache_backend.get(first, "first").request_id == "first"
     assert executor.cache_backend.get(second, "second").request_id == "second"
+
+
+def test_executor_mixes_decode_and_prefill_in_one_model_invocation() -> None:
+    model = _RecordingModel()
+    executor = _executor(model)
+    decode_handle = executor.create_cache("decode")
+    prefill_handle = executor.create_cache("prefill")
+    initial = executor.execute_batch(
+        ExecutionBatch(requests=(_request("decode", (1, 2), (0, 1), decode_handle),))
+    )
+    model.calls.clear()
+
+    result = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                _request(
+                    "decode",
+                    (int(initial.results[0].next_token_id),),
+                    (2,),
+                    decode_handle,
+                    phase="decode",
+                ),
+                _request("prefill", (3, 4, 5), (0, 1, 2), prefill_handle),
+            )
+        )
+    )
+
+    assert model.calls == [((2, 3), (1, 3))]
+    assert result.forward_mode is ForwardMode.MIXED
+    assert result.physical_batch_size == 2
+    assert result.model_forward_count == 1
+    assert [item.phase for item in result.results] == ["decode", "prefill"]
+    assert [item.cache_length for item in result.results] == [3, 3]
+
+
+def test_executor_isolates_request_local_preflight_failure() -> None:
+    model = _RecordingModel()
+    executor = _executor(model)
+    valid_handle = executor.create_cache("valid")
+
+    result = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                _request("invalid", (1,), (0,), "missing-cache"),
+                _request("valid", (2, 3), (0, 1), valid_handle),
+            )
+        )
+    )
+
+    invalid, valid = result.results
+    assert invalid.error_code == "INVALID_EXECUTION_REQUEST"
+    assert invalid.error_message == "invalid cache handle"
+    assert valid.error_code is None
+    assert valid.cache_length == 2
+    assert executor.cache_len(valid_handle) == 2
+    assert model.calls == [((1, 2), (2,))]
+    assert result.physical_batch_size == 1
+    assert result.model_forward_count == 1
+
+
+def test_executor_skips_model_when_every_request_fails_preflight() -> None:
+    model = _RecordingModel()
+    executor = _executor(model)
+
+    result = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                _request("prefill", (1,), (0,), "missing-prefill"),
+                _request(
+                    "decode",
+                    (2,),
+                    (0,),
+                    "missing-decode",
+                    phase="decode",
+                ),
+            )
+        )
+    )
+
+    assert result.forward_mode is ForwardMode.MIXED
+    assert result.physical_batch_size == 0
+    assert result.model_forward_count == 0
+    assert all(
+        item.error_code == "INVALID_EXECUTION_REQUEST" for item in result.results
+    )
+    assert model.calls == []
 
 
 @dataclass
@@ -267,6 +355,7 @@ class _FakeExecutor:
     lengths: dict[str, int] = field(default_factory=dict)
     batches: list[ExecutionBatch] = field(default_factory=list)
     released: list[str] = field(default_factory=list)
+    request_failures: set[str] = field(default_factory=set)
 
     def load(self, options: Any) -> None:
         del options
@@ -276,28 +365,50 @@ class _FakeExecutor:
         self.lengths[handle] = 0
         return handle
 
-    def prefill_batch(self, batch: ExecutionBatch) -> StepResult:
-        return self._step(batch)
-
-    def decode_batch(self, batch: ExecutionBatch) -> StepResult:
-        return self._step(batch)
-
-    def _step(self, batch: ExecutionBatch) -> StepResult:
+    def execute_batch(self, batch: ExecutionBatch) -> StepResult:
         self.batches.append(batch)
         results = []
         for request in batch.requests:
             assert request.cache_handle is not None
+            if request.request_id in self.request_failures:
+                results.append(
+                    StepRequestResult(
+                        request_id=request.request_id,
+                        phase=request.phase,
+                        token_ids=request.token_ids,
+                        cache_handle=request.cache_handle,
+                        cache_length=self.lengths[request.cache_handle],
+                        error_code="INVALID_EXECUTION_REQUEST",
+                        error_message="request-local failure",
+                    )
+                )
+                continue
             self.lengths[request.cache_handle] += len(request.token_ids)
             results.append(
                 StepRequestResult(
                     request_id=request.request_id,
+                    phase=request.phase,
                     token_ids=request.token_ids,
                     cache_handle=request.cache_handle,
                     cache_length=self.lengths[request.cache_handle],
                     next_token_id=9,
                 )
             )
-        return StepResult(batch.phase, tuple(results), 1)
+        return StepResult(
+            forward_mode=batch.forward_mode,
+            results=tuple(results),
+            step_time_ms=1,
+            physical_batch_size=sum(
+                request.request_id not in self.request_failures
+                for request in batch.requests
+            ),
+            model_forward_count=int(
+                any(
+                    request.request_id not in self.request_failures
+                    for request in batch.requests
+                )
+            ),
+        )
 
     def cache_len(self, cache_handle: str | None) -> int:
         return self.lengths.get(cache_handle or "", 0)
@@ -326,10 +437,12 @@ def test_scheduler_owns_chunking_and_emits_typed_token_events() -> None:
     second = scheduler.tick()
     third = scheduler.tick()
 
-    assert [batch.phase for batch in executor.batches] == [
-        "prefill",
-        "prefill",
-        "prefill",
+    assert [
+        [request.phase for request in batch.requests] for batch in executor.batches
+    ] == [
+        ["prefill"],
+        ["prefill"],
+        ["prefill"],
     ]
     assert [batch.requests[0].token_ids for batch in executor.batches] == [
         (1, 2),
@@ -340,7 +453,7 @@ def test_scheduler_owns_chunking_and_emits_typed_token_events() -> None:
     assert any(event.kind == "token" and event.token_id == 9 for event in third)
 
 
-def test_scheduler_decode_is_dispatched_before_new_prefill() -> None:
+def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None:
     executor = _FakeExecutor()
     scheduler = NativeContinuousScheduler(executor, prefill_step_size=8)
     scheduler.submit(_schedulable("running", (1,)))
@@ -349,10 +462,33 @@ def test_scheduler_decode_is_dispatched_before_new_prefill() -> None:
 
     scheduler.tick()
 
-    assert [batch.phase for batch in executor.batches[-2:]] == [
-        "decode",
-        "prefill",
-    ]
+    assert len(executor.batches) == 2
+    mixed = executor.batches[-1]
+    assert mixed.forward_mode is ForwardMode.MIXED
+    assert [request.phase for request in mixed.requests] == ["decode", "prefill"]
+
+
+def test_scheduler_isolates_request_local_executor_failure() -> None:
+    executor = _FakeExecutor(request_failures={"invalid"})
+    scheduler = NativeContinuousScheduler(executor)
+    scheduler.submit(_schedulable("invalid", (1,)))
+    scheduler.submit(_schedulable("valid", (2,)))
+
+    events = scheduler.tick()
+
+    assert any(
+        event.kind == "execution_error" and event.request_id == "invalid"
+        for event in events
+    )
+    assert any(
+        event.kind == "token" and event.request_id == "valid" for event in events
+    )
+    assert not any(
+        event.kind == "execution_error" and event.request_id == "valid"
+        for event in events
+    )
+    assert executor.lengths["cache-invalid"] == 0
+    assert executor.lengths["cache-valid"] == 1
 
 
 def test_scheduler_cancellation_releases_only_after_runtime_finish() -> None:

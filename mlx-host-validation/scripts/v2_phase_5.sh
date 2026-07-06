@@ -118,12 +118,12 @@ try:
 
     handle = executor.create_cache("phase-5-no-trace")
     try:
-        prefill = executor.prefill_batch(
+        prefill = executor.execute_batch(
             ExecutionBatch(
-                phase="prefill",
                 requests=(
                     ExecutionRequest(
                         request_id="phase-5-no-trace",
+                        phase="prefill",
                         token_ids=tuple(prompt_token_ids),
                         positions=tuple(range(len(prompt_token_ids))),
                         cache_handle=handle,
@@ -133,12 +133,12 @@ try:
             )
         )
         decode_input = int(prefill.results[0].next_token_id)
-        executor.decode_batch(
+        executor.execute_batch(
             ExecutionBatch(
-                phase="decode",
                 requests=(
                     ExecutionRequest(
                         request_id="phase-5-no-trace",
+                        phase="decode",
                         token_ids=(decode_input,),
                         positions=(executor.cache_len(handle),),
                         cache_handle=handle,

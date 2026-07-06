@@ -144,6 +144,7 @@ prompt_b = prompt_ids(2)
 def prefill_request(request_id: str, tokens: tuple[int, ...], handle: str) -> ExecutionRequest:
     return ExecutionRequest(
         request_id=request_id,
+        phase="prefill",
         token_ids=tokens,
         positions=tuple(range(len(tokens))),
         cache_handle=handle,
@@ -154,6 +155,7 @@ def prefill_request(request_id: str, tokens: tuple[int, ...], handle: str) -> Ex
 def decode_request(request_id: str, token_id: int, position: int, handle: str) -> ExecutionRequest:
     return ExecutionRequest(
         request_id=request_id,
+        phase="decode",
         token_ids=(token_id,),
         positions=(position,),
         cache_handle=handle,
@@ -178,9 +180,8 @@ try:
     recorder = RecordingModel(executor.model)
     executor.model = recorder
     prefill_started = time.perf_counter()
-    prefill = executor.prefill_batch(
+    prefill = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 prefill_request("req-a", prompt_a, handle_a),
                 prefill_request("req-b", prompt_b, handle_b),
@@ -190,33 +191,29 @@ try:
     prefill_calls = recorder.calls
     prefill_batch_size = max(recorder.batch_sizes)
 
-    independent_prefill_a = executor.prefill_batch(
+    independent_prefill_a = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 prefill_request("ind-a", prompt_a, ind_a),
             ),
         )
     )
-    independent_prefill_b = executor.prefill_batch(
+    independent_prefill_b = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 prefill_request("ind-b", prompt_b, ind_b),
             ),
         )
     )
-    isolated_prefill_b = executor.prefill_batch(
+    isolated_prefill_b = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 prefill_request("iso-b", prompt_b, iso_b),
             ),
         )
     )
-    shared_isolation_prefill = executor.prefill_batch(
+    shared_isolation_prefill = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 prefill_request("iso-a", prompt_a, iso_a),
                 prefill_request("iso-shared-b", prompt_b, iso_shared_b),
@@ -229,9 +226,8 @@ try:
     decode_input_b = int(prefill.results[1].next_token_id)
     executor.model = RecordingModel(recorder.inner)
     decode_started = time.perf_counter()
-    decode = executor.decode_batch(
+    decode = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request("req-a", decode_input_a, executor.cache_len(handle_a), handle_a),
                 decode_request("req-b", decode_input_b, executor.cache_len(handle_b), handle_b),
@@ -242,9 +238,8 @@ try:
     decode_batch_size = max(executor.model.batch_sizes)
     decode_elapsed_ms = max(1, int((time.perf_counter() - decode_started) * 1000))
 
-    independent_decode_a = executor.decode_batch(
+    independent_decode_a = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request(
                     "ind-a",
@@ -255,9 +250,8 @@ try:
             ),
         )
     )
-    independent_decode_b = executor.decode_batch(
+    independent_decode_b = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request(
                     "ind-b",
@@ -291,9 +285,8 @@ try:
     )
 
     executor.release(iso_a)
-    isolated_decode_b = executor.decode_batch(
+    isolated_decode_b = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request(
                     "iso-shared-b",
@@ -304,9 +297,8 @@ try:
             ),
         )
     )
-    isolated_reference_b = executor.decode_batch(
+    isolated_reference_b = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request(
                     "iso-b",

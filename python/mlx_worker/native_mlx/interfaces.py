@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
 
 import mlx.core as mx
@@ -14,6 +15,27 @@ if TYPE_CHECKING:
 
 
 ExecutionPhase = Literal["prefill", "decode"]
+
+
+class ForwardMode(str, Enum):
+    """Physical model-forward shape selected for one scheduler step."""
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+    MIXED = "mixed"
+
+    @classmethod
+    def from_phases(cls, phases: Sequence[ExecutionPhase]) -> "ForwardMode":
+        """Derive one physical forward mode from request-local phases."""
+
+        unique = set(phases)
+        if unique == {"prefill"}:
+            return cls.PREFILL
+        if unique == {"decode"}:
+            return cls.DECODE
+        if unique == {"prefill", "decode"}:
+            return cls.MIXED
+        raise ValueError("execution batch must contain prefill or decode work")
 
 
 @dataclass(frozen=True)
@@ -28,6 +50,7 @@ class SamplingParams:
 class ForwardBatch:
     """Model-facing metadata for one physical tensor invocation."""
 
+    forward_mode: ForwardMode
     token_lengths: tuple[int, ...]
     cache_lengths: tuple[int, ...]
     attention_mask: mx.array | str | None
@@ -60,6 +83,7 @@ class ExecutionRequest:
     """
 
     request_id: str
+    phase: ExecutionPhase
     token_ids: tuple[int, ...]
     positions: tuple[int, ...]
     cache_handle: str | None
@@ -70,8 +94,15 @@ class ExecutionRequest:
 class ExecutionBatch:
     """Scheduler-owned batch passed into one executor step."""
 
-    phase: ExecutionPhase
     requests: tuple[ExecutionRequest, ...]
+
+    @property
+    def forward_mode(self) -> ForwardMode:
+        """Derive the model-forward mode without duplicating phase state."""
+
+        return ForwardMode.from_phases(
+            tuple(request.phase for request in self.requests)
+        )
 
 
 @dataclass(frozen=True)
@@ -79,21 +110,33 @@ class StepRequestResult:
     """Per-request executor output for one model step."""
 
     request_id: str
+    phase: ExecutionPhase
     token_ids: tuple[int, ...]
     cache_handle: str | None
     cache_length: int
     next_token_id: int | None = None
     model_terminal: bool = False
     error_code: str | None = None
+    error_message: str | None = None
 
 
 @dataclass(frozen=True)
 class StepResult:
     """Executor output returned to the scheduler."""
 
-    phase: ExecutionPhase
+    forward_mode: ForwardMode
     results: tuple[StepRequestResult, ...]
     step_time_ms: int
+    physical_batch_size: int
+    model_forward_count: int
+
+
+class BatchExecutionError(RuntimeError):
+    """Non-attributable failure for one physical executor invocation."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -113,11 +156,8 @@ class NativeMlxExecutor(Protocol):
     def create_cache(self, request_id: str) -> str:
         """Create opaque Python-only cache handle for request."""
 
-    def prefill_batch(self, batch: ExecutionBatch) -> StepResult:
-        """Run one prefill step."""
-
-    def decode_batch(self, batch: ExecutionBatch) -> StepResult:
-        """Run one decode step."""
+    def execute_batch(self, batch: ExecutionBatch) -> StepResult:
+        """Run one homogeneous or mixed model step."""
 
     def cache_len(self, cache_handle: str | None) -> int:
         """Return cache length for handle."""

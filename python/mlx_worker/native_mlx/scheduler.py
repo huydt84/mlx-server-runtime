@@ -7,11 +7,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from .interfaces import (
+    BatchExecutionError,
     ExecutionBatch,
     ExecutionRequest,
     NativeMlxExecutor,
     SchedulableRequest,
     SchedulerEvent,
+    StepRequestResult,
+    StepResult,
 )
 
 
@@ -24,6 +27,12 @@ class _ScheduledState:
     last_token_id: int | None = None
     cancel_requested: bool = False
     running_started_at: float | None = None
+
+
+@dataclass(frozen=True)
+class _SelectedWork:
+    state: _ScheduledState
+    request: ExecutionRequest
 
 
 class NativeContinuousScheduler:
@@ -66,18 +75,9 @@ class NativeContinuousScheduler:
         events = self._pending_events
         self._pending_events = []
         self._reap_cancelled(events)
-        if any(
-            state.last_token_id is not None and not state.cancel_requested
-            for state in self._running.values()
-        ):
-            self._run_decode(events)
-            self._reap_cancelled(events)
-        if self._waiting or any(
-            state.prompt_cursor < len(state.work.prompt_token_ids)
-            and not state.cancel_requested
-            for state in self._running.values()
-        ):
-            self._run_prefill(events)
+        selected = self._select_work()
+        if selected:
+            self._run_step(selected, events)
             self._reap_cancelled(events)
         return tuple(events)
 
@@ -88,22 +88,32 @@ class NativeContinuousScheduler:
         for request_id in tuple(self._waiting) + tuple(self._running):
             self.finish(request_id)
 
-    def _run_prefill(self, events: list[SchedulerEvent]) -> None:
-        started = time.perf_counter()
-        states = [
+    def _select_work(self) -> list[_SelectedWork]:
+        selected = [
+            _SelectedWork(
+                state=state,
+                request=ExecutionRequest(
+                    request_id=state.work.request_id,
+                    phase="decode",
+                    token_ids=(int(state.last_token_id),),
+                    positions=(state.cache_length,),
+                    cache_handle=state.cache_handle,
+                    sampling=state.work.sampling,
+                ),
+            )
+            for state in self._running.values()
+            if not state.cancel_requested and state.last_token_id is not None
+        ]
+        prefill_states = [
             state
             for state in self._running.values()
             if not state.cancel_requested
             and state.prompt_cursor < len(state.work.prompt_token_ids)
         ]
-        states.extend(
+        prefill_states.extend(
             state for state in self._waiting.values() if not state.cancel_requested
         )
-        if not states:
-            return
-        requests: list[ExecutionRequest] = []
-        chunk_lengths: dict[str, int] = {}
-        for state in states:
+        for state in prefill_states:
             request_id = state.work.request_id
             if state.cache_handle is None:
                 self._waiting.pop(request_id, None)
@@ -113,105 +123,128 @@ class NativeContinuousScheduler:
             start = state.prompt_cursor
             end = min(len(state.work.prompt_token_ids), start + self._prefill_step_size)
             tokens = state.work.prompt_token_ids[start:end]
-            chunk_lengths[request_id] = len(tokens)
-            requests.append(
-                ExecutionRequest(
-                    request_id=request_id,
-                    token_ids=tokens,
-                    positions=tuple(range(start, end)),
-                    cache_handle=state.cache_handle,
-                    sampling=state.work.sampling,
+            selected.append(
+                _SelectedWork(
+                    state=state,
+                    request=ExecutionRequest(
+                        request_id=request_id,
+                        phase="prefill",
+                        token_ids=tokens,
+                        positions=tuple(range(start, end)),
+                        cache_handle=state.cache_handle,
+                        sampling=state.work.sampling,
+                    ),
                 )
             )
+        return selected
+
+    def _run_step(
+        self,
+        selected: list[_SelectedWork],
+        events: list[SchedulerEvent],
+    ) -> None:
+        started = time.perf_counter()
         try:
-            result = self._executor.prefill_batch(
-                ExecutionBatch(phase="prefill", requests=tuple(requests))
+            result = self._executor.execute_batch(
+                ExecutionBatch(
+                    requests=tuple(item.request for item in selected),
+                )
             )
-        except Exception as exc:
-            self._emit_failures(states, events, str(exc))
+        except BatchExecutionError as exc:
+            self._emit_failures(selected, events, exc.code, str(exc))
             return
+        except Exception as exc:
+            self._emit_failures(selected, events, "WORKER_ERROR", str(exc))
+            return
+
         results = {item.request_id: item for item in result.results}
-        for state in states:
-            item = results.get(state.work.request_id)
+        for selected_work in selected:
+            state = selected_work.state
+            request = selected_work.request
+            item = results.get(request.request_id)
             if item is None:
-                self._emit_failure(state, events, "missing prefill result")
+                self._emit_failure(
+                    state,
+                    events,
+                    "INCOMPLETE_EXECUTION_RESULT",
+                    "missing executor result",
+                )
                 continue
-            state.prompt_cursor += chunk_lengths[state.work.request_id]
-            state.cache_length = item.cache_length
-            events.append(
-                SchedulerEvent(
-                    kind="prefill_progress",
-                    request_id=state.work.request_id,
-                    cache_length=item.cache_length,
-                    phase="prefill",
-                    metrics={
-                        "step_time_ms": result.step_time_ms,
-                        "batch_size": len(states),
-                        "scheduled_tokens": chunk_lengths[state.work.request_id],
-                        "prompt_complete": state.prompt_cursor
-                        == len(state.work.prompt_token_ids),
-                        "queue_time_ms": max(
-                            0,
-                            int(
-                                (
-                                    (state.running_started_at or state.work.enqueued_at)
-                                    - state.work.enqueued_at
-                                )
-                                * 1000
-                            ),
-                        ),
+            if item.phase != request.phase:
+                self._emit_failure(
+                    state,
+                    events,
+                    "INVALID_EXECUTION_RESULT",
+                    "executor result phase does not match scheduled work",
+                )
+                continue
+            if item.error_code is not None:
+                self._emit_failure(
+                    state,
+                    events,
+                    item.error_code,
+                    item.error_message or "native execution request failed",
+                )
+                continue
+            if request.phase == "prefill":
+                self._apply_prefill_result(state, request, item, result, events)
+            else:
+                self._apply_decode_result(state, item, result, events)
+
+        for phase in ("decode", "prefill"):
+            phase_work = [item for item in selected if item.request.phase == phase]
+            if phase_work:
+                self._emit_metrics(
+                    events,
+                    phase,
+                    len(phase_work),
+                    sum(len(item.request.token_ids) for item in phase_work),
+                    started,
+                    execution_metrics={
+                        "forward_mode": result.forward_mode.value,
+                        "physical_batch_size": result.physical_batch_size,
+                        "model_forward_count": result.model_forward_count,
                     },
                 )
-            )
-            if state.prompt_cursor == len(state.work.prompt_token_ids):
-                state.last_token_id = item.next_token_id
-                events.append(
-                    SchedulerEvent(
-                        kind="token",
-                        request_id=state.work.request_id,
-                        token_id=item.next_token_id,
-                        cache_length=item.cache_length,
-                        phase="prefill",
-                    )
-                )
-        self._emit_metrics(
-            events, "prefill", len(states), sum(chunk_lengths.values()), started
-        )
 
-    def _run_decode(self, events: list[SchedulerEvent]) -> None:
-        started = time.perf_counter()
-        states = [
-            state
-            for state in self._running.values()
-            if not state.cancel_requested and state.last_token_id is not None
-        ]
-        if not states:
-            return
-        batch = ExecutionBatch(
-            phase="decode",
-            requests=tuple(
-                ExecutionRequest(
-                    request_id=state.work.request_id,
-                    token_ids=(int(state.last_token_id),),
-                    positions=(state.cache_length,),
-                    cache_handle=state.cache_handle,
-                    sampling=state.work.sampling,
-                )
-                for state in states
-            ),
+    def _apply_prefill_result(
+        self,
+        state: _ScheduledState,
+        request: ExecutionRequest,
+        item: StepRequestResult,
+        result: StepResult,
+        events: list[SchedulerEvent],
+    ) -> None:
+        state.prompt_cursor += len(request.token_ids)
+        state.cache_length = item.cache_length
+        events.append(
+            SchedulerEvent(
+                kind="prefill_progress",
+                request_id=state.work.request_id,
+                cache_length=item.cache_length,
+                phase="prefill",
+                metrics={
+                    "step_time_ms": result.step_time_ms,
+                    "batch_size": sum(
+                        result_item.phase == "prefill" for result_item in result.results
+                    ),
+                    "scheduled_tokens": len(request.token_ids),
+                    "prompt_complete": state.prompt_cursor
+                    == len(state.work.prompt_token_ids),
+                    "queue_time_ms": max(
+                        0,
+                        int(
+                            (
+                                (state.running_started_at or state.work.enqueued_at)
+                                - state.work.enqueued_at
+                            )
+                            * 1000
+                        ),
+                    ),
+                },
+            )
         )
-        try:
-            result = self._executor.decode_batch(batch)
-        except Exception as exc:
-            self._emit_failures(states, events, str(exc))
-            return
-        results = {item.request_id: item for item in result.results}
-        for state in states:
-            item = results.get(state.work.request_id)
-            if item is None:
-                self._emit_failure(state, events, "missing decode result")
-                continue
-            state.cache_length = item.cache_length
+        if state.prompt_cursor == len(state.work.prompt_token_ids):
             state.last_token_id = item.next_token_id
             events.append(
                 SchedulerEvent(
@@ -219,14 +252,34 @@ class NativeContinuousScheduler:
                     request_id=state.work.request_id,
                     token_id=item.next_token_id,
                     cache_length=item.cache_length,
-                    phase="decode",
-                    metrics={
-                        "step_time_ms": result.step_time_ms,
-                        "batch_size": len(states),
-                    },
+                    phase="prefill",
                 )
             )
-        self._emit_metrics(events, "decode", len(states), len(states), started)
+
+    @staticmethod
+    def _apply_decode_result(
+        state: _ScheduledState,
+        item: StepRequestResult,
+        result: StepResult,
+        events: list[SchedulerEvent],
+    ) -> None:
+        state.cache_length = item.cache_length
+        state.last_token_id = item.next_token_id
+        events.append(
+            SchedulerEvent(
+                kind="token",
+                request_id=state.work.request_id,
+                token_id=item.next_token_id,
+                cache_length=item.cache_length,
+                phase="decode",
+                metrics={
+                    "step_time_ms": result.step_time_ms,
+                    "batch_size": sum(
+                        result_item.phase == "decode" for result_item in result.results
+                    ),
+                },
+            )
+        )
 
     def _reap_cancelled(self, events: list[SchedulerEvent]) -> None:
         for state in tuple(self._waiting.values()) + tuple(self._running.values()):
@@ -242,25 +295,27 @@ class NativeContinuousScheduler:
     def _emit_failure(
         state: _ScheduledState,
         events: list[SchedulerEvent],
+        code: str,
         message: str,
     ) -> None:
         events.append(
             SchedulerEvent(
                 kind="execution_error",
                 request_id=state.work.request_id,
-                error_code="WORKER_ERROR",
+                error_code=code,
                 message=message,
             )
         )
 
     def _emit_failures(
         self,
-        states: list[_ScheduledState],
+        selected: list[_SelectedWork],
         events: list[SchedulerEvent],
+        code: str,
         message: str,
     ) -> None:
-        for state in states:
-            self._emit_failure(state, events, message)
+        for item in selected:
+            self._emit_failure(item.state, events, code, message)
 
     def _emit_metrics(
         self,
@@ -269,6 +324,7 @@ class NativeContinuousScheduler:
         batch_size: int,
         scheduled_tokens: int,
         started: float,
+        execution_metrics: dict[str, object] | None = None,
     ) -> None:
         events.append(
             SchedulerEvent(
@@ -283,6 +339,7 @@ class NativeContinuousScheduler:
                     "scheduler_tick_latency_ms": max(
                         1, int((time.perf_counter() - started) * 1000)
                     ),
+                    **(execution_metrics or {}),
                 },
             )
         )

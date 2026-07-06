@@ -13,9 +13,11 @@ from .cache import (
     KVCacheBackend,
 )
 from .interfaces import (
+    BatchExecutionError,
     ExecutionBatch,
     ExecutionRequest,
     ForwardBatch,
+    ForwardMode,
     NativeBackendOptions,
     NativeModel,
     StepRequestResult,
@@ -26,12 +28,14 @@ from .interfaces import (
 @dataclass(frozen=True)
 class _BatchLayout:
     requests: tuple[ExecutionRequest, ...]
+    source_indices: tuple[int, ...]
     request_caches: tuple[DenseRequestCache, ...]
     token_lengths: tuple[int, ...]
     cache_lengths: tuple[int, ...]
     input_ids: mx.array
     positions: mx.array
     attention_mask: mx.array
+    forward_mode: ForwardMode
 
 
 @dataclass
@@ -60,87 +64,123 @@ class MlxGenerationExecutor:
     def release(self, cache_handle: str | None) -> None:
         self.cache_backend.release(cache_handle)
 
-    def prefill_batch(self, batch: ExecutionBatch) -> StepResult:
-        return self._execute(batch, require_decode=False)
+    def execute_batch(self, batch: ExecutionBatch) -> StepResult:
+        """Execute all valid scheduler-selected work in one model invocation."""
 
-    def decode_batch(self, batch: ExecutionBatch) -> StepResult:
-        return self._execute(batch, require_decode=True)
-
-    def _execute(self, batch: ExecutionBatch, *, require_decode: bool) -> StepResult:
         started = time.perf_counter()
-        layout = self._prepare(batch, require_decode=require_decode)
+        layout, ordered_results = self._prepare(batch)
+        if layout is None:
+            return StepResult(
+                forward_mode=batch.forward_mode,
+                results=tuple(_require_result(item) for item in ordered_results),
+                step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
+                physical_batch_size=0,
+                model_forward_count=0,
+            )
         layer_caches = self.cache_backend.batch_layers(
             layout.request_caches,
             layout.token_lengths,
         )
         forward_batch = ForwardBatch(
+            forward_mode=layout.forward_mode,
             token_lengths=layout.token_lengths,
             cache_lengths=layout.cache_lengths,
             attention_mask=layout.attention_mask,
             layer_caches=tuple(layer_caches),
         )
-        logits = self.model(layout.input_ids, layout.positions, forward_batch)
-        next_tokens = self._sample_last_logits(logits, layout.token_lengths)
-        mx.eval(logits, next_tokens)
-        self._commit(
+        try:
+            logits = self.model(layout.input_ids, layout.positions, forward_batch)
+            next_tokens = self._sample_last_logits(logits, layout.token_lengths)
+            mx.eval(logits, next_tokens)
+            token_ids = [int(value) for value in next_tokens.tolist()]
+        except Exception as exc:
+            raise BatchExecutionError("MODEL_EXECUTION_FAILED", str(exc)) from exc
+        try:
+            self._commit(
+                layout.request_caches,
+                layer_caches,
+                layout.cache_lengths,
+                layout.token_lengths,
+            )
+        except Exception as exc:
+            raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
+        for source_index, request, cache, token_id in zip(
+            layout.source_indices,
+            layout.requests,
             layout.request_caches,
-            layer_caches,
-            layout.cache_lengths,
-            layout.token_lengths,
-        )
-        token_ids = [int(value) for value in next_tokens.tolist()]
-        results = tuple(
-            StepRequestResult(
+            token_ids,
+            strict=True,
+        ):
+            ordered_results[source_index] = StepRequestResult(
                 request_id=request.request_id,
+                phase=request.phase,
                 token_ids=request.token_ids,
                 cache_handle=request.cache_handle,
                 cache_length=cache.size(),
                 next_token_id=token_id,
             )
-            for request, cache, token_id in zip(
-                layout.requests,
-                layout.request_caches,
-                token_ids,
-                strict=True,
-            )
-        )
         return StepResult(
-            phase=batch.phase,
-            results=results,
+            forward_mode=layout.forward_mode,
+            results=tuple(_require_result(item) for item in ordered_results),
             step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
+            physical_batch_size=len(layout.requests),
+            model_forward_count=1,
         )
 
     def _prepare(
-        self,
-        batch: ExecutionBatch,
-        *,
-        require_decode: bool,
-    ) -> _BatchLayout:
+        self, batch: ExecutionBatch
+    ) -> tuple[_BatchLayout | None, list[StepRequestResult | None]]:
         if not batch.requests:
-            raise ValueError("execution batch must contain at least one request")
+            raise BatchExecutionError(
+                "INVALID_EXECUTION_BATCH",
+                "execution batch must contain at least one request",
+            )
+        request_ids = [request.request_id for request in batch.requests]
+        if len(request_ids) != len(set(request_ids)):
+            raise BatchExecutionError(
+                "INVALID_EXECUTION_BATCH",
+                "execution batch contains duplicate request IDs",
+            )
         caches: list[DenseRequestCache] = []
+        valid_requests: list[ExecutionRequest] = []
+        source_indices: list[int] = []
         token_lengths: list[int] = []
         cache_lengths: list[int] = []
         token_rows: list[list[int]] = []
         position_rows: list[list[int]] = []
-        max_tokens = max(len(request.token_ids) for request in batch.requests)
+        ordered_results: list[StepRequestResult | None] = [None] * len(batch.requests)
 
-        for request in batch.requests:
+        for index, request in enumerate(batch.requests):
             token_count = len(request.token_ids)
-            if require_decode and token_count != 1:
-                raise ValueError("decode requires exactly one token per request")
-            if not require_decode and token_count == 0:
-                raise ValueError("prefill requires at least one token per request")
-            cache = self.cache_backend.get(request.cache_handle, request.request_id)
+            error = self._preflight_error(request)
+            if error is not None:
+                ordered_results[index] = StepRequestResult(
+                    request_id=request.request_id,
+                    phase=request.phase,
+                    token_ids=request.token_ids,
+                    cache_handle=request.cache_handle,
+                    cache_length=self.cache_backend.length(request.cache_handle),
+                    error_code="INVALID_EXECUTION_REQUEST",
+                    error_message=error,
+                )
+                continue
+            cache = self.cache_backend.get(
+                request.cache_handle,
+                request.request_id,
+            )
             cache_length = cache.size()
-            if require_decode and cache_length == 0:
-                raise ValueError("decode requires existing prefill state")
-            expected_positions = tuple(range(cache_length, cache_length + token_count))
-            if request.positions != expected_positions:
-                raise ValueError("positions do not match cache length")
+            valid_requests.append(request)
+            source_indices.append(index)
             caches.append(cache)
             token_lengths.append(token_count)
             cache_lengths.append(cache_length)
+
+        if not valid_requests:
+            return None, ordered_results
+
+        max_tokens = max(token_lengths)
+        for request in valid_requests:
+            token_count = len(request.token_ids)
             token_rows.append(
                 list(request.token_ids) + [0] * (max_tokens - token_count)
             )
@@ -149,15 +189,45 @@ class MlxGenerationExecutor:
                 + [request.positions[-1]] * (max_tokens - token_count)
             )
 
-        return _BatchLayout(
-            requests=batch.requests,
-            request_caches=tuple(caches),
-            token_lengths=tuple(token_lengths),
-            cache_lengths=tuple(cache_lengths),
-            input_ids=mx.array(token_rows, dtype=mx.int32),
-            positions=mx.array(position_rows, dtype=mx.int32),
-            attention_mask=_causal_attention_mask(cache_lengths, token_lengths),
+        return (
+            _BatchLayout(
+                requests=tuple(valid_requests),
+                source_indices=tuple(source_indices),
+                request_caches=tuple(caches),
+                token_lengths=tuple(token_lengths),
+                cache_lengths=tuple(cache_lengths),
+                input_ids=mx.array(token_rows, dtype=mx.int32),
+                positions=mx.array(position_rows, dtype=mx.int32),
+                attention_mask=_causal_attention_mask(cache_lengths, token_lengths),
+                forward_mode=ForwardMode.from_phases(
+                    tuple(request.phase for request in valid_requests)
+                ),
+            ),
+            ordered_results,
         )
+
+    def _preflight_error(self, request: ExecutionRequest) -> str | None:
+        token_count = len(request.token_ids)
+        if request.phase == "decode" and token_count != 1:
+            return "decode requires exactly one token"
+        if request.phase == "prefill" and token_count == 0:
+            return "prefill requires at least one token"
+        if request.phase not in ("prefill", "decode"):
+            return "unsupported execution phase"
+        try:
+            cache = self.cache_backend.get(
+                request.cache_handle,
+                request.request_id,
+            )
+        except ValueError as exc:
+            return str(exc)
+        cache_length = cache.size()
+        if request.phase == "decode" and cache_length == 0:
+            return "decode requires existing prefill state"
+        expected_positions = tuple(range(cache_length, cache_length + token_count))
+        if request.positions != expected_positions:
+            return "positions do not match cache length"
+        return None
 
     @staticmethod
     def _sample_last_logits(
@@ -215,3 +285,12 @@ def _causal_attention_mask(
             )
         rows.append([query_rows])
     return mx.array(rows, dtype=mx.float32)
+
+
+def _require_result(result: StepRequestResult | None) -> StepRequestResult:
+    if result is None:
+        raise BatchExecutionError(
+            "INCOMPLETE_EXECUTION_RESULT",
+            "executor did not produce a result for every request",
+        )
+    return result

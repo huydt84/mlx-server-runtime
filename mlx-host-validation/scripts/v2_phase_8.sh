@@ -31,6 +31,9 @@
 #   - `native_phase8_physical_batch_observed=1`
 #   - `native_phase8_single_forward_per_batch_ok=1`
 #   - `native_phase8_unequal_lengths_ok=1`
+#   - `native_phase8_mixed_single_forward_ok=1`
+#   - `native_phase8_mixed_parity_ok=1`
+#   - `native_phase8_request_failure_isolation_ok=1`
 #   - `chunk_96_prefill_metric_ok=1`
 #   - `chunk_96_decode_metric_ok=1`
 #   - `chunk_96_interleave_ok=1`
@@ -171,6 +174,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import time
 
 from mlx_worker.native_mlx.bootstrap import (
     build_finalized_token_ids,
@@ -504,6 +508,7 @@ uv --directory "$PYTHON_DIR" run python - <<'PY' "$CHECKPOINT"
 from __future__ import annotations
 
 import sys
+import time
 
 import mlx.core as mx
 
@@ -549,6 +554,7 @@ def prompt_ids(model_path, prefix: str, min_tokens: int) -> tuple[int, ...]:
 def prefill_request(request_id: str, tokens: tuple[int, ...], handle: str) -> ExecutionRequest:
     return ExecutionRequest(
         request_id=request_id,
+        phase="prefill",
         token_ids=tokens,
         positions=tuple(range(len(tokens))),
         cache_handle=handle,
@@ -559,6 +565,7 @@ def prefill_request(request_id: str, tokens: tuple[int, ...], handle: str) -> Ex
 def decode_request(request_id: str, token_id: int, position: int, handle: str) -> ExecutionRequest:
     return ExecutionRequest(
         request_id=request_id,
+        phase="decode",
         token_ids=(token_id,),
         positions=(position,),
         cache_handle=handle,
@@ -584,12 +591,16 @@ handle_a = executor.create_cache("phase8-a")
 handle_b = executor.create_cache("phase8-b")
 ind_a = executor.create_cache("phase8-ind-a")
 ind_b = executor.create_cache("phase8-ind-b")
+mixed_decode_handle = executor.create_cache("phase8-mixed-decode")
+mixed_prefill_handle = executor.create_cache("phase8-mixed-prefill")
+split_decode_handle = executor.create_cache("phase8-split-decode")
+split_prefill_handle = executor.create_cache("phase8-split-prefill")
+isolation_valid_handle = executor.create_cache("phase8-isolation-valid")
 try:
     recorder = RecordingModel(executor.model)
     executor.model = recorder
-    prefill = executor.prefill_batch(
+    prefill = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(
                 prefill_request("phase8-a", prompt_a, handle_a),
                 prefill_request("phase8-b", prompt_b, handle_b),
@@ -599,23 +610,20 @@ try:
     prefill_calls = recorder.calls
     prefill_batch_size = max(recorder.batch_sizes)
 
-    independent_prefill_a = executor.prefill_batch(
+    independent_prefill_a = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(prefill_request("phase8-ind-a", prompt_a, ind_a),),
         )
     )
-    independent_prefill_b = executor.prefill_batch(
+    independent_prefill_b = executor.execute_batch(
         ExecutionBatch(
-            phase="prefill",
             requests=(prefill_request("phase8-ind-b", prompt_b, ind_b),),
         )
     )
 
     executor.model = RecordingModel(recorder.inner)
-    decode = executor.decode_batch(
+    decode = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request(
                     "phase8-a",
@@ -635,9 +643,8 @@ try:
     decode_calls = executor.model.calls
     decode_batch_size = max(executor.model.batch_sizes)
 
-    independent_decode_a = executor.decode_batch(
+    independent_decode_a = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request(
                     "phase8-ind-a",
@@ -648,9 +655,8 @@ try:
             ),
         )
     )
-    independent_decode_b = executor.decode_batch(
+    independent_decode_b = executor.execute_batch(
         ExecutionBatch(
-            phase="decode",
             requests=(
                 decode_request(
                     "phase8-ind-b",
@@ -684,20 +690,162 @@ try:
         )
     )
 
+    base_model = recorder.inner
+    mixed_decode_prefill = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                prefill_request(
+                    "phase8-mixed-decode",
+                    prompt_a,
+                    mixed_decode_handle,
+                ),
+            ),
+        )
+    )
+    split_decode_prefill = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                prefill_request(
+                    "phase8-split-decode",
+                    prompt_a,
+                    split_decode_handle,
+                ),
+            ),
+        )
+    )
+
+    mixed_recorder = RecordingModel(base_model)
+    executor.model = mixed_recorder
+    mixed_started = time.perf_counter()
+    mixed = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                decode_request(
+                    "phase8-mixed-decode",
+                    int(mixed_decode_prefill.results[0].next_token_id),
+                    executor.cache_len(mixed_decode_handle),
+                    mixed_decode_handle,
+                ),
+                prefill_request(
+                    "phase8-mixed-prefill",
+                    prompt_b,
+                    mixed_prefill_handle,
+                ),
+            ),
+        )
+    )
+    mixed_elapsed_ms = max(1, int((time.perf_counter() - mixed_started) * 1000))
+
+    split_recorder = RecordingModel(base_model)
+    executor.model = split_recorder
+    split_started = time.perf_counter()
+    split_decode = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                decode_request(
+                    "phase8-split-decode",
+                    int(split_decode_prefill.results[0].next_token_id),
+                    executor.cache_len(split_decode_handle),
+                    split_decode_handle,
+                ),
+            ),
+        )
+    )
+    split_prefill = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                prefill_request(
+                    "phase8-split-prefill",
+                    prompt_b,
+                    split_prefill_handle,
+                ),
+            ),
+        )
+    )
+    split_elapsed_ms = max(1, int((time.perf_counter() - split_started) * 1000))
+
+    mixed_single_forward_ok = (
+        mixed.forward_mode.value == "mixed"
+        and mixed.model_forward_count == 1
+        and mixed.physical_batch_size == 2
+        and mixed_recorder.calls == 1
+        and mixed_recorder.batch_sizes == [2]
+        and [item.phase for item in mixed.results] == ["decode", "prefill"]
+        and split_recorder.calls == 2
+    )
+    mixed_parity_ok = result_pair_ok(
+        mixed.results[0],
+        split_decode.results[0],
+        atol=0.5,
+    ) and result_pair_ok(
+        mixed.results[1],
+        split_prefill.results[0],
+        atol=0.5,
+    )
+
+    isolation_recorder = RecordingModel(base_model)
+    executor.model = isolation_recorder
+    isolated = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                prefill_request(
+                    "phase8-invalid",
+                    prompt_b,
+                    "missing-phase8-cache",
+                ),
+                prefill_request(
+                    "phase8-isolation-valid",
+                    prompt_b,
+                    isolation_valid_handle,
+                ),
+            ),
+        )
+    )
+    invalid_result, valid_result = isolated.results
+    request_failure_isolation_ok = (
+        invalid_result.error_code == "INVALID_EXECUTION_REQUEST"
+        and valid_result.error_code is None
+        and valid_result.cache_length == len(prompt_b)
+        and executor.cache_len(isolation_valid_handle) == len(prompt_b)
+        and isolated.physical_batch_size == 1
+        and isolated.model_forward_count == 1
+        and isolation_recorder.calls == 1
+        and isolation_recorder.batch_sizes == [1]
+    )
+
     print(f"native_phase8_physical_batch_observed={int(physical_batch_observed)}")
     print(f"native_phase8_single_forward_per_batch_ok={int(single_forward_per_batch_ok)}")
     print(f"native_phase8_unequal_lengths_ok={int(unequal_lengths_ok and parity_ok)}")
+    print(f"native_phase8_mixed_single_forward_ok={int(mixed_single_forward_ok)}")
+    print(f"native_phase8_mixed_parity_ok={int(mixed_parity_ok)}")
+    print(
+        "native_phase8_request_failure_isolation_ok="
+        f"{int(request_failure_isolation_ok)}"
+    )
+    print(f"native_phase8_mixed_step_time_ms={mixed_elapsed_ms}")
+    print(f"native_phase8_split_step_time_ms={split_elapsed_ms}")
     if not physical_batch_observed:
         raise SystemExit("phase 8 physical batch size proof failed")
     if not single_forward_per_batch_ok:
         raise SystemExit("phase 8 single-forward proof failed")
     if not unequal_lengths_ok or not parity_ok:
         raise SystemExit("phase 8 unequal-length physical batching proof failed")
+    if not mixed_single_forward_ok:
+        raise SystemExit("phase 8 mixed step did not use one physical forward")
+    if not mixed_parity_ok:
+        raise SystemExit("phase 8 mixed and split execution parity failed")
+    if not request_failure_isolation_ok:
+        raise SystemExit("phase 8 request-local failure isolation failed")
 finally:
     executor.release(handle_a)
     executor.release(handle_b)
     executor.release(ind_a)
     executor.release(ind_b)
+    executor.release(mixed_decode_handle)
+    executor.release(mixed_prefill_handle)
+    executor.release(split_decode_handle)
+    executor.release(split_prefill_handle)
+    executor.release(isolation_valid_handle)
 PY
 
 probe_chunk_size 32 18082
