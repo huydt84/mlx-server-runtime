@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .cache import DenseKVCacheBackend, KVCacheBackend
+import mlx.core as mx
+
+from .cache import KVCacheGeometry
 from .interfaces import NativeModel
 from .mapping import WeightMappingAdapter
 from .models.qwen2 import (
@@ -36,7 +38,7 @@ class ArchitectureSpec:
     parse_config: Callable[[dict[str, Any]], Any]
     create_weight_adapter: Callable[[], WeightMappingAdapter]
     create_model: Callable[[Any, list[tuple[str, Any]]], NativeModel]
-    create_cache_backend: Callable[[Any], KVCacheBackend]
+    cache_geometry: Callable[[Any], KVCacheGeometry]
 
 
 _REGISTRY: dict[str, ArchitectureSpec] = {
@@ -60,8 +62,11 @@ _REGISTRY: dict[str, ArchitectureSpec] = {
         parse_config=parse_qwen2_config,
         create_weight_adapter=Qwen2WeightAdapter,
         create_model=build_qwen2_model,
-        create_cache_backend=lambda config: DenseKVCacheBackend(
-            num_layers=int(config.num_hidden_layers)
+        cache_geometry=lambda config: KVCacheGeometry(
+            num_layers=int(config.num_hidden_layers),
+            num_kv_heads=int(config.num_key_value_heads),
+            head_dim=int(config.hidden_size // config.num_attention_heads),
+            dtype=(mx.bfloat16 if config.kv_cache_dtype == "bfloat16" else mx.float16),
         ),
     )
 }

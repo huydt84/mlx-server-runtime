@@ -35,6 +35,7 @@ class WorkerConfig:
     vlm_prefill_chunk_size: int = 256
     text_cache_budget_bytes: int = 8 * 1024 * 1024
     text_cache_max_entries: int = 32
+    native_kv_page_size: int = 16
     vlm_apc_cache_budget_bytes: int = 8 * 1024 * 1024
     vlm_apc_cache_max_entries: int = 32
     vision_feature_cache_budget_bytes: int = 8 * 1024 * 1024
@@ -97,6 +98,9 @@ def load_config() -> WorkerConfig:
         None,
         32,
     )
+    native_kv_page_size = int(os.environ.get("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "16"))
+    if native_kv_page_size not in (8, 16, 32):
+        raise ValueError("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE must be one of 8, 16, or 32")
     vlm_apc_cache_budget_bytes = _load_int_with_alias(
         "MLX_RUNTIME_VLM_APC_CACHE_BUDGET_BYTES",
         None,
@@ -138,6 +142,7 @@ def load_config() -> WorkerConfig:
         vlm_prefill_chunk_size=vlm_prefill_chunk_size,
         text_cache_budget_bytes=text_cache_budget_bytes,
         text_cache_max_entries=text_cache_max_entries,
+        native_kv_page_size=native_kv_page_size,
         vlm_apc_cache_budget_bytes=vlm_apc_cache_budget_bytes,
         vlm_apc_cache_max_entries=vlm_apc_cache_max_entries,
         vision_feature_cache_budget_bytes=vision_feature_cache_budget_bytes,

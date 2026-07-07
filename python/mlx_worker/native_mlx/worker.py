@@ -150,10 +150,16 @@ def create_native_worker(
 ) -> NativeRuntime:
     """Compose bootstrap, shared executor, scheduler, and request runtime."""
 
-    artifacts = build_native_artifacts(config.model, stage_callback)
+    artifacts = build_native_artifacts(
+        config.model,
+        stage_callback,
+        cache_budget_bytes=config.text_cache_budget_bytes,
+        kv_page_size=config.native_kv_page_size,
+    )
     artifacts.executor.load(artifacts.options)
     scheduler = NativeContinuousScheduler(
         artifacts.executor,
+        artifacts.cache_coordinator,
         prefill_step_size=getattr(
             config,
             "text_prefill_chunk_size",

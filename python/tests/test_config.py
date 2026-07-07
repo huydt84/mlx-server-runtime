@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from mlx_worker.config import load_config
 
 
@@ -62,3 +64,18 @@ def test_load_config_prefers_backend_specific_controls(monkeypatch) -> None:
     assert config.text_cache_budget_bytes == 1024
     assert config.vlm_apc_cache_budget_bytes == 2048
     assert config.vision_feature_cache_max_entries == 7
+
+
+def test_load_config_parses_native_kv_page_size(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "32")
+
+    config = load_config()
+
+    assert config.native_kv_page_size == 32
+
+
+def test_load_config_rejects_invalid_native_kv_page_size(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "7")
+
+    with pytest.raises(ValueError, match="MLX_RUNTIME_NATIVE_KV_PAGE_SIZE"):
+        load_config()

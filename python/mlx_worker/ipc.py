@@ -211,6 +211,22 @@ class SchedulerMetricsEvent:
     waiting_requests: int
     running_requests: int
     scheduler_tick_latency_ms: int
+    forward_mode: str | None = None
+    physical_batch_size: int | None = None
+    model_forward_count: int | None = None
+    cache_backend: str | None = None
+    attention_backend: str | None = None
+    attention_mode: str | None = None
+    attention_time_ms: int | None = None
+    total_pages: int | None = None
+    used_pages: int | None = None
+    free_pages: int | None = None
+    pinned_pages: int | None = None
+    internal_fragmentation_tokens: int | None = None
+    active_kv_bytes: int | None = None
+    allocation_failures: int | None = None
+    page_size: int | None = None
+    prefix_strategy: str | None = None
 
 
 def encode_bootstrap_message(
@@ -582,6 +598,22 @@ def decode_event(
             waiting_requests=metrics["waiting_requests"],
             running_requests=metrics["running_requests"],
             scheduler_tick_latency_ms=metrics["scheduler_tick_latency_ms"],
+            forward_mode=metrics.get("forward_mode"),
+            physical_batch_size=metrics.get("physical_batch_size"),
+            model_forward_count=metrics.get("model_forward_count"),
+            cache_backend=metrics.get("cache_backend"),
+            attention_backend=metrics.get("attention_backend"),
+            attention_mode=metrics.get("attention_mode"),
+            attention_time_ms=metrics.get("attention_time_ms"),
+            total_pages=metrics.get("total_pages"),
+            used_pages=metrics.get("used_pages"),
+            free_pages=metrics.get("free_pages"),
+            pinned_pages=metrics.get("pinned_pages"),
+            internal_fragmentation_tokens=metrics.get("internal_fragmentation_tokens"),
+            active_kv_bytes=metrics.get("active_kv_bytes"),
+            allocation_failures=metrics.get("allocation_failures"),
+            page_size=metrics.get("page_size"),
+            prefix_strategy=metrics.get("prefix_strategy"),
         )
     return None
 

@@ -7,11 +7,8 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from .cache import (
-    DenseBatchLayerCache,
-    DenseRequestCache,
-    KVCacheBackend,
-)
+from .attention import AttentionBackend
+from .cache import KVCacheBackend, RequestCache
 from .interfaces import (
     BatchExecutionError,
     ExecutionBatch,
@@ -29,40 +26,26 @@ from .interfaces import (
 class _BatchLayout:
     requests: tuple[ExecutionRequest, ...]
     source_indices: tuple[int, ...]
-    request_caches: tuple[DenseRequestCache, ...]
+    request_caches: tuple[RequestCache, ...]
     token_lengths: tuple[int, ...]
     cache_lengths: tuple[int, ...]
     input_ids: mx.array
     positions: mx.array
-    attention_mask: mx.array
     forward_mode: ForwardMode
 
 
 @dataclass
 class MlxGenerationExecutor:
-    """Shared dense causal-model executor.
-
-    Schedulers select token work. This module validates and tensorizes that
-    work, performs one model invocation, commits model-side cache state, and
-    returns sampled token IDs.
-    """
+    """Shared causal-model executor with no request-cache lifecycle methods."""
 
     architecture_class: str
     model: NativeModel
     cache_backend: KVCacheBackend
+    attention_backend: AttentionBackend
 
     def load(self, options: NativeBackendOptions) -> None:
         if options.architecture_class != self.architecture_class:
             raise ValueError("executor architecture does not match backend options")
-
-    def create_cache(self, request_id: str) -> str:
-        return self.cache_backend.create(request_id)
-
-    def cache_len(self, cache_handle: str | None) -> int:
-        return self.cache_backend.length(cache_handle)
-
-    def release(self, cache_handle: str | None) -> None:
-        self.cache_backend.release(cache_handle)
 
     def execute_batch(self, batch: ExecutionBatch) -> StepResult:
         """Execute all valid scheduler-selected work in one model invocation."""
@@ -76,17 +59,24 @@ class MlxGenerationExecutor:
                 step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
                 physical_batch_size=0,
                 model_forward_count=0,
+                metrics=self.cache_backend.metrics(),
             )
-        layer_caches = self.cache_backend.batch_layers(
-            layout.request_caches,
-            layout.token_lengths,
-        )
+        try:
+            reservation = self.cache_backend.reserve_batch(
+                layout.request_caches,
+                layout.token_lengths,
+            )
+        except Exception as exc:
+            raise BatchExecutionError("KV_RESERVATION_FAILED", str(exc)) from exc
         forward_batch = ForwardBatch(
             forward_mode=layout.forward_mode,
             token_lengths=layout.token_lengths,
             cache_lengths=layout.cache_lengths,
-            attention_mask=layout.attention_mask,
-            layer_caches=tuple(layer_caches),
+            attention_mask="causal",
+            layer_attention=self.attention_backend.contexts(
+                reservation,
+                layout.forward_mode,
+            ),
         )
         try:
             logits = self.model(layout.input_ids, layout.positions, forward_batch)
@@ -94,20 +84,17 @@ class MlxGenerationExecutor:
             mx.eval(logits, next_tokens)
             token_ids = [int(value) for value in next_tokens.tolist()]
         except Exception as exc:
+            reservation.abort()
             raise BatchExecutionError("MODEL_EXECUTION_FAILED", str(exc)) from exc
         try:
-            self._commit(
-                layout.request_caches,
-                layer_caches,
-                layout.cache_lengths,
-                layout.token_lengths,
-            )
+            committed_lengths = reservation.commit()
         except Exception as exc:
+            reservation.abort()
             raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
-        for source_index, request, cache, token_id in zip(
+        for source_index, request, cache_length, token_id in zip(
             layout.source_indices,
             layout.requests,
-            layout.request_caches,
+            committed_lengths,
             token_ids,
             strict=True,
         ):
@@ -116,7 +103,7 @@ class MlxGenerationExecutor:
                 phase=request.phase,
                 token_ids=request.token_ids,
                 cache_handle=request.cache_handle,
-                cache_length=cache.size(),
+                cache_length=cache_length,
                 next_token_id=token_id,
             )
         return StepResult(
@@ -125,6 +112,7 @@ class MlxGenerationExecutor:
             step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
             physical_batch_size=len(layout.requests),
             model_forward_count=1,
+            metrics=self.cache_backend.metrics(),
         )
 
     def _prepare(
@@ -141,44 +129,75 @@ class MlxGenerationExecutor:
                 "INVALID_EXECUTION_BATCH",
                 "execution batch contains duplicate request IDs",
             )
-        caches: list[DenseRequestCache] = []
+        caches: list[RequestCache] = []
         valid_requests: list[ExecutionRequest] = []
         source_indices: list[int] = []
         token_lengths: list[int] = []
         cache_lengths: list[int] = []
-        token_rows: list[list[int]] = []
-        position_rows: list[list[int]] = []
         ordered_results: list[StepRequestResult | None] = [None] * len(batch.requests)
 
         for index, request in enumerate(batch.requests):
-            token_count = len(request.token_ids)
             error = self._preflight_error(request)
             if error is not None:
-                ordered_results[index] = StepRequestResult(
-                    request_id=request.request_id,
-                    phase=request.phase,
-                    token_ids=request.token_ids,
-                    cache_handle=request.cache_handle,
-                    cache_length=self.cache_backend.length(request.cache_handle),
-                    error_code="INVALID_EXECUTION_REQUEST",
-                    error_message=error,
+                ordered_results[index] = self._request_error(
+                    request,
+                    "INVALID_EXECUTION_REQUEST",
+                    error,
                 )
                 continue
             cache = self.cache_backend.get(
                 request.cache_handle,
                 request.request_id,
             )
-            cache_length = cache.size()
             valid_requests.append(request)
             source_indices.append(index)
             caches.append(cache)
-            token_lengths.append(token_count)
-            cache_lengths.append(cache_length)
+            token_lengths.append(len(request.token_ids))
+            cache_lengths.append(cache.size())
+
+        if valid_requests:
+            capacity_errors = self.cache_backend.preflight(
+                tuple(caches),
+                tuple(token_lengths),
+            )
+            kept_requests: list[ExecutionRequest] = []
+            kept_indices: list[int] = []
+            kept_caches: list[RequestCache] = []
+            kept_token_lengths: list[int] = []
+            kept_cache_lengths: list[int] = []
+            for request, source_index, cache, token_length, cache_length, error in zip(
+                valid_requests,
+                source_indices,
+                caches,
+                token_lengths,
+                cache_lengths,
+                capacity_errors,
+                strict=True,
+            ):
+                if error is not None:
+                    ordered_results[source_index] = self._request_error(
+                        request,
+                        "KV_CAPACITY_EXHAUSTED",
+                        error,
+                    )
+                    continue
+                kept_requests.append(request)
+                kept_indices.append(source_index)
+                kept_caches.append(cache)
+                kept_token_lengths.append(token_length)
+                kept_cache_lengths.append(cache_length)
+            valid_requests = kept_requests
+            source_indices = kept_indices
+            caches = kept_caches
+            token_lengths = kept_token_lengths
+            cache_lengths = kept_cache_lengths
 
         if not valid_requests:
             return None, ordered_results
 
         max_tokens = max(token_lengths)
+        token_rows: list[list[int]] = []
+        position_rows: list[list[int]] = []
         for request in valid_requests:
             token_count = len(request.token_ids)
             token_rows.append(
@@ -198,7 +217,6 @@ class MlxGenerationExecutor:
                 cache_lengths=tuple(cache_lengths),
                 input_ids=mx.array(token_rows, dtype=mx.int32),
                 positions=mx.array(position_rows, dtype=mx.int32),
-                attention_mask=_causal_attention_mask(cache_lengths, token_lengths),
                 forward_mode=ForwardMode.from_phases(
                     tuple(request.phase for request in valid_requests)
                 ),
@@ -229,6 +247,22 @@ class MlxGenerationExecutor:
             return "positions do not match cache length"
         return None
 
+    def _request_error(
+        self,
+        request: ExecutionRequest,
+        code: str,
+        message: str,
+    ) -> StepRequestResult:
+        return StepRequestResult(
+            request_id=request.request_id,
+            phase=request.phase,
+            token_ids=request.token_ids,
+            cache_handle=request.cache_handle,
+            cache_length=self.cache_backend.length(request.cache_handle),
+            error_code=code,
+            error_message=message,
+        )
+
     @staticmethod
     def _sample_last_logits(
         logits: mx.array,
@@ -238,53 +272,6 @@ class MlxGenerationExecutor:
             [logits[index, length - 1, :] for index, length in enumerate(token_lengths)]
         )
         return mx.argmax(rows, axis=-1)
-
-    @staticmethod
-    def _commit(
-        request_caches: tuple[DenseRequestCache, ...],
-        layer_caches: list[DenseBatchLayerCache],
-        old_lengths: tuple[int, ...],
-        append_lengths: tuple[int, ...],
-    ) -> None:
-        for layer_cache in layer_caches:
-            layer_cache.validate_commit()
-        for layer_cache in layer_caches:
-            layer_cache.commit()
-        expected = tuple(
-            old + append
-            for old, append in zip(old_lengths, append_lengths, strict=True)
-        )
-        for cache, length in zip(request_caches, expected, strict=True):
-            if cache.size() != length:
-                raise ValueError("cache layer lengths diverged after commit")
-
-
-def _causal_attention_mask(
-    cache_lengths: list[int],
-    token_lengths: list[int],
-) -> mx.array:
-    max_tokens = max(token_lengths)
-    max_total = max(
-        cache_length + token_length
-        for cache_length, token_length in zip(cache_lengths, token_lengths, strict=True)
-    )
-    rows: list[list[list[list[float]]]] = []
-    for cache_length, token_length in zip(cache_lengths, token_lengths, strict=True):
-        query_rows: list[list[float]] = []
-        for query_index in range(max_tokens):
-            max_key = cache_length + query_index
-            query_rows.append(
-                [
-                    0.0
-                    if query_index < token_length
-                    and key_index < cache_length + token_length
-                    and key_index <= max_key
-                    else -1e9
-                    for key_index in range(max_total)
-                ]
-            )
-        rows.append([query_rows])
-    return mx.array(rows, dtype=mx.float32)
 
 
 def _require_result(result: StepRequestResult | None) -> StepRequestResult:

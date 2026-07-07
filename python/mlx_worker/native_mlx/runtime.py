@@ -185,6 +185,30 @@ class NativeRuntime:
                         scheduler_tick_latency_ms=int(
                             metrics.get("scheduler_tick_latency_ms", 0)
                         ),
+                        forward_mode=_optional_str(metrics, "forward_mode"),
+                        physical_batch_size=_optional_int(
+                            metrics, "physical_batch_size"
+                        ),
+                        model_forward_count=_optional_int(
+                            metrics, "model_forward_count"
+                        ),
+                        cache_backend=_optional_str(metrics, "cache_backend"),
+                        attention_backend=_optional_str(metrics, "attention_backend"),
+                        attention_mode=_optional_str(metrics, "attention_mode"),
+                        attention_time_ms=_optional_int(metrics, "attention_time_ms"),
+                        total_pages=_optional_int(metrics, "total_pages"),
+                        used_pages=_optional_int(metrics, "used_pages"),
+                        free_pages=_optional_int(metrics, "free_pages"),
+                        pinned_pages=_optional_int(metrics, "pinned_pages"),
+                        internal_fragmentation_tokens=_optional_int(
+                            metrics, "internal_fragmentation_tokens"
+                        ),
+                        active_kv_bytes=_optional_int(metrics, "active_kv_bytes"),
+                        allocation_failures=_optional_int(
+                            metrics, "allocation_failures"
+                        ),
+                        page_size=_optional_int(metrics, "page_size"),
+                        prefix_strategy=_optional_str(metrics, "prefix_strategy"),
                     ),
                 )
             )
@@ -370,3 +394,13 @@ class NativeRuntime:
             raise ValueError("completion exceeds max_completion_tokens")
         if len(prompt) + request.max_tokens > request.max_total_tokens_per_request:
             raise ValueError("request exceeds max_total_tokens_per_request")
+
+
+def _optional_int(metrics: dict[str, object], name: str) -> int | None:
+    value = metrics.get(name)
+    return None if value is None else int(value)
+
+
+def _optional_str(metrics: dict[str, object], name: str) -> str | None:
+    value = metrics.get(name)
+    return None if value is None else str(value)

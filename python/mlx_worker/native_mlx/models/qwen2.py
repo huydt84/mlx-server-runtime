@@ -9,8 +9,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..cache import LayerKVCache
-from ..interfaces import ForwardBatch
+from ..interfaces import ForwardBatch, LayerAttentionContext
 from ..mapping import (
     WeightIndex,
     WeightMappingBug,
@@ -38,6 +37,7 @@ class Qwen2ModelConfig:
     rope_scaling: dict[str, Any] | None
     tie_word_embeddings: bool
     quantization: dict[str, Any] | None
+    kv_cache_dtype: str = "float16"
 
 
 def _silu_gate(gate: mx.array, up: mx.array) -> mx.array:
@@ -45,7 +45,7 @@ def _silu_gate(gate: mx.array, up: mx.array) -> mx.array:
 
 
 class Qwen2Attention(nn.Module):
-    """Qwen2 self-attention using MLX built-in SDPA."""
+    """Qwen2 projections and RoPE over a shared attention context."""
 
     def __init__(self, config: Qwen2ModelConfig):
         super().__init__()
@@ -69,8 +69,8 @@ class Qwen2Attention(nn.Module):
         self,
         x: mx.array,
         positions: mx.array,
-        cache: LayerKVCache | None = None,
-        attention_mask: mx.array | str | None = None,
+        attention_context: LayerAttentionContext,
+        attention_mask: str | None = None,
     ) -> mx.array:
         batch_size, seq_len, _ = x.shape
         queries = self.q_proj(x)
@@ -87,41 +87,29 @@ class Qwen2Attention(nn.Module):
             0, 2, 1, 3
         )
 
-        if cache is not None:
-            offsets = positions[:, 0]
-            queries = mx.fast.rope(
-                queries,
-                self.head_dim,
-                traditional=self.rope.traditional,
-                base=self.rope.base,
-                scale=self.rope.scale,
-                offset=offsets,
-            )
-            keys = mx.fast.rope(
-                keys,
-                self.head_dim,
-                traditional=self.rope.traditional,
-                base=self.rope.base,
-                scale=self.rope.scale,
-                offset=offsets,
-            )
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-        sdpa_mask = attention_mask
-        if sdpa_mask is not None and not isinstance(sdpa_mask, str):
-            sdpa_mask = sdpa_mask.astype(queries.dtype)
-        output = mx.fast.scaled_dot_product_attention(
+        offsets = positions[:, 0]
+        queries = mx.fast.rope(
+            queries,
+            self.head_dim,
+            traditional=self.rope.traditional,
+            base=self.rope.base,
+            scale=self.rope.scale,
+            offset=offsets,
+        )
+        keys = mx.fast.rope(
+            keys,
+            self.head_dim,
+            traditional=self.rope.traditional,
+            base=self.rope.base,
+            scale=self.rope.scale,
+            offset=offsets,
+        )
+        output = attention_context.append_and_attend(
             queries,
             keys,
             values,
             scale=self.scale,
-            mask=sdpa_mask
-            if sdpa_mask is not None
-            else "causal"
-            if seq_len > 1 or cache is not None
-            else None,
+            mask=attention_mask,
         )
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
         return self.o_proj(output)
@@ -162,13 +150,13 @@ class Qwen2TransformerBlock(nn.Module):
         self,
         x: mx.array,
         positions: mx.array,
-        cache: LayerKVCache | None = None,
-        attention_mask: mx.array | str | None = None,
+        attention_context: LayerAttentionContext,
+        attention_mask: str | None = None,
     ) -> mx.array:
         attn_out = self.self_attn(
             self.input_layernorm(x),
             positions=positions,
-            cache=cache,
+            attention_context=attention_context,
             attention_mask=attention_mask,
         )
         hidden = x + attn_out
@@ -191,16 +179,21 @@ class Qwen2Backbone(nn.Module):
         self,
         inputs: mx.array,
         positions: mx.array,
-        cache: list[LayerKVCache] | None = None,
-        attention_mask: mx.array | str | None = None,
+        layer_attention: tuple[LayerAttentionContext, ...],
+        attention_mask: str | None = None,
     ) -> mx.array:
         hidden = self.embed_tokens(inputs)
-        active_cache = cache or [None] * len(self.layers)
-        for layer, layer_cache in zip(self.layers, active_cache):
+        if len(layer_attention) != len(self.layers):
+            raise ValueError("Qwen2 requires one attention context per layer")
+        for layer, attention_context in zip(
+            self.layers,
+            layer_attention,
+            strict=True,
+        ):
             hidden = layer(
                 hidden,
                 positions=positions,
-                cache=layer_cache,
+                attention_context=attention_context,
                 attention_mask=attention_mask,
             )
         return self.norm(hidden)
@@ -226,9 +219,7 @@ class Qwen2ForCausalLM(nn.Module):
         hidden = self.model(
             input_ids,
             positions=positions,
-            cache=(
-                list(forward_batch.layer_caches) if forward_batch.layer_caches else None
-            ),
+            layer_attention=forward_batch.layer_attention,
             attention_mask=forward_batch.attention_mask,
         )
         if self.config.tie_word_embeddings:
@@ -267,6 +258,9 @@ def parse_qwen2_config(payload: dict[str, Any]) -> Qwen2ModelConfig:
     hidden = int(payload["hidden_size"])
     if hidden % heads or heads % kv_heads:
         raise ValueError("invalid Qwen2 head dimensions")
+    kv_cache_dtype = str(payload.get("torch_dtype", "float16")).lower()
+    if kv_cache_dtype not in {"float16", "bfloat16"}:
+        raise ValueError("native paged KV requires float16 or bfloat16 torch_dtype")
     return Qwen2ModelConfig(
         architecture_class=architecture,
         model_type="qwen2",
@@ -283,6 +277,7 @@ def parse_qwen2_config(payload: dict[str, Any]) -> Qwen2ModelConfig:
         rope_scaling=payload.get("rope_scaling"),
         tie_word_embeddings=bool(payload.get("tie_word_embeddings", True)),
         quantization=payload.get("quantization"),
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 

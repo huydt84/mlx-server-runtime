@@ -5,7 +5,8 @@ from pathlib import Path
 
 import mlx.core as mx
 
-from mlx_worker.native_mlx.cache import DenseLayerCache
+from mlx_worker.native_mlx.attention import DenseReferenceAttentionBackend
+from mlx_worker.native_mlx.cache import DenseKVCacheBackend, DenseLayerCache
 from mlx_worker.native_mlx.interfaces import ForwardBatch, ForwardMode
 from mlx_worker.native_mlx.models.qwen2 import Qwen2ForCausalLM, Qwen2ModelConfig
 from mlx_worker.native_mlx.trace import (
@@ -84,6 +85,9 @@ def _reference_qwen2_model(config: Qwen2ModelConfig):
 def _native_forward(model: Qwen2ForCausalLM, token_ids: tuple[int, ...]) -> mx.array:
     inputs = mx.array([list(token_ids)], dtype=mx.int32)
     positions = mx.array([list(range(len(token_ids)))], dtype=mx.int32)
+    backend = DenseKVCacheBackend(num_layers=model.num_layers)
+    cache = backend.get(backend.create("trace"), "trace")
+    reservation = backend.reserve_batch((cache,), (len(token_ids),))
     return model(
         inputs,
         positions,
@@ -92,7 +96,10 @@ def _native_forward(model: Qwen2ForCausalLM, token_ids: tuple[int, ...]) -> mx.a
             token_lengths=(len(token_ids),),
             cache_lengths=(0,),
             attention_mask="causal",
-            layer_caches=(),
+            layer_attention=DenseReferenceAttentionBackend().contexts(
+                reservation,
+                ForwardMode.PREFILL,
+            ),
         ),
     )
 

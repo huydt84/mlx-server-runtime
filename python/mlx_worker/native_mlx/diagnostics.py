@@ -11,8 +11,10 @@ from typing import Sequence
 
 import mlx.core as mx
 
-from .cache import DenseLayerCache
+from .attention import DenseReferenceAttentionBackend
+from .cache import DenseKVCacheBackend, DenseLayerCache
 from .interfaces import (
+    CacheCoordinator,
     ExecutionBatch,
     ExecutionRequest,
     ForwardBatch,
@@ -30,21 +32,33 @@ class ModelDiagnostics:
 
     model: NativeModel
     executor: NativeMlxExecutor
+    cache_coordinator: CacheCoordinator
     model_config: object
 
     def forward_token_ids(self, token_ids: Sequence[int]) -> mx.array:
         inputs = mx.array([list(token_ids)], dtype=mx.int32)
         positions = mx.array([list(range(len(token_ids)))], dtype=mx.int32)
-        batch = ForwardBatch(
-            forward_mode=ForwardMode.PREFILL,
-            token_lengths=(len(token_ids),),
-            cache_lengths=(0,),
-            attention_mask="causal",
-            layer_caches=(),
-        )
-        logits = self.model(inputs, positions, batch)
-        mx.eval(logits)
-        return logits
+        backend = DenseKVCacheBackend(num_layers=self.model.num_layers)
+        handle = backend.create("diagnostic-forward")
+        cache = backend.get(handle, "diagnostic-forward")
+        reservation = backend.reserve_batch((cache,), (len(token_ids),))
+        try:
+            batch = ForwardBatch(
+                forward_mode=ForwardMode.PREFILL,
+                token_lengths=(len(token_ids),),
+                cache_lengths=(0,),
+                attention_mask="causal",
+                layer_attention=DenseReferenceAttentionBackend().contexts(
+                    reservation,
+                    ForwardMode.PREFILL,
+                ),
+            )
+            logits = self.model(inputs, positions, batch)
+            mx.eval(logits)
+            return logits
+        finally:
+            reservation.abort()
+            backend.release(handle)
 
     def prefill_then_decode_tokens(
         self,
@@ -52,7 +66,11 @@ class ModelDiagnostics:
         decode_steps: int,
     ) -> tuple[list[int], list[int], int]:
         request_id = "diagnostic"
-        handle = self.executor.create_cache(request_id)
+        admission = self.cache_coordinator.acquire(
+            request_id,
+            tuple(int(token) for token in prompt_token_ids),
+        )
+        handle = admission.cache_handle
         try:
             started = time.perf_counter()
             prefill = self.executor.execute_batch(
@@ -80,7 +98,7 @@ class ModelDiagnostics:
                                 request_id=request_id,
                                 phase="decode",
                                 token_ids=(tokens[-1],),
-                                positions=(self.executor.cache_len(handle),),
+                                positions=(self.cache_coordinator.length(handle),),
                                 cache_handle=handle,
                                 sampling=SamplingParams(),
                             ),
@@ -91,7 +109,7 @@ class ModelDiagnostics:
                 lengths.append(result.results[0].cache_length)
             return tokens, lengths, prefill_ms
         finally:
-            self.executor.release(handle)
+            self.cache_coordinator.release(handle)
 
     def trace_to_mlx_lm(
         self,

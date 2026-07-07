@@ -146,6 +146,22 @@ class IpcEncodingTests(unittest.TestCase):
             waiting_requests=1,
             running_requests=2,
             scheduler_tick_latency_ms=3,
+            forward_mode="mixed",
+            physical_batch_size=2,
+            model_forward_count=1,
+            cache_backend="paged-mlx",
+            attention_backend="native-metal-paged",
+            attention_mode="mixed",
+            attention_time_ms=4,
+            total_pages=16,
+            used_pages=2,
+            free_pages=14,
+            pinned_pages=0,
+            internal_fragmentation_tokens=3,
+            active_kv_bytes=1024,
+            allocation_failures=0,
+            page_size=16,
+            prefix_strategy="none",
         )
 
         encoded = encode_event(event)

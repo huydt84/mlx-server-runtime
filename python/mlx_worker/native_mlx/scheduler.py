@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from .interfaces import (
     BatchExecutionError,
+    CacheCoordinator,
     ExecutionBatch,
     ExecutionRequest,
     NativeMlxExecutor,
@@ -41,12 +42,14 @@ class NativeContinuousScheduler:
     def __init__(
         self,
         executor: NativeMlxExecutor,
+        cache_coordinator: CacheCoordinator,
         *,
         prefill_step_size: int = 256,
     ) -> None:
         if prefill_step_size <= 0:
             raise ValueError("native-mlx prefill chunk size must be positive")
         self._executor = executor
+        self._cache_coordinator = cache_coordinator
         self._prefill_step_size = int(prefill_step_size)
         self._waiting: OrderedDict[str, _ScheduledState] = OrderedDict()
         self._running: OrderedDict[str, _ScheduledState] = OrderedDict()
@@ -69,7 +72,7 @@ class NativeContinuousScheduler:
         if state is None:
             state = self._waiting.pop(request_id, None)
         if state is not None:
-            self._executor.release(state.cache_handle)
+            self._cache_coordinator.release(state.cache_handle)
 
     def tick(self) -> tuple[SchedulerEvent, ...]:
         events = self._pending_events
@@ -117,7 +120,13 @@ class NativeContinuousScheduler:
             request_id = state.work.request_id
             if state.cache_handle is None:
                 self._waiting.pop(request_id, None)
-                state.cache_handle = self._executor.create_cache(request_id)
+                admission = self._cache_coordinator.acquire(
+                    request_id,
+                    state.work.prompt_token_ids,
+                )
+                state.cache_handle = admission.cache_handle
+                state.cache_length = admission.cache_length
+                state.prompt_cursor = admission.reused_tokens
                 state.running_started_at = time.perf_counter()
                 self._running[request_id] = state
             start = state.prompt_cursor
@@ -204,6 +213,7 @@ class NativeContinuousScheduler:
                         "forward_mode": result.forward_mode.value,
                         "physical_batch_size": result.physical_batch_size,
                         "model_forward_count": result.model_forward_count,
+                        **result.metrics,
                     },
                 )
 
@@ -217,6 +227,11 @@ class NativeContinuousScheduler:
     ) -> None:
         state.prompt_cursor += len(request.token_ids)
         state.cache_length = item.cache_length
+        self._cache_coordinator.publish_committed(
+            item.cache_handle or "",
+            state.work.prompt_token_ids,
+            item.cache_length,
+        )
         events.append(
             SchedulerEvent(
                 kind="prefill_progress",

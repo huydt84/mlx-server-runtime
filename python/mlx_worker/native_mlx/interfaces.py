@@ -1,14 +1,12 @@
-"""Native MLX scheduler and executor boundaries for Phase 1."""
+"""Typed native MLX runtime, scheduler, cache, and executor boundaries."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
 
 import mlx.core as mx
-
-from .cache import LayerKVCache
 
 if TYPE_CHECKING:
     from ..ipc import ChatCompletionRequest
@@ -46,6 +44,21 @@ class SamplingParams:
     top_p: float = 1.0
 
 
+class LayerAttentionContext(Protocol):
+    """Model-facing attention operation independent of physical KV layout."""
+
+    def append_and_attend(
+        self,
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        *,
+        scale: float,
+        mask: str | None,
+    ) -> mx.array:
+        """Stage K/V append and attend over committed plus staged history."""
+
+
 @dataclass(frozen=True)
 class ForwardBatch:
     """Model-facing metadata for one physical tensor invocation."""
@@ -53,8 +66,8 @@ class ForwardBatch:
     forward_mode: ForwardMode
     token_lengths: tuple[int, ...]
     cache_lengths: tuple[int, ...]
-    attention_mask: mx.array | str | None
-    layer_caches: tuple[LayerKVCache, ...]
+    attention_mask: str | None
+    layer_attention: tuple[LayerAttentionContext, ...]
 
 
 class NativeModel(Protocol):
@@ -129,6 +142,7 @@ class StepResult:
     step_time_ms: int
     physical_batch_size: int
     model_forward_count: int
+    metrics: dict[str, Any] = field(default_factory=dict)
 
 
 class BatchExecutionError(RuntimeError):
@@ -153,17 +167,57 @@ class NativeMlxExecutor(Protocol):
     def load(self, options: NativeBackendOptions) -> None:
         """Load native model resources."""
 
-    def create_cache(self, request_id: str) -> str:
-        """Create opaque Python-only cache handle for request."""
-
     def execute_batch(self, batch: ExecutionBatch) -> StepResult:
         """Run one homogeneous or mixed model step."""
 
-    def cache_len(self, cache_handle: str | None) -> int:
-        """Return cache length for handle."""
 
-    def release(self, cache_handle: str | None) -> None:
-        """Release per-request cache resources."""
+@dataclass(frozen=True)
+class PrefixProbe:
+    """Side-effect-free prefix lookup result."""
+
+    matched_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class CacheAdmission:
+    """Scheduler-visible cache acquisition result."""
+
+    cache_handle: str
+    cache_length: int
+    reused_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class CachePublication:
+    """Result of publishing committed prefill state."""
+
+    published_tokens: int = 0
+
+
+class CacheCoordinator(Protocol):
+    """Only cache lifecycle surface available to the scheduler."""
+
+    def probe(self, token_ids: tuple[int, ...]) -> PrefixProbe: ...
+
+    def acquire(
+        self,
+        request_id: str,
+        token_ids: tuple[int, ...],
+        probe: PrefixProbe | None = None,
+    ) -> CacheAdmission: ...
+
+    def publish_committed(
+        self,
+        cache_handle: str,
+        token_ids: tuple[int, ...],
+        committed_length: int,
+    ) -> CachePublication: ...
+
+    def length(self, cache_handle: str | None) -> int: ...
+
+    def release(self, cache_handle: str | None) -> None: ...
+
+    def metrics(self) -> dict[str, Any]: ...
 
 
 class NativeMlxDiagnostics(Protocol):

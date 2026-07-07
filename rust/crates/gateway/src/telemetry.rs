@@ -575,6 +575,38 @@ impl MetricsRegistry {
                     "Latest arbitration delay by backend.",
                 ),
                 (
+                    "mlx_executor_physical_batch_size_by_backend",
+                    "Latest native executor physical batch size by forward mode.",
+                ),
+                (
+                    "mlx_executor_model_forward_count_by_backend",
+                    "Latest native executor physical model invocation count.",
+                ),
+                (
+                    "mlx_kv_cache_pages_by_backend",
+                    "Latest native KV-cache page counts by state.",
+                ),
+                (
+                    "mlx_kv_cache_fragmentation_tokens_by_backend",
+                    "Latest native KV-cache internal fragmentation in tokens.",
+                ),
+                (
+                    "mlx_kv_cache_active_bytes_by_backend",
+                    "Latest native KV-cache active physical bytes.",
+                ),
+                (
+                    "mlx_kv_cache_allocation_failures_by_backend",
+                    "Latest native KV-cache pre-mutation allocation failures.",
+                ),
+                (
+                    "mlx_kv_cache_page_size_by_backend",
+                    "Configured native KV-cache page size in tokens.",
+                ),
+                (
+                    "mlx_attention_time_by_backend_ms",
+                    "Latest native attention backend dispatch latency.",
+                ),
+                (
                     "mlx_peak_memory_by_backend_bytes",
                     "Latest peak memory by backend.",
                 ),

@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from ..ipc import ModelError
+from .attention import PagedMetalAttentionBackend
+from .cache import PagedKVCacheBackend
+from .cache_coordinator import NativeCacheCoordinator
 from .diagnostics import ModelDiagnostics
 from .executor import MlxGenerationExecutor
 from .interfaces import NativeBackendOptions
@@ -19,6 +22,7 @@ from .mapping import (
     load_weight_index,
 )
 from .registry import ArchitectureSpec, get_architecture_spec
+from .prefix_cache import NoPrefixCache
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,7 @@ class BootstrapArtifacts:
     architecture: NativeArchitecture
     options: NativeBackendOptions
     executor: MlxGenerationExecutor
+    cache_coordinator: NativeCacheCoordinator
     diagnostics: ModelDiagnostics
     tokenizer: Any
     decode_target: Any
@@ -56,6 +61,9 @@ class NativeBootstrapFailure(RuntimeError):
 def build_native_artifacts(
     model: str,
     stage_callback: Any | None = None,
+    *,
+    cache_budget_bytes: int = 8 * 1024 * 1024,
+    kv_page_size: int = 16,
 ) -> BootstrapArtifacts:
     """Validate and construct the registered architecture and shared executor."""
 
@@ -106,10 +114,25 @@ def build_native_artifacts(
         stage_callback("weight_mapping", "loading_weights")
     try:
         native_model = architecture.spec.create_model(config, weights)
+        geometry = architecture.spec.cache_geometry(config)
+        cache_backend = PagedKVCacheBackend(
+            num_layers=geometry.num_layers,
+            num_kv_heads=geometry.num_kv_heads,
+            head_dim=geometry.head_dim,
+            page_size=kv_page_size,
+            budget_bytes=cache_budget_bytes,
+            dtype=geometry.dtype,
+        )
+        attention_backend = PagedMetalAttentionBackend()
+        cache_coordinator = NativeCacheCoordinator(
+            backend=cache_backend,
+            prefix_cache=NoPrefixCache(),
+        )
         executor = MlxGenerationExecutor(
             architecture_class=architecture.architecture_class,
             model=native_model,
-            cache_backend=architecture.spec.create_cache_backend(config),
+            cache_backend=cache_backend,
+            attention_backend=attention_backend,
         )
     except Exception as exc:
         raise _failure(
@@ -131,9 +154,11 @@ def build_native_artifacts(
             architecture_class=architecture.architecture_class,
         ),
         executor=executor,
+        cache_coordinator=cache_coordinator,
         diagnostics=ModelDiagnostics(
             model=native_model,
             executor=executor,
+            cache_coordinator=cache_coordinator,
             model_config=config,
         ),
         tokenizer=tokenizer,

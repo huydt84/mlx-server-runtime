@@ -159,4 +159,52 @@ pub struct SchedulerMetricsEvent {
     pub running_requests: u32,
     /// End-to-end tick latency in milliseconds.
     pub scheduler_tick_latency_ms: u32,
+    /// Physical model-forward mode selected by the executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_mode: Option<String>,
+    /// Number of requests submitted to the physical model invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_batch_size: Option<u32>,
+    /// Number of physical model invocations used by the scheduler step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_forward_count: Option<u32>,
+    /// Physical KV-cache backend label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_backend: Option<String>,
+    /// Attention implementation label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_backend: Option<String>,
+    /// Attention forward mode observed by the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_mode: Option<String>,
+    /// Attention dispatch latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_time_ms: Option<u32>,
+    /// Total physical KV pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_pages: Option<u32>,
+    /// Physical KV pages referenced by active requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_pages: Option<u32>,
+    /// Physical KV pages available for allocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_pages: Option<u32>,
+    /// Physical KV pages protected by in-flight reservations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_pages: Option<u32>,
+    /// Unused logical token slots in active requests' final pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_fragmentation_tokens: Option<u32>,
+    /// Bytes occupied by referenced physical KV pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_kv_bytes: Option<u64>,
+    /// Number of pre-mutation KV allocation failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_failures: Option<u64>,
+    /// Configured number of tokens per KV page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_size: Option<u32>,
+    /// Selected prefix-index strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_strategy: Option<String>,
 }

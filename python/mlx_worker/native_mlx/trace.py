@@ -589,6 +589,15 @@ def _call_attention_for_trace(
     cache: Any,
 ) -> Any:
     parameters = inspect.signature(attention.__call__).parameters
+    if "attention_context" in parameters:
+        from .attention import DenseTraceAttentionContext
+
+        return attention(
+            hidden,
+            positions=positions,
+            attention_context=DenseTraceAttentionContext(cache),
+            attention_mask="causal",
+        )
     if "mask" in parameters:
         return attention(hidden, mask=mask, cache=cache)
     if "positions" in parameters:

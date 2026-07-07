@@ -626,6 +626,159 @@ impl WorkerClient {
                         ],
                         scheduler.scheduler_tick_latency_ms as u64,
                     );
+                    if let Some(value) = scheduler.physical_batch_size {
+                        metrics.set_labeled_gauge(
+                            "mlx_executor_physical_batch_size_by_backend",
+                            &[
+                                ("backend", scheduler.backend.as_str()),
+                                ("modality", scheduler.modality.as_str()),
+                                (
+                                    "forward_mode",
+                                    scheduler.forward_mode.as_deref().unwrap_or("unknown"),
+                                ),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.model_forward_count {
+                        metrics.set_labeled_gauge(
+                            "mlx_executor_model_forward_count_by_backend",
+                            &[
+                                ("backend", scheduler.backend.as_str()),
+                                ("modality", scheduler.modality.as_str()),
+                                (
+                                    "forward_mode",
+                                    scheduler.forward_mode.as_deref().unwrap_or("unknown"),
+                                ),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.total_pages {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_pages_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                                ("state", "total"),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.used_pages {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_pages_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                                ("state", "used"),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.free_pages {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_pages_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                                ("state", "free"),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.pinned_pages {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_pages_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                                ("state", "pinned"),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.internal_fragmentation_tokens {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_fragmentation_tokens_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.active_kv_bytes {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_active_bytes_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                            ],
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.allocation_failures {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_allocation_failures_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                            ],
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.page_size {
+                        metrics.set_labeled_gauge(
+                            "mlx_kv_cache_page_size_by_backend",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.cache_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.attention_time_ms {
+                        metrics.set_labeled_gauge(
+                            "mlx_attention_time_by_backend_ms",
+                            &[
+                                (
+                                    "backend",
+                                    scheduler.attention_backend.as_deref().unwrap_or("unknown"),
+                                ),
+                                (
+                                    "mode",
+                                    scheduler.attention_mode.as_deref().unwrap_or("unknown"),
+                                ),
+                                ("modality", scheduler.modality.as_str()),
+                            ],
+                            value as u64,
+                        );
+                    }
                     continue;
                 }
 
@@ -894,6 +1047,22 @@ mod tests {
                     waiting_requests: 1,
                     running_requests: 2,
                     scheduler_tick_latency_ms: 3,
+                    forward_mode: Some("mixed".to_string()),
+                    physical_batch_size: Some(2),
+                    model_forward_count: Some(1),
+                    cache_backend: Some("paged-mlx".to_string()),
+                    attention_backend: Some("native-metal-paged".to_string()),
+                    attention_mode: Some("mixed".to_string()),
+                    attention_time_ms: Some(4),
+                    total_pages: Some(16),
+                    used_pages: Some(2),
+                    free_pages: Some(14),
+                    pinned_pages: Some(1),
+                    internal_fragmentation_tokens: Some(3),
+                    active_kv_bytes: Some(1024),
+                    allocation_failures: Some(0),
+                    page_size: Some(16),
+                    prefix_strategy: Some("none".to_string()),
                 },
             };
             let response_event = WorkerEvent::ChatCompletion {
@@ -958,5 +1127,16 @@ mod tests {
         let rendered = metrics.render_prometheus(0);
         assert!(rendered.contains("mlx_scheduler_requests_by_backend{backend=\"native-mlx\",modality=\"text\",state=\"running\"} 2"));
         assert!(rendered.contains("mlx_scheduled_tokens_by_backend{backend=\"native-mlx\",modality=\"text\",phase=\"decode\"} 2"));
+        assert!(rendered.contains("mlx_executor_physical_batch_size_by_backend{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\"} 2"));
+        assert!(rendered.contains("mlx_executor_model_forward_count_by_backend{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\"} 1"));
+        assert!(rendered.contains("mlx_kv_cache_pages_by_backend{backend=\"paged-mlx\",modality=\"text\",state=\"used\"} 2"));
+        assert!(rendered.contains("mlx_kv_cache_fragmentation_tokens_by_backend{backend=\"paged-mlx\",modality=\"text\"} 3"));
+        assert!(rendered.contains(
+            "mlx_kv_cache_active_bytes_by_backend{backend=\"paged-mlx\",modality=\"text\"} 1024"
+        ));
+        assert!(rendered.contains(
+            "mlx_kv_cache_page_size_by_backend{backend=\"paged-mlx\",modality=\"text\"} 16"
+        ));
+        assert!(rendered.contains("mlx_attention_time_by_backend_ms{backend=\"native-metal-paged\",mode=\"mixed\",modality=\"text\"} 4"));
     }
 }

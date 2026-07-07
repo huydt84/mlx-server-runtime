@@ -17,7 +17,12 @@ from mlx_worker.native_mlx.bootstrap import (
     build_native_artifacts,
     detect_native_architecture,
 )
-from mlx_worker.native_mlx.cache import DenseKVCacheBackend
+from mlx_worker.native_mlx.attention import (
+    DenseReferenceAttentionBackend,
+    PagedMetalAttentionBackend,
+)
+from mlx_worker.native_mlx.cache import DenseKVCacheBackend, PagedKVCacheBackend
+from mlx_worker.native_mlx.cache_coordinator import NativeCacheCoordinator
 from mlx_worker.native_mlx.executor import MlxGenerationExecutor
 from mlx_worker.native_mlx.interfaces import (
     BatchExecutionError,
@@ -37,6 +42,7 @@ from mlx_worker.native_mlx.models.qwen2 import (
     Qwen2ModelConfig,
     Qwen2WeightAdapter,
 )
+from mlx_worker.native_mlx.prefix_cache import NoPrefixCache
 from mlx_worker.native_mlx.registry import get_architecture_spec
 from mlx_worker.native_mlx.runtime import NativeRuntime
 from mlx_worker.native_mlx.scheduler import NativeContinuousScheduler
@@ -101,10 +107,17 @@ class _RecordingModel:
             )
         )
         batch, sequence = int(input_ids.shape[0]), int(input_ids.shape[1])
-        keys = mx.zeros((batch, 1, sequence, 2))
-        values = mx.zeros((batch, 1, sequence, 2))
-        for cache in forward_batch.layer_caches:
-            cache.update_and_fetch(keys, values)
+        queries = mx.zeros((batch, 1, sequence, 2), dtype=mx.float16)
+        keys = mx.zeros((batch, 1, sequence, 2), dtype=mx.float16)
+        values = mx.zeros((batch, 1, sequence, 2), dtype=mx.float16)
+        for attention in forward_batch.layer_attention:
+            attention.append_and_attend(
+                queries,
+                keys,
+                values,
+                scale=1.0,
+                mask=forward_batch.attention_mask,
+            )
         if self.fail_after_cache_stage:
             raise RuntimeError("model failed")
         row = mx.arange(4, dtype=mx.float32)
@@ -119,13 +132,27 @@ class _RecordingModel:
         del weights, strict
 
 
-def _executor(model: _RecordingModel | None = None) -> MlxGenerationExecutor:
+@dataclass(frozen=True)
+class _ExecutorFixture:
+    executor: MlxGenerationExecutor
+    cache_backend: DenseKVCacheBackend
+    cache_coordinator: NativeCacheCoordinator
+
+    def acquire(self, request_id: str, token_ids: tuple[int, ...] = ()) -> str:
+        return self.cache_coordinator.acquire(request_id, token_ids).cache_handle
+
+
+def _executor(model: _RecordingModel | None = None) -> _ExecutorFixture:
     active_model = model or _RecordingModel()
-    return MlxGenerationExecutor(
+    cache_backend = DenseKVCacheBackend(num_layers=active_model.num_layers)
+    cache_coordinator = NativeCacheCoordinator(cache_backend, NoPrefixCache())
+    executor = MlxGenerationExecutor(
         architecture_class="FakeForCausalLM",
         model=active_model,
-        cache_backend=DenseKVCacheBackend(num_layers=active_model.num_layers),
+        cache_backend=cache_backend,
+        attention_backend=DenseReferenceAttentionBackend(),
     )
+    return _ExecutorFixture(executor, cache_backend, cache_coordinator)
 
 
 def test_models_directory_has_one_qwen2_module() -> None:
@@ -166,7 +193,10 @@ def test_registry_composes_shared_model_and_cache_backend() -> None:
     spec = get_architecture_spec("Qwen2ForCausalLM")
     assert spec is not None
     assert spec.create_model is not None
-    assert spec.create_cache_backend(_tiny_qwen2_config()).num_layers == 2
+    geometry = spec.cache_geometry(_tiny_qwen2_config())
+    assert geometry.num_layers == 2
+    assert geometry.num_kv_heads == 2
+    assert geometry.head_dim == 4
     assert Qwen2ForCausalLM.__module__.endswith("models.qwen2")
     assert Qwen2WeightAdapter.__module__.endswith("models.qwen2")
 
@@ -195,11 +225,11 @@ def test_bootstrap_classifies_invalid_supported_config_as_malformed(
 
 def test_executor_physically_batches_unequal_prefill_rows() -> None:
     model = _RecordingModel()
-    executor = _executor(model)
-    first = executor.create_cache("first")
-    second = executor.create_cache("second")
+    fixture = _executor(model)
+    first = fixture.acquire("first")
+    second = fixture.acquire("second")
 
-    result = executor.execute_batch(
+    result = fixture.executor.execute_batch(
         ExecutionBatch(
             requests=(
                 _request("first", (1, 2, 3), (0, 1, 2), first),
@@ -215,10 +245,10 @@ def test_executor_physically_batches_unequal_prefill_rows() -> None:
 
 def test_executor_physically_batches_decode_with_different_cache_lengths() -> None:
     model = _RecordingModel()
-    executor = _executor(model)
-    first = executor.create_cache("first")
-    second = executor.create_cache("second")
-    executor.execute_batch(
+    fixture = _executor(model)
+    first = fixture.acquire("first")
+    second = fixture.acquire("second")
+    fixture.executor.execute_batch(
         ExecutionBatch(
             requests=(
                 _request("first", (1, 2), (0, 1), first),
@@ -228,7 +258,7 @@ def test_executor_physically_batches_decode_with_different_cache_lengths() -> No
     )
     model.calls.clear()
 
-    result = executor.execute_batch(
+    result = fixture.executor.execute_batch(
         ExecutionBatch(
             requests=(
                 _request("first", (7,), (2,), first, phase="decode"),
@@ -243,12 +273,12 @@ def test_executor_physically_batches_decode_with_different_cache_lengths() -> No
 
 def test_executor_failure_does_not_commit_or_release_request_caches() -> None:
     model = _RecordingModel(fail_after_cache_stage=True)
-    executor = _executor(model)
-    first = executor.create_cache("first")
-    second = executor.create_cache("second")
+    fixture = _executor(model)
+    first = fixture.acquire("first")
+    second = fixture.acquire("second")
 
     with pytest.raises(BatchExecutionError, match="model failed") as caught:
-        executor.execute_batch(
+        fixture.executor.execute_batch(
             ExecutionBatch(
                 requests=(
                     _request("first", (1,), (0,), first),
@@ -258,23 +288,23 @@ def test_executor_failure_does_not_commit_or_release_request_caches() -> None:
         )
 
     assert caught.value.code == "MODEL_EXECUTION_FAILED"
-    assert executor.cache_len(first) == 0
-    assert executor.cache_len(second) == 0
-    assert executor.cache_backend.get(first, "first").request_id == "first"
-    assert executor.cache_backend.get(second, "second").request_id == "second"
+    assert fixture.cache_coordinator.length(first) == 0
+    assert fixture.cache_coordinator.length(second) == 0
+    assert fixture.cache_backend.get(first, "first").request_id == "first"
+    assert fixture.cache_backend.get(second, "second").request_id == "second"
 
 
 def test_executor_mixes_decode_and_prefill_in_one_model_invocation() -> None:
     model = _RecordingModel()
-    executor = _executor(model)
-    decode_handle = executor.create_cache("decode")
-    prefill_handle = executor.create_cache("prefill")
-    initial = executor.execute_batch(
+    fixture = _executor(model)
+    decode_handle = fixture.acquire("decode")
+    prefill_handle = fixture.acquire("prefill")
+    initial = fixture.executor.execute_batch(
         ExecutionBatch(requests=(_request("decode", (1, 2), (0, 1), decode_handle),))
     )
     model.calls.clear()
 
-    result = executor.execute_batch(
+    result = fixture.executor.execute_batch(
         ExecutionBatch(
             requests=(
                 _request(
@@ -299,10 +329,10 @@ def test_executor_mixes_decode_and_prefill_in_one_model_invocation() -> None:
 
 def test_executor_isolates_request_local_preflight_failure() -> None:
     model = _RecordingModel()
-    executor = _executor(model)
-    valid_handle = executor.create_cache("valid")
+    fixture = _executor(model)
+    valid_handle = fixture.acquire("valid")
 
-    result = executor.execute_batch(
+    result = fixture.executor.execute_batch(
         ExecutionBatch(
             requests=(
                 _request("invalid", (1,), (0,), "missing-cache"),
@@ -316,7 +346,7 @@ def test_executor_isolates_request_local_preflight_failure() -> None:
     assert invalid.error_message == "invalid cache handle"
     assert valid.error_code is None
     assert valid.cache_length == 2
-    assert executor.cache_len(valid_handle) == 2
+    assert fixture.cache_coordinator.length(valid_handle) == 2
     assert model.calls == [((1, 2), (2,))]
     assert result.physical_batch_size == 1
     assert result.model_forward_count == 1
@@ -324,9 +354,9 @@ def test_executor_isolates_request_local_preflight_failure() -> None:
 
 def test_executor_skips_model_when_every_request_fails_preflight() -> None:
     model = _RecordingModel()
-    executor = _executor(model)
+    fixture = _executor(model)
 
-    result = executor.execute_batch(
+    result = fixture.executor.execute_batch(
         ExecutionBatch(
             requests=(
                 _request("prefill", (1,), (0,), "missing-prefill"),
@@ -350,20 +380,182 @@ def test_executor_skips_model_when_every_request_fails_preflight() -> None:
     assert model.calls == []
 
 
+def test_paged_backend_allocates_pages_and_commits_block_tables() -> None:
+    backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=512,
+        dtype=mx.float16,
+    )
+    first = backend.get(backend.create("first"), "first")
+    second = backend.get(backend.create("second"), "second")
+    reservation = backend.reserve_batch((first, second), (3, 1))
+    keys = mx.ones((2, 1, 3, 2), dtype=mx.float16)
+    values = mx.ones((2, 1, 3, 2), dtype=mx.float16)
+    reservation.stage_layer(0, keys, values)
+
+    assert reservation.commit() == (3, 1)
+    assert len(first.block_table) == 1
+    assert len(second.block_table) == 1
+    metrics = backend.metrics()
+    assert metrics["cache_backend"] == "paged-mlx"
+    assert metrics["used_pages"] == 2
+    assert metrics["internal_fragmentation_tokens"] == 12
+
+
+def test_paged_backend_capacity_failure_is_pre_mutation() -> None:
+    backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=64,
+        dtype=mx.float16,
+    )
+    first = backend.get(backend.create("first"), "first")
+    second = backend.get(backend.create("second"), "second")
+
+    errors = backend.preflight((first, second), (1, 1))
+
+    assert errors == (None, "native paged KV capacity exhausted before model execution")
+    assert first.size() == 0
+    assert second.size() == 0
+    assert backend.metrics()["used_pages"] == 0
+
+
+def test_paged_backend_fork_uses_copy_on_write_for_shared_tail() -> None:
+    backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=256,
+        dtype=mx.float16,
+    )
+    parent_handle = backend.create("parent")
+    parent = backend.get(parent_handle, "parent")
+    first = backend.reserve_batch((parent,), (3,))
+    first.stage_layer(
+        0,
+        mx.ones((1, 1, 3, 2), dtype=mx.float16),
+        mx.ones((1, 1, 3, 2), dtype=mx.float16),
+    )
+    first.commit()
+    child_handle = backend.fork(parent_handle, "child")
+    child = backend.get(child_handle, "child")
+
+    append = backend.reserve_batch((child,), (1,))
+    append.stage_layer(
+        0,
+        mx.ones((1, 1, 1, 2), dtype=mx.float16),
+        mx.ones((1, 1, 1, 2), dtype=mx.float16),
+    )
+    assert append.commit() == (4,)
+
+    assert parent.size() == 3
+    assert child.size() == 4
+    assert parent.block_table != child.block_table
+    assert backend.metrics()["used_pages"] == 2
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_paged_metal_attention_matches_dense_reference() -> None:
+    dense_backend = DenseKVCacheBackend(num_layers=1)
+    dense_cache = dense_backend.get(dense_backend.create("dense"), "dense")
+    dense_reservation = dense_backend.reserve_batch((dense_cache,), (2,))
+    paged_backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=4,
+        page_size=8,
+        budget_bytes=256,
+        dtype=mx.float16,
+    )
+    paged_cache = paged_backend.get(paged_backend.create("paged"), "paged")
+    paged_reservation = paged_backend.reserve_batch((paged_cache,), (2,))
+    queries = mx.array(
+        [[[[1, 0, 0, 0], [0, 1, 0, 0]], [[0, 0, 1, 0], [0, 0, 0, 1]]]],
+        dtype=mx.float16,
+    )
+    keys = mx.array([[[[1, 0, 0, 0], [0, 1, 0, 0]]]], dtype=mx.float16)
+    values = mx.array([[[[1, 2, 3, 4], [5, 6, 7, 8]]]], dtype=mx.float16)
+    dense_context = DenseReferenceAttentionBackend().contexts(
+        dense_reservation,
+        ForwardMode.PREFILL,
+    )[0]
+    paged_context = PagedMetalAttentionBackend().contexts(
+        paged_reservation,
+        ForwardMode.PREFILL,
+    )[0]
+
+    dense = dense_context.append_and_attend(
+        queries,
+        keys,
+        values,
+        scale=0.5,
+        mask="causal",
+    )
+    paged = paged_context.append_and_attend(
+        queries,
+        keys,
+        values,
+        scale=0.5,
+        mask="causal",
+    )
+    mx.eval(dense, paged)
+
+    assert mx.allclose(dense, paged, atol=1e-3, rtol=1e-3).item()
+    assert paged_backend.metrics()["attention_backend"] == "native-metal-paged"
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_executor_isolates_paged_capacity_failure_before_model_call() -> None:
+    model = _RecordingModel()
+    cache_backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=64,
+        dtype=mx.float16,
+    )
+    executor = MlxGenerationExecutor(
+        architecture_class="FakeForCausalLM",
+        model=model,
+        cache_backend=cache_backend,
+        attention_backend=PagedMetalAttentionBackend(),
+    )
+    first = cache_backend.create("first")
+    second = cache_backend.create("second")
+
+    result = executor.execute_batch(
+        ExecutionBatch(
+            requests=(
+                _request("first", (1,), (0,), first),
+                _request("second", (2,), (0,), second),
+            )
+        )
+    )
+
+    assert [item.error_code for item in result.results] == [
+        None,
+        "KV_CAPACITY_EXHAUSTED",
+    ]
+    assert [item.cache_length for item in result.results] == [1, 0]
+    assert model.calls == [((1, 1), (1,))]
+    assert result.physical_batch_size == 1
+
+
 @dataclass
 class _FakeExecutor:
     lengths: dict[str, int] = field(default_factory=dict)
     batches: list[ExecutionBatch] = field(default_factory=list)
-    released: list[str] = field(default_factory=list)
     request_failures: set[str] = field(default_factory=set)
 
     def load(self, options: Any) -> None:
         del options
-
-    def create_cache(self, request_id: str) -> str:
-        handle = f"cache-{request_id}"
-        self.lengths[handle] = 0
-        return handle
 
     def execute_batch(self, batch: ExecutionBatch) -> StepResult:
         self.batches.append(batch)
@@ -410,13 +602,70 @@ class _FakeExecutor:
             ),
         )
 
-    def cache_len(self, cache_handle: str | None) -> int:
+
+@dataclass
+class _FakeCacheCoordinator:
+    lengths: dict[str, int]
+    released: list[str] = field(default_factory=list)
+
+    def probe(self, token_ids: tuple[int, ...]) -> Any:
+        del token_ids
+        return None
+
+    def acquire(
+        self,
+        request_id: str,
+        token_ids: tuple[int, ...],
+        probe: Any = None,
+    ) -> Any:
+        del token_ids, probe
+        handle = f"cache-{request_id}"
+        self.lengths[handle] = 0
+        return type(
+            "Admission",
+            (),
+            {
+                "cache_handle": handle,
+                "cache_length": 0,
+                "reused_tokens": 0,
+            },
+        )()
+
+    def publish_committed(
+        self,
+        cache_handle: str,
+        token_ids: tuple[int, ...],
+        committed_length: int,
+    ) -> Any:
+        del cache_handle, token_ids, committed_length
+        return None
+
+    def length(self, cache_handle: str | None) -> int:
         return self.lengths.get(cache_handle or "", 0)
 
     def release(self, cache_handle: str | None) -> None:
         if cache_handle is not None:
             self.released.append(cache_handle)
             self.lengths.pop(cache_handle, None)
+
+    def metrics(self) -> dict[str, Any]:
+        return {}
+
+
+def _scheduler(
+    executor: _FakeExecutor,
+    *,
+    prefill_step_size: int = 256,
+) -> tuple[NativeContinuousScheduler, _FakeCacheCoordinator]:
+    cache_coordinator = _FakeCacheCoordinator(executor.lengths)
+    return (
+        NativeContinuousScheduler(
+            executor,
+            cache_coordinator,  # type: ignore[arg-type]
+            prefill_step_size=prefill_step_size,
+        ),
+        cache_coordinator,
+    )
 
 
 def _schedulable(request_id: str, tokens: tuple[int, ...]) -> SchedulableRequest:
@@ -430,7 +679,7 @@ def _schedulable(request_id: str, tokens: tuple[int, ...]) -> SchedulableRequest
 
 def test_scheduler_owns_chunking_and_emits_typed_token_events() -> None:
     executor = _FakeExecutor()
-    scheduler = NativeContinuousScheduler(executor, prefill_step_size=2)
+    scheduler, _ = _scheduler(executor, prefill_step_size=2)
     scheduler.submit(_schedulable("request", (1, 2, 3, 4, 5)))
 
     first = scheduler.tick()
@@ -455,7 +704,7 @@ def test_scheduler_owns_chunking_and_emits_typed_token_events() -> None:
 
 def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None:
     executor = _FakeExecutor()
-    scheduler = NativeContinuousScheduler(executor, prefill_step_size=8)
+    scheduler, _ = _scheduler(executor, prefill_step_size=8)
     scheduler.submit(_schedulable("running", (1,)))
     scheduler.tick()
     scheduler.submit(_schedulable("waiting", (2,)))
@@ -470,7 +719,7 @@ def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None
 
 def test_scheduler_isolates_request_local_executor_failure() -> None:
     executor = _FakeExecutor(request_failures={"invalid"})
-    scheduler = NativeContinuousScheduler(executor)
+    scheduler, _ = _scheduler(executor)
     scheduler.submit(_schedulable("invalid", (1,)))
     scheduler.submit(_schedulable("valid", (2,)))
 
@@ -493,17 +742,17 @@ def test_scheduler_isolates_request_local_executor_failure() -> None:
 
 def test_scheduler_cancellation_releases_only_after_runtime_finish() -> None:
     executor = _FakeExecutor()
-    scheduler = NativeContinuousScheduler(executor)
+    scheduler, cache_coordinator = _scheduler(executor)
     scheduler.submit(_schedulable("request", (1,)))
     scheduler.tick()
 
     assert scheduler.cancel("request")
     events = scheduler.tick()
     assert any(event.kind == "cancelled" for event in events)
-    assert executor.released == []
+    assert cache_coordinator.released == []
 
     scheduler.finish("request")
-    assert executor.released == ["cache-request"]
+    assert cache_coordinator.released == ["cache-request"]
 
 
 @dataclass
