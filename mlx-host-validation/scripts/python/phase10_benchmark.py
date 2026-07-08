@@ -143,6 +143,12 @@ def write_fixtures(args: argparse.Namespace) -> None:
             stream=True,
             max_tokens=4,
         ),
+        "bench_short_nonstream.json": _payload(
+            checkpoint,
+            "Say hello in one short sentence.",
+            stream=False,
+            max_tokens=4,
+        ),
         "bench_miss.json": _payload(
             checkpoint, shared + " benchmark miss", stream=True
         ),
@@ -151,6 +157,26 @@ def write_fixtures(args: argparse.Namespace) -> None:
         ),
         "bench_partial.json": _payload(
             checkpoint, partial_shared + " benchmark partial", stream=True
+        ),
+        "bench_unique.json": _payload(
+            checkpoint,
+            _repeated_words(model_path, 96, "unique") + " benchmark unique",
+            stream=True,
+        ),
+        "bench_long_a.json": _payload(
+            checkpoint,
+            _repeated_words(model_path, 160, "long-a") + " benchmark long a",
+            stream=True,
+        ),
+        "bench_long_b.json": _payload(
+            checkpoint,
+            _repeated_words(model_path, 192, "long-b") + " benchmark long b",
+            stream=True,
+        ),
+        "bench_long_c.json": _payload(
+            checkpoint,
+            _repeated_words(model_path, 176, "long-c") + " benchmark long c",
+            stream=True,
         ),
     }
     metadata: dict[str, dict[str, int]] = {}
@@ -298,27 +324,108 @@ def run_benchmark(args: argparse.Namespace) -> None:
     metrics_capture = (
         pathlib.Path(args.metrics_capture) if args.metrics_capture else None
     )
-    scenarios = [
-        ("short_baseline", "bench_short.json", 3),
-        ("shared_prefix_miss", "bench_miss.json", 2),
-        ("shared_prefix_exact", "bench_exact.json", 3),
-        ("shared_prefix_partial", "bench_partial.json", 3),
+    scenarios: list[dict[str, Any]] = [
+        {
+            "name": "stream_short_single",
+            "files": ["bench_short.json"],
+            "iterations": 3,
+            "mode": "stream",
+        },
+        {
+            "name": "nonstream_short_single",
+            "files": ["bench_short_nonstream.json"],
+            "iterations": 3,
+            "mode": "nonstream",
+        },
+        {
+            "name": "stream_shared_prefix_miss",
+            "files": ["bench_miss.json"],
+            "iterations": 2,
+            "mode": "stream",
+        },
+        {
+            "name": "stream_shared_prefix_exact",
+            "files": ["bench_exact.json"],
+            "iterations": 3,
+            "mode": "stream",
+        },
+        {
+            "name": "stream_shared_prefix_partial",
+            "files": ["bench_partial.json"],
+            "iterations": 3,
+            "mode": "stream",
+        },
+        {
+            "name": "stream_shared_prefix_mixed_ratio",
+            "files": [
+                "bench_miss.json",
+                "bench_exact.json",
+                "bench_partial.json",
+                "bench_unique.json",
+                "bench_exact.json",
+            ],
+            "iterations": 1,
+            "mode": "stream",
+            "concurrent": False,
+        },
+        {
+            "name": "stream_few_long_many_short_concurrent",
+            "files": [
+                "bench_long_a.json",
+                "bench_long_b.json",
+                "bench_short.json",
+                "bench_short.json",
+                "bench_short.json",
+                "bench_short.json",
+            ],
+            "iterations": 1,
+            "mode": "stream",
+            "concurrent": True,
+        },
+        {
+            "name": "stream_few_short_many_long_concurrent",
+            "files": [
+                "bench_short.json",
+                "bench_short.json",
+                "bench_long_a.json",
+                "bench_long_b.json",
+                "bench_long_c.json",
+            ],
+            "iterations": 1,
+            "mode": "stream",
+            "concurrent": True,
+        },
     ]
     results: dict[str, Any] = {"backend": args.backend, "scenarios": []}
-    for scenario, filename, samples in scenarios:
-        print(f"benchmark_backend={args.backend} scenario={scenario} samples={samples}")
-        observed = [
-            _timed_post(scenario, request_dir / filename, args.port)
-            for _ in range(samples)
-        ]
+    for scenario in scenarios:
+        print(
+            "benchmark_backend={backend} scenario={name} iterations={iterations} requests_per_iteration={requests}".format(
+                backend=args.backend,
+                name=scenario["name"],
+                iterations=scenario["iterations"],
+                requests=len(scenario["files"]),
+            )
+        )
+        observed: list[RequestResult] = []
+        for _ in range(int(scenario["iterations"])):
+            observed.extend(
+                _run_workload(
+                    scenario["name"],
+                    [request_dir / filename for filename in scenario["files"]],
+                    args.port,
+                    concurrent=bool(scenario.get("concurrent", False)),
+                )
+            )
         metrics_text = _metrics(args.port, metrics_capture) if metrics_capture else ""
         results["scenarios"].append(
             _summarize(
                 args.backend,
-                scenario,
+                scenario["name"],
                 observed,
                 metrics_text,
-                metadata[filename],
+                [metadata[filename] for filename in scenario["files"]]
+                * int(scenario["iterations"]),
+                scenario["mode"],
             )
         )
     pathlib.Path(args.output).write_text(json.dumps(results, indent=2))
@@ -336,14 +443,14 @@ def write_report(args: argparse.Namespace) -> None:
         "Compared public gateway requests for `native-mlx` block-hash APC and v1.",
         "All scenarios use the same checkpoint, prompt fixtures, request parameters, and public `/v1/chat/completions` surface.",
         "",
-        "| scenario | backend | samples | ttft_mean_ms | latency_mean_ms | prompt_tokens_mean | completion_tokens_mean | reused_tokens | reused_pages | scheduled_prefill_tokens | notes |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| scenario | backend | mode | samples | ttft_mean_ms | latency_mean_ms | prompt_tokens_mean | completion_tokens_mean | reused_tokens | reused_pages | scheduled_prefill_tokens | scheduler_tick_ms | attention_ms | eval_ms | commit_ms | notes |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for native_item in native["scenarios"]:
         v1_item = by_name[native_item["scenario"]]
         for item in (v1_item, native_item):
             lines.append(
-                "| {scenario} | {backend} | {samples} | {ttft_mean_ms:.1f} | {latency_mean_ms:.1f} | {prompt_tokens_mean:.1f} | {completion_tokens_mean:.1f} | {reused_tokens:.0f} | {reused_pages:.0f} | {scheduled_prefill_tokens:.0f} | {notes} |".format(
+                "| {scenario} | {backend} | {mode} | {samples} | {ttft_mean_ms:.1f} | {latency_mean_ms:.1f} | {prompt_tokens_mean:.1f} | {completion_tokens_mean:.1f} | {reused_tokens:.0f} | {reused_pages:.0f} | {scheduled_prefill_tokens:.0f} | {scheduler_tick_ms:.0f} | {attention_ms:.0f} | {eval_ms:.0f} | {commit_ms:.0f} | {notes} |".format(
                     **item
                 )
             )
@@ -429,13 +536,16 @@ def _timed_post(name: str, path: pathlib.Path, port: int) -> RequestResult:
     conn.send(body)
     response = conn.getresponse()
     chunks: list[str] = []
-    while True:
-        raw = response.fp.readline()
-        if not raw:
-            break
-        if math.isnan(ttft_ms):
-            ttft_ms = (time.perf_counter() - started) * 1000
-        chunks.append(raw.decode("utf-8", errors="replace").rstrip())
+    if json.loads(body).get("stream"):
+        while True:
+            raw = response.fp.readline()
+            if not raw:
+                break
+            if math.isnan(ttft_ms):
+                ttft_ms = (time.perf_counter() - started) * 1000
+            chunks.append(raw.decode("utf-8", errors="replace").rstrip())
+    else:
+        chunks.append(response.read().decode("utf-8", errors="replace"))
     latency_ms = (time.perf_counter() - started) * 1000
     return RequestResult(
         name=name,
@@ -444,6 +554,36 @@ def _timed_post(name: str, path: pathlib.Path, port: int) -> RequestResult:
         latency_ms=latency_ms,
         body="\n".join(chunks),
     )
+
+
+def _run_workload(
+    name: str,
+    paths: list[pathlib.Path],
+    port: int,
+    *,
+    concurrent: bool,
+) -> list[RequestResult]:
+    if len(paths) == 1 or not concurrent:
+        return [
+            _timed_post(f"{name}-{index}", path, port)
+            for index, path in enumerate(paths)
+        ]
+    output: list[RequestResult | None] = [None] * len(paths)
+    threads = [
+        threading.Thread(
+            target=lambda index, path: output.__setitem__(
+                index,
+                _timed_post(f"{name}-{index}", path, port),
+            ),
+            args=(index, path),
+        )
+        for index, path in enumerate(paths)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return [item for item in output if item is not None]
 
 
 def _metrics(port: int, capture: pathlib.Path | None = None) -> str:
@@ -470,7 +610,8 @@ def _summarize(
     scenario: str,
     observed: list[RequestResult],
     metrics_text: str,
-    metadata: dict[str, int],
+    metadata: list[dict[str, int]],
+    mode: str,
 ) -> dict[str, Any]:
     good = [item for item in observed if item.status == 200]
     if len(good) != len(observed):
@@ -479,16 +620,19 @@ def _summarize(
     return {
         "backend": backend,
         "scenario": scenario,
+        "mode": mode,
         "samples": len(good),
-        "ttft_mean_ms": statistics.mean(item.ttft_ms for item in good),
+        "ttft_mean_ms": _mean_float(
+            [item.ttft_ms for item in good if not math.isnan(item.ttft_ms)]
+        ),
         "latency_mean_ms": statistics.mean(item.latency_ms for item in good),
         "prompt_tokens_mean": _mean_or_metadata(
             [body["prompt_tokens"] for body in bodies],
-            metadata["prompt_tokens"],
+            int(statistics.mean(item["prompt_tokens"] for item in metadata)),
         ),
         "completion_tokens_mean": _mean_or_metadata(
             [body["completion_tokens"] for body in bodies],
-            metadata["max_tokens"],
+            int(statistics.mean(item["max_tokens"] for item in metadata)),
         ),
         "reused_tokens": _metric_value(
             metrics_text,
@@ -502,8 +646,30 @@ def _summarize(
             metrics_text,
             'mlx_scheduled_tokens_by_backend{backend="native-mlx",modality="text",phase="prefill"}',
         ),
+        "scheduler_tick_ms": _metric_value(
+            metrics_text,
+            'mlx_scheduler_tick_latency_by_backend_ms{backend="native-mlx",modality="text"}',
+        ),
+        "attention_ms": _metric_value(
+            metrics_text,
+            'mlx_attention_time_by_backend_ms{backend="native-metal-paged-sdpa",mode="prefill",modality="text"}',
+        ),
+        "eval_ms": _metric_value(
+            metrics_text,
+            'mlx_executor_stage_latency_by_backend_ms{backend="native-mlx",modality="text",forward_mode="prefill",kind="eval"}',
+        ),
+        "commit_ms": _metric_value(
+            metrics_text,
+            'mlx_executor_stage_latency_by_backend_ms{backend="native-mlx",modality="text",forward_mode="prefill",kind="commit"}',
+        ),
         "notes": "-" if backend == "native-mlx" else "v1 baseline",
     }
+
+
+def _mean_float(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return statistics.mean(values)
 
 
 def _mean_or_metadata(values: list[int], fallback: int) -> float:

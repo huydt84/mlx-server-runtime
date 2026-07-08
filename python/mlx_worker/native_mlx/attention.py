@@ -112,110 +112,13 @@ class DenseReferenceAttentionBackend:
         )
 
 
-# Phase 9 provenance:
-# This MLX Metal kernel is a project-local paged-attention implementation. Its
-# required capability follows the vLLM/SGLang paged-KV practice recorded in
-# plan/references/06-upstream-sources.md and the phase references, and it can be
-# compared against Hugging Face's community Metal paged-attention kernel for
-# operator expectations. The source below is intentionally not vendored from
-# those projects; keep behavior/metrics compatible while preserving this local
-# ownership boundary.
-_PAGED_ATTENTION_SOURCE = r"""
-    uint tid = thread_position_in_grid.x;
-    uint batch_size = queries_shape[0];
-    uint query_heads = queries_shape[1];
-    uint max_tokens = queries_shape[2];
-    uint head_dim = queries_shape[3];
-    uint kv_heads = key_cache_shape[2];
-    uint page_size = key_cache_shape[1];
-    uint max_blocks = block_tables_shape[1];
-    uint total_rows = batch_size * query_heads * max_tokens;
-    if (tid >= total_rows) {
-        return;
-    }
-
-    uint query_index = tid % max_tokens;
-    uint head_index = (tid / max_tokens) % query_heads;
-    uint batch_index = tid / (max_tokens * query_heads);
-    uint query_base =
-        ((batch_index * query_heads + head_index) * max_tokens + query_index)
-        * head_dim;
-
-    if (query_index >= uint(token_lengths[batch_index])) {
-        for (uint dim = 0; dim < head_dim; ++dim) {
-            output[query_base + dim] = 0;
-        }
-        return;
-    }
-
-    uint group_size = query_heads / kv_heads;
-    uint kv_head = head_index / group_size;
-    uint context_limit =
-        uint(cache_lengths[batch_index]) + query_index + 1;
-    float max_score = -INFINITY;
-
-    for (uint position = 0; position < context_limit; ++position) {
-        uint block = uint(
-            block_tables[batch_index * max_blocks + position / page_size]
-        );
-        uint cache_base =
-            ((block * page_size + position % page_size) * kv_heads + kv_head)
-            * head_dim;
-        float score = 0.0f;
-        for (uint dim = 0; dim < head_dim; ++dim) {
-            score += float(queries[query_base + dim])
-                * float(key_cache[cache_base + dim]);
-        }
-        score *= scale[0];
-        max_score = metal::max(max_score, score);
-    }
-
-    float denominator = 0.0f;
-    for (uint position = 0; position < context_limit; ++position) {
-        uint block = uint(
-            block_tables[batch_index * max_blocks + position / page_size]
-        );
-        uint cache_base =
-            ((block * page_size + position % page_size) * kv_heads + kv_head)
-            * head_dim;
-        float score = 0.0f;
-        for (uint dim = 0; dim < head_dim; ++dim) {
-            score += float(queries[query_base + dim])
-                * float(key_cache[cache_base + dim]);
-        }
-        denominator += metal::exp(score * scale[0] - max_score);
-    }
-
-    for (uint dim = 0; dim < head_dim; ++dim) {
-        float accumulator = 0.0f;
-        for (uint position = 0; position < context_limit; ++position) {
-            uint block = uint(
-                block_tables[batch_index * max_blocks + position / page_size]
-            );
-            uint cache_base =
-                ((block * page_size + position % page_size) * kv_heads + kv_head)
-                * head_dim;
-            float score = 0.0f;
-            for (uint inner = 0; inner < head_dim; ++inner) {
-                score += float(queries[query_base + inner])
-                    * float(key_cache[cache_base + inner]);
-            }
-            float weight = metal::exp(score * scale[0] - max_score);
-            accumulator += weight * float(value_cache[cache_base + dim]);
-        }
-        output[query_base + dim] = accumulator / denominator;
-    }
-"""
-
-
 @dataclass
 class PagedLayerAttentionContext:
-    """Layer-local paged append plus native Metal attention dispatch."""
+    """Layer-local paged append plus optimized MLX attention dispatch."""
 
     reservation: PagedBatchReservation
     layer_index: int
     forward_mode: ForwardMode
-    kernel: object
 
     def append_and_attend(
         self,
@@ -241,58 +144,89 @@ class PagedLayerAttentionContext:
             keys,
             values,
         )
-        token_lengths = mx.array(self.reservation.token_lengths, dtype=mx.int32)
-        cache_lengths = mx.array(self.reservation.cache_lengths, dtype=mx.int32)
-        scale_value = mx.array([scale], dtype=mx.float32)
-        total_rows = (
-            int(queries.shape[0]) * int(queries.shape[1]) * int(queries.shape[2])
-        )
         started = time.perf_counter()
-        output = self.kernel(  # type: ignore[operator]
-            inputs=[
-                mx.contiguous(queries),
-                key_cache,
-                value_cache,
-                self.reservation.block_tables,
-                token_lengths,
-                cache_lengths,
-                scale_value,
-            ],
-            output_shapes=[queries.shape],
-            output_dtypes=[queries.dtype],
-            grid=(total_rows, 1, 1),
-            threadgroup=(min(256, total_rows), 1, 1),
-        )[0]
+        dense_keys, dense_values = self._dense_kv_rows(key_cache, value_cache)
+        attention_mask = _dense_causal_mask(
+            mx.array(self.reservation.cache_lengths, dtype=mx.int32),
+            self.reservation.token_lengths,
+            int(queries.shape[2]),
+            int(dense_keys.shape[2]),
+        )
+        output = mx.fast.scaled_dot_product_attention(
+            queries,
+            dense_keys,
+            dense_values,
+            scale=scale,
+            mask=attention_mask.astype(queries.dtype),
+        )
         self.reservation.backend.record_attention(
             self.forward_mode.value,
             max(0, int((time.perf_counter() - started) * 1000)),
         )
         return output
 
+    def _dense_kv_rows(
+        self,
+        key_cache: mx.array,
+        value_cache: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        max_total = max(
+            cache_length + append_length
+            for cache_length, append_length in zip(
+                self.reservation.cache_lengths,
+                self.reservation.append_lengths,
+                strict=True,
+            )
+        )
+        key_rows: list[mx.array] = []
+        value_rows: list[mx.array] = []
+        for cache, total_length, table in zip(
+            self.reservation.request_caches,
+            (
+                cache_length + append_length
+                for cache_length, append_length in zip(
+                    self.reservation.cache_lengths,
+                    self.reservation.append_lengths,
+                    strict=True,
+                )
+            ),
+            self.reservation.candidate_tables,
+            strict=True,
+        ):
+            del cache
+            page_ids = mx.array(list(table), dtype=mx.int32)
+            row_keys = key_cache[page_ids].reshape(
+                (
+                    -1,
+                    self.reservation.backend.num_kv_heads,
+                    self.reservation.backend.head_dim,
+                )
+            )[:total_length]
+            row_values = value_cache[page_ids].reshape(
+                (
+                    -1,
+                    self.reservation.backend.num_kv_heads,
+                    self.reservation.backend.head_dim,
+                )
+            )[:total_length]
+            row_keys = row_keys.transpose(1, 0, 2)
+            row_values = row_values.transpose(1, 0, 2)
+            pad = max_total - total_length
+            if pad > 0:
+                row_keys = mx.pad(row_keys, [(0, 0), (0, pad), (0, 0)])
+                row_values = mx.pad(row_values, [(0, 0), (0, pad), (0, 0)])
+            key_rows.append(row_keys)
+            value_rows.append(row_values)
+        return mx.stack(key_rows, axis=0), mx.stack(value_rows, axis=0)
+
 
 @dataclass
 class PagedMetalAttentionBackend:
-    """MLX-native Metal attention over fixed-size paged K/V."""
-
-    _kernel: object | None = None
+    """MLX-native attention over fixed-size paged K/V."""
 
     def __post_init__(self) -> None:
         if not mx.metal.is_available():
             raise ValueError("native paged attention requires MLX Metal")
-        self._kernel = mx.fast.metal_kernel(
-            name="native_mlx_paged_attention",
-            input_names=[
-                "queries",
-                "key_cache",
-                "value_cache",
-                "block_tables",
-                "token_lengths",
-                "cache_lengths",
-                "scale",
-            ],
-            output_names=["output"],
-            source=_PAGED_ATTENTION_SOURCE,
-        )
 
     def contexts(
         self,
@@ -301,14 +235,11 @@ class PagedMetalAttentionBackend:
     ) -> tuple[LayerAttentionContext, ...]:
         if not isinstance(reservation, PagedBatchReservation):
             raise TypeError("paged attention requires a paged cache reservation")
-        if self._kernel is None:
-            raise RuntimeError("paged attention kernel is not initialized")
         return tuple(
             PagedLayerAttentionContext(
                 reservation=reservation,
                 layer_index=index,
                 forward_mode=forward_mode,
-                kernel=self._kernel,
             )
             for index in range(reservation.backend.num_layers)
         )

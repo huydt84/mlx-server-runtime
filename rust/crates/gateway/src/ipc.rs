@@ -654,6 +654,30 @@ impl WorkerClient {
                             value as u64,
                         );
                     }
+                    for (kind, value) in [
+                        ("prepare", scheduler.executor_prepare_ms),
+                        ("reserve", scheduler.executor_reserve_ms),
+                        ("forward", scheduler.executor_forward_ms),
+                        ("sample", scheduler.executor_sample_ms),
+                        ("eval", scheduler.executor_eval_ms),
+                        ("commit", scheduler.executor_commit_ms),
+                    ] {
+                        if let Some(value) = value {
+                            metrics.set_labeled_gauge(
+                                "mlx_executor_stage_latency_by_backend_ms",
+                                &[
+                                    ("backend", scheduler.backend.as_str()),
+                                    ("modality", scheduler.modality.as_str()),
+                                    (
+                                        "forward_mode",
+                                        scheduler.forward_mode.as_deref().unwrap_or("unknown"),
+                                    ),
+                                    ("kind", kind),
+                                ],
+                                value as u64,
+                            );
+                        }
+                    }
                     if let Some(value) = scheduler.total_pages {
                         metrics.set_labeled_gauge(
                             "mlx_kv_cache_pages_by_backend",
@@ -1129,9 +1153,15 @@ mod tests {
                     physical_batch_size: Some(2),
                     model_forward_count: Some(1),
                     cache_backend: Some("paged-mlx".to_string()),
-                    attention_backend: Some("native-metal-paged".to_string()),
+                    attention_backend: Some("native-metal-paged-sdpa".to_string()),
                     attention_mode: Some("mixed".to_string()),
                     attention_time_ms: Some(4),
+                    executor_prepare_ms: Some(5),
+                    executor_reserve_ms: Some(6),
+                    executor_forward_ms: Some(7),
+                    executor_sample_ms: Some(8),
+                    executor_eval_ms: Some(9),
+                    executor_commit_ms: Some(10),
                     total_pages: Some(16),
                     used_pages: Some(2),
                     free_pages: Some(14),
@@ -1225,7 +1255,9 @@ mod tests {
         assert!(rendered.contains(
             "mlx_kv_cache_page_size_by_backend{backend=\"paged-mlx\",modality=\"text\"} 16"
         ));
-        assert!(rendered.contains("mlx_attention_time_by_backend_ms{backend=\"native-metal-paged\",mode=\"mixed\",modality=\"text\"} 4"));
+        assert!(rendered.contains("mlx_attention_time_by_backend_ms{backend=\"native-metal-paged-sdpa\",mode=\"mixed\",modality=\"text\"} 4"));
+        assert!(rendered.contains("mlx_executor_stage_latency_by_backend_ms{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\",kind=\"eval\"} 9"));
+        assert!(rendered.contains("mlx_executor_stage_latency_by_backend_ms{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\",kind=\"commit\"} 10"));
         assert!(rendered.contains("mlx_prefix_cache_hits_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 1"));
         assert!(rendered.contains("mlx_prefix_cache_reused_tokens_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 4"));
         assert!(rendered.contains("mlx_prefix_cache_collisions_rejected_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 0"));

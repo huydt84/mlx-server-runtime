@@ -51,7 +51,9 @@ class MlxGenerationExecutor:
         """Execute all valid scheduler-selected work in one model invocation."""
 
         started = time.perf_counter()
+        prepare_started = started
         layout, ordered_results = self._prepare(batch)
+        prepare_ms = _elapsed_ms(prepare_started)
         if layout is None:
             return StepResult(
                 forward_mode=batch.forward_mode,
@@ -59,8 +61,17 @@ class MlxGenerationExecutor:
                 step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
                 physical_batch_size=0,
                 model_forward_count=0,
-                metrics=self.cache_backend.metrics(),
+                metrics={
+                    **self.cache_backend.metrics(),
+                    "executor_prepare_ms": prepare_ms,
+                    "executor_reserve_ms": 0,
+                    "executor_forward_ms": 0,
+                    "executor_sample_ms": 0,
+                    "executor_eval_ms": 0,
+                    "executor_commit_ms": 0,
+                },
             )
+        reserve_started = time.perf_counter()
         try:
             reservation = self.cache_backend.reserve_batch(
                 layout.request_caches,
@@ -68,6 +79,7 @@ class MlxGenerationExecutor:
             )
         except Exception as exc:
             raise BatchExecutionError("KV_RESERVATION_FAILED", str(exc)) from exc
+        reserve_ms = _elapsed_ms(reserve_started)
         forward_batch = ForwardBatch(
             forward_mode=layout.forward_mode,
             token_lengths=layout.token_lengths,
@@ -79,15 +91,23 @@ class MlxGenerationExecutor:
             ),
         )
         try:
+            forward_started = time.perf_counter()
             logits = self.model(layout.input_ids, layout.positions, forward_batch)
+            forward_ms = _elapsed_ms(forward_started)
+            sample_started = time.perf_counter()
             next_tokens = self._sample_last_logits(logits, layout.token_lengths)
+            sample_ms = _elapsed_ms(sample_started)
+            eval_started = time.perf_counter()
             mx.eval(logits, next_tokens)
+            eval_ms = _elapsed_ms(eval_started)
             token_ids = [int(value) for value in next_tokens.tolist()]
         except Exception as exc:
             reservation.abort()
             raise BatchExecutionError("MODEL_EXECUTION_FAILED", str(exc)) from exc
         try:
+            commit_started = time.perf_counter()
             committed_lengths = reservation.commit()
+            commit_ms = _elapsed_ms(commit_started)
         except Exception as exc:
             reservation.abort()
             raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
@@ -112,7 +132,15 @@ class MlxGenerationExecutor:
             step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
             physical_batch_size=len(layout.requests),
             model_forward_count=1,
-            metrics=self.cache_backend.metrics(),
+            metrics={
+                **self.cache_backend.metrics(),
+                "executor_prepare_ms": prepare_ms,
+                "executor_reserve_ms": reserve_ms,
+                "executor_forward_ms": forward_ms,
+                "executor_sample_ms": sample_ms,
+                "executor_eval_ms": eval_ms,
+                "executor_commit_ms": commit_ms,
+            },
         )
 
     def _prepare(
@@ -281,3 +309,7 @@ def _require_result(result: StepRequestResult | None) -> StepRequestResult:
             "executor did not produce a result for every request",
         )
     return result
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1000))

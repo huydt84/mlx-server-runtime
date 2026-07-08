@@ -354,12 +354,12 @@ class MlxBatchCompletionBackend:
 
             suffix = tokens[len(cached_prompt.tokens) :]
             if not suffix:
-                effective_prompts.append([])
-                cache_inputs.append(cached_prompt.prompt_cache)
-                cached_prefixes.append(list(cached_prompt.tokens))
-                prompt_cache_hits.append(True)
-                cached_token_counts.append(len(cached_prompt.tokens))
-                prompt_cache_bytes.append(cached_prompt.cache_bytes)
+                effective_prompts.append(tokens)
+                cache_inputs.append(None)
+                cached_prefixes.append([])
+                prompt_cache_hits.append(False)
+                cached_token_counts.append(0)
+                prompt_cache_bytes.append(0)
                 continue
 
             effective_prompts.append(suffix)
@@ -712,6 +712,12 @@ class ContinuousBatchScheduler:
                 continue
 
             suffix = job.prompt_tokens[len(job.cached_prompt.tokens) :]
+            if not suffix:
+                prompts.append(job.prompt_tokens)
+                caches.append(None)
+                cached_prefixes.append([])
+                job.cached_prompt = None
+                continue
             prompts.append(suffix)
             caches.append(job.cached_prompt.prompt_cache)
             cached_prefixes.append(list(job.cached_prompt.tokens))

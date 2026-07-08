@@ -218,6 +218,12 @@ class SchedulerMetricsEvent:
     attention_backend: str | None = None
     attention_mode: str | None = None
     attention_time_ms: int | None = None
+    executor_prepare_ms: int | None = None
+    executor_reserve_ms: int | None = None
+    executor_forward_ms: int | None = None
+    executor_sample_ms: int | None = None
+    executor_eval_ms: int | None = None
+    executor_commit_ms: int | None = None
     total_pages: int | None = None
     used_pages: int | None = None
     free_pages: int | None = None

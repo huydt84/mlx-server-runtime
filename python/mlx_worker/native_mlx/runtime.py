@@ -196,6 +196,18 @@ class NativeRuntime:
                         attention_backend=_optional_str(metrics, "attention_backend"),
                         attention_mode=_optional_str(metrics, "attention_mode"),
                         attention_time_ms=_optional_int(metrics, "attention_time_ms"),
+                        executor_prepare_ms=_optional_int(
+                            metrics, "executor_prepare_ms"
+                        ),
+                        executor_reserve_ms=_optional_int(
+                            metrics, "executor_reserve_ms"
+                        ),
+                        executor_forward_ms=_optional_int(
+                            metrics, "executor_forward_ms"
+                        ),
+                        executor_sample_ms=_optional_int(metrics, "executor_sample_ms"),
+                        executor_eval_ms=_optional_int(metrics, "executor_eval_ms"),
+                        executor_commit_ms=_optional_int(metrics, "executor_commit_ms"),
                         total_pages=_optional_int(metrics, "total_pages"),
                         used_pages=_optional_int(metrics, "used_pages"),
                         free_pages=_optional_int(metrics, "free_pages"),

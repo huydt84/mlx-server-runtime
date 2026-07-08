@@ -180,6 +180,24 @@ pub struct SchedulerMetricsEvent {
     /// Attention dispatch latency in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_time_ms: Option<u32>,
+    /// Executor request validation and tensor layout time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_prepare_ms: Option<u32>,
+    /// Executor KV reservation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_reserve_ms: Option<u32>,
+    /// Executor model forward graph construction time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_forward_ms: Option<u32>,
+    /// Executor sampling graph construction time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_sample_ms: Option<u32>,
+    /// Executor MLX evaluation latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_eval_ms: Option<u32>,
+    /// Executor KV commit latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_commit_ms: Option<u32>,
     /// Total physical KV pages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_pages: Option<u32>,

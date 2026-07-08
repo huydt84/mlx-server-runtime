@@ -19,8 +19,10 @@
 #   - failure non-publication through an invalid public request
 #   - eviction through a deliberately tiny prefix-cache entry limit
 #   - default v1 public gateway request against the same checkpoint
-#   - benchmark comparison of native block-hash and v1 on short, miss, exact-hit,
-#     partial-hit, and shared-prefix scenarios
+#   - benchmark comparison of native block-hash and v1 on streaming and
+#     non-streaming single requests, shared-prefix miss/exact/partial/mixed
+#     ratios, concurrent few-long/many-short, and concurrent few-short/many-long
+#     scenarios
 #
 # Host requirements:
 #   - Apple Silicon (`arm64`)

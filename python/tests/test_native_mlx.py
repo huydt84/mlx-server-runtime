@@ -681,7 +681,7 @@ def test_paged_metal_attention_matches_dense_reference() -> None:
     mx.eval(dense, paged)
 
     assert mx.allclose(dense, paged, atol=1e-3, rtol=1e-3).item()
-    assert paged_backend.metrics()["attention_backend"] == "native-metal-paged"
+    assert paged_backend.metrics()["attention_backend"] == "native-metal-paged-sdpa"
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")

@@ -278,6 +278,51 @@ def test_batch_backend_batches_requests_and_reuses_prompt_cache(monkeypatch) -> 
     assert prompt_cache_store.lookup([1, 2, 3, 11, 12, 13]) is not None
 
 
+def test_batch_backend_exact_prompt_cache_hit_avoids_empty_insert(monkeypatch) -> None:
+    _install_fake_cache_module(monkeypatch)
+    fake_generate = ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = FakeBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+    FakeBatchGenerator.instances.clear()
+
+    prompt_cache_store = PromptCacheStore()
+    prompt_cache_store.remember([1, 2, 3], ["cached-full"])
+    backend = MlxBatchCompletionBackend(
+        BatchBackendContext(
+            model_id="test-model",
+            model=SimpleNamespace(),
+            tokenizer=FakeTokenizer(),
+            prompt_cache_store=prompt_cache_store,
+            build_prompt_tokens=lambda request: [1, 2, 3],
+            validate_token_limits=lambda request, tokens: None,
+            make_sampler=lambda temp, top_p: None,
+        )
+    )
+
+    response = backend.complete_many(
+        [
+            ChatCompletionRequest(
+                request_id="req-1",
+                model="test-model",
+                messages=[ChatMessage(role="user", content="repeat")],
+                max_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                max_prompt_tokens=32,
+                max_completion_tokens=32,
+                max_total_tokens_per_request=64,
+            )
+        ]
+    )[0]
+    generator = FakeBatchGenerator.instances[-1]
+
+    assert generator.insert_calls[0]["prompts"] == [[1, 2, 3]]
+    assert generator.insert_calls[0]["caches"] == [None]
+    assert generator.insert_calls[0]["all_tokens"] == [[]]
+    assert response.prompt_cache_hit is False
+
+
 def test_engine_complete_chat_uses_batch_backend() -> None:
     fake_backend_calls: list[list[str]] = []
 
@@ -773,3 +818,92 @@ def test_continuous_scheduler_admits_new_request_while_decoding(monkeypatch) -> 
     assert any(event[0] == "response" and event[1] == "req-1" for event in events)
     assert any(event[0] == "response" and event[1] == "req-2" for event in events)
     assert generator.removed == [[103]]
+
+
+def test_continuous_scheduler_exact_prompt_cache_hit_avoids_empty_insert(
+    monkeypatch,
+) -> None:
+    _install_fake_cache_module(monkeypatch)
+    sys.modules["mlx_lm.models.cache"].trim_prompt_cache = (
+        lambda prompt_cache, num_tokens: list(prompt_cache)
+    )
+    generators: list[FakeBatchGenerator] = []
+
+    class RecordingBatchGenerator(FakeBatchGenerator):
+        def __init__(
+            self,
+            model,
+            stop_tokens=None,
+            completion_batch_size=None,
+            prefill_batch_size=None,
+            prefill_step_size=None,
+        ) -> None:
+            super().__init__(model, stop_tokens)
+            del completion_batch_size, prefill_batch_size, prefill_step_size
+            generators.append(self)
+
+        def remove(self, uids) -> None:
+            del uids
+
+    fake_generate = ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = RecordingBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+
+    scheduler = ContinuousBatchScheduler(
+        BatchBackendContext(
+            model_id="test-model",
+            model=SimpleNamespace(),
+            tokenizer=FakeTokenizer(),
+            prompt_cache_store=PromptCacheStore(),
+            build_prompt_tokens=lambda request: [1, 2, 3],
+            validate_token_limits=lambda request, tokens: None,
+            make_sampler=lambda temp, top_p: None,
+        ),
+        BatchEventSink(
+            emit_delta=lambda request_id, delta: None,
+            emit_response=lambda response: None,
+            emit_error=lambda request_id, code, message: None,
+        ),
+        prompt_concurrency=1,
+        decode_concurrency=1,
+        prefill_step_size=64,
+    )
+
+    scheduler.submit(
+        ChatCompletionRequest(
+            request_id="first",
+            model="test-model",
+            messages=[ChatMessage(role="user", content="repeat")],
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=32,
+            max_completion_tokens=32,
+            max_total_tokens_per_request=64,
+        ),
+        stream=False,
+    )
+    scheduler.tick()
+    scheduler.tick()
+    scheduler.tick()
+    scheduler.submit(
+        ChatCompletionRequest(
+            request_id="second",
+            model="test-model",
+            messages=[ChatMessage(role="user", content="repeat")],
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=32,
+            max_completion_tokens=32,
+            max_total_tokens_per_request=64,
+        ),
+        stream=False,
+    )
+    scheduler.tick()
+
+    assert generators[0].insert_calls[0]["prompts"] == [[1, 2, 3]]
+    assert generators[0].insert_calls[1]["prompts"] == [[1, 2, 3]]
+    assert generators[0].insert_calls[1]["caches"] == [None]
+    assert generators[0].insert_calls[1]["all_tokens"] == [[]]

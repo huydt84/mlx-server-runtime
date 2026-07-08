@@ -681,7 +681,7 @@ class PagedKVCacheBackend:
         )
         return {
             "cache_backend": "paged-mlx",
-            "attention_backend": "native-metal-paged",
+            "attention_backend": "native-metal-paged-sdpa",
             "attention_mode": self._attention_mode,
             "attention_time_ms": self._attention_time_ms,
             "total_pages": self.num_pages,

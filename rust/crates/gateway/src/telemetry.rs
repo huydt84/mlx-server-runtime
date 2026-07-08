@@ -583,6 +583,10 @@ impl MetricsRegistry {
                     "Latest native executor physical model invocation count.",
                 ),
                 (
+                    "mlx_executor_stage_latency_by_backend_ms",
+                    "Latest native executor stage latency by forward mode.",
+                ),
+                (
                     "mlx_kv_cache_pages_by_backend",
                     "Latest native KV-cache page counts by state.",
                 ),
