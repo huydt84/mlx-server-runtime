@@ -120,9 +120,11 @@ class NativeContinuousScheduler:
             request_id = state.work.request_id
             if state.cache_handle is None:
                 self._waiting.pop(request_id, None)
+                probe = self._cache_coordinator.probe(state.work.prompt_token_ids)
                 admission = self._cache_coordinator.acquire(
                     request_id,
                     state.work.prompt_token_ids,
+                    probe,
                 )
                 state.cache_handle = admission.cache_handle
                 state.cache_length = admission.cache_length
@@ -213,6 +215,7 @@ class NativeContinuousScheduler:
                         "forward_mode": result.forward_mode.value,
                         "physical_batch_size": result.physical_batch_size,
                         "model_forward_count": result.model_forward_count,
+                        **self._cache_coordinator.metrics(),
                         **result.metrics,
                     },
                 )

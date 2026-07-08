@@ -74,6 +74,31 @@ def test_load_config_parses_native_kv_page_size(monkeypatch) -> None:
     assert config.native_kv_page_size == 32
 
 
+def test_load_config_parses_native_prefix_cache_strategy(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY", "radix")
+
+    config = load_config()
+
+    assert config.native_prefix_cache_strategy == "radix"
+
+
+def test_load_config_defaults_native_prefix_cache_strategy_to_block_hash(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY", raising=False)
+
+    config = load_config()
+
+    assert config.native_prefix_cache_strategy == "block-hash"
+
+
+def test_load_config_rejects_invalid_native_prefix_cache_strategy(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY", "none")
+
+    with pytest.raises(ValueError, match="MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY"):
+        load_config()
+
+
 def test_load_config_rejects_invalid_native_kv_page_size(monkeypatch) -> None:
     monkeypatch.setenv("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "7")
 

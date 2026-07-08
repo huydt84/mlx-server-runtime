@@ -154,7 +154,9 @@ def create_native_worker(
         config.model,
         stage_callback,
         cache_budget_bytes=config.text_cache_budget_bytes,
+        cache_max_entries=config.text_cache_max_entries,
         kv_page_size=config.native_kv_page_size,
+        prefix_cache_strategy=config.native_prefix_cache_strategy,
     )
     artifacts.executor.load(artifacts.options)
     scheduler = NativeContinuousScheduler(

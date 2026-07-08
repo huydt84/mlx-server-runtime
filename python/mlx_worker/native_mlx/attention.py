@@ -215,7 +215,7 @@ class PagedLayerAttentionContext:
     reservation: PagedBatchReservation
     layer_index: int
     forward_mode: ForwardMode
-    kernel: object       
+    kernel: object
 
     def append_and_attend(
         self,

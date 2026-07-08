@@ -779,6 +779,84 @@ impl WorkerClient {
                             value as u64,
                         );
                     }
+                    let prefix_labels = [
+                        ("backend", scheduler.backend.as_str()),
+                        ("modality", scheduler.modality.as_str()),
+                        (
+                            "strategy",
+                            scheduler.prefix_strategy.as_deref().unwrap_or("unknown"),
+                        ),
+                    ];
+                    if let Some(value) = scheduler.prefix_queries {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_queries_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_hits {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_hits_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_misses {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_misses_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_reused_tokens {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_reused_tokens_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_reused_pages {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_reused_pages_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_entries {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_entries_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_bytes {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_bytes_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_pinned_pages {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_pinned_pages_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_collisions_rejected {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_collisions_rejected_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
+                    if let Some(value) = scheduler.prefix_evictions {
+                        metrics.set_labeled_gauge(
+                            "mlx_prefix_cache_evictions_by_backend",
+                            &prefix_labels,
+                            value,
+                        );
+                    }
                     continue;
                 }
 
@@ -1062,7 +1140,17 @@ mod tests {
                     active_kv_bytes: Some(1024),
                     allocation_failures: Some(0),
                     page_size: Some(16),
-                    prefix_strategy: Some("none".to_string()),
+                    prefix_strategy: Some("block-hash".to_string()),
+                    prefix_queries: Some(3),
+                    prefix_hits: Some(1),
+                    prefix_misses: Some(2),
+                    prefix_reused_tokens: Some(4),
+                    prefix_reused_pages: Some(1),
+                    prefix_entries: Some(2),
+                    prefix_bytes: Some(1024),
+                    prefix_pinned_pages: Some(1),
+                    prefix_collisions_rejected: Some(0),
+                    prefix_evictions: Some(1),
                 },
             };
             let response_event = WorkerEvent::ChatCompletion {
@@ -1138,5 +1226,8 @@ mod tests {
             "mlx_kv_cache_page_size_by_backend{backend=\"paged-mlx\",modality=\"text\"} 16"
         ));
         assert!(rendered.contains("mlx_attention_time_by_backend_ms{backend=\"native-metal-paged\",mode=\"mixed\",modality=\"text\"} 4"));
+        assert!(rendered.contains("mlx_prefix_cache_hits_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 1"));
+        assert!(rendered.contains("mlx_prefix_cache_reused_tokens_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 4"));
+        assert!(rendered.contains("mlx_prefix_cache_collisions_rejected_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 0"));
     }
 }

@@ -209,6 +209,24 @@ class NativeRuntime:
                         ),
                         page_size=_optional_int(metrics, "page_size"),
                         prefix_strategy=_optional_str(metrics, "prefix_strategy"),
+                        prefix_queries=_optional_int(metrics, "prefix_queries"),
+                        prefix_hits=_optional_int(metrics, "prefix_hits"),
+                        prefix_misses=_optional_int(metrics, "prefix_misses"),
+                        prefix_reused_tokens=_optional_int(
+                            metrics, "prefix_reused_tokens"
+                        ),
+                        prefix_reused_pages=_optional_int(
+                            metrics, "prefix_reused_pages"
+                        ),
+                        prefix_entries=_optional_int(metrics, "prefix_entries"),
+                        prefix_bytes=_optional_int(metrics, "prefix_bytes"),
+                        prefix_pinned_pages=_optional_int(
+                            metrics, "prefix_pinned_pages"
+                        ),
+                        prefix_collisions_rejected=_optional_int(
+                            metrics, "prefix_collisions_rejected"
+                        ),
+                        prefix_evictions=_optional_int(metrics, "prefix_evictions"),
                     ),
                 )
             )

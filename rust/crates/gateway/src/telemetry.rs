@@ -607,6 +607,46 @@ impl MetricsRegistry {
                     "Latest native attention backend dispatch latency.",
                 ),
                 (
+                    "mlx_prefix_cache_queries_by_backend",
+                    "Latest native prefix-cache lookup count.",
+                ),
+                (
+                    "mlx_prefix_cache_hits_by_backend",
+                    "Latest native prefix-cache hit count.",
+                ),
+                (
+                    "mlx_prefix_cache_misses_by_backend",
+                    "Latest native prefix-cache miss count.",
+                ),
+                (
+                    "mlx_prefix_cache_reused_tokens_by_backend",
+                    "Latest native prefix-cache reused token count.",
+                ),
+                (
+                    "mlx_prefix_cache_reused_pages_by_backend",
+                    "Latest native prefix-cache reused page count.",
+                ),
+                (
+                    "mlx_prefix_cache_entries_by_backend",
+                    "Latest native prefix-cache entry count.",
+                ),
+                (
+                    "mlx_prefix_cache_bytes_by_backend",
+                    "Latest native prefix-cache stored bytes.",
+                ),
+                (
+                    "mlx_prefix_cache_pinned_pages_by_backend",
+                    "Latest native prefix-cache pinned pages.",
+                ),
+                (
+                    "mlx_prefix_cache_collisions_rejected_by_backend",
+                    "Latest native block-hash collision rejections.",
+                ),
+                (
+                    "mlx_prefix_cache_evictions_by_backend",
+                    "Latest native prefix-cache eviction count.",
+                ),
+                (
                     "mlx_peak_memory_by_backend_bytes",
                     "Latest peak memory by backend.",
                 ),

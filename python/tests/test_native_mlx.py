@@ -43,6 +43,10 @@ from mlx_worker.native_mlx.models.qwen2 import (
     Qwen2WeightAdapter,
 )
 from mlx_worker.native_mlx.prefix_cache import NoPrefixCache
+from mlx_worker.native_mlx.prefix_cache import (
+    BlockHashPrefixCache,
+    PrefixCompatibilityFingerprint,
+)
 from mlx_worker.native_mlx.registry import get_architecture_spec
 from mlx_worker.native_mlx.runtime import NativeRuntime
 from mlx_worker.native_mlx.scheduler import NativeContinuousScheduler
@@ -153,6 +157,36 @@ def _executor(model: _RecordingModel | None = None) -> _ExecutorFixture:
         attention_backend=DenseReferenceAttentionBackend(),
     )
     return _ExecutorFixture(executor, cache_backend, cache_coordinator)
+
+
+def _fingerprint(
+    *,
+    tokenizer_assets_hash: str = "tokenizer-a",
+    page_size: int = 2,
+) -> PrefixCompatibilityFingerprint:
+    return PrefixCompatibilityFingerprint(
+        checkpoint="checkpoint-a",
+        architecture_class="FakeForCausalLM",
+        tokenizer_assets_hash=tokenizer_assets_hash,
+        model_dtype="float16",
+        kv_dtype="float16",
+        quantization="none",
+        page_size=page_size,
+    )
+
+
+def _commit_dense_tokens(
+    backend: DenseKVCacheBackend,
+    handle: str,
+    request_id: str,
+    length: int,
+) -> None:
+    cache = backend.get(handle, request_id)
+    reservation = backend.reserve_batch((cache,), (length,))
+    keys = mx.ones((1, 1, length, 2), dtype=mx.float16)
+    values = mx.ones((1, 1, length, 2), dtype=mx.float16)
+    reservation.layer_views[0].update_and_fetch(keys, values)
+    reservation.commit()
 
 
 def test_models_directory_has_one_qwen2_module() -> None:
@@ -460,6 +494,146 @@ def test_paged_backend_fork_uses_copy_on_write_for_shared_tail() -> None:
     assert backend.metrics()["used_pages"] == 2
 
 
+def test_block_hash_prefix_cache_reuses_only_exact_full_pages() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    handle = backend.create("source")
+    _commit_dense_tokens(backend, handle, "source", 4)
+    cache = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=8,
+        max_bytes=4096,
+    )
+
+    publication = cache.publish(handle, (1, 2, 3, 4), 4)
+    exact = cache.probe((1, 2, 3, 4, 9))
+    partial = cache.probe((1, 2, 8))
+    token_mismatch = cache.probe((1, 9, 3, 4))
+    partial_page_only = cache.probe((1,))
+
+    assert publication.published_tokens == 4
+    assert publication.published_pages == 2
+    assert exact.matched_tokens == 4
+    assert exact.matched_pages == 2
+    assert partial.matched_tokens == 2
+    assert partial.matched_pages == 1
+    assert token_mismatch.matched_tokens == 0
+    assert partial_page_only.matched_tokens == 0
+    assert cache.metrics()["prefix_hits"] == 2
+    assert cache.metrics()["prefix_misses"] == 2
+
+
+def test_block_hash_prefix_cache_rejects_incompatible_fingerprint() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    handle = backend.create("source")
+    _commit_dense_tokens(backend, handle, "source", 2)
+    first = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(tokenizer_assets_hash="tokenizer-a"),
+        page_size=2,
+    )
+    second = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(tokenizer_assets_hash="tokenizer-b"),
+        page_size=2,
+    )
+
+    first.publish(handle, (1, 2), 2)
+
+    assert first.probe((1, 2, 3)).matched_tokens == 2
+    assert second.probe((1, 2, 3)).matched_tokens == 0
+
+
+def test_block_hash_prefix_cache_acquire_pins_and_release_unpins() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    handle = backend.create("source")
+    _commit_dense_tokens(backend, handle, "source", 4)
+    cache = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=8,
+        max_bytes=4096,
+    )
+    cache.publish(handle, (1, 2, 3, 4), 4)
+    probe = cache.probe((1, 2, 3, 4, 5))
+
+    admission = cache.acquire("child", (1, 2, 3, 4, 5), probe)
+
+    assert admission is not None
+    assert admission.reused_tokens == 4
+    assert backend.length(admission.cache_handle) == 4
+    assert cache.metrics()["prefix_reused_pages"] == 2
+    assert cache.metrics()["prefix_pinned_pages"] == 2
+
+    cache.release(admission.cache_handle)
+    backend.release(admission.cache_handle)
+
+    assert cache.metrics()["prefix_pinned_pages"] == 0
+
+
+def test_block_hash_prefix_cache_evicts_unpinned_lru_entries() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    first = backend.create("first")
+    second = backend.create("second")
+    _commit_dense_tokens(backend, first, "first", 2)
+    _commit_dense_tokens(backend, second, "second", 2)
+    cache = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=1,
+        max_bytes=4096,
+    )
+
+    cache.publish(first, (1, 2), 2)
+    cache.publish(second, (3, 4), 2)
+
+    assert cache.probe((1, 2, 9)).matched_tokens == 0
+    assert cache.probe((3, 4, 9)).matched_tokens == 2
+    assert cache.metrics()["prefix_evictions"] == 1
+
+
+def test_block_hash_prefix_cache_entry_limit_keeps_reusable_root_chain() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    handle = backend.create("source")
+    _commit_dense_tokens(backend, handle, "source", 12)
+    cache = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=4,
+        max_bytes=4096,
+    )
+
+    cache.publish(handle, tuple(range(12)), 12)
+    cache.publish(handle, tuple(range(12)), 12)
+
+    assert cache.probe(tuple(range(12)) + (99,)).matched_tokens == 8
+    assert cache.metrics()["prefix_entries"] == 4
+    assert cache.metrics()["prefix_evictions"] == 0
+
+
+def test_block_hash_prefix_cache_byte_limit_counts_shared_pages_once() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    handle = backend.create("source")
+    _commit_dense_tokens(backend, handle, "source", 8)
+    cache = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=8,
+        max_bytes=8,
+    )
+
+    cache.publish(handle, tuple(range(8)), 8)
+
+    assert cache.probe(tuple(range(8)) + (99,)).matched_tokens == 8
+    assert cache.metrics()["prefix_entries"] == 4
+    assert cache.metrics()["prefix_bytes"] == 8
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
 def test_paged_metal_attention_matches_dense_reference() -> None:
     dense_backend = DenseKVCacheBackend(num_layers=1)
@@ -606,11 +780,21 @@ class _FakeExecutor:
 @dataclass
 class _FakeCacheCoordinator:
     lengths: dict[str, int]
+    reused_tokens: dict[str, int] = field(default_factory=dict)
     released: list[str] = field(default_factory=list)
 
     def probe(self, token_ids: tuple[int, ...]) -> Any:
-        del token_ids
-        return None
+        return type(
+            "Probe",
+            (),
+            {
+                "matched_tokens": self.reused_tokens.get(str(token_ids), 0),
+                "matched_pages": self.reused_tokens.get(str(token_ids), 0) // 2,
+                "cache_handle": "cached"
+                if str(token_ids) in self.reused_tokens
+                else None,
+            },
+        )()
 
     def acquire(
         self,
@@ -618,16 +802,20 @@ class _FakeCacheCoordinator:
         token_ids: tuple[int, ...],
         probe: Any = None,
     ) -> Any:
-        del token_ids, probe
+        del token_ids
         handle = f"cache-{request_id}"
-        self.lengths[handle] = 0
+        reused = 0
+        if probe is not None:
+            reused = int(getattr(probe, "matched_tokens", 0))
+        self.lengths[handle] = reused
         return type(
             "Admission",
             (),
             {
                 "cache_handle": handle,
-                "cache_length": 0,
-                "reused_tokens": 0,
+                "cache_length": reused,
+                "reused_tokens": reused,
+                "reused_pages": reused // 2,
             },
         )()
 
@@ -715,6 +903,25 @@ def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None
     mixed = executor.batches[-1]
     assert mixed.forward_mode is ForwardMode.MIXED
     assert [request.phase for request in mixed.requests] == ["decode", "prefill"]
+
+
+def test_scheduler_prefix_hit_reduces_scheduled_prefill_tokens() -> None:
+    executor = _FakeExecutor()
+    scheduler, cache = _scheduler(executor, prefill_step_size=8)
+    tokens = (1, 2, 3, 4, 5)
+    cache.reused_tokens[str(tokens)] = 4
+
+    scheduler.submit(_schedulable("request", tokens))
+    events = scheduler.tick()
+
+    assert executor.batches[0].requests[0].token_ids == (5,)
+    assert executor.batches[0].requests[0].positions == (4,)
+    assert any(
+        event.kind == "metrics"
+        and event.metrics is not None
+        and event.metrics["scheduled_tokens"] == 1
+        for event in events
+    )
 
 
 def test_scheduler_isolates_request_local_executor_failure() -> None:

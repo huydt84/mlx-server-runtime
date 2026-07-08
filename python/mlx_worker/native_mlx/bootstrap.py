@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +23,11 @@ from .mapping import (
     load_weight_index,
 )
 from .registry import ArchitectureSpec, get_architecture_spec
-from .prefix_cache import NoPrefixCache
+from .prefix_cache import (
+    BlockHashPrefixCache,
+    NoPrefixCache,
+    PrefixCompatibilityFingerprint,
+)
 
 
 @dataclass(frozen=True)
@@ -63,7 +68,9 @@ def build_native_artifacts(
     stage_callback: Any | None = None,
     *,
     cache_budget_bytes: int = 8 * 1024 * 1024,
+    cache_max_entries: int = 32,
     kv_page_size: int = 16,
+    prefix_cache_strategy: str = "block-hash",
 ) -> BootstrapArtifacts:
     """Validate and construct the registered architecture and shared executor."""
 
@@ -124,9 +131,20 @@ def build_native_artifacts(
             dtype=geometry.dtype,
         )
         attention_backend = PagedMetalAttentionBackend()
+        prefix_cache = _build_prefix_cache(
+            strategy=prefix_cache_strategy,
+            backend=cache_backend,
+            model=model,
+            model_path=architecture.model_path,
+            architecture_class=architecture.architecture_class,
+            model_config=config,
+            page_size=kv_page_size,
+            cache_budget_bytes=cache_budget_bytes,
+            cache_max_entries=cache_max_entries,
+        )
         cache_coordinator = NativeCacheCoordinator(
             backend=cache_backend,
-            prefix_cache=NoPrefixCache(),
+            prefix_cache=prefix_cache,
         )
         executor = MlxGenerationExecutor(
             architecture_class=architecture.architecture_class,
@@ -165,6 +183,61 @@ def build_native_artifacts(
         decode_target=decode_target,
         eos_token_ids=eos,
     )
+
+
+def _build_prefix_cache(
+    *,
+    strategy: str,
+    backend: PagedKVCacheBackend,
+    model: str,
+    model_path: Path,
+    architecture_class: str,
+    model_config: Any,
+    page_size: int,
+    cache_budget_bytes: int,
+    cache_max_entries: int,
+) -> NoPrefixCache | BlockHashPrefixCache:
+    if strategy == "block-hash":
+        return BlockHashPrefixCache(
+            backend=backend,
+            compatibility=PrefixCompatibilityFingerprint(
+                checkpoint=_checkpoint_identity(model, model_path),
+                architecture_class=architecture_class,
+                tokenizer_assets_hash=_tokenizer_assets_hash(model_path),
+                model_dtype=str(getattr(model_config, "kv_cache_dtype", "float16")),
+                kv_dtype=str(getattr(model_config, "kv_cache_dtype", "float16")),
+                quantization=str(getattr(model_config, "quantization", None)),
+                page_size=page_size,
+            ),
+            page_size=page_size,
+            max_entries=cache_max_entries,
+            max_bytes=cache_budget_bytes,
+        )
+    if strategy == "radix":
+        raise ValueError(
+            "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY=radix is reserved for Phase 11"
+        )
+    raise ValueError(
+        "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY must be block-hash or radix"
+    )
+
+
+def _checkpoint_identity(model: str, model_path: Path) -> str:
+    config_path = model_path / "config.json"
+    stat = config_path.stat()
+    return f"{model}|{model_path.resolve()}|config:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _tokenizer_assets_hash(model_path: Path) -> str:
+    digest = hashlib.sha256()
+    for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+        path = model_path / name
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        if path.exists():
+            digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def detect_native_architecture(model: str) -> NativeArchitecture:

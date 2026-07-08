@@ -207,4 +207,34 @@ pub struct SchedulerMetricsEvent {
     /// Selected prefix-index strategy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_strategy: Option<String>,
+    /// Prefix-cache lookup count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_queries: Option<u64>,
+    /// Prefix-cache hit count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_hits: Option<u64>,
+    /// Prefix-cache miss count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_misses: Option<u64>,
+    /// Tokens reused from prefix-cache pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_reused_tokens: Option<u64>,
+    /// Pages reused from prefix-cache pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_reused_pages: Option<u64>,
+    /// Prefix-cache entry count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_entries: Option<u64>,
+    /// Prefix-cache stored bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_bytes: Option<u64>,
+    /// Prefix-cache pages currently pinned by attached requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_pinned_pages: Option<u64>,
+    /// Block-hash matches rejected by exact verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_collisions_rejected: Option<u64>,
+    /// Prefix-cache eviction count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_evictions: Option<u64>,
 }

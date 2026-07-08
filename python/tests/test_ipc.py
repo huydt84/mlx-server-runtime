@@ -161,7 +161,17 @@ class IpcEncodingTests(unittest.TestCase):
             active_kv_bytes=1024,
             allocation_failures=0,
             page_size=16,
-            prefix_strategy="none",
+            prefix_strategy="block-hash",
+            prefix_queries=3,
+            prefix_hits=1,
+            prefix_misses=2,
+            prefix_reused_tokens=4,
+            prefix_reused_pages=1,
+            prefix_entries=2,
+            prefix_bytes=1024,
+            prefix_pinned_pages=1,
+            prefix_collisions_rejected=0,
+            prefix_evictions=1,
         )
 
         encoded = encode_event(event)

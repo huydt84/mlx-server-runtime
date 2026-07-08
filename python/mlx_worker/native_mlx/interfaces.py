@@ -176,6 +176,8 @@ class PrefixProbe:
     """Side-effect-free prefix lookup result."""
 
     matched_tokens: int = 0
+    matched_pages: int = 0
+    cache_handle: str | None = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,7 @@ class CacheAdmission:
     cache_handle: str
     cache_length: int
     reused_tokens: int = 0
+    reused_pages: int = 0
 
 
 @dataclass(frozen=True)
@@ -192,6 +195,7 @@ class CachePublication:
     """Result of publishing committed prefill state."""
 
     published_tokens: int = 0
+    published_pages: int = 0
 
 
 class CacheCoordinator(Protocol):

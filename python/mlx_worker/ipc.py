@@ -227,6 +227,16 @@ class SchedulerMetricsEvent:
     allocation_failures: int | None = None
     page_size: int | None = None
     prefix_strategy: str | None = None
+    prefix_queries: int | None = None
+    prefix_hits: int | None = None
+    prefix_misses: int | None = None
+    prefix_reused_tokens: int | None = None
+    prefix_reused_pages: int | None = None
+    prefix_entries: int | None = None
+    prefix_bytes: int | None = None
+    prefix_pinned_pages: int | None = None
+    prefix_collisions_rejected: int | None = None
+    prefix_evictions: int | None = None
 
 
 def encode_bootstrap_message(
@@ -614,6 +624,16 @@ def decode_event(
             allocation_failures=metrics.get("allocation_failures"),
             page_size=metrics.get("page_size"),
             prefix_strategy=metrics.get("prefix_strategy"),
+            prefix_queries=metrics.get("prefix_queries"),
+            prefix_hits=metrics.get("prefix_hits"),
+            prefix_misses=metrics.get("prefix_misses"),
+            prefix_reused_tokens=metrics.get("prefix_reused_tokens"),
+            prefix_reused_pages=metrics.get("prefix_reused_pages"),
+            prefix_entries=metrics.get("prefix_entries"),
+            prefix_bytes=metrics.get("prefix_bytes"),
+            prefix_pinned_pages=metrics.get("prefix_pinned_pages"),
+            prefix_collisions_rejected=metrics.get("prefix_collisions_rejected"),
+            prefix_evictions=metrics.get("prefix_evictions"),
         )
     return None
 

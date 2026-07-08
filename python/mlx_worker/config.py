@@ -36,6 +36,7 @@ class WorkerConfig:
     text_cache_budget_bytes: int = 8 * 1024 * 1024
     text_cache_max_entries: int = 32
     native_kv_page_size: int = 16
+    native_prefix_cache_strategy: str = "block-hash"
     vlm_apc_cache_budget_bytes: int = 8 * 1024 * 1024
     vlm_apc_cache_max_entries: int = 32
     vision_feature_cache_budget_bytes: int = 8 * 1024 * 1024
@@ -101,6 +102,14 @@ def load_config() -> WorkerConfig:
     native_kv_page_size = int(os.environ.get("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "16"))
     if native_kv_page_size not in (8, 16, 32):
         raise ValueError("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE must be one of 8, 16, or 32")
+    native_prefix_cache_strategy = os.environ.get(
+        "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY",
+        "block-hash",
+    ).strip()
+    if native_prefix_cache_strategy not in {"block-hash", "radix"}:
+        raise ValueError(
+            "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY must be block-hash or radix"
+        )
     vlm_apc_cache_budget_bytes = _load_int_with_alias(
         "MLX_RUNTIME_VLM_APC_CACHE_BUDGET_BYTES",
         None,
@@ -143,6 +152,7 @@ def load_config() -> WorkerConfig:
         text_cache_budget_bytes=text_cache_budget_bytes,
         text_cache_max_entries=text_cache_max_entries,
         native_kv_page_size=native_kv_page_size,
+        native_prefix_cache_strategy=native_prefix_cache_strategy,
         vlm_apc_cache_budget_bytes=vlm_apc_cache_budget_bytes,
         vlm_apc_cache_max_entries=vlm_apc_cache_max_entries,
         vision_feature_cache_budget_bytes=vision_feature_cache_budget_bytes,

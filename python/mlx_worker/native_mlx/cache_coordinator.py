@@ -18,12 +18,21 @@ class PrefixCache(Protocol):
 
     def probe(self, token_ids: tuple[int, ...]) -> PrefixProbe: ...
 
+    def acquire(
+        self,
+        request_id: str,
+        token_ids: tuple[int, ...],
+        probe: PrefixProbe,
+    ) -> CacheAdmission | None: ...
+
     def publish(
         self,
         cache_handle: str,
         token_ids: tuple[int, ...],
         committed_length: int,
     ) -> CachePublication: ...
+
+    def release(self, cache_handle: str | None) -> None: ...
 
     def metrics(self) -> dict[str, Any]: ...
 
@@ -46,7 +55,9 @@ class NativeCacheCoordinator:
     ) -> CacheAdmission:
         active_probe = probe or self.probe(token_ids)
         if active_probe.matched_tokens:
-            raise ValueError("Phase 9 no-prefix adapter cannot return a cache hit")
+            admission = self.prefix_cache.acquire(request_id, token_ids, active_probe)
+            if admission is not None:
+                return admission
         handle = self.backend.create(request_id)
         return CacheAdmission(cache_handle=handle, cache_length=0)
 
@@ -66,6 +77,7 @@ class NativeCacheCoordinator:
         return self.backend.length(cache_handle)
 
     def release(self, cache_handle: str | None) -> None:
+        self.prefix_cache.release(cache_handle)
         self.backend.release(cache_handle)
 
     def metrics(self) -> dict[str, Any]:

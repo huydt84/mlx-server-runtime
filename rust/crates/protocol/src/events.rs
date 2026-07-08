@@ -309,7 +309,17 @@ mod tests {
                 active_kv_bytes: Some(1024),
                 allocation_failures: Some(0),
                 page_size: Some(16),
-                prefix_strategy: Some("none".to_string()),
+                prefix_strategy: Some("block-hash".to_string()),
+                prefix_queries: Some(3),
+                prefix_hits: Some(1),
+                prefix_misses: Some(2),
+                prefix_reused_tokens: Some(4),
+                prefix_reused_pages: Some(1),
+                prefix_entries: Some(2),
+                prefix_bytes: Some(1024),
+                prefix_pinned_pages: Some(1),
+                prefix_collisions_rejected: Some(0),
+                prefix_evictions: Some(1),
             },
         };
 

@@ -66,6 +66,14 @@ class KVCacheBackend(Protocol):
 
     def release(self, handle: str | None) -> None: ...
 
+    def fork(
+        self,
+        handle: str,
+        request_id: str,
+        *,
+        length: int | None = None,
+    ) -> str: ...
+
     def metrics(self) -> dict[str, Any]: ...
 
 
@@ -291,6 +299,29 @@ class DenseKVCacheBackend:
     def release(self, handle: str | None) -> None:
         if handle is not None:
             self._caches.pop(handle, None)
+
+    def fork(
+        self,
+        handle: str,
+        request_id: str,
+        *,
+        length: int | None = None,
+    ) -> str:
+        source = self.get(handle, self._caches[handle].request_id)
+        fork_length = source.size() if length is None else int(length)
+        if fork_length < 0 or fork_length > source.size():
+            raise ValueError("fork length is outside source cache")
+        new_handle = self.create(request_id)
+        target = self._caches[new_handle]
+        for source_layer, target_layer in zip(
+            source.layers, target.layers, strict=True
+        ):
+            if source_layer.keys is not None:
+                target_layer.keys = source_layer.keys[:, :, :fork_length, :]
+            if source_layer.values is not None:
+                target_layer.values = source_layer.values[:, :, :fork_length, :]
+            target_layer.offset = fork_length
+        return new_handle
 
     def metrics(self) -> dict[str, Any]:
         return {
