@@ -224,6 +224,15 @@ class SchedulerMetricsEvent:
     executor_sample_ms: int | None = None
     executor_eval_ms: int | None = None
     executor_commit_ms: int | None = None
+    model_graph_embedding_ms: int | None = None
+    model_graph_projection_total_ms: int | None = None
+    model_graph_attention_ms: int | None = None
+    model_graph_mlp_total_ms: int | None = None
+    model_graph_norm_ms: int | None = None
+    model_graph_lm_head_ms: int | None = None
+    model_graph_layer_total_ms: int | None = None
+    model_graph_worst_layer_ms: int | None = None
+    model_graph_worst_layer_index: int | None = None
     total_pages: int | None = None
     used_pages: int | None = None
     free_pages: int | None = None

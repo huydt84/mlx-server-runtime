@@ -91,6 +91,9 @@ class MlxGenerationExecutor:
             ),
         )
         try:
+            reset_graph_profile = getattr(self.model, "reset_graph_profile", None)
+            if callable(reset_graph_profile):
+                reset_graph_profile()
             forward_started = time.perf_counter()
             logits = self.model(layout.input_ids, layout.positions, forward_batch)
             forward_ms = _elapsed_ms(forward_started)
@@ -111,6 +114,7 @@ class MlxGenerationExecutor:
         except Exception as exc:
             reservation.abort()
             raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
+        graph_profile_metrics = _graph_profile_metrics(self.model)
         for source_index, request, cache_length, token_id in zip(
             layout.source_indices,
             layout.requests,
@@ -140,6 +144,7 @@ class MlxGenerationExecutor:
                 "executor_sample_ms": sample_ms,
                 "executor_eval_ms": eval_ms,
                 "executor_commit_ms": commit_ms,
+                **graph_profile_metrics,
             },
         )
 
@@ -313,3 +318,41 @@ def _require_result(result: StepRequestResult | None) -> StepRequestResult:
 
 def _elapsed_ms(started: float) -> int:
     return max(0, int((time.perf_counter() - started) * 1000))
+
+
+def _graph_profile_metrics(model: NativeModel) -> dict[str, int]:
+    read_metrics = getattr(model, "graph_profile_metrics", None)
+    if not callable(read_metrics):
+        return {}
+    metrics = read_metrics()
+    if not isinstance(metrics, dict):
+        return {}
+    normalized = {
+        str(name): int(value)
+        for name, value in metrics.items()
+        if str(name).startswith("model_graph_")
+    }
+    projection_total = normalized.get("model_graph_projection_ms", 0) + sum(
+        normalized.get(name, 0)
+        for name in (
+            "model_graph_q_proj_ms",
+            "model_graph_k_proj_ms",
+            "model_graph_v_proj_ms",
+            "model_graph_o_proj_ms",
+            "model_graph_lm_head_ms",
+        )
+    )
+    if projection_total:
+        normalized["model_graph_projection_total_ms"] = projection_total
+    mlp_total = normalized.get("model_graph_mlp_ms", 0) + sum(
+        normalized.get(name, 0)
+        for name in (
+            "model_graph_mlp_gate_ms",
+            "model_graph_mlp_up_ms",
+            "model_graph_mlp_activation_ms",
+            "model_graph_mlp_down_ms",
+        )
+    )
+    if mlp_total:
+        normalized["model_graph_mlp_total_ms"] = mlp_total
+    return normalized

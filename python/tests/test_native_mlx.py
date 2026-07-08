@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from mlx_worker.native_mlx.bootstrap import (
@@ -24,6 +25,7 @@ from mlx_worker.native_mlx.attention import (
 from mlx_worker.native_mlx.cache import DenseKVCacheBackend, PagedKVCacheBackend
 from mlx_worker.native_mlx.cache_coordinator import NativeCacheCoordinator
 from mlx_worker.native_mlx.executor import MlxGenerationExecutor
+from mlx_worker.native_mlx.graph_profile import GraphProfiledModel
 from mlx_worker.native_mlx.interfaces import (
     BatchExecutionError,
     ExecutionBatch,
@@ -136,6 +138,53 @@ class _RecordingModel:
         del weights, strict
 
 
+class _TinyGraphBlock(nn.Module):
+    """Synthetic transformer-like block used by graph profiling tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.self_attn = nn.Linear(4, 4)
+        self.mlp = nn.Linear(4, 4)
+        self.input_layernorm = nn.RMSNorm(4)
+        self.post_attention_layernorm = nn.RMSNorm(4)
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        attention = self.self_attn(self.input_layernorm(hidden))
+        return self.mlp(self.post_attention_layernorm(hidden + attention))
+
+
+class _TinyGraphModel(nn.Module):
+    """Minimal model tree with common transformer module names."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.num_layers = 2
+        self.embed_tokens = nn.Embedding(8, 4)
+        self.layers = [_TinyGraphBlock(), _TinyGraphBlock()]
+        self.norm = nn.RMSNorm(4)
+        self.lm_head = nn.Linear(4, 8)
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        positions: mx.array,
+        forward_batch: ForwardBatch,
+    ) -> mx.array:
+        del positions, forward_batch
+        hidden = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            hidden = layer(hidden)
+        return self.lm_head(self.norm(hidden))
+
+    def load_weights(
+        self,
+        weights: Any,
+        *,
+        strict: bool = True,
+    ) -> None:
+        del weights, strict
+
+
 @dataclass(frozen=True)
 class _ExecutorFixture:
     executor: MlxGenerationExecutor
@@ -233,6 +282,43 @@ def test_registry_composes_shared_model_and_cache_backend() -> None:
     assert geometry.head_dim == 4
     assert Qwen2ForCausalLM.__module__.endswith("models.qwen2")
     assert Qwen2WeightAdapter.__module__.endswith("models.qwen2")
+
+
+def test_graph_profile_wraps_model_tree_without_architecture_hooks() -> None:
+    model = _TinyGraphModel()
+    profiled = GraphProfiledModel(model)
+    profiled.reset_graph_profile()
+
+    logits = profiled(
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        mx.array([[0, 1, 2]], dtype=mx.int32),
+        ForwardBatch(
+            forward_mode=ForwardMode.PREFILL,
+            token_lengths=(3,),
+            cache_lengths=(0,),
+            attention_mask="causal",
+            layer_attention=(),
+        ),
+    )
+    mx.eval(logits)
+
+    metrics = profiled.graph_profile_metrics()
+    assert metrics["model_graph_embedding_ms"] >= 0
+    assert metrics["model_graph_attention_ms"] >= 0
+    assert metrics["model_graph_mlp_ms"] >= 0
+    assert metrics["model_graph_norm_ms"] >= 0
+    assert metrics["model_graph_lm_head_ms"] >= 0
+    assert metrics["model_graph_layer_total_ms"] >= (
+        metrics["model_graph_attention_ms"] + metrics["model_graph_mlp_ms"]
+    )
+    assert metrics["model_graph_worst_layer_index"] in {0, 1}
+    assert (
+        "reset_graph_profile"
+        not in Path(__file__)
+        .parents[1]
+        .joinpath("mlx_worker/native_mlx/models/qwen2.py")
+        .read_text()
+    )
 
 
 def test_detect_native_architecture_rejects_unsupported_class(tmp_path: Path) -> None:
@@ -843,14 +929,18 @@ class _FakeCacheCoordinator:
 def _scheduler(
     executor: _FakeExecutor,
     *,
+    prefill_batch_size: int = 4,
     prefill_step_size: int = 256,
+    prioritize_decode: bool = True,
 ) -> tuple[NativeContinuousScheduler, _FakeCacheCoordinator]:
     cache_coordinator = _FakeCacheCoordinator(executor.lengths)
     return (
         NativeContinuousScheduler(
             executor,
             cache_coordinator,  # type: ignore[arg-type]
+            prefill_batch_size=prefill_batch_size,
             prefill_step_size=prefill_step_size,
+            prioritize_decode=prioritize_decode,
         ),
         cache_coordinator,
     )
@@ -892,7 +982,11 @@ def test_scheduler_owns_chunking_and_emits_typed_token_events() -> None:
 
 def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None:
     executor = _FakeExecutor()
-    scheduler, _ = _scheduler(executor, prefill_step_size=8)
+    scheduler, _ = _scheduler(
+        executor,
+        prefill_step_size=8,
+        prioritize_decode=False,
+    )
     scheduler.submit(_schedulable("running", (1,)))
     scheduler.tick()
     scheduler.submit(_schedulable("waiting", (2,)))
@@ -903,6 +997,62 @@ def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None
     mixed = executor.batches[-1]
     assert mixed.forward_mode is ForwardMode.MIXED
     assert [request.phase for request in mixed.requests] == ["decode", "prefill"]
+
+
+def test_scheduler_prioritizes_active_decode_by_default() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _scheduler(executor, prefill_step_size=8)
+    scheduler.submit(_schedulable("running", (1,)))
+    scheduler.tick()
+    scheduler.submit(_schedulable("waiting", (2,)))
+
+    scheduler.tick()
+
+    assert len(executor.batches) == 2
+    decode = executor.batches[-1]
+    assert decode.forward_mode is ForwardMode.DECODE
+    assert [request.phase for request in decode.requests] == ["decode"]
+    assert [request.request_id for request in decode.requests] == ["running"]
+
+
+def test_scheduler_respects_prefill_batch_size() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _scheduler(
+        executor,
+        prefill_batch_size=4,
+        prefill_step_size=8,
+        prioritize_decode=False,
+    )
+    for index in range(5):
+        scheduler.submit(_schedulable(f"request-{index}", (index + 1,)))
+
+    scheduler.tick()
+
+    first = executor.batches[-1]
+    assert [request.request_id for request in first.requests] == [
+        "request-0",
+        "request-1",
+        "request-2",
+        "request-3",
+    ]
+
+    scheduler.tick()
+
+    second = executor.batches[-1]
+    assert [request.request_id for request in second.requests] == [
+        "request-0",
+        "request-1",
+        "request-2",
+        "request-3",
+        "request-4",
+    ]
+    assert [request.phase for request in second.requests] == [
+        "decode",
+        "decode",
+        "decode",
+        "decode",
+        "prefill",
+    ]
 
 
 def test_scheduler_prefix_hit_reduces_scheduled_prefill_tokens() -> None:

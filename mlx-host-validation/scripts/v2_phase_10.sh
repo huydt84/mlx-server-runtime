@@ -23,6 +23,9 @@
 #     non-streaming single requests, shared-prefix miss/exact/partial/mixed
 #     ratios, concurrent few-long/many-short, and concurrent few-short/many-long
 #     scenarios
+#   - native model graph profiling with `MLX_RUNTIME_NATIVE_GRAPH_PROFILE=1`
+#     for mixed concurrent workloads; graph-profile timings are diagnostic and
+#     separate from fair benchmark latency/throughput rows
 #
 # Host requirements:
 #   - Apple Silicon (`arm64`)
@@ -45,6 +48,7 @@
 #   - `phase10_eviction_ok=1`
 #   - `phase10_metrics_labels_ok=1`
 #   - `phase10_benchmark_report=<path>`
+#   - graph profile JSON under the host-validation temp directory
 #   - `v1_non_regression_ok=1`
 #   - `phase_10_validation_ok=1`
 #
@@ -75,6 +79,8 @@ CAPTURE="$TMP_ROOT/capture.json"
 METRICS_CAPTURE="$TMP_ROOT/metrics.txt"
 NATIVE_BENCHMARK="$TMP_ROOT/benchmark-native.json"
 V1_BENCHMARK="$TMP_ROOT/benchmark-v1.json"
+GRAPH_PROFILE_JSON="$TMP_ROOT/graph-profile-native.json"
+GRAPH_PROFILE_METRICS="$TMP_ROOT/graph-profile-metrics.txt"
 BENCHMARK_REPORT="${MLX_PHASE10_BENCHMARK_REPORT:-$ROOT/benchmarks/results/v2_phase_10_benchmark.md}"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 PHASE10_HELPER="$ROOT/mlx-host-validation/scripts/python/phase10_benchmark.py"
@@ -243,9 +249,26 @@ uv --directory "$PYTHON_DIR" run python "$PHASE10_HELPER" benchmark \
     --output "$V1_BENCHMARK"
 stop_gateway
 
+start_gateway \
+    "$NATIVE_LOG" \
+    "$NATIVE_PORT" \
+    "$NATIVE_CONFIG" \
+    MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY=block-hash \
+    MLX_RUNTIME_NATIVE_GRAPH_PROFILE=1 \
+    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_PHASE10_PREFILL_CHUNK_SIZE:-16}" \
+    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${MLX_PHASE10_TEXT_CACHE_MAX_ENTRIES:-64}" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_PHASE10_TEXT_CACHE_BUDGET_BYTES:-268435456}"
+uv --directory "$PYTHON_DIR" run python "$PHASE10_HELPER" graph-profile \
+    --request-dir "$REQUEST_DIR" \
+    --port "$NATIVE_PORT" \
+    --output "$GRAPH_PROFILE_JSON" \
+    --metrics-capture "$GRAPH_PROFILE_METRICS"
+stop_gateway
+
 uv --directory "$PYTHON_DIR" run python "$PHASE10_HELPER" report \
     --native-json "$NATIVE_BENCHMARK" \
     --v1-json "$V1_BENCHMARK" \
+    --graph-profile-json "$GRAPH_PROFILE_JSON" \
     --output "$BENCHMARK_REPORT"
 
 echo "phase_10_validation_ok=1"

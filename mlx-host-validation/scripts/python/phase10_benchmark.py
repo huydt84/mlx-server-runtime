@@ -30,6 +30,14 @@ class RequestResult:
     body: str
 
 
+@dataclass(frozen=True)
+class WorkloadResult:
+    """One workload iteration with wall-clock timing."""
+
+    requests: tuple[RequestResult, ...]
+    wall_ms: float
+
+
 def main() -> None:
     """Run one Phase 10 helper subcommand."""
 
@@ -62,9 +70,16 @@ def main() -> None:
     benchmark.add_argument("--output", required=True)
     benchmark.add_argument("--metrics-capture")
 
+    graph_profile = subcommands.add_parser("graph-profile")
+    graph_profile.add_argument("--request-dir", required=True)
+    graph_profile.add_argument("--port", type=int, required=True)
+    graph_profile.add_argument("--output", required=True)
+    graph_profile.add_argument("--metrics-capture", required=True)
+
     report = subcommands.add_parser("report")
     report.add_argument("--native-json", required=True)
     report.add_argument("--v1-json", required=True)
+    report.add_argument("--graph-profile-json")
     report.add_argument("--output", required=True)
 
     args = parser.parse_args()
@@ -76,6 +91,8 @@ def main() -> None:
         run_incompatible_miss(args)
     elif args.command == "benchmark":
         run_benchmark(args)
+    elif args.command == "graph-profile":
+        run_graph_profile(args)
     elif args.command == "report":
         write_report(args)
 
@@ -407,15 +424,16 @@ def run_benchmark(args: argparse.Namespace) -> None:
             )
         )
         observed: list[RequestResult] = []
+        workload_wall_ms: list[float] = []
         for _ in range(int(scenario["iterations"])):
-            observed.extend(
-                _run_workload(
-                    scenario["name"],
-                    [request_dir / filename for filename in scenario["files"]],
-                    args.port,
-                    concurrent=bool(scenario.get("concurrent", False)),
-                )
+            workload = _run_workload(
+                scenario["name"],
+                [request_dir / filename for filename in scenario["files"]],
+                args.port,
+                concurrent=bool(scenario.get("concurrent", False)),
             )
+            observed.extend(workload.requests)
+            workload_wall_ms.append(workload.wall_ms)
         metrics_text = _metrics(args.port, metrics_capture) if metrics_capture else ""
         results["scenarios"].append(
             _summarize(
@@ -426,7 +444,100 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 [metadata[filename] for filename in scenario["files"]]
                 * int(scenario["iterations"]),
                 scenario["mode"],
+                workload_wall_ms,
             )
+        )
+    pathlib.Path(args.output).write_text(json.dumps(results, indent=2))
+
+
+def run_graph_profile(args: argparse.Namespace) -> None:
+    """Run a graph-profiling workload and capture model-component metrics."""
+
+    request_dir = pathlib.Path(args.request_dir)
+    metrics_capture = pathlib.Path(args.metrics_capture)
+    workloads = {
+        "few_long_many_short": [
+            "bench_long_a.json",
+            "bench_long_b.json",
+            "bench_short.json",
+            "bench_short.json",
+            "bench_short.json",
+            "bench_short.json",
+        ],
+        "few_short_many_long": [
+            "bench_short.json",
+            "bench_short.json",
+            "bench_long_a.json",
+            "bench_long_b.json",
+            "bench_long_c.json",
+        ],
+    }
+    results: dict[str, Any] = {"backend": "native-mlx", "workloads": []}
+    for name, filenames in workloads.items():
+        print(f"graph_profile_workload={name} requests={len(filenames)}")
+        workload = _run_workload(
+            name,
+            [request_dir / filename for filename in filenames],
+            args.port,
+            concurrent=True,
+        )
+        if any(request.status != 200 for request in workload.requests):
+            raise SystemExit(f"graph profile workload {name} had non-200 response")
+        metrics_text = _metrics(args.port, metrics_capture)
+        results["workloads"].append(
+            {
+                "workload": name,
+                "samples": len(workload.requests),
+                "wall_ms": workload.wall_ms,
+                "model_graph_attention_ms": _metric_family_sum(
+                    metrics_text,
+                    "mlx_model_graph_latency_by_backend_ms",
+                    {'backend="native-mlx"', 'modality="text"', 'kind="attention"'},
+                ),
+                "model_graph_mlp_ms": _metric_family_sum(
+                    metrics_text,
+                    "mlx_model_graph_latency_by_backend_ms",
+                    {'backend="native-mlx"', 'modality="text"', 'kind="mlp"'},
+                ),
+                "model_graph_projection_ms": _metric_family_sum(
+                    metrics_text,
+                    "mlx_model_graph_latency_by_backend_ms",
+                    {
+                        'backend="native-mlx"',
+                        'modality="text"',
+                        'kind="projection"',
+                    },
+                ),
+                "model_graph_norm_ms": _metric_family_sum(
+                    metrics_text,
+                    "mlx_model_graph_latency_by_backend_ms",
+                    {'backend="native-mlx"', 'modality="text"', 'kind="norm"'},
+                ),
+                "model_graph_layer_total_ms": _metric_family_sum(
+                    metrics_text,
+                    "mlx_model_graph_latency_by_backend_ms",
+                    {
+                        'backend="native-mlx"',
+                        'modality="text"',
+                        'kind="layer_total"',
+                    },
+                ),
+                "model_graph_worst_layer_ms": _metric_family_max(
+                    metrics_text,
+                    "mlx_model_graph_worst_layer_by_backend_ms",
+                    {'backend="native-mlx"', 'modality="text"'},
+                ),
+                "model_graph_worst_layer_index": _metric_family_max(
+                    metrics_text,
+                    "mlx_model_graph_worst_layer_index_by_backend",
+                    {'backend="native-mlx"', 'modality="text"'},
+                ),
+                "executor_eval_ms": _metric_family_sum(
+                    metrics_text,
+                    "mlx_executor_stage_latency_by_backend_ms",
+                    {'backend="native-mlx"', 'modality="text"', 'kind="eval"'},
+                ),
+            }
         )
     pathlib.Path(args.output).write_text(json.dumps(results, indent=2))
 
@@ -436,6 +547,11 @@ def write_report(args: argparse.Namespace) -> None:
 
     native = json.loads(pathlib.Path(args.native_json).read_text())
     v1 = json.loads(pathlib.Path(args.v1_json).read_text())
+    graph_profile = (
+        json.loads(pathlib.Path(args.graph_profile_json).read_text())
+        if args.graph_profile_json
+        else None
+    )
     by_name = {item["scenario"]: item for item in v1["scenarios"]}
     lines = [
         "# Phase 10 Native v2 Benchmark",
@@ -443,14 +559,14 @@ def write_report(args: argparse.Namespace) -> None:
         "Compared public gateway requests for `native-mlx` block-hash APC and v1.",
         "All scenarios use the same checkpoint, prompt fixtures, request parameters, and public `/v1/chat/completions` surface.",
         "",
-        "| scenario | backend | mode | samples | ttft_mean_ms | latency_mean_ms | prompt_tokens_mean | completion_tokens_mean | reused_tokens | reused_pages | scheduled_prefill_tokens | scheduler_tick_ms | attention_ms | eval_ms | commit_ms | notes |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| scenario | backend | mode | samples | ttft_mean_ms | latency_mean_ms | prompt_tokens_mean | completion_tokens_mean | prompt_tps | completion_tps | total_tps | reused_tokens | reused_pages | scheduled_prefill_tokens | scheduler_tick_ms | attention_ms | eval_ms | commit_ms | notes |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for native_item in native["scenarios"]:
         v1_item = by_name[native_item["scenario"]]
         for item in (v1_item, native_item):
             lines.append(
-                "| {scenario} | {backend} | {mode} | {samples} | {ttft_mean_ms:.1f} | {latency_mean_ms:.1f} | {prompt_tokens_mean:.1f} | {completion_tokens_mean:.1f} | {reused_tokens:.0f} | {reused_pages:.0f} | {scheduled_prefill_tokens:.0f} | {scheduler_tick_ms:.0f} | {attention_ms:.0f} | {eval_ms:.0f} | {commit_ms:.0f} | {notes} |".format(
+                "| {scenario} | {backend} | {mode} | {samples} | {ttft_mean_ms:.1f} | {latency_mean_ms:.1f} | {prompt_tokens_mean:.1f} | {completion_tokens_mean:.1f} | {prompt_tokens_per_second:.1f} | {completion_tokens_per_second:.1f} | {total_tokens_per_second:.1f} | {reused_tokens:.0f} | {reused_pages:.0f} | {scheduled_prefill_tokens:.0f} | {scheduler_tick_ms:.0f} | {attention_ms:.0f} | {eval_ms:.0f} | {commit_ms:.0f} | {notes} |".format(
                     **item
                 )
             )
@@ -471,6 +587,46 @@ def write_report(args: argparse.Namespace) -> None:
                 delta=native_item["ttft_mean_ms"] - v1_item["ttft_mean_ms"],
             )
         )
+    lines.extend(
+        [
+            "",
+            "## Concurrent Request Detail",
+            "",
+            "| scenario | backend | request | ttft_ms | latency_ms |",
+            "| --- | --- | --- | ---: | ---: |",
+        ]
+    )
+    for native_item in native["scenarios"]:
+        if "concurrent" not in native_item["scenario"]:
+            continue
+        v1_item = by_name[native_item["scenario"]]
+        for item in (v1_item, native_item):
+            for timing in item.get("request_timings", []):
+                lines.append(
+                    "| {scenario} | {backend} | {name} | {ttft_ms:.1f} | {latency_ms:.1f} |".format(
+                        scenario=item["scenario"],
+                        backend=item["backend"],
+                        **timing,
+                    )
+                )
+    if graph_profile is not None:
+        lines.extend(
+            [
+                "",
+                "## Native Graph Profile",
+                "",
+                "Graph profiling is collected in a separate native run with `MLX_RUNTIME_NATIVE_GRAPH_PROFILE=1`; it forces component-level evaluation and is not part of the fair latency benchmark.",
+                "",
+                "| workload | samples | wall_ms | attention_ms | mlp_ms | projection_ms | norm_ms | layer_total_ms | worst_layer_ms | worst_layer_index | executor_eval_ms |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for item in graph_profile["workloads"]:
+            lines.append(
+                "| {workload} | {samples} | {wall_ms:.1f} | {model_graph_attention_ms:.0f} | {model_graph_mlp_ms:.0f} | {model_graph_projection_ms:.0f} | {model_graph_norm_ms:.0f} | {model_graph_layer_total_ms:.0f} | {model_graph_worst_layer_ms:.0f} | {model_graph_worst_layer_index:.0f} | {executor_eval_ms:.0f} |".format(
+                    **item
+                )
+            )
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines) + "\n")
@@ -562,12 +718,17 @@ def _run_workload(
     port: int,
     *,
     concurrent: bool,
-) -> list[RequestResult]:
+) -> WorkloadResult:
+    started = time.perf_counter()
     if len(paths) == 1 or not concurrent:
-        return [
+        requests = [
             _timed_post(f"{name}-{index}", path, port)
             for index, path in enumerate(paths)
         ]
+        return WorkloadResult(
+            requests=tuple(requests),
+            wall_ms=(time.perf_counter() - started) * 1000,
+        )
     output: list[RequestResult | None] = [None] * len(paths)
     threads = [
         threading.Thread(
@@ -583,7 +744,10 @@ def _run_workload(
         thread.start()
     for thread in threads:
         thread.join()
-    return [item for item in output if item is not None]
+    return WorkloadResult(
+        requests=tuple(item for item in output if item is not None),
+        wall_ms=(time.perf_counter() - started) * 1000,
+    )
 
 
 def _metrics(port: int, capture: pathlib.Path | None = None) -> str:
@@ -605,6 +769,27 @@ def _metric_value(text: str, needle: str) -> float:
     return 0.0
 
 
+def _metric_family_sum(text: str, family: str, labels: set[str]) -> float:
+    return sum(_metric_family_values(text, family, labels))
+
+
+def _metric_family_max(text: str, family: str, labels: set[str]) -> float:
+    values = _metric_family_values(text, family, labels)
+    return max(values) if values else 0.0
+
+
+def _metric_family_values(text: str, family: str, labels: set[str]) -> list[float]:
+    prefix = family + "{"
+    values: list[float] = []
+    for line in text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        head, _, raw_value = line.rpartition(" ")
+        if labels.issubset(set(head.removeprefix(prefix).removesuffix("}").split(","))):
+            values.append(float(raw_value))
+    return values
+
+
 def _summarize(
     backend: str,
     scenario: str,
@@ -612,11 +797,15 @@ def _summarize(
     metrics_text: str,
     metadata: list[dict[str, int]],
     mode: str,
+    workload_wall_ms: list[float],
 ) -> dict[str, Any]:
     good = [item for item in observed if item.status == 200]
     if len(good) != len(observed):
         raise SystemExit(f"{backend} {scenario} had non-200 response")
     bodies = [_parse_stream_body(item.body) for item in good]
+    prompt_token_total = sum(item["prompt_tokens"] for item in metadata)
+    completion_token_total = sum(item["max_tokens"] for item in metadata)
+    wall_seconds = max(0.001, sum(workload_wall_ms) / 1000.0)
     return {
         "backend": backend,
         "scenario": scenario,
@@ -634,6 +823,18 @@ def _summarize(
             [body["completion_tokens"] for body in bodies],
             int(statistics.mean(item["max_tokens"] for item in metadata)),
         ),
+        "prompt_tokens_per_second": prompt_token_total / wall_seconds,
+        "completion_tokens_per_second": completion_token_total / wall_seconds,
+        "total_tokens_per_second": (prompt_token_total + completion_token_total)
+        / wall_seconds,
+        "request_timings": [
+            {
+                "name": item.name,
+                "ttft_ms": item.ttft_ms,
+                "latency_ms": item.latency_ms,
+            }
+            for item in good
+        ],
         "reused_tokens": _metric_value(
             metrics_text,
             'mlx_prefix_cache_reused_tokens_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',

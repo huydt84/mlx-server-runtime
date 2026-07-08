@@ -587,6 +587,18 @@ impl MetricsRegistry {
                     "Latest native executor stage latency by forward mode.",
                 ),
                 (
+                    "mlx_model_graph_latency_by_backend_ms",
+                    "Latest native model graph latency by component.",
+                ),
+                (
+                    "mlx_model_graph_worst_layer_by_backend_ms",
+                    "Latest native model graph worst transformer layer latency.",
+                ),
+                (
+                    "mlx_model_graph_worst_layer_index_by_backend",
+                    "Latest native model graph worst transformer layer index.",
+                ),
+                (
                     "mlx_kv_cache_pages_by_backend",
                     "Latest native KV-cache page counts by state.",
                 ),

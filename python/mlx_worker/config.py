@@ -37,6 +37,7 @@ class WorkerConfig:
     text_cache_max_entries: int = 32
     native_kv_page_size: int = 16
     native_prefix_cache_strategy: str = "block-hash"
+    native_graph_profile: bool = False
     vlm_apc_cache_budget_bytes: int = 8 * 1024 * 1024
     vlm_apc_cache_max_entries: int = 32
     vision_feature_cache_budget_bytes: int = 8 * 1024 * 1024
@@ -110,6 +111,7 @@ def load_config() -> WorkerConfig:
         raise ValueError(
             "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY must be block-hash or radix"
         )
+    native_graph_profile = _load_bool("MLX_RUNTIME_NATIVE_GRAPH_PROFILE", "0")
     vlm_apc_cache_budget_bytes = _load_int_with_alias(
         "MLX_RUNTIME_VLM_APC_CACHE_BUDGET_BYTES",
         None,
@@ -153,6 +155,7 @@ def load_config() -> WorkerConfig:
         text_cache_max_entries=text_cache_max_entries,
         native_kv_page_size=native_kv_page_size,
         native_prefix_cache_strategy=native_prefix_cache_strategy,
+        native_graph_profile=native_graph_profile,
         vlm_apc_cache_budget_bytes=vlm_apc_cache_budget_bytes,
         vlm_apc_cache_max_entries=vlm_apc_cache_max_entries,
         vision_feature_cache_budget_bytes=vision_feature_cache_budget_bytes,

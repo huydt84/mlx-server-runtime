@@ -15,6 +15,7 @@ from .cache import PagedKVCacheBackend
 from .cache_coordinator import NativeCacheCoordinator
 from .diagnostics import ModelDiagnostics
 from .executor import MlxGenerationExecutor
+from .graph_profile import GraphProfiledModel
 from .interfaces import NativeBackendOptions
 from .mapping import (
     WeightArtifactValidationError,
@@ -71,6 +72,7 @@ def build_native_artifacts(
     cache_max_entries: int = 32,
     kv_page_size: int = 16,
     prefix_cache_strategy: str = "block-hash",
+    graph_profile: bool = False,
 ) -> BootstrapArtifacts:
     """Validate and construct the registered architecture and shared executor."""
 
@@ -121,6 +123,8 @@ def build_native_artifacts(
         stage_callback("weight_mapping", "loading_weights")
     try:
         native_model = architecture.spec.create_model(config, weights)
+        if graph_profile:
+            native_model = GraphProfiledModel(native_model)
         geometry = architecture.spec.cache_geometry(config)
         cache_backend = PagedKVCacheBackend(
             num_layers=geometry.num_layers,

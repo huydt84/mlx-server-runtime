@@ -208,6 +208,33 @@ class NativeRuntime:
                         executor_sample_ms=_optional_int(metrics, "executor_sample_ms"),
                         executor_eval_ms=_optional_int(metrics, "executor_eval_ms"),
                         executor_commit_ms=_optional_int(metrics, "executor_commit_ms"),
+                        model_graph_embedding_ms=_optional_int(
+                            metrics, "model_graph_embedding_ms"
+                        ),
+                        model_graph_projection_total_ms=_optional_int(
+                            metrics, "model_graph_projection_total_ms"
+                        ),
+                        model_graph_attention_ms=_optional_int(
+                            metrics, "model_graph_attention_ms"
+                        ),
+                        model_graph_mlp_total_ms=_optional_int(
+                            metrics, "model_graph_mlp_total_ms"
+                        ),
+                        model_graph_norm_ms=_optional_int(
+                            metrics, "model_graph_norm_ms"
+                        ),
+                        model_graph_lm_head_ms=_optional_int(
+                            metrics, "model_graph_lm_head_ms"
+                        ),
+                        model_graph_layer_total_ms=_optional_int(
+                            metrics, "model_graph_layer_total_ms"
+                        ),
+                        model_graph_worst_layer_ms=_optional_int(
+                            metrics, "model_graph_worst_layer_ms"
+                        ),
+                        model_graph_worst_layer_index=_optional_int(
+                            metrics, "model_graph_worst_layer_index"
+                        ),
                         total_pages=_optional_int(metrics, "total_pages"),
                         used_pages=_optional_int(metrics, "used_pages"),
                         free_pages=_optional_int(metrics, "free_pages"),

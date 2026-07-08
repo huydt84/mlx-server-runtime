@@ -678,6 +678,59 @@ impl WorkerClient {
                             );
                         }
                     }
+                    for (kind, value) in [
+                        ("embedding", scheduler.model_graph_embedding_ms),
+                        ("projection", scheduler.model_graph_projection_total_ms),
+                        ("attention", scheduler.model_graph_attention_ms),
+                        ("mlp", scheduler.model_graph_mlp_total_ms),
+                        ("norm", scheduler.model_graph_norm_ms),
+                        ("lm_head", scheduler.model_graph_lm_head_ms),
+                        ("layer_total", scheduler.model_graph_layer_total_ms),
+                    ] {
+                        if let Some(value) = value {
+                            metrics.set_labeled_gauge(
+                                "mlx_model_graph_latency_by_backend_ms",
+                                &[
+                                    ("backend", scheduler.backend.as_str()),
+                                    ("modality", scheduler.modality.as_str()),
+                                    (
+                                        "forward_mode",
+                                        scheduler.forward_mode.as_deref().unwrap_or("unknown"),
+                                    ),
+                                    ("kind", kind),
+                                ],
+                                value as u64,
+                            );
+                        }
+                    }
+                    if let Some(value) = scheduler.model_graph_worst_layer_ms {
+                        metrics.set_labeled_gauge(
+                            "mlx_model_graph_worst_layer_by_backend_ms",
+                            &[
+                                ("backend", scheduler.backend.as_str()),
+                                ("modality", scheduler.modality.as_str()),
+                                (
+                                    "forward_mode",
+                                    scheduler.forward_mode.as_deref().unwrap_or("unknown"),
+                                ),
+                            ],
+                            value as u64,
+                        );
+                    }
+                    if let Some(value) = scheduler.model_graph_worst_layer_index {
+                        metrics.set_labeled_gauge(
+                            "mlx_model_graph_worst_layer_index_by_backend",
+                            &[
+                                ("backend", scheduler.backend.as_str()),
+                                ("modality", scheduler.modality.as_str()),
+                                (
+                                    "forward_mode",
+                                    scheduler.forward_mode.as_deref().unwrap_or("unknown"),
+                                ),
+                            ],
+                            value as u64,
+                        );
+                    }
                     if let Some(value) = scheduler.total_pages {
                         metrics.set_labeled_gauge(
                             "mlx_kv_cache_pages_by_backend",
@@ -1162,6 +1215,15 @@ mod tests {
                     executor_sample_ms: Some(8),
                     executor_eval_ms: Some(9),
                     executor_commit_ms: Some(10),
+                    model_graph_embedding_ms: Some(11),
+                    model_graph_projection_total_ms: Some(12),
+                    model_graph_attention_ms: Some(13),
+                    model_graph_mlp_total_ms: Some(14),
+                    model_graph_norm_ms: Some(15),
+                    model_graph_lm_head_ms: Some(16),
+                    model_graph_layer_total_ms: Some(17),
+                    model_graph_worst_layer_ms: Some(18),
+                    model_graph_worst_layer_index: Some(1),
                     total_pages: Some(16),
                     used_pages: Some(2),
                     free_pages: Some(14),
@@ -1258,6 +1320,10 @@ mod tests {
         assert!(rendered.contains("mlx_attention_time_by_backend_ms{backend=\"native-metal-paged-sdpa\",mode=\"mixed\",modality=\"text\"} 4"));
         assert!(rendered.contains("mlx_executor_stage_latency_by_backend_ms{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\",kind=\"eval\"} 9"));
         assert!(rendered.contains("mlx_executor_stage_latency_by_backend_ms{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\",kind=\"commit\"} 10"));
+        assert!(rendered.contains("mlx_model_graph_latency_by_backend_ms{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\",kind=\"attention\"} 13"));
+        assert!(rendered.contains("mlx_model_graph_latency_by_backend_ms{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\",kind=\"mlp\"} 14"));
+        assert!(rendered.contains("mlx_model_graph_worst_layer_by_backend_ms{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\"} 18"));
+        assert!(rendered.contains("mlx_model_graph_worst_layer_index_by_backend{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\"} 1"));
         assert!(rendered.contains("mlx_prefix_cache_hits_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 1"));
         assert!(rendered.contains("mlx_prefix_cache_reused_tokens_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 4"));
         assert!(rendered.contains("mlx_prefix_cache_collisions_rejected_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 0"));

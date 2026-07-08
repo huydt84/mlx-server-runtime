@@ -44,13 +44,19 @@ class NativeContinuousScheduler:
         executor: NativeMlxExecutor,
         cache_coordinator: CacheCoordinator,
         *,
+        prefill_batch_size: int = 4,
         prefill_step_size: int = 256,
+        prioritize_decode: bool = True,
     ) -> None:
+        if prefill_batch_size <= 0:
+            raise ValueError("native-mlx prefill batch size must be positive")
         if prefill_step_size <= 0:
             raise ValueError("native-mlx prefill chunk size must be positive")
         self._executor = executor
         self._cache_coordinator = cache_coordinator
+        self._prefill_batch_size = int(prefill_batch_size)
         self._prefill_step_size = int(prefill_step_size)
+        self._prioritize_decode = bool(prioritize_decode)
         self._waiting: OrderedDict[str, _ScheduledState] = OrderedDict()
         self._running: OrderedDict[str, _ScheduledState] = OrderedDict()
         self._pending_events: list[SchedulerEvent] = []
@@ -116,7 +122,9 @@ class NativeContinuousScheduler:
         prefill_states.extend(
             state for state in self._waiting.values() if not state.cancel_requested
         )
-        for state in prefill_states:
+        if selected and self._prioritize_decode:
+            return selected
+        for state in prefill_states[: self._prefill_batch_size]:
             request_id = state.work.request_id
             if state.cache_handle is None:
                 self._waiting.pop(request_id, None)

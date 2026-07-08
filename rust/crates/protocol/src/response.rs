@@ -198,6 +198,33 @@ pub struct SchedulerMetricsEvent {
     /// Executor KV commit latency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_commit_ms: Option<u32>,
+    /// Model embedding graph latency when graph profiling is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_embedding_ms: Option<u32>,
+    /// Model projection graph latency when graph profiling is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_projection_total_ms: Option<u32>,
+    /// Model attention graph latency when graph profiling is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_attention_ms: Option<u32>,
+    /// Model MLP graph latency when graph profiling is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_mlp_total_ms: Option<u32>,
+    /// Model normalization graph latency when graph profiling is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_norm_ms: Option<u32>,
+    /// Model LM-head graph latency when graph profiling is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_lm_head_ms: Option<u32>,
+    /// Sum of per-layer profiled graph latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_layer_total_ms: Option<u32>,
+    /// Slowest profiled transformer layer latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_worst_layer_ms: Option<u32>,
+    /// Index of the slowest profiled transformer layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_graph_worst_layer_index: Option<u32>,
     /// Total physical KV pages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_pages: Option<u32>,

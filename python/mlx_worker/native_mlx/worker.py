@@ -157,11 +157,17 @@ def create_native_worker(
         cache_max_entries=config.text_cache_max_entries,
         kv_page_size=config.native_kv_page_size,
         prefix_cache_strategy=config.native_prefix_cache_strategy,
+        graph_profile=config.native_graph_profile,
     )
     artifacts.executor.load(artifacts.options)
     scheduler = NativeContinuousScheduler(
         artifacts.executor,
         artifacts.cache_coordinator,
+        prefill_batch_size=getattr(
+            config,
+            "text_prompt_concurrency",
+            getattr(config, "prompt_concurrency", 4),
+        ),
         prefill_step_size=getattr(
             config,
             "text_prefill_chunk_size",
