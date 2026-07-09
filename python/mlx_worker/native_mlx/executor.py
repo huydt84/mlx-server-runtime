@@ -170,7 +170,7 @@ class MlxGenerationExecutor:
         ordered_results: list[StepRequestResult | None] = [None] * len(batch.requests)
 
         for index, request in enumerate(batch.requests):
-            error = self._preflight_error(request)
+            cache, error = self._preflight_cache(request)
             if error is not None:
                 ordered_results[index] = self._request_error(
                     request,
@@ -178,10 +178,7 @@ class MlxGenerationExecutor:
                     error,
                 )
                 continue
-            cache = self.cache_backend.get(
-                request.cache_handle,
-                request.request_id,
-            )
+            assert cache is not None
             valid_requests.append(request)
             source_indices.append(index)
             caches.append(cache)
@@ -257,28 +254,31 @@ class MlxGenerationExecutor:
             ordered_results,
         )
 
-    def _preflight_error(self, request: ExecutionRequest) -> str | None:
+    def _preflight_cache(
+        self,
+        request: ExecutionRequest,
+    ) -> tuple[RequestCache | None, str | None]:
         token_count = len(request.token_ids)
         if request.phase == "decode" and token_count != 1:
-            return "decode requires exactly one token"
+            return None, "decode requires exactly one token"
         if request.phase == "prefill" and token_count == 0:
-            return "prefill requires at least one token"
+            return None, "prefill requires at least one token"
         if request.phase not in ("prefill", "decode"):
-            return "unsupported execution phase"
+            return None, "unsupported execution phase"
         try:
             cache = self.cache_backend.get(
                 request.cache_handle,
                 request.request_id,
             )
         except ValueError as exc:
-            return str(exc)
+            return None, str(exc)
         cache_length = cache.size()
         if request.phase == "decode" and cache_length == 0:
-            return "decode requires existing prefill state"
+            return None, "decode requires existing prefill state"
         expected_positions = tuple(range(cache_length, cache_length + token_count))
         if request.positions != expected_positions:
-            return "positions do not match cache length"
-        return None
+            return None, "positions do not match cache length"
+        return cache, None
 
     def _request_error(
         self,

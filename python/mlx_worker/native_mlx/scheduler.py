@@ -84,9 +84,17 @@ class NativeContinuousScheduler:
         events = self._pending_events
         self._pending_events = []
         self._reap_cancelled(events)
-        selected = self._select_work()
+        select_started = time.perf_counter()
+        timings: dict[str, int] = {
+            "scheduler_cache_probe_ms": 0,
+            "scheduler_cache_acquire_ms": 0,
+            "scheduler_cache_publish_ms": 0,
+            "scheduler_apply_ms": 0,
+        }
+        selected = self._select_work(timings)
+        timings["scheduler_select_ms"] = _elapsed_ms(select_started)
         if selected:
-            self._run_step(selected, events)
+            self._run_step(selected, events, timings)
             self._reap_cancelled(events)
         return tuple(events)
 
@@ -97,7 +105,7 @@ class NativeContinuousScheduler:
         for request_id in tuple(self._waiting) + tuple(self._running):
             self.finish(request_id)
 
-    def _select_work(self) -> list[_SelectedWork]:
+    def _select_work(self, timings: dict[str, int]) -> list[_SelectedWork]:
         selected = [
             _SelectedWork(
                 state=state,
@@ -128,12 +136,16 @@ class NativeContinuousScheduler:
             request_id = state.work.request_id
             if state.cache_handle is None:
                 self._waiting.pop(request_id, None)
+                probe_started = time.perf_counter()
                 probe = self._cache_coordinator.probe(state.work.prompt_token_ids)
+                timings["scheduler_cache_probe_ms"] += _elapsed_ms(probe_started)
+                acquire_started = time.perf_counter()
                 admission = self._cache_coordinator.acquire(
                     request_id,
                     state.work.prompt_token_ids,
                     probe,
                 )
+                timings["scheduler_cache_acquire_ms"] += _elapsed_ms(acquire_started)
                 state.cache_handle = admission.cache_handle
                 state.cache_length = admission.cache_length
                 state.prompt_cursor = admission.reused_tokens
@@ -161,6 +173,7 @@ class NativeContinuousScheduler:
         self,
         selected: list[_SelectedWork],
         events: list[SchedulerEvent],
+        timings: dict[str, int],
     ) -> None:
         started = time.perf_counter()
         try:
@@ -177,6 +190,7 @@ class NativeContinuousScheduler:
             return
 
         results = {item.request_id: item for item in result.results}
+        apply_started = time.perf_counter()
         for selected_work in selected:
             state = selected_work.state
             request = selected_work.request
@@ -206,9 +220,17 @@ class NativeContinuousScheduler:
                 )
                 continue
             if request.phase == "prefill":
-                self._apply_prefill_result(state, request, item, result, events)
+                self._apply_prefill_result(
+                    state,
+                    request,
+                    item,
+                    result,
+                    events,
+                    timings,
+                )
             else:
                 self._apply_decode_result(state, item, result, events)
+        timings["scheduler_apply_ms"] += _elapsed_ms(apply_started)
 
         for phase in ("decode", "prefill"):
             phase_work = [item for item in selected if item.request.phase == phase]
@@ -224,6 +246,7 @@ class NativeContinuousScheduler:
                         "physical_batch_size": result.physical_batch_size,
                         "model_forward_count": result.model_forward_count,
                         **self._cache_coordinator.metrics(),
+                        **timings,
                         **result.metrics,
                     },
                 )
@@ -235,14 +258,17 @@ class NativeContinuousScheduler:
         item: StepRequestResult,
         result: StepResult,
         events: list[SchedulerEvent],
+        timings: dict[str, int],
     ) -> None:
         state.prompt_cursor += len(request.token_ids)
         state.cache_length = item.cache_length
+        publish_started = time.perf_counter()
         self._cache_coordinator.publish_committed(
             item.cache_handle or "",
             state.work.prompt_token_ids,
             item.cache_length,
         )
+        timings["scheduler_cache_publish_ms"] += _elapsed_ms(publish_started)
         events.append(
             SchedulerEvent(
                 kind="prefill_progress",
@@ -369,3 +395,7 @@ class NativeContinuousScheduler:
                 },
             )
         )
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.perf_counter() - started) * 1000))

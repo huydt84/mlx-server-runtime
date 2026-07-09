@@ -356,6 +356,11 @@ class RadixPrefixCache:
     _reused_pages: int = field(default=0, init=False)
     _splits: int = field(default=0, init=False)
     _evictions: int = field(default=0, init=False)
+    _metrics_cache: dict[str, int | str] = field(default_factory=dict, init=False)
+    _metrics_dirty: bool = field(default=True, init=False)
+    _published_lengths_by_handle: dict[str, int] = field(
+        default_factory=dict, init=False
+    )
 
     def __post_init__(self) -> None:
         if self.page_size <= 0:
@@ -370,8 +375,10 @@ class RadixPrefixCache:
         match = self._lookup(token_ids, mutate=False)
         if match is None:
             self._misses += 1
+            self._metrics_dirty = True
             return PrefixProbe()
         self._hits += 1
+        self._metrics_dirty = True
         return PrefixProbe(
             matched_tokens=match.cached_length,
             matched_pages=match.pages,
@@ -396,8 +403,10 @@ class RadixPrefixCache:
             length=node.cached_length,
         )
         self._active_handles[child] = node
+        self._published_lengths_by_handle[child] = node.cached_length
         self._reused_tokens += node.cached_length
         self._reused_pages += node.pages
+        self._metrics_dirty = True
         return CacheAdmission(
             cache_handle=child,
             cache_length=node.cached_length,
@@ -416,8 +425,17 @@ class RadixPrefixCache:
         )
         if publish_length <= 0:
             return CachePublication()
+        previous_publish_length = self._published_lengths_by_handle.get(
+            cache_handle,
+            0,
+        )
+        if publish_length <= previous_publish_length:
+            return CachePublication()
         published = 0
-        for length in range(self.page_size, publish_length + 1, self.page_size):
+        start_length = (
+            (previous_publish_length // self.page_size) + 1
+        ) * self.page_size
+        for length in range(start_length, publish_length + 1, self.page_size):
             if length // self.page_size > self._publishable_chain_pages():
                 break
             node = self._insert_prefix(token_ids[:length])
@@ -433,6 +451,9 @@ class RadixPrefixCache:
             node.last_used = self._tick()
             published = length
         self._evict_until_within_limits()
+        if published:
+            self._published_lengths_by_handle[cache_handle] = published
+        self._metrics_dirty = True
         return CachePublication(
             published_tokens=published,
             published_pages=published // self.page_size,
@@ -441,17 +462,21 @@ class RadixPrefixCache:
     def release(self, cache_handle: str | None) -> None:
         if cache_handle is None:
             return
+        self._published_lengths_by_handle.pop(cache_handle, None)
         node = self._active_handles.pop(cache_handle, None)
         if node is None:
             return
         node.pins = max(0, node.pins - 1)
         self._evict_until_within_limits()
+        self._metrics_dirty = True
 
     def metrics(self) -> dict[str, int | str]:
+        if not self._metrics_dirty:
+            return dict(self._metrics_cache)
         nodes = tuple(self._walk_nodes())
         entries = [node for node in nodes if node.cache_handle is not None]
         leaves = [node for node in entries if not node.children]
-        return {
+        self._metrics_cache = {
             "prefix_strategy": "radix",
             "prefix_queries": self._queries,
             "prefix_hits": self._hits,
@@ -476,6 +501,8 @@ class RadixPrefixCache:
             ),
             "radix_leaf_evictions": self._evictions,
         }
+        self._metrics_dirty = False
+        return dict(self._metrics_cache)
 
     def _lookup(self, token_ids: tuple[int, ...], *, mutate: bool) -> _RadixNode | None:
         max_reusable = ((max(0, len(token_ids) - 1)) // self.page_size) * self.page_size
@@ -488,8 +515,11 @@ class RadixPrefixCache:
             child = node.children.get(token_ids[offset])
             if child is None:
                 break
-            common = _common_prefix_len(
-                child.edge_tokens, token_ids[offset:max_reusable]
+            common = _common_prefix_len_at(
+                child.edge_tokens,
+                token_ids,
+                offset,
+                max_reusable,
             )
             if common < len(child.edge_tokens):
                 break
@@ -561,6 +591,7 @@ class RadixPrefixCache:
             victim.pages = 0
             victim.bytes = 0
             self._evictions += 1
+            self._metrics_dirty = True
             self._prune_empty_ancestors(victim)
 
     def _prune_empty_ancestors(self, node: _RadixNode) -> None:
@@ -618,5 +649,18 @@ def _common_prefix_len(left: tuple[int, ...], right: tuple[int, ...]) -> int:
     for left_item, right_item in zip(left, right, strict=False):
         if left_item != right_item:
             break
+        count += 1
+    return count
+
+
+def _common_prefix_len_at(
+    left: tuple[int, ...],
+    right: tuple[int, ...],
+    offset: int,
+    limit: int,
+) -> int:
+    count = 0
+    max_count = min(len(left), max(0, limit - offset))
+    while count < max_count and left[count] == right[offset + count]:
         count += 1
     return count

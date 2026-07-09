@@ -852,6 +852,31 @@ def _summarize(
             metrics_text,
             'mlx_scheduler_tick_latency_by_backend_ms{backend="native-mlx",modality="text"}',
         ),
+        "scheduler_select_ms": _scheduler_stage_metric(
+            metrics_text,
+            mode,
+            "select",
+        ),
+        "scheduler_cache_probe_ms": _scheduler_stage_metric(
+            metrics_text,
+            mode,
+            "cache_probe",
+        ),
+        "scheduler_cache_acquire_ms": _scheduler_stage_metric(
+            metrics_text,
+            mode,
+            "cache_acquire",
+        ),
+        "scheduler_cache_publish_ms": _scheduler_stage_metric(
+            metrics_text,
+            mode,
+            "cache_publish",
+        ),
+        "scheduler_apply_ms": _scheduler_stage_metric(
+            metrics_text,
+            mode,
+            "apply",
+        ),
         "attention_ms": _metric_value(
             metrics_text,
             'mlx_attention_time_by_backend_ms{backend="native-metal-paged-sdpa",mode="prefill",modality="text"}',
@@ -899,6 +924,15 @@ def _radix_metric(metrics_text: str, strategy: str, kind: str) -> float:
     return _metric_value(
         metrics_text,
         f'mlx_radix_cache_by_backend{{backend="native-mlx",modality="text",strategy="radix",kind="{kind}"}}',
+    )
+
+
+def _scheduler_stage_metric(metrics_text: str, mode: str, kind: str) -> float:
+    del mode
+    return _metric_family_max(
+        metrics_text,
+        "mlx_scheduler_stage_latency_by_backend_ms",
+        {'backend="native-mlx"', 'modality="text"', f'kind="{kind}"'},
     )
 
 

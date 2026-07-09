@@ -159,6 +159,21 @@ pub struct SchedulerMetricsEvent {
     pub running_requests: u32,
     /// End-to-end tick latency in milliseconds.
     pub scheduler_tick_latency_ms: u32,
+    /// Scheduler work selection latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_select_ms: Option<u32>,
+    /// Scheduler prefix-cache probe latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_cache_probe_ms: Option<u32>,
+    /// Scheduler cache acquisition latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_cache_acquire_ms: Option<u32>,
+    /// Scheduler committed-prefix publication latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_cache_publish_ms: Option<u32>,
+    /// Scheduler result application latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_apply_ms: Option<u32>,
     /// Physical model-forward mode selected by the executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_mode: Option<String>,

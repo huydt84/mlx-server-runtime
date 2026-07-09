@@ -211,6 +211,11 @@ class SchedulerMetricsEvent:
     waiting_requests: int
     running_requests: int
     scheduler_tick_latency_ms: int
+    scheduler_select_ms: int | None = None
+    scheduler_cache_probe_ms: int | None = None
+    scheduler_cache_acquire_ms: int | None = None
+    scheduler_cache_publish_ms: int | None = None
+    scheduler_apply_ms: int | None = None
     forward_mode: str | None = None
     physical_batch_size: int | None = None
     model_forward_count: int | None = None
@@ -630,6 +635,11 @@ def decode_event(
             waiting_requests=metrics["waiting_requests"],
             running_requests=metrics["running_requests"],
             scheduler_tick_latency_ms=metrics["scheduler_tick_latency_ms"],
+            scheduler_select_ms=metrics.get("scheduler_select_ms"),
+            scheduler_cache_probe_ms=metrics.get("scheduler_cache_probe_ms"),
+            scheduler_cache_acquire_ms=metrics.get("scheduler_cache_acquire_ms"),
+            scheduler_cache_publish_ms=metrics.get("scheduler_cache_publish_ms"),
+            scheduler_apply_ms=metrics.get("scheduler_apply_ms"),
             forward_mode=metrics.get("forward_mode"),
             physical_batch_size=metrics.get("physical_batch_size"),
             model_forward_count=metrics.get("model_forward_count"),
@@ -637,6 +647,23 @@ def decode_event(
             attention_backend=metrics.get("attention_backend"),
             attention_mode=metrics.get("attention_mode"),
             attention_time_ms=metrics.get("attention_time_ms"),
+            executor_prepare_ms=metrics.get("executor_prepare_ms"),
+            executor_reserve_ms=metrics.get("executor_reserve_ms"),
+            executor_forward_ms=metrics.get("executor_forward_ms"),
+            executor_sample_ms=metrics.get("executor_sample_ms"),
+            executor_eval_ms=metrics.get("executor_eval_ms"),
+            executor_commit_ms=metrics.get("executor_commit_ms"),
+            model_graph_embedding_ms=metrics.get("model_graph_embedding_ms"),
+            model_graph_projection_total_ms=metrics.get(
+                "model_graph_projection_total_ms"
+            ),
+            model_graph_attention_ms=metrics.get("model_graph_attention_ms"),
+            model_graph_mlp_total_ms=metrics.get("model_graph_mlp_total_ms"),
+            model_graph_norm_ms=metrics.get("model_graph_norm_ms"),
+            model_graph_lm_head_ms=metrics.get("model_graph_lm_head_ms"),
+            model_graph_layer_total_ms=metrics.get("model_graph_layer_total_ms"),
+            model_graph_worst_layer_ms=metrics.get("model_graph_worst_layer_ms"),
+            model_graph_worst_layer_index=metrics.get("model_graph_worst_layer_index"),
             total_pages=metrics.get("total_pages"),
             used_pages=metrics.get("used_pages"),
             free_pages=metrics.get("free_pages"),

@@ -626,6 +626,30 @@ impl WorkerClient {
                         ],
                         scheduler.scheduler_tick_latency_ms as u64,
                     );
+                    for (kind, value) in [
+                        ("select", scheduler.scheduler_select_ms),
+                        ("cache_probe", scheduler.scheduler_cache_probe_ms),
+                        ("cache_acquire", scheduler.scheduler_cache_acquire_ms),
+                        ("cache_publish", scheduler.scheduler_cache_publish_ms),
+                        ("apply", scheduler.scheduler_apply_ms),
+                    ] {
+                        if let Some(value) = value {
+                            metrics.set_labeled_gauge(
+                                "mlx_scheduler_stage_latency_by_backend_ms",
+                                &[
+                                    ("backend", scheduler.backend.as_str()),
+                                    ("modality", scheduler.modality.as_str()),
+                                    ("phase", scheduler.phase.as_str()),
+                                    (
+                                        "forward_mode",
+                                        scheduler.forward_mode.as_deref().unwrap_or("unknown"),
+                                    ),
+                                    ("kind", kind),
+                                ],
+                                value as u64,
+                            );
+                        }
+                    }
                     if let Some(value) = scheduler.physical_batch_size {
                         metrics.set_labeled_gauge(
                             "mlx_executor_physical_batch_size_by_backend",
@@ -1227,6 +1251,11 @@ mod tests {
                     waiting_requests: 1,
                     running_requests: 2,
                     scheduler_tick_latency_ms: 3,
+                    scheduler_select_ms: Some(4),
+                    scheduler_cache_probe_ms: Some(5),
+                    scheduler_cache_acquire_ms: Some(6),
+                    scheduler_cache_publish_ms: Some(7),
+                    scheduler_apply_ms: Some(8),
                     forward_mode: Some("mixed".to_string()),
                     physical_batch_size: Some(2),
                     model_forward_count: Some(1),
@@ -1339,6 +1368,7 @@ mod tests {
         let rendered = metrics.render_prometheus(0);
         assert!(rendered.contains("mlx_scheduler_requests_by_backend{backend=\"native-mlx\",modality=\"text\",state=\"running\"} 2"));
         assert!(rendered.contains("mlx_scheduled_tokens_by_backend{backend=\"native-mlx\",modality=\"text\",phase=\"decode\"} 2"));
+        assert!(rendered.contains("mlx_scheduler_stage_latency_by_backend_ms{backend=\"native-mlx\",modality=\"text\",phase=\"decode\",forward_mode=\"mixed\",kind=\"cache_publish\"} 7"));
         assert!(rendered.contains("mlx_executor_physical_batch_size_by_backend{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\"} 2"));
         assert!(rendered.contains("mlx_executor_model_forward_count_by_backend{backend=\"native-mlx\",modality=\"text\",forward_mode=\"mixed\"} 1"));
         assert!(rendered.contains("mlx_kv_cache_pages_by_backend{backend=\"paged-mlx\",modality=\"text\",state=\"used\"} 2"));

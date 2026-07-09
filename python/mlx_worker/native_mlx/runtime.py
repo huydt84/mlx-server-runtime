@@ -185,6 +185,19 @@ class NativeRuntime:
                         scheduler_tick_latency_ms=int(
                             metrics.get("scheduler_tick_latency_ms", 0)
                         ),
+                        scheduler_select_ms=_optional_int(
+                            metrics, "scheduler_select_ms"
+                        ),
+                        scheduler_cache_probe_ms=_optional_int(
+                            metrics, "scheduler_cache_probe_ms"
+                        ),
+                        scheduler_cache_acquire_ms=_optional_int(
+                            metrics, "scheduler_cache_acquire_ms"
+                        ),
+                        scheduler_cache_publish_ms=_optional_int(
+                            metrics, "scheduler_cache_publish_ms"
+                        ),
+                        scheduler_apply_ms=_optional_int(metrics, "scheduler_apply_ms"),
                         forward_mode=_optional_str(metrics, "forward_mode"),
                         physical_batch_size=_optional_int(
                             metrics, "physical_batch_size"

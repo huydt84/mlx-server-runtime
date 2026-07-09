@@ -193,15 +193,15 @@ def write_report(args: argparse.Namespace) -> None:
         "Compared public gateway requests for default `radix`, explicit `block-hash`, and v1.",
         "All scenarios use the same checkpoint, prompt fixtures, request parameters, and public `/v1/chat/completions` surface.",
         "",
-        "| scenario | backend | mode | samples | ttft_mean_ms | latency_mean_ms | prompt_tokens_mean | completion_tokens_mean | prompt_tps | completion_tps | total_tps | reused_tokens | reused_pages | scheduled_prefill_tokens | scheduler_tick_ms | prefix_queries | prefix_hits | prefix_misses | radix_nodes | radix_splits | radix_shared_pages | radix_tree_depth | radix_leaf_evictions | notes |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| scenario | backend | mode | samples | ttft_mean_ms | latency_mean_ms | prompt_tokens_mean | completion_tokens_mean | prompt_tps | completion_tps | total_tps | reused_tokens | reused_pages | scheduled_prefill_tokens | scheduler_tick_ms | scheduler_select_ms | cache_probe_ms | cache_acquire_ms | cache_publish_ms | scheduler_apply_ms | prefix_queries | prefix_hits | prefix_misses | radix_nodes | radix_splits | radix_shared_pages | radix_tree_depth | radix_leaf_evictions | notes |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for scenario in by_backend["radix"]:
         for backend in ("v1", "block-hash", "radix"):
             item = _with_metric_defaults(by_backend[backend][scenario])
             item["notes"] = _report_note(backend)
             lines.append(
-                "| {scenario} | {backend} | {mode} | {samples} | {ttft_mean_ms:.1f} | {latency_mean_ms:.1f} | {prompt_tokens_mean:.1f} | {completion_tokens_mean:.1f} | {prompt_tokens_per_second:.1f} | {completion_tokens_per_second:.1f} | {total_tokens_per_second:.1f} | {reused_tokens:.0f} | {reused_pages:.0f} | {scheduled_prefill_tokens:.0f} | {scheduler_tick_ms:.0f} | {prefix_queries:.0f} | {prefix_hits:.0f} | {prefix_misses:.0f} | {radix_nodes:.0f} | {radix_splits:.0f} | {radix_shared_pages:.0f} | {radix_tree_depth:.0f} | {radix_leaf_evictions:.0f} | {notes} |".format(
+                "| {scenario} | {backend} | {mode} | {samples} | {ttft_mean_ms:.1f} | {latency_mean_ms:.1f} | {prompt_tokens_mean:.1f} | {completion_tokens_mean:.1f} | {prompt_tokens_per_second:.1f} | {completion_tokens_per_second:.1f} | {total_tokens_per_second:.1f} | {reused_tokens:.0f} | {reused_pages:.0f} | {scheduled_prefill_tokens:.0f} | {scheduler_tick_ms:.0f} | {scheduler_select_ms:.0f} | {scheduler_cache_probe_ms:.0f} | {scheduler_cache_acquire_ms:.0f} | {scheduler_cache_publish_ms:.0f} | {scheduler_apply_ms:.0f} | {prefix_queries:.0f} | {prefix_hits:.0f} | {prefix_misses:.0f} | {radix_nodes:.0f} | {radix_splits:.0f} | {radix_shared_pages:.0f} | {radix_tree_depth:.0f} | {radix_leaf_evictions:.0f} | {notes} |".format(
                     **item,
                 )
             )
@@ -283,6 +283,11 @@ def _with_metric_defaults(item: dict[str, Any]) -> dict[str, Any]:
         "radix_shared_pages",
         "radix_tree_depth",
         "radix_leaf_evictions",
+        "scheduler_select_ms",
+        "scheduler_cache_probe_ms",
+        "scheduler_cache_acquire_ms",
+        "scheduler_cache_publish_ms",
+        "scheduler_apply_ms",
     ):
         with_defaults.setdefault(key, 0)
     return with_defaults
