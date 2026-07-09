@@ -934,6 +934,31 @@ impl WorkerClient {
                             value,
                         );
                     }
+                    for (kind, value) in [
+                        ("nodes", scheduler.radix_nodes),
+                        ("splits", scheduler.radix_splits),
+                        ("shared_pages", scheduler.radix_shared_pages),
+                        ("protected_pages", scheduler.radix_protected_pages),
+                        ("evictable_pages", scheduler.radix_evictable_pages),
+                        ("tree_depth", scheduler.radix_tree_depth),
+                        ("leaf_evictions", scheduler.radix_leaf_evictions),
+                    ] {
+                        if let Some(value) = value {
+                            metrics.set_labeled_gauge(
+                                "mlx_radix_cache_by_backend",
+                                &[
+                                    ("backend", scheduler.backend.as_str()),
+                                    ("modality", scheduler.modality.as_str()),
+                                    (
+                                        "strategy",
+                                        scheduler.prefix_strategy.as_deref().unwrap_or("unknown"),
+                                    ),
+                                    ("kind", kind),
+                                ],
+                                value,
+                            );
+                        }
+                    }
                     continue;
                 }
 
@@ -1243,6 +1268,13 @@ mod tests {
                     prefix_pinned_pages: Some(1),
                     prefix_collisions_rejected: Some(0),
                     prefix_evictions: Some(1),
+                    radix_nodes: Some(5),
+                    radix_splits: Some(2),
+                    radix_shared_pages: Some(3),
+                    radix_protected_pages: Some(1),
+                    radix_evictable_pages: Some(2),
+                    radix_tree_depth: Some(8),
+                    radix_leaf_evictions: Some(1),
                 },
             };
             let response_event = WorkerEvent::ChatCompletion {
@@ -1327,5 +1359,8 @@ mod tests {
         assert!(rendered.contains("mlx_prefix_cache_hits_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 1"));
         assert!(rendered.contains("mlx_prefix_cache_reused_tokens_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 4"));
         assert!(rendered.contains("mlx_prefix_cache_collisions_rejected_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\"} 0"));
+        assert!(rendered.contains("mlx_radix_cache_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\",kind=\"nodes\"} 5"));
+        assert!(rendered.contains("mlx_radix_cache_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\",kind=\"splits\"} 2"));
+        assert!(rendered.contains("mlx_radix_cache_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\",kind=\"tree_depth\"} 8"));
     }
 }

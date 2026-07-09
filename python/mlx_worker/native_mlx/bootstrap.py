@@ -28,6 +28,7 @@ from .prefix_cache import (
     BlockHashPrefixCache,
     NoPrefixCache,
     PrefixCompatibilityFingerprint,
+    RadixPrefixCache,
 )
 
 
@@ -71,7 +72,7 @@ def build_native_artifacts(
     cache_budget_bytes: int = 8 * 1024 * 1024,
     cache_max_entries: int = 32,
     kv_page_size: int = 16,
-    prefix_cache_strategy: str = "block-hash",
+    prefix_cache_strategy: str = "radix",
     graph_profile: bool = False,
 ) -> BootstrapArtifacts:
     """Validate and construct the registered architecture and shared executor."""
@@ -200,26 +201,31 @@ def _build_prefix_cache(
     page_size: int,
     cache_budget_bytes: int,
     cache_max_entries: int,
-) -> NoPrefixCache | BlockHashPrefixCache:
+) -> NoPrefixCache | BlockHashPrefixCache | RadixPrefixCache:
+    compatibility = PrefixCompatibilityFingerprint(
+        checkpoint=_checkpoint_identity(model, model_path),
+        architecture_class=architecture_class,
+        tokenizer_assets_hash=_tokenizer_assets_hash(model_path),
+        model_dtype=str(getattr(model_config, "kv_cache_dtype", "float16")),
+        kv_dtype=str(getattr(model_config, "kv_cache_dtype", "float16")),
+        quantization=str(getattr(model_config, "quantization", None)),
+        page_size=page_size,
+    )
     if strategy == "block-hash":
         return BlockHashPrefixCache(
             backend=backend,
-            compatibility=PrefixCompatibilityFingerprint(
-                checkpoint=_checkpoint_identity(model, model_path),
-                architecture_class=architecture_class,
-                tokenizer_assets_hash=_tokenizer_assets_hash(model_path),
-                model_dtype=str(getattr(model_config, "kv_cache_dtype", "float16")),
-                kv_dtype=str(getattr(model_config, "kv_cache_dtype", "float16")),
-                quantization=str(getattr(model_config, "quantization", None)),
-                page_size=page_size,
-            ),
+            compatibility=compatibility,
             page_size=page_size,
             max_entries=cache_max_entries,
             max_bytes=cache_budget_bytes,
         )
     if strategy == "radix":
-        raise ValueError(
-            "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY=radix is reserved for Phase 11"
+        return RadixPrefixCache(
+            backend=backend,
+            compatibility=compatibility,
+            page_size=page_size,
+            max_entries=cache_max_entries,
+            max_bytes=cache_budget_bytes,
         )
     raise ValueError(
         "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY must be block-hash or radix"

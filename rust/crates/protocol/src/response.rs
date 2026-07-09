@@ -282,4 +282,25 @@ pub struct SchedulerMetricsEvent {
     /// Prefix-cache eviction count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_evictions: Option<u64>,
+    /// Number of radix-tree nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radix_nodes: Option<u64>,
+    /// Number of radix node splits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radix_splits: Option<u64>,
+    /// Pages stored on radix nodes that have children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radix_shared_pages: Option<u64>,
+    /// Pages protected by active radix matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radix_protected_pages: Option<u64>,
+    /// Pages on evictable radix leaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radix_evictable_pages: Option<u64>,
+    /// Longest token depth in the radix tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radix_tree_depth: Option<u64>,
+    /// Number of radix leaf evictions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radix_leaf_evictions: Option<u64>,
 }

@@ -82,14 +82,14 @@ def test_load_config_parses_native_prefix_cache_strategy(monkeypatch) -> None:
     assert config.native_prefix_cache_strategy == "radix"
 
 
-def test_load_config_defaults_native_prefix_cache_strategy_to_block_hash(
+def test_load_config_defaults_native_prefix_cache_strategy_to_radix(
     monkeypatch,
 ) -> None:
     monkeypatch.delenv("MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY", raising=False)
 
     config = load_config()
 
-    assert config.native_prefix_cache_strategy == "block-hash"
+    assert config.native_prefix_cache_strategy == "radix"
 
 
 def test_load_config_rejects_invalid_native_prefix_cache_strategy(monkeypatch) -> None:

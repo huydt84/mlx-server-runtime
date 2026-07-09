@@ -266,6 +266,19 @@ class NativeRuntime:
                             metrics, "prefix_collisions_rejected"
                         ),
                         prefix_evictions=_optional_int(metrics, "prefix_evictions"),
+                        radix_nodes=_optional_int(metrics, "radix_nodes"),
+                        radix_splits=_optional_int(metrics, "radix_splits"),
+                        radix_shared_pages=_optional_int(metrics, "radix_shared_pages"),
+                        radix_protected_pages=_optional_int(
+                            metrics, "radix_protected_pages"
+                        ),
+                        radix_evictable_pages=_optional_int(
+                            metrics, "radix_evictable_pages"
+                        ),
+                        radix_tree_depth=_optional_int(metrics, "radix_tree_depth"),
+                        radix_leaf_evictions=_optional_int(
+                            metrics, "radix_leaf_evictions"
+                        ),
                     ),
                 )
             )

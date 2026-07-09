@@ -172,6 +172,13 @@ class IpcEncodingTests(unittest.TestCase):
             prefix_pinned_pages=1,
             prefix_collisions_rejected=0,
             prefix_evictions=1,
+            radix_nodes=5,
+            radix_splits=2,
+            radix_shared_pages=3,
+            radix_protected_pages=1,
+            radix_evictable_pages=2,
+            radix_tree_depth=8,
+            radix_leaf_evictions=1,
         )
 
         encoded = encode_event(event)

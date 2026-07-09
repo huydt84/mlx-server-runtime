@@ -663,6 +663,10 @@ impl MetricsRegistry {
                     "Latest native prefix-cache eviction count.",
                 ),
                 (
+                    "mlx_radix_cache_by_backend",
+                    "Latest native radix prefix-cache tree metrics.",
+                ),
+                (
                     "mlx_peak_memory_by_backend_bytes",
                     "Latest peak memory by backend.",
                 ),

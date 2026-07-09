@@ -48,6 +48,7 @@ from mlx_worker.native_mlx.prefix_cache import NoPrefixCache
 from mlx_worker.native_mlx.prefix_cache import (
     BlockHashPrefixCache,
     PrefixCompatibilityFingerprint,
+    RadixPrefixCache,
 )
 from mlx_worker.native_mlx.registry import get_architecture_spec
 from mlx_worker.native_mlx.runtime import NativeRuntime
@@ -718,6 +719,110 @@ def test_block_hash_prefix_cache_byte_limit_counts_shared_pages_once() -> None:
     assert cache.probe(tuple(range(8)) + (99,)).matched_tokens == 8
     assert cache.metrics()["prefix_entries"] == 4
     assert cache.metrics()["prefix_bytes"] == 8
+
+
+def test_radix_prefix_cache_returns_longest_page_aligned_match() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    handle = backend.create("source")
+    _commit_dense_tokens(backend, handle, "source", 6)
+    cache = RadixPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=8,
+        max_bytes=4096,
+    )
+
+    publication = cache.publish(handle, (1, 2, 3, 4, 5, 6), 6)
+    exact = cache.probe((1, 2, 3, 4, 5, 6, 9))
+    partial = cache.probe((1, 2, 3, 8))
+    partial_page_only = cache.probe((1,))
+
+    assert publication.published_tokens == 6
+    assert publication.published_pages == 3
+    assert exact.matched_tokens == 6
+    assert exact.matched_pages == 3
+    assert partial.matched_tokens == 2
+    assert partial.matched_pages == 1
+    assert partial_page_only.matched_tokens == 0
+    assert cache.metrics()["prefix_strategy"] == "radix"
+    assert cache.metrics()["prefix_hits"] == 2
+    assert cache.metrics()["prefix_misses"] == 1
+
+
+def test_radix_prefix_cache_splits_branching_edges() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    first = backend.create("first")
+    second = backend.create("second")
+    _commit_dense_tokens(backend, first, "first", 6)
+    _commit_dense_tokens(backend, second, "second", 6)
+    cache = RadixPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=8,
+        max_bytes=4096,
+    )
+
+    cache.publish(first, (1, 2, 3, 4, 5, 6), 6)
+    cache.publish(second, (1, 2, 3, 9, 10, 11), 6)
+
+    assert cache.probe((1, 2, 3, 4, 5, 6, 7)).matched_tokens == 6
+    assert cache.probe((1, 2, 3, 9, 10, 11, 12)).matched_tokens == 6
+    assert cache.probe((1, 2, 3, 8)).matched_tokens == 2
+    metrics = cache.metrics()
+    assert metrics["radix_splits"] >= 1
+    assert metrics["radix_shared_pages"] >= 1
+
+
+def test_radix_prefix_cache_acquire_pins_and_release_unpins() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    handle = backend.create("source")
+    _commit_dense_tokens(backend, handle, "source", 4)
+    cache = RadixPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=8,
+        max_bytes=4096,
+    )
+    cache.publish(handle, (1, 2, 3, 4), 4)
+    probe = cache.probe((1, 2, 3, 4, 5))
+
+    admission = cache.acquire("child", (1, 2, 3, 4, 5), probe)
+
+    assert admission is not None
+    assert admission.reused_tokens == 4
+    assert backend.length(admission.cache_handle) == 4
+    assert cache.metrics()["prefix_reused_pages"] == 2
+    assert cache.metrics()["radix_protected_pages"] == 2
+
+    cache.release(admission.cache_handle)
+    backend.release(admission.cache_handle)
+
+    assert cache.metrics()["radix_protected_pages"] == 0
+
+
+def test_radix_prefix_cache_evicts_unpinned_leaves_first() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    first = backend.create("first")
+    second = backend.create("second")
+    _commit_dense_tokens(backend, first, "first", 4)
+    _commit_dense_tokens(backend, second, "second", 4)
+    cache = RadixPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=2,
+        max_bytes=4096,
+    )
+
+    cache.publish(first, (1, 2, 3, 4), 4)
+    cache.publish(second, (1, 2, 5, 6), 4)
+
+    assert cache.probe((1, 2, 9)).matched_tokens == 2
+    assert cache.metrics()["prefix_entries"] == 2
+    assert cache.metrics()["radix_leaf_evictions"] == 1
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")

@@ -214,6 +214,7 @@ def run_native_probes(args: argparse.Namespace) -> None:
     capture = pathlib.Path(args.capture)
     metrics_capture = pathlib.Path(args.metrics_capture)
     port = int(args.port)
+    strategy = getattr(args, "strategy", "block-hash")
 
     events: dict[str, Any] = {}
     events["miss"] = _post(request_dir / "miss.json", port)
@@ -225,7 +226,7 @@ def run_native_probes(args: argparse.Namespace) -> None:
     after_exact = _metrics(port, metrics_capture)
     exact_reused = _metric_value(
         after_exact,
-        'mlx_prefix_cache_reused_tokens_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("reused_tokens", strategy),
     )
     if exact_reused <= 0:
         raise SystemExit("exact full-page hit did not increase reused tokens")
@@ -236,7 +237,7 @@ def run_native_probes(args: argparse.Namespace) -> None:
     after_partial = _metrics(port, metrics_capture)
     partial_reused = _metric_value(
         after_partial,
-        'mlx_prefix_cache_reused_pages_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("reused_pages", strategy),
     )
     if partial_reused <= 0:
         raise SystemExit("partial full-page hit did not increase reused pages")
@@ -244,22 +245,22 @@ def run_native_probes(args: argparse.Namespace) -> None:
 
     tail_before = _metric_value(
         after_partial,
-        'mlx_prefix_cache_hits_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("hits", strategy),
     )
     tail_reused_before = _metric_value(
         after_partial,
-        'mlx_prefix_cache_reused_tokens_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("reused_tokens", strategy),
     )
     events["tail"] = _post(request_dir / "tail.json", port)
     _require_status(events["tail"], "tail")
     tail_after_metrics = _metrics(port, metrics_capture)
     tail_after = _metric_value(
         tail_after_metrics,
-        'mlx_prefix_cache_hits_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("hits", strategy),
     )
     tail_reused_after = _metric_value(
         tail_after_metrics,
-        'mlx_prefix_cache_reused_tokens_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("reused_tokens", strategy),
     )
     if tail_after - tail_before > 1 or tail_reused_after - tail_reused_before > 16:
         raise SystemExit(
@@ -284,25 +285,24 @@ def run_native_probes(args: argparse.Namespace) -> None:
     if any(value["status"] != 200 for value in concurrent_out.values()):
         raise SystemExit(f"concurrent sharing request failed: {concurrent_out}")
     sharing_metrics = _metrics(port, metrics_capture)
-    if (
-        'mlx_prefix_cache_pinned_pages_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}'
-        not in sharing_metrics
-    ):
+    if _prefix_metric("pinned_pages", strategy) not in sharing_metrics:
         raise SystemExit("missing pinned-page sharing metric")
     print("phase10_concurrent_sharing_ok=1")
 
-    _assert_cancel_cleanup(request_dir, port, sharing_metrics, metrics_capture)
+    _assert_cancel_cleanup(
+        request_dir, port, sharing_metrics, metrics_capture, strategy
+    )
     print("phase10_cancellation_cleanup_ok=1")
 
     failure_before = _metric_value(
         _metrics(port, metrics_capture),
-        'mlx_prefix_cache_entries_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("entries", strategy),
     )
     events["failure"] = _post(request_dir / "failure.json", port)
     failure_after_metrics = _metrics(port, metrics_capture)
     failure_after = _metric_value(
         failure_after_metrics,
-        'mlx_prefix_cache_entries_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("entries", strategy),
     )
     if failure_after < failure_before:
         raise SystemExit("failure probe lost existing reusable pages")
@@ -311,14 +311,14 @@ def run_native_probes(args: argparse.Namespace) -> None:
     if (
         _metric_value(
             failure_after_metrics,
-            'mlx_prefix_cache_evictions_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+            _prefix_metric("evictions", strategy),
         )
         < 0
     ):
         raise SystemExit("eviction metric missing")
     print("phase10_eviction_ok=1")
 
-    for needle in _required_metric_names():
+    for needle in _required_metric_names(strategy):
         if needle not in failure_after_metrics:
             raise SystemExit(f"missing metric {needle}")
     print("phase10_metrics_labels_ok=1")
@@ -806,6 +806,7 @@ def _summarize(
     prompt_token_total = sum(item["prompt_tokens"] for item in metadata)
     completion_token_total = sum(item["max_tokens"] for item in metadata)
     wall_seconds = max(0.001, sum(workload_wall_ms) / 1000.0)
+    strategy = _strategy_for_backend(backend)
     return {
         "backend": backend,
         "scenario": scenario,
@@ -837,11 +838,11 @@ def _summarize(
         ],
         "reused_tokens": _metric_value(
             metrics_text,
-            'mlx_prefix_cache_reused_tokens_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+            _prefix_metric("reused_tokens", strategy),
         ),
         "reused_pages": _metric_value(
             metrics_text,
-            'mlx_prefix_cache_reused_pages_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+            _prefix_metric("reused_pages", strategy),
         ),
         "scheduled_prefill_tokens": _metric_value(
             metrics_text,
@@ -863,8 +864,42 @@ def _summarize(
             metrics_text,
             'mlx_executor_stage_latency_by_backend_ms{backend="native-mlx",modality="text",forward_mode="prefill",kind="commit"}',
         ),
+        "prefix_queries": _metric_value(
+            metrics_text, _prefix_metric("queries", strategy)
+        ),
+        "prefix_hits": _metric_value(metrics_text, _prefix_metric("hits", strategy)),
+        "prefix_misses": _metric_value(
+            metrics_text, _prefix_metric("misses", strategy)
+        ),
+        "radix_nodes": _radix_metric(metrics_text, strategy, "nodes"),
+        "radix_splits": _radix_metric(metrics_text, strategy, "splits"),
+        "radix_shared_pages": _radix_metric(metrics_text, strategy, "shared_pages"),
+        "radix_tree_depth": _radix_metric(metrics_text, strategy, "tree_depth"),
+        "radix_leaf_evictions": _radix_metric(metrics_text, strategy, "leaf_evictions"),
         "notes": "-" if backend == "native-mlx" else "v1 baseline",
     }
+
+
+def _strategy_for_backend(backend: str) -> str:
+    if backend in {"radix", "block-hash"}:
+        return backend
+    return "block-hash"
+
+
+def _prefix_metric(metric: str, strategy: str) -> str:
+    return (
+        f"mlx_prefix_cache_{metric}_by_backend"
+        f'{{backend="native-mlx",modality="text",strategy="{strategy}"}}'
+    )
+
+
+def _radix_metric(metrics_text: str, strategy: str, kind: str) -> float:
+    if strategy != "radix":
+        return 0.0
+    return _metric_value(
+        metrics_text,
+        f'mlx_radix_cache_by_backend{{backend="native-mlx",modality="text",strategy="radix",kind="{kind}"}}',
+    )
 
 
 def _mean_float(values: list[float]) -> float:
@@ -909,11 +944,12 @@ def _assert_cancel_cleanup(
     port: int,
     before_metrics: str,
     metrics_capture: pathlib.Path,
+    strategy: str = "block-hash",
 ) -> None:
     active_before = _metric_value(before_metrics, "mlx_requests_active")
     pinned_before = _metric_value(
         before_metrics,
-        'mlx_prefix_cache_pinned_pages_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("pinned_pages", strategy),
     )
     body = (request_dir / "cancel.json").read_bytes()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
@@ -930,25 +966,25 @@ def _assert_cancel_cleanup(
         active_after = _metric_value(current, "mlx_requests_active")
         pinned_after = _metric_value(
             current,
-            'mlx_prefix_cache_pinned_pages_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+            _prefix_metric("pinned_pages", strategy),
         )
         if active_after <= active_before and pinned_after <= pinned_before:
             return
     raise SystemExit("cancelled public stream did not release active request resources")
 
 
-def _required_metric_names() -> tuple[str, ...]:
+def _required_metric_names(strategy: str = "block-hash") -> tuple[str, ...]:
     return (
-        'mlx_prefix_cache_queries_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_hits_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_misses_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_reused_tokens_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_reused_pages_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_entries_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_bytes_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_pinned_pages_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_collisions_rejected_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
-        'mlx_prefix_cache_evictions_by_backend{backend="native-mlx",modality="text",strategy="block-hash"}',
+        _prefix_metric("queries", strategy),
+        _prefix_metric("hits", strategy),
+        _prefix_metric("misses", strategy),
+        _prefix_metric("reused_tokens", strategy),
+        _prefix_metric("reused_pages", strategy),
+        _prefix_metric("entries", strategy),
+        _prefix_metric("bytes", strategy),
+        _prefix_metric("pinned_pages", strategy),
+        _prefix_metric("collisions_rejected", strategy),
+        _prefix_metric("evictions", strategy),
     )
 
 

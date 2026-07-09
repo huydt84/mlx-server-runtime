@@ -80,10 +80,6 @@ pub enum GatewayCommand {
 /// Events sent from the worker to the gateway after bootstrap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Protocol enum stays flat to preserve serde wire shape without boxing every response payload."
-)]
 pub enum WorkerEvent {
     /// Per-step scheduler metrics not tied to one request id.
     SchedulerMetrics { metrics: SchedulerMetricsEvent },
@@ -335,6 +331,13 @@ mod tests {
                 prefix_pinned_pages: Some(1),
                 prefix_collisions_rejected: Some(0),
                 prefix_evictions: Some(1),
+                radix_nodes: Some(5),
+                radix_splits: Some(2),
+                radix_shared_pages: Some(3),
+                radix_protected_pages: Some(1),
+                radix_evictable_pages: Some(2),
+                radix_tree_depth: Some(8),
+                radix_leaf_evictions: Some(1),
             },
         };
 

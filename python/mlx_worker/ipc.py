@@ -252,6 +252,13 @@ class SchedulerMetricsEvent:
     prefix_pinned_pages: int | None = None
     prefix_collisions_rejected: int | None = None
     prefix_evictions: int | None = None
+    radix_nodes: int | None = None
+    radix_splits: int | None = None
+    radix_shared_pages: int | None = None
+    radix_protected_pages: int | None = None
+    radix_evictable_pages: int | None = None
+    radix_tree_depth: int | None = None
+    radix_leaf_evictions: int | None = None
 
 
 def encode_bootstrap_message(
@@ -649,6 +656,13 @@ def decode_event(
             prefix_pinned_pages=metrics.get("prefix_pinned_pages"),
             prefix_collisions_rejected=metrics.get("prefix_collisions_rejected"),
             prefix_evictions=metrics.get("prefix_evictions"),
+            radix_nodes=metrics.get("radix_nodes"),
+            radix_splits=metrics.get("radix_splits"),
+            radix_shared_pages=metrics.get("radix_shared_pages"),
+            radix_protected_pages=metrics.get("radix_protected_pages"),
+            radix_evictable_pages=metrics.get("radix_evictable_pages"),
+            radix_tree_depth=metrics.get("radix_tree_depth"),
+            radix_leaf_evictions=metrics.get("radix_leaf_evictions"),
         )
     return None
 
