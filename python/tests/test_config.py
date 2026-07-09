@@ -92,6 +92,29 @@ def test_load_config_defaults_native_prefix_cache_strategy_to_radix(
     assert config.native_prefix_cache_strategy == "radix"
 
 
+def test_load_config_parses_native_scheduling_policy(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_SCHEDULING_POLICY", "lpm")
+
+    config = load_config()
+
+    assert config.native_scheduling_policy == "lpm"
+
+
+def test_load_config_defaults_native_scheduling_policy_to_fcfs(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_NATIVE_SCHEDULING_POLICY", raising=False)
+
+    config = load_config()
+
+    assert config.native_scheduling_policy == "fcfs"
+
+
+def test_load_config_rejects_invalid_native_scheduling_policy(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_SCHEDULING_POLICY", "random")
+
+    with pytest.raises(ValueError, match="MLX_RUNTIME_NATIVE_SCHEDULING_POLICY"):
+        load_config()
+
+
 def test_load_config_rejects_invalid_native_prefix_cache_strategy(monkeypatch) -> None:
     monkeypatch.setenv("MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY", "none")
 

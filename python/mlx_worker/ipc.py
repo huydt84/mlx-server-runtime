@@ -154,11 +154,14 @@ class ChatCompletionResponse:
     scheduler_stage: str | None = None
     cancellation_stage: str | None = None
     queue_time_ms: int | None = None
+    gateway_queue_wait_ms: int | None = None
+    scheduler_queue_wait_ms: int | None = None
     prefill_time_ms: int | None = None
     ttft_ms: int | None = None
     decode_time_ms: int | None = None
     completion_time_ms: int | None = None
     scheduler_tick_latency_ms: int | None = None
+    cancellation_latency_ms: int | None = None
     arbitration_delay_ms: int | None = None
     worker_cancellation_count: int | None = None
     worker_error_count: int | None = None
@@ -216,6 +219,9 @@ class SchedulerMetricsEvent:
     scheduler_cache_acquire_ms: int | None = None
     scheduler_cache_publish_ms: int | None = None
     scheduler_apply_ms: int | None = None
+    scheduler_queue_wait_ms: int | None = None
+    cancellation_latency_ms: int | None = None
+    scheduling_policy: str | None = None
     forward_mode: str | None = None
     physical_batch_size: int | None = None
     model_forward_count: int | None = None
@@ -492,10 +498,13 @@ def encode_event(
                 "scheduler_stage": event.scheduler_stage,
                 "cancellation_stage": event.cancellation_stage,
                 "queue_time_ms": event.queue_time_ms,
+                "gateway_queue_wait_ms": event.gateway_queue_wait_ms,
+                "scheduler_queue_wait_ms": event.scheduler_queue_wait_ms,
                 "prefill_time_ms": event.prefill_time_ms,
                 "ttft_ms": event.ttft_ms,
                 "decode_time_ms": event.decode_time_ms,
                 "completion_time_ms": event.completion_time_ms,
+                "cancellation_latency_ms": event.cancellation_latency_ms,
                 "vision_feature_cache_hit": event.vision_feature_cache_hit,
                 "vision_feature_cache_bytes": event.vision_feature_cache_bytes,
                 "vision_encoder_latency_ms": event.vision_encoder_latency_ms,
@@ -518,11 +527,14 @@ def encode_event(
             "scheduler_stage": event.scheduler_stage,
             "cancellation_stage": event.cancellation_stage,
             "queue_time_ms": event.queue_time_ms,
+            "gateway_queue_wait_ms": event.gateway_queue_wait_ms,
+            "scheduler_queue_wait_ms": event.scheduler_queue_wait_ms,
             "prefill_time_ms": event.prefill_time_ms,
             "ttft_ms": event.ttft_ms,
             "decode_time_ms": event.decode_time_ms,
             "completion_time_ms": event.completion_time_ms,
             "scheduler_tick_latency_ms": event.scheduler_tick_latency_ms,
+            "cancellation_latency_ms": event.cancellation_latency_ms,
             "arbitration_delay_ms": event.arbitration_delay_ms,
             "worker_cancellation_count": event.worker_cancellation_count,
             "worker_error_count": event.worker_error_count,
@@ -600,10 +612,13 @@ def decode_event(
             scheduler_stage=response.get("scheduler_stage"),
             cancellation_stage=response.get("cancellation_stage"),
             queue_time_ms=response.get("queue_time_ms"),
+            gateway_queue_wait_ms=response.get("gateway_queue_wait_ms"),
+            scheduler_queue_wait_ms=response.get("scheduler_queue_wait_ms"),
             prefill_time_ms=response.get("prefill_time_ms"),
             ttft_ms=response.get("ttft_ms"),
             decode_time_ms=response.get("decode_time_ms"),
             completion_time_ms=response.get("completion_time_ms"),
+            cancellation_latency_ms=response.get("cancellation_latency_ms"),
             vision_feature_cache_hit=response.get("vision_feature_cache_hit"),
             vision_feature_cache_bytes=response.get("vision_feature_cache_bytes"),
             vision_encoder_latency_ms=response.get("vision_encoder_latency_ms"),
@@ -640,6 +655,9 @@ def decode_event(
             scheduler_cache_acquire_ms=metrics.get("scheduler_cache_acquire_ms"),
             scheduler_cache_publish_ms=metrics.get("scheduler_cache_publish_ms"),
             scheduler_apply_ms=metrics.get("scheduler_apply_ms"),
+            scheduler_queue_wait_ms=metrics.get("scheduler_queue_wait_ms"),
+            cancellation_latency_ms=metrics.get("cancellation_latency_ms"),
+            scheduling_policy=metrics.get("scheduling_policy"),
             forward_mode=metrics.get("forward_mode"),
             physical_batch_size=metrics.get("physical_batch_size"),
             model_forward_count=metrics.get("model_forward_count"),

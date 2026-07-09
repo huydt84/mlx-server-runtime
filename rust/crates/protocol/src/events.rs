@@ -123,6 +123,10 @@ pub enum WorkerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queue_time_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway_queue_wait_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheduler_queue_wait_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         prefill_time_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttft_ms: Option<u32>,
@@ -132,6 +136,8 @@ pub enum WorkerEvent {
         completion_time_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scheduler_tick_latency_ms: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_latency_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arbitration_delay_ms: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -295,6 +301,9 @@ mod tests {
                 scheduler_cache_acquire_ms: Some(6),
                 scheduler_cache_publish_ms: Some(7),
                 scheduler_apply_ms: Some(8),
+                scheduler_queue_wait_ms: Some(9),
+                cancellation_latency_ms: Some(10),
+                scheduling_policy: Some("priority".to_string()),
                 forward_mode: Some("mixed".to_string()),
                 physical_batch_size: Some(2),
                 model_forward_count: Some(1),
@@ -386,11 +395,14 @@ mod tests {
                 scheduler_stage: Some("completed".to_string()),
                 cancellation_stage: None,
                 queue_time_ms: Some(3),
+                gateway_queue_wait_ms: Some(2),
+                scheduler_queue_wait_ms: Some(3),
                 prefill_time_ms: Some(5),
                 ttft_ms: Some(7),
                 decode_time_ms: Some(11),
                 completion_time_ms: Some(18),
                 scheduler_tick_latency_ms: Some(1),
+                cancellation_latency_ms: None,
                 arbitration_delay_ms: Some(2),
                 worker_cancellation_count: Some(3),
                 worker_error_count: Some(1),
@@ -423,11 +435,14 @@ mod tests {
             scheduler_stage: Some("completed".to_string()),
             cancellation_stage: None,
             queue_time_ms: Some(3),
+            gateway_queue_wait_ms: Some(2),
+            scheduler_queue_wait_ms: Some(3),
             prefill_time_ms: Some(5),
             ttft_ms: Some(7),
             decode_time_ms: Some(11),
             completion_time_ms: Some(18),
             scheduler_tick_latency_ms: Some(1),
+            cancellation_latency_ms: None,
             arbitration_delay_ms: Some(2),
             worker_cancellation_count: Some(3),
             worker_error_count: Some(1),

@@ -290,6 +290,8 @@ class SchedulableRequest:
     prompt_token_ids: tuple[int, ...]
     sampling: SamplingParams
     enqueued_at: float
+    max_tokens: int = 0
+    priority: int = 0
 
 
 SchedulerEventKind = Literal[

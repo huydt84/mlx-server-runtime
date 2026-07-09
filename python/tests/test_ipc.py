@@ -113,6 +113,9 @@ class IpcEncodingTests(unittest.TestCase):
             finish_reason="stop",
             prompt_tokens=10,
             completion_tokens=3,
+            gateway_queue_wait_ms=2,
+            scheduler_queue_wait_ms=4,
+            cancellation_latency_ms=0,
         )
 
         encoded = encode_event(response)
@@ -151,6 +154,9 @@ class IpcEncodingTests(unittest.TestCase):
             scheduler_cache_acquire_ms=6,
             scheduler_cache_publish_ms=7,
             scheduler_apply_ms=8,
+            scheduler_queue_wait_ms=9,
+            cancellation_latency_ms=10,
+            scheduling_policy="lpm",
             forward_mode="mixed",
             physical_batch_size=2,
             model_forward_count=1,
@@ -324,6 +330,9 @@ class VlmIpcTests(unittest.TestCase):
             active_batch_cache_bytes=128,
             prompt_batch_size=2,
             decode_batch_size=2,
+            gateway_queue_wait_ms=3,
+            scheduler_queue_wait_ms=5,
+            cancellation_latency_ms=0,
         )
 
         encoded = encode_event(response)

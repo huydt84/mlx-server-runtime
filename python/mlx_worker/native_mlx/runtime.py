@@ -73,7 +73,8 @@ class _RuntimeState:
     decode_batch_size: int | None = None
     ttft_ms: int | None = None
     cancellation_stage: str | None = None
-    queue_time_ms: int = 0
+    scheduler_queue_wait_ms: int = 0
+    cancellation_latency_ms: int | None = None
 
 
 class NativeRuntime:
@@ -140,6 +141,8 @@ class NativeRuntime:
                     top_p=request.top_p,
                 ),
                 enqueued_at=state.enqueued_at,
+                max_tokens=request.max_tokens,
+                priority=0,
             )
         )
 
@@ -147,7 +150,13 @@ class NativeRuntime:
         state = self._requests.get(request_id)
         if state is not None:
             state.cancellation_stage = (
-                "decode" if state.completion_token_ids else "prefill"
+                "decode"
+                if state.completion_token_ids
+                else (
+                    "python_waiting"
+                    if state.prefill_time_ms == 0 and state.prompt_batch_size is None
+                    else "prefill"
+                )
             )
         return self._scheduler.cancel(request_id)
 
@@ -198,6 +207,13 @@ class NativeRuntime:
                             metrics, "scheduler_cache_publish_ms"
                         ),
                         scheduler_apply_ms=_optional_int(metrics, "scheduler_apply_ms"),
+                        scheduler_queue_wait_ms=_optional_int(
+                            metrics, "scheduler_queue_wait_ms"
+                        ),
+                        cancellation_latency_ms=_optional_int(
+                            metrics, "cancellation_latency_ms"
+                        ),
+                        scheduling_policy=_optional_str(metrics, "scheduling_policy"),
                         forward_mode=_optional_str(metrics, "forward_mode"),
                         physical_batch_size=_optional_int(
                             metrics, "physical_batch_size"
@@ -305,7 +321,12 @@ class NativeRuntime:
             metrics = event.metrics or {}
             state.prefill_time_ms += int(metrics.get("step_time_ms", 0))
             state.prompt_batch_size = int(metrics.get("batch_size", 0))
-            state.queue_time_ms = int(metrics.get("queue_time_ms", 0))
+            state.scheduler_queue_wait_ms = int(
+                metrics.get(
+                    "scheduler_queue_wait_ms",
+                    metrics.get("queue_time_ms", 0),
+                )
+            )
             return
         if event.kind == "token":
             if event.metrics:
@@ -319,6 +340,12 @@ class NativeRuntime:
                 self._accept_token(state, event.token_id, output)
             return
         if event.kind == "cancelled":
+            metrics = event.metrics or {}
+            if metrics.get("cancellation_stage") is not None:
+                state.cancellation_stage = str(metrics["cancellation_stage"])
+            state.cancellation_latency_ms = _optional_int(
+                metrics, "cancellation_latency_ms"
+            )
             self._cancellation_count += 1
             self._finish(state, "cancelled", output)
             return
@@ -410,7 +437,9 @@ class NativeRuntime:
                     if reason == "cancelled"
                     else "completed",
                     cancellation_stage=state.cancellation_stage,
-                    queue_time_ms=state.queue_time_ms,
+                    queue_time_ms=state.scheduler_queue_wait_ms,
+                    scheduler_queue_wait_ms=state.scheduler_queue_wait_ms,
+                    cancellation_latency_ms=state.cancellation_latency_ms,
                     prefill_time_ms=state.prefill_time_ms,
                     ttft_ms=state.ttft_ms,
                     decode_time_ms=state.decode_time_ms,

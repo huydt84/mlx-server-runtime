@@ -1037,6 +1037,7 @@ def _scheduler(
     prefill_batch_size: int = 4,
     prefill_step_size: int = 256,
     prioritize_decode: bool = True,
+    scheduling_policy: str = "fcfs",
 ) -> tuple[NativeContinuousScheduler, _FakeCacheCoordinator]:
     cache_coordinator = _FakeCacheCoordinator(executor.lengths)
     return (
@@ -1046,17 +1047,26 @@ def _scheduler(
             prefill_batch_size=prefill_batch_size,
             prefill_step_size=prefill_step_size,
             prioritize_decode=prioritize_decode,
+            scheduling_policy=scheduling_policy,
         ),
         cache_coordinator,
     )
 
 
-def _schedulable(request_id: str, tokens: tuple[int, ...]) -> SchedulableRequest:
+def _schedulable(
+    request_id: str,
+    tokens: tuple[int, ...],
+    *,
+    max_tokens: int = 1,
+    priority: int = 0,
+) -> SchedulableRequest:
     return SchedulableRequest(
         request_id=request_id,
         prompt_token_ids=tokens,
         sampling=SamplingParams(),
         enqueued_at=time.perf_counter(),
+        max_tokens=max_tokens,
+        priority=priority,
     )
 
 
@@ -1202,7 +1212,7 @@ def test_scheduler_isolates_request_local_executor_failure() -> None:
     assert executor.lengths["cache-valid"] == 1
 
 
-def test_scheduler_cancellation_releases_only_after_runtime_finish() -> None:
+def test_scheduler_cancellation_releases_at_safe_point() -> None:
     executor = _FakeExecutor()
     scheduler, cache_coordinator = _scheduler(executor)
     scheduler.submit(_schedulable("request", (1,)))
@@ -1210,11 +1220,113 @@ def test_scheduler_cancellation_releases_only_after_runtime_finish() -> None:
 
     assert scheduler.cancel("request")
     events = scheduler.tick()
-    assert any(event.kind == "cancelled" for event in events)
-    assert cache_coordinator.released == []
+    cancelled = [event for event in events if event.kind == "cancelled"]
 
-    scheduler.finish("request")
+    assert len(cancelled) == 1
+    assert cancelled[0].metrics["cancellation_stage"] == "decode"
+    assert cancelled[0].metrics["cancellation_latency_ms"] >= 0
     assert cache_coordinator.released == ["cache-request"]
+
+
+def test_scheduler_fcfs_policy_orders_by_arrival() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _scheduler(
+        executor,
+        prefill_batch_size=2,
+        prioritize_decode=False,
+        scheduling_policy="fcfs",
+    )
+    scheduler.submit(_schedulable("first", (1,), priority=0, max_tokens=1))
+    scheduler.submit(_schedulable("second", (2,), priority=10, max_tokens=10))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[-1].requests] == [
+        "first",
+        "second",
+    ]
+
+
+def test_scheduler_priority_policy_orders_by_internal_priority() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _scheduler(
+        executor,
+        prefill_batch_size=2,
+        prioritize_decode=False,
+        scheduling_policy="priority",
+    )
+    scheduler.submit(_schedulable("low", (1,), priority=0))
+    scheduler.submit(_schedulable("high", (2,), priority=5))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[-1].requests] == [
+        "high",
+        "low",
+    ]
+
+
+def test_scheduler_lof_policy_orders_by_max_tokens() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _scheduler(
+        executor,
+        prefill_batch_size=2,
+        prioritize_decode=False,
+        scheduling_policy="lof",
+    )
+    scheduler.submit(_schedulable("short", (1,), max_tokens=1))
+    scheduler.submit(_schedulable("long", (2,), max_tokens=8))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[-1].requests] == [
+        "long",
+        "short",
+    ]
+
+
+def test_scheduler_lpm_policy_orders_by_probe_match_length() -> None:
+    executor = _FakeExecutor()
+    scheduler, cache = _scheduler(
+        executor,
+        prefill_batch_size=2,
+        prioritize_decode=False,
+        scheduling_policy="lpm",
+    )
+    low_tokens = (1, 2, 3)
+    high_tokens = (4, 5, 6)
+    cache.reused_tokens[str(low_tokens)] = 1
+    cache.reused_tokens[str(high_tokens)] = 2
+    scheduler.submit(_schedulable("low", low_tokens))
+    scheduler.submit(_schedulable("high", high_tokens))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[-1].requests] == [
+        "high",
+        "low",
+    ]
+    assert executor.batches[-1].requests[0].positions == (2,)
+
+
+def test_scheduler_non_fcfs_policy_ages_old_request_ahead_of_newer_work() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _scheduler(
+        executor,
+        prefill_batch_size=1,
+        prioritize_decode=False,
+        scheduling_policy="priority",
+    )
+    scheduler.submit(_schedulable("old-low", (1,), priority=0))
+    for index in range(3):
+        scheduler.submit(_schedulable(f"new-high-{index}", (index + 2,), priority=10))
+        scheduler.tick()
+        scheduler.finish(f"new-high-{index}")
+
+    scheduler.submit(_schedulable("last-high", (9,), priority=10))
+    scheduler.tick()
+
+    assert executor.batches[-1].requests[0].request_id == "old-low"
 
 
 @dataclass
@@ -1227,7 +1339,21 @@ class _FakeScheduler:
         self.submitted.append(request)
 
     def cancel(self, request_id: str) -> bool:
-        return any(item.request_id == request_id for item in self.submitted)
+        handled = any(item.request_id == request_id for item in self.submitted)
+        if handled:
+            self.events.append(
+                (
+                    SchedulerEvent(
+                        kind="cancelled",
+                        request_id=request_id,
+                        metrics={
+                            "cancellation_stage": "python_waiting",
+                            "cancellation_latency_ms": 2,
+                        },
+                    ),
+                )
+            )
+        return handled
 
     def finish(self, request_id: str) -> None:
         self.finished.append(request_id)
@@ -1333,3 +1459,82 @@ def test_runtime_normalizes_public_request_and_owns_terminal_text() -> None:
     assert response.text == "ab"
     assert response.finish_reason == "length"
     assert scheduler.finished == ["request"]
+
+
+def test_runtime_passes_scheduler_policy_metadata() -> None:
+    scheduler = _FakeScheduler()
+    tokenizer = _FakeTokenizer()
+    runtime = NativeRuntime(
+        scheduler,  # type: ignore[arg-type]
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+    )
+
+    runtime.submit(_chat_request(max_tokens=7, max_completion_tokens=8))
+
+    assert scheduler.submitted[0].max_tokens == 7
+    assert scheduler.submitted[0].priority == 0
+
+
+def test_runtime_reports_scheduler_queue_wait_separately() -> None:
+    scheduler = _FakeScheduler()
+    tokenizer = _FakeTokenizer()
+    runtime = NativeRuntime(
+        scheduler,  # type: ignore[arg-type]
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+    )
+    runtime.submit(_chat_request(max_tokens=1, stream=False))
+    scheduler.events.append(
+        (
+            SchedulerEvent(
+                kind="prefill_progress",
+                request_id="request",
+                cache_length=2,
+                phase="prefill",
+                metrics={
+                    "step_time_ms": 1,
+                    "batch_size": 1,
+                    "scheduler_queue_wait_ms": 12,
+                },
+            ),
+            SchedulerEvent(
+                kind="token",
+                request_id="request",
+                token_id=1,
+                cache_length=2,
+                phase="prefill",
+            ),
+        )
+    )
+
+    events = runtime.tick()
+    response = next(event.payload for event in events if event.kind == "response")
+
+    assert response.scheduler_queue_wait_ms == 12
+    assert response.queue_time_ms == 12
+
+
+def test_runtime_cancellation_terminal_response_carries_stage_and_latency() -> None:
+    scheduler = _FakeScheduler()
+    tokenizer = _FakeTokenizer()
+    runtime = NativeRuntime(
+        scheduler,  # type: ignore[arg-type]
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+    )
+    runtime.submit(_chat_request(stream=False))
+
+    assert runtime.cancel("request")
+    events = runtime.tick()
+    response = next(event.payload for event in events if event.kind == "response")
+
+    assert response.finish_reason == "cancelled"
+    assert response.cancellation_stage == "python_waiting"
+    assert response.cancellation_latency_ms == 2

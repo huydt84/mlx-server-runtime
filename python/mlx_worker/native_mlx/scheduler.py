@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from enum import Enum
+from typing import Protocol
 
 from .interfaces import (
     BatchExecutionError,
@@ -19,21 +21,179 @@ from .interfaces import (
 )
 
 
+class SchedulingPolicy(str, Enum):
+    """Inner waiting-queue policy owned by the native scheduler."""
+
+    FCFS = "fcfs"
+    LPM = "lpm"
+    LOF = "lof"
+    PRIORITY = "priority"
+
+
+class SchedulerPolicy(Protocol):
+    """Policy interface for ordering Python waiting-queue requests."""
+
+    name: SchedulingPolicy
+
+    def order(
+        self,
+        states: list["_ScheduledState"],
+        *,
+        scheduler_round: int,
+        cache_coordinator: CacheCoordinator,
+        timings: dict[str, int],
+    ) -> list["_ScheduledState"]:
+        """Return states in preferred admission order."""
+
+
 @dataclass
 class _ScheduledState:
     work: SchedulableRequest
+    arrival_order: int
     prompt_cursor: int = 0
     cache_handle: str | None = None
     cache_length: int = 0
     last_token_id: int | None = None
     cancel_requested: bool = False
+    cancel_requested_at: float | None = None
     running_started_at: float | None = None
+    cached_probe: object | None = None
 
 
 @dataclass(frozen=True)
 class _SelectedWork:
     state: _ScheduledState
     request: ExecutionRequest
+
+
+@dataclass(frozen=True)
+class _PolicyScore:
+    state: _ScheduledState
+    score: tuple[int, int, int, int]
+
+
+class _BasePolicy:
+    name = SchedulingPolicy.FCFS
+
+    def order(
+        self,
+        states: list[_ScheduledState],
+        *,
+        scheduler_round: int,
+        cache_coordinator: CacheCoordinator,
+        timings: dict[str, int],
+    ) -> list[_ScheduledState]:
+        del scheduler_round, cache_coordinator, timings
+        return sorted(states, key=lambda state: state.arrival_order)
+
+
+class _ScoredPolicy(_BasePolicy):
+    """Shared deterministic ordering for non-FCFS policies."""
+
+    starvation_rounds = 3
+
+    def order(
+        self,
+        states: list[_ScheduledState],
+        *,
+        scheduler_round: int,
+        cache_coordinator: CacheCoordinator,
+        timings: dict[str, int],
+    ) -> list[_ScheduledState]:
+        scored = [
+            _PolicyScore(
+                state=state,
+                score=self._score(
+                    state,
+                    scheduler_round=scheduler_round,
+                    cache_coordinator=cache_coordinator,
+                    timings=timings,
+                ),
+            )
+            for state in states
+        ]
+        return [
+            item.state
+            for item in sorted(
+                scored,
+                key=lambda item: item.score,
+                reverse=True,
+            )
+        ]
+
+    def _score(
+        self,
+        state: _ScheduledState,
+        *,
+        scheduler_round: int,
+        cache_coordinator: CacheCoordinator,
+        timings: dict[str, int],
+    ) -> tuple[int, int, int, int]:
+        del cache_coordinator, timings
+        age_rounds = max(0, scheduler_round - state.arrival_order)
+        starvation_boost = int(age_rounds >= self.starvation_rounds)
+        return (
+            starvation_boost,
+            self._policy_value(state),
+            age_rounds,
+            -state.arrival_order,
+        )
+
+    def _policy_value(self, state: _ScheduledState) -> int:
+        del state
+        return 0
+
+
+class _LpmPolicy(_ScoredPolicy):
+    name = SchedulingPolicy.LPM
+
+    def _score(
+        self,
+        state: _ScheduledState,
+        *,
+        scheduler_round: int,
+        cache_coordinator: CacheCoordinator,
+        timings: dict[str, int],
+    ) -> tuple[int, int, int, int]:
+        probe_started = time.perf_counter()
+        probe = cache_coordinator.probe(state.work.prompt_token_ids)
+        timings["scheduler_cache_probe_ms"] += _elapsed_ms(probe_started)
+        state.cached_probe = probe
+        age_rounds = max(0, scheduler_round - state.arrival_order)
+        starvation_boost = int(age_rounds >= self.starvation_rounds)
+        return (
+            starvation_boost,
+            int(getattr(probe, "matched_tokens", 0)),
+            age_rounds,
+            -state.arrival_order,
+        )
+
+
+class _LofPolicy(_ScoredPolicy):
+    name = SchedulingPolicy.LOF
+
+    def _policy_value(self, state: _ScheduledState) -> int:
+        return int(state.work.max_tokens)
+
+
+class _PriorityPolicy(_ScoredPolicy):
+    name = SchedulingPolicy.PRIORITY
+
+    def _policy_value(self, state: _ScheduledState) -> int:
+        return int(state.work.priority)
+
+
+def _policy_from_name(name: str) -> SchedulerPolicy:
+    normalized = name.strip().lower()
+    if normalized == SchedulingPolicy.FCFS.value:
+        return _BasePolicy()
+    if normalized == SchedulingPolicy.LPM.value:
+        return _LpmPolicy()
+    if normalized == SchedulingPolicy.LOF.value:
+        return _LofPolicy()
+    if normalized == SchedulingPolicy.PRIORITY.value:
+        return _PriorityPolicy()
+    raise ValueError("native-mlx scheduling policy must be fcfs, lpm, lof, or priority")
 
 
 class NativeContinuousScheduler:
@@ -47,6 +207,7 @@ class NativeContinuousScheduler:
         prefill_batch_size: int = 4,
         prefill_step_size: int = 256,
         prioritize_decode: bool = True,
+        scheduling_policy: str = "fcfs",
     ) -> None:
         if prefill_batch_size <= 0:
             raise ValueError("native-mlx prefill batch size must be positive")
@@ -57,20 +218,28 @@ class NativeContinuousScheduler:
         self._prefill_batch_size = int(prefill_batch_size)
         self._prefill_step_size = int(prefill_step_size)
         self._prioritize_decode = bool(prioritize_decode)
+        self._policy = _policy_from_name(scheduling_policy)
         self._waiting: OrderedDict[str, _ScheduledState] = OrderedDict()
         self._running: OrderedDict[str, _ScheduledState] = OrderedDict()
         self._pending_events: list[SchedulerEvent] = []
+        self._arrival_counter = 0
+        self._scheduler_round = 0
 
     def submit(self, request: SchedulableRequest) -> None:
         if request.request_id in self._waiting or request.request_id in self._running:
             raise ValueError(f"duplicate native request {request.request_id!r}")
-        self._waiting[request.request_id] = _ScheduledState(work=request)
+        self._arrival_counter += 1
+        self._waiting[request.request_id] = _ScheduledState(
+            work=request,
+            arrival_order=self._arrival_counter,
+        )
 
     def cancel(self, request_id: str) -> bool:
         state = self._waiting.get(request_id) or self._running.get(request_id)
         if state is None:
             return False
         state.cancel_requested = True
+        state.cancel_requested_at = time.perf_counter()
         return True
 
     def finish(self, request_id: str) -> None:
@@ -83,6 +252,7 @@ class NativeContinuousScheduler:
     def tick(self) -> tuple[SchedulerEvent, ...]:
         events = self._pending_events
         self._pending_events = []
+        self._scheduler_round += 1
         self._reap_cancelled(events)
         select_started = time.perf_counter()
         timings: dict[str, int] = {
@@ -132,18 +302,27 @@ class NativeContinuousScheduler:
         )
         if selected and self._prioritize_decode:
             return selected
+        prefill_states = self._policy.order(
+            prefill_states,
+            scheduler_round=self._scheduler_round,
+            cache_coordinator=self._cache_coordinator,
+            timings=timings,
+        )
         for state in prefill_states[: self._prefill_batch_size]:
             request_id = state.work.request_id
             if state.cache_handle is None:
                 self._waiting.pop(request_id, None)
-                probe_started = time.perf_counter()
-                probe = self._cache_coordinator.probe(state.work.prompt_token_ids)
-                timings["scheduler_cache_probe_ms"] += _elapsed_ms(probe_started)
+                probe = state.cached_probe
+                if probe is None:
+                    probe_started = time.perf_counter()
+                    probe = self._cache_coordinator.probe(state.work.prompt_token_ids)
+                    timings["scheduler_cache_probe_ms"] += _elapsed_ms(probe_started)
+                state.cached_probe = None
                 acquire_started = time.perf_counter()
                 admission = self._cache_coordinator.acquire(
                     request_id,
                     state.work.prompt_token_ids,
-                    probe,
+                    probe,  # type: ignore[arg-type]
                 )
                 timings["scheduler_cache_acquire_ms"] += _elapsed_ms(acquire_started)
                 state.cache_handle = admission.cache_handle
@@ -293,6 +472,16 @@ class NativeContinuousScheduler:
                             * 1000
                         ),
                     ),
+                    "scheduler_queue_wait_ms": max(
+                        0,
+                        int(
+                            (
+                                (state.running_started_at or state.work.enqueued_at)
+                                - state.work.enqueued_at
+                            )
+                            * 1000
+                        ),
+                    ),
                 },
             )
         )
@@ -336,10 +525,25 @@ class NativeContinuousScheduler:
     def _reap_cancelled(self, events: list[SchedulerEvent]) -> None:
         for state in tuple(self._waiting.values()) + tuple(self._running.values()):
             if state.cancel_requested:
+                request_id = state.work.request_id
+                stage = (
+                    "python_waiting"
+                    if request_id in self._waiting
+                    else ("decode" if state.last_token_id is not None else "prefill")
+                )
+                self._waiting.pop(request_id, None)
+                self._running.pop(request_id, None)
+                self._cache_coordinator.release(state.cache_handle)
                 events.append(
                     SchedulerEvent(
                         kind="cancelled",
-                        request_id=state.work.request_id,
+                        request_id=request_id,
+                        metrics={
+                            "cancellation_stage": stage,
+                            "cancellation_latency_ms": _elapsed_ms(
+                                state.cancel_requested_at or time.perf_counter()
+                            ),
+                        },
                     )
                 )
 
@@ -391,6 +595,7 @@ class NativeContinuousScheduler:
                     "scheduler_tick_latency_ms": max(
                         1, int((time.perf_counter() - started) * 1000)
                     ),
+                    "scheduling_policy": self._policy.name.value,
                     **(execution_metrics or {}),
                 },
             )

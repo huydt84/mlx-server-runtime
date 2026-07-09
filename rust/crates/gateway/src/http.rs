@@ -787,6 +787,7 @@ fn handle_chat_completion(
         }
     };
     let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
+    record_gateway_queue_wait(&state.runtime, is_vlm, queue_time_ms);
     let worker_model = worker_request.model.clone();
     let request_tracker = Arc::new(RequestTracker::new(
         state.runtime.metrics.clone(),
@@ -1027,6 +1028,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         }
     };
     let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
+    record_gateway_queue_wait(&state.runtime, is_vlm, queue_time_ms);
     let worker_model = worker_request.model.clone();
     // Save the requested model name before worker_model is moved into
     // RequestTracker; used for consistent "model" field across all SSE chunks.
@@ -1233,6 +1235,18 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     write!(writer, "data: [DONE]\n\n")?;
     writer.flush()?;
     Ok(())
+}
+
+fn record_gateway_queue_wait(runtime: &RuntimeState, is_vlm: bool, queue_time_ms: u64) {
+    runtime.metrics.set_labeled_gauge(
+        "mlx_latency_by_backend_ms",
+        &[
+            ("backend", "gateway"),
+            ("modality", if is_vlm { "vlm" } else { "text" }),
+            ("kind", "gateway_queue"),
+        ],
+        queue_time_ms,
+    );
 }
 
 fn ensure_sse_stream_started<W: Write>(

@@ -121,11 +121,14 @@ impl WorkerClient {
                         scheduler_stage,
                         cancellation_stage,
                         queue_time_ms,
+                        gateway_queue_wait_ms,
+                        scheduler_queue_wait_ms,
                         prefill_time_ms,
                         ttft_ms,
                         decode_time_ms,
                         completion_time_ms,
                         scheduler_tick_latency_ms,
+                        cancellation_latency_ms,
                         arbitration_delay_ms,
                         worker_cancellation_count,
                         worker_error_count,
@@ -323,6 +326,28 @@ impl WorkerClient {
                                 value_ms as u64,
                             );
                         }
+                        if let Some(value_ms) = gateway_queue_wait_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "gateway_queue"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = scheduler_queue_wait_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "scheduler_queue"),
+                                ],
+                                value_ms as u64,
+                            );
+                        }
                         if let Some(value_ms) = prefill_time_ms {
                             self.metrics.set_labeled_gauge(
                                 "mlx_latency_by_backend_ms",
@@ -371,6 +396,17 @@ impl WorkerClient {
                             self.metrics.set_labeled_gauge(
                                 "mlx_scheduler_tick_latency_by_backend_ms",
                                 &[("backend", backend), ("modality", modality)],
+                                value_ms as u64,
+                            );
+                        }
+                        if let Some(value_ms) = cancellation_latency_ms {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[
+                                    ("backend", backend),
+                                    ("modality", modality),
+                                    ("kind", "cancellation"),
+                                ],
                                 value_ms as u64,
                             );
                         }
@@ -632,6 +668,8 @@ impl WorkerClient {
                         ("cache_acquire", scheduler.scheduler_cache_acquire_ms),
                         ("cache_publish", scheduler.scheduler_cache_publish_ms),
                         ("apply", scheduler.scheduler_apply_ms),
+                        ("scheduler_queue", scheduler.scheduler_queue_wait_ms),
+                        ("cancellation", scheduler.cancellation_latency_ms),
                     ] {
                         if let Some(value) = value {
                             metrics.set_labeled_gauge(
@@ -649,6 +687,17 @@ impl WorkerClient {
                                 value as u64,
                             );
                         }
+                    }
+                    if let Some(policy) = scheduler.scheduling_policy.as_deref() {
+                        metrics.set_labeled_gauge(
+                            "mlx_scheduler_policy_by_backend",
+                            &[
+                                ("backend", scheduler.backend.as_str()),
+                                ("modality", scheduler.modality.as_str()),
+                                ("policy", policy),
+                            ],
+                            1,
+                        );
                     }
                     if let Some(value) = scheduler.physical_batch_size {
                         metrics.set_labeled_gauge(
@@ -1116,11 +1165,14 @@ mod tests {
                     scheduler_stage: None,
                     cancellation_stage: None,
                     queue_time_ms: None,
+                    gateway_queue_wait_ms: None,
+                    scheduler_queue_wait_ms: None,
                     prefill_time_ms: None,
                     ttft_ms: None,
                     decode_time_ms: None,
                     completion_time_ms: None,
                     scheduler_tick_latency_ms: None,
+                    cancellation_latency_ms: None,
                     arbitration_delay_ms: None,
                     worker_cancellation_count: None,
                     worker_error_count: None,
@@ -1163,11 +1215,14 @@ mod tests {
                     scheduler_stage: None,
                     cancellation_stage: None,
                     queue_time_ms: None,
+                    gateway_queue_wait_ms: None,
+                    scheduler_queue_wait_ms: None,
                     prefill_time_ms: None,
                     ttft_ms: None,
                     decode_time_ms: None,
                     completion_time_ms: None,
                     scheduler_tick_latency_ms: None,
+                    cancellation_latency_ms: None,
                     arbitration_delay_ms: None,
                     worker_cancellation_count: None,
                     worker_error_count: None,
@@ -1256,6 +1311,9 @@ mod tests {
                     scheduler_cache_acquire_ms: Some(6),
                     scheduler_cache_publish_ms: Some(7),
                     scheduler_apply_ms: Some(8),
+                    scheduler_queue_wait_ms: Some(9),
+                    cancellation_latency_ms: Some(10),
+                    scheduling_policy: Some("lpm".to_string()),
                     forward_mode: Some("mixed".to_string()),
                     physical_batch_size: Some(2),
                     model_forward_count: Some(1),
@@ -1333,11 +1391,14 @@ mod tests {
                 scheduler_stage: None,
                 cancellation_stage: None,
                 queue_time_ms: None,
+                gateway_queue_wait_ms: None,
+                scheduler_queue_wait_ms: None,
                 prefill_time_ms: None,
                 ttft_ms: None,
                 decode_time_ms: None,
                 completion_time_ms: None,
                 scheduler_tick_latency_ms: None,
+                cancellation_latency_ms: None,
                 arbitration_delay_ms: None,
                 worker_cancellation_count: None,
                 worker_error_count: None,

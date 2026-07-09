@@ -173,6 +173,7 @@ def create_native_worker(
             "text_prefill_chunk_size",
             getattr(config, "prefill_chunk_size", 256),
         ),
+        scheduling_policy=getattr(config, "native_scheduling_policy", "fcfs"),
     )
     return NativeRequestRuntime(
         scheduler,

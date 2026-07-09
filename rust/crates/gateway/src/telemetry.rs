@@ -571,6 +571,10 @@ impl MetricsRegistry {
                     "Latest waiting and running request counts by backend.",
                 ),
                 (
+                    "mlx_scheduler_policy_by_backend",
+                    "Latest native scheduler waiting-queue policy by backend.",
+                ),
+                (
                     "mlx_scheduled_tokens_by_backend",
                     "Latest scheduled token counts by backend and phase.",
                 ),

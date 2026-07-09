@@ -72,6 +72,12 @@ pub struct ChatCompletionResponse {
     /// Time spent waiting before decode started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_time_ms: Option<u32>,
+    /// Time spent waiting in the Rust gateway admission queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_queue_wait_ms: Option<u32>,
+    /// Time spent waiting in the Python scheduler queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_queue_wait_ms: Option<u32>,
     /// Time spent in prompt processing before decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_time_ms: Option<u32>,
@@ -87,6 +93,9 @@ pub struct ChatCompletionResponse {
     /// Latency for the worker scheduler tick that produced this response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler_tick_latency_ms: Option<u32>,
+    /// Time from cancellation request to worker-side terminal cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_latency_ms: Option<u32>,
     /// Delay between the arbitration round start and this backend tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arbitration_delay_ms: Option<u32>,
@@ -174,6 +183,15 @@ pub struct SchedulerMetricsEvent {
     /// Scheduler result application latency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler_apply_ms: Option<u32>,
+    /// Time spent waiting in the Python scheduler queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_queue_wait_ms: Option<u32>,
+    /// Worker-side cancellation latency at scheduler/runtime safe points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_latency_ms: Option<u32>,
+    /// Inner waiting-queue scheduling policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling_policy: Option<String>,
     /// Physical model-forward mode selected by the executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_mode: Option<String>,
