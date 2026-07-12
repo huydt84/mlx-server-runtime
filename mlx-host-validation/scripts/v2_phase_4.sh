@@ -97,6 +97,7 @@ from mlx_worker.native_mlx.interfaces import (
 checkpoint = sys.argv[1]
 artifacts = build_native_artifacts(checkpoint)
 executor = artifacts.executor
+cache_coordinator = artifacts.cache_coordinator
 model_path = Path(artifacts.architecture.model_path)
 token_ids = build_finalized_token_ids(
     model_path,
@@ -169,13 +170,13 @@ def result_pair_ok(batched, single, atol: float) -> bool:
         and batched.cache_length == single.cache_length
     )
 
-handle_a = executor.create_cache("req-a")
-handle_b = executor.create_cache("req-b")
-ind_a = executor.create_cache("ind-a")
-ind_b = executor.create_cache("ind-b")
-iso_a = executor.create_cache("iso-a")
-iso_shared_b = executor.create_cache("iso-shared-b")
-iso_b = executor.create_cache("iso-b")
+handle_a = cache_coordinator.acquire("req-a", ()).cache_handle
+handle_b = cache_coordinator.acquire("req-b", ()).cache_handle
+ind_a = cache_coordinator.acquire("ind-a", ()).cache_handle
+ind_b = cache_coordinator.acquire("ind-b", ()).cache_handle
+iso_a = cache_coordinator.acquire("iso-a", ()).cache_handle
+iso_shared_b = cache_coordinator.acquire("iso-shared-b", ()).cache_handle
+iso_b = cache_coordinator.acquire("iso-b", ()).cache_handle
 try:
     recorder = RecordingModel(executor.model)
     executor.model = recorder
@@ -229,8 +230,8 @@ try:
     decode = executor.execute_batch(
         ExecutionBatch(
             requests=(
-                decode_request("req-a", decode_input_a, executor.cache_len(handle_a), handle_a),
-                decode_request("req-b", decode_input_b, executor.cache_len(handle_b), handle_b),
+                decode_request("req-a", decode_input_a, cache_coordinator.length(handle_a), handle_a),
+                decode_request("req-b", decode_input_b, cache_coordinator.length(handle_b), handle_b),
             ),
         )
     )
@@ -244,7 +245,7 @@ try:
                 decode_request(
                     "ind-a",
                     int(independent_prefill_a.results[0].next_token_id),
-                    executor.cache_len(ind_a),
+                    cache_coordinator.length(ind_a),
                     ind_a,
                 ),
             ),
@@ -256,7 +257,7 @@ try:
                 decode_request(
                     "ind-b",
                     int(independent_prefill_b.results[0].next_token_id),
-                    executor.cache_len(ind_b),
+                    cache_coordinator.length(ind_b),
                     ind_b,
                 ),
             ),
@@ -284,14 +285,14 @@ try:
         and decode.results[0].cache_length != decode.results[1].cache_length
     )
 
-    executor.release(iso_a)
+    cache_coordinator.release(iso_a)
     isolated_decode_b = executor.execute_batch(
         ExecutionBatch(
             requests=(
                 decode_request(
                     "iso-shared-b",
                     int(shared_isolation_prefill.results[1].next_token_id),
-                    executor.cache_len(iso_shared_b),
+                    cache_coordinator.length(iso_shared_b),
                     iso_shared_b,
                 ),
             ),
@@ -303,7 +304,7 @@ try:
                 decode_request(
                     "iso-b",
                     int(isolated_prefill_b.results[0].next_token_id),
-                    executor.cache_len(iso_b),
+                    cache_coordinator.length(iso_b),
                     iso_b,
                 ),
             ),
@@ -355,16 +356,16 @@ try:
     if not parity.token_ok:
         raise SystemExit("native prefill/decode token parity failed")
 finally:
-    executor.release(handle_a)
-    executor.release(handle_b)
-    executor.release(ind_a)
-    executor.release(ind_b)
-    executor.release(iso_a)
-    executor.release(iso_shared_b)
-    executor.release(iso_b)
+    cache_coordinator.release(handle_a)
+    cache_coordinator.release(handle_b)
+    cache_coordinator.release(ind_a)
+    cache_coordinator.release(ind_b)
+    cache_coordinator.release(iso_a)
+    cache_coordinator.release(iso_shared_b)
+    cache_coordinator.release(iso_b)
 
 release_ok = all(
-    executor.cache_len(handle) == 0
+    cache_coordinator.length(handle) == 0
     for handle in (handle_a, handle_b, ind_a, ind_b, iso_a, iso_shared_b, iso_b)
 )
 print(f"release_ok={1 if release_ok else 0}")

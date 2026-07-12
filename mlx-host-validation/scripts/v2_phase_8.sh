@@ -20,6 +20,7 @@
 #   - `uv` environment for `python/`
 #   - known-good checkpoint already available to local Hugging Face cache
 #   - `cargo` toolchain for `mlx_runtime_gateway`
+#   - optional `MLX_PHASE8_TEXT_CACHE_BUDGET_BYTES` override for native KV budget
 #
 # Expected success signals:
 #   - `mlx_import_ok=1`
@@ -53,6 +54,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 CHECKPOINT="mlx-community/Qwen2.5-7B-Instruct-4bit"
+TEXT_CACHE_BUDGET_BYTES="${MLX_PHASE8_TEXT_CACHE_BUDGET_BYTES:-268435456}"
 NATIVE_PORT_BASE=18082
 V1_PORT=18083
 TMP_ROOT="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-8"
@@ -112,6 +114,7 @@ start_gateway() {
         exec env \
             MLX_RUNTIME_CONFIG="$config_path" \
             MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$chunk_size" \
+            MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES" \
             "$GATEWAY_BIN"
     ) >"$log_path" 2>&1 &
     GATEWAY_PID=$!
@@ -584,18 +587,21 @@ checkpoint = sys.argv[1]
 model_path = resolve_model_path(checkpoint)
 artifacts = build_native_artifacts(checkpoint)
 executor = artifacts.executor
+cache_coordinator = artifacts.cache_coordinator
 prompt_a = prompt_ids(model_path, "phase8a", 3)
 prompt_b = prompt_ids(model_path, "phase8b", 1)
 
-handle_a = executor.create_cache("phase8-a")
-handle_b = executor.create_cache("phase8-b")
-ind_a = executor.create_cache("phase8-ind-a")
-ind_b = executor.create_cache("phase8-ind-b")
-mixed_decode_handle = executor.create_cache("phase8-mixed-decode")
-mixed_prefill_handle = executor.create_cache("phase8-mixed-prefill")
-split_decode_handle = executor.create_cache("phase8-split-decode")
-split_prefill_handle = executor.create_cache("phase8-split-prefill")
-isolation_valid_handle = executor.create_cache("phase8-isolation-valid")
+handle_a = cache_coordinator.acquire("phase8-a", ()).cache_handle
+handle_b = cache_coordinator.acquire("phase8-b", ()).cache_handle
+ind_a = cache_coordinator.acquire("phase8-ind-a", ()).cache_handle
+ind_b = cache_coordinator.acquire("phase8-ind-b", ()).cache_handle
+mixed_decode_handle = cache_coordinator.acquire("phase8-mixed-decode", ()).cache_handle
+mixed_prefill_handle = cache_coordinator.acquire("phase8-mixed-prefill", ()).cache_handle
+split_decode_handle = cache_coordinator.acquire("phase8-split-decode", ()).cache_handle
+split_prefill_handle = cache_coordinator.acquire("phase8-split-prefill", ()).cache_handle
+isolation_valid_handle = cache_coordinator.acquire(
+    "phase8-isolation-valid", ()
+).cache_handle
 try:
     recorder = RecordingModel(executor.model)
     executor.model = recorder
@@ -628,13 +634,13 @@ try:
                 decode_request(
                     "phase8-a",
                     int(prefill.results[0].next_token_id),
-                    executor.cache_len(handle_a),
+                    cache_coordinator.length(handle_a),
                     handle_a,
                 ),
                 decode_request(
                     "phase8-b",
                     int(prefill.results[1].next_token_id),
-                    executor.cache_len(handle_b),
+                    cache_coordinator.length(handle_b),
                     handle_b,
                 ),
             ),
@@ -649,7 +655,7 @@ try:
                 decode_request(
                     "phase8-ind-a",
                     int(independent_prefill_a.results[0].next_token_id),
-                    executor.cache_len(ind_a),
+                    cache_coordinator.length(ind_a),
                     ind_a,
                 ),
             ),
@@ -661,7 +667,7 @@ try:
                 decode_request(
                     "phase8-ind-b",
                     int(independent_prefill_b.results[0].next_token_id),
-                    executor.cache_len(ind_b),
+                    cache_coordinator.length(ind_b),
                     ind_b,
                 ),
             ),
@@ -723,7 +729,7 @@ try:
                 decode_request(
                     "phase8-mixed-decode",
                     int(mixed_decode_prefill.results[0].next_token_id),
-                    executor.cache_len(mixed_decode_handle),
+                    cache_coordinator.length(mixed_decode_handle),
                     mixed_decode_handle,
                 ),
                 prefill_request(
@@ -745,7 +751,7 @@ try:
                 decode_request(
                     "phase8-split-decode",
                     int(split_decode_prefill.results[0].next_token_id),
-                    executor.cache_len(split_decode_handle),
+                    cache_coordinator.length(split_decode_handle),
                     split_decode_handle,
                 ),
             ),
@@ -806,7 +812,7 @@ try:
         invalid_result.error_code == "INVALID_EXECUTION_REQUEST"
         and valid_result.error_code is None
         and valid_result.cache_length == len(prompt_b)
-        and executor.cache_len(isolation_valid_handle) == len(prompt_b)
+        and cache_coordinator.length(isolation_valid_handle) == len(prompt_b)
         and isolated.physical_batch_size == 1
         and isolated.model_forward_count == 1
         and isolation_recorder.calls == 1
@@ -837,15 +843,15 @@ try:
     if not request_failure_isolation_ok:
         raise SystemExit("phase 8 request-local failure isolation failed")
 finally:
-    executor.release(handle_a)
-    executor.release(handle_b)
-    executor.release(ind_a)
-    executor.release(ind_b)
-    executor.release(mixed_decode_handle)
-    executor.release(mixed_prefill_handle)
-    executor.release(split_decode_handle)
-    executor.release(split_prefill_handle)
-    executor.release(isolation_valid_handle)
+    cache_coordinator.release(handle_a)
+    cache_coordinator.release(handle_b)
+    cache_coordinator.release(ind_a)
+    cache_coordinator.release(ind_b)
+    cache_coordinator.release(mixed_decode_handle)
+    cache_coordinator.release(mixed_prefill_handle)
+    cache_coordinator.release(split_decode_handle)
+    cache_coordinator.release(split_prefill_handle)
+    cache_coordinator.release(isolation_valid_handle)
 PY
 
 probe_chunk_size 32 18082

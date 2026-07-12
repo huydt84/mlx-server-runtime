@@ -17,6 +17,7 @@ A lightweight MLX inference runtime for Apple Silicon. Rust control plane + Pyth
 | **Reference** | [Configuration](reference/configuration.md) | All TOML fields with defaults |
 | **Reference** | [IPC Protocol](reference/protocol.md) | UDS handshake and frame format |
 | **Reference** | [Metrics](reference/metrics.md) | All Prometheus metrics, labels, types |
+| **Reference** | [Native MLX v2](reference/native-mlx-v2.md) | Experimental native backend support, validation, metrics, and limitations |
 | **Reference** | [CLI](reference/cli.md) | Gateway and worker CLI flags |
 | **Explanation** | [Architecture](explanation/architecture.md) | Rust/Python split, IPC, lifecycle, design rationale |
 

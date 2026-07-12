@@ -96,6 +96,7 @@ no_trace_dir = Path(tempfile.mkdtemp(prefix="v2-phase5-no-trace-"))
 try:
     runtime_artifacts = build_native_artifacts(checkpoint)
     executor = runtime_artifacts.executor
+    cache_coordinator = runtime_artifacts.cache_coordinator
     model_path = runtime_artifacts.architecture.model_path
     prompt_token_ids = build_finalized_token_ids(model_path, messages)
     prompt_fingerprint = build_prompt_fingerprint(messages)
@@ -116,7 +117,7 @@ try:
     if not artifacts.summary_markdown_path.exists():
         raise SystemExit("first-divergence markdown artifact missing")
 
-    handle = executor.create_cache("phase-5-no-trace")
+    handle = cache_coordinator.acquire("phase-5-no-trace", ()).cache_handle
     try:
         prefill = executor.execute_batch(
             ExecutionBatch(
@@ -140,7 +141,7 @@ try:
                         request_id="phase-5-no-trace",
                         phase="decode",
                         token_ids=(decode_input,),
-                        positions=(executor.cache_len(handle),),
+                        positions=(cache_coordinator.length(handle),),
                         cache_handle=handle,
                         sampling=SamplingParams(),
                     ),
@@ -148,7 +149,7 @@ try:
             )
         )
     finally:
-        executor.release(handle)
+        cache_coordinator.release(handle)
 
     trace_off_normal_execution = not any(no_trace_dir.iterdir())
 
