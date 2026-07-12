@@ -8,13 +8,14 @@ Compare inference performance across three backends: raw `mlx-lm`, `mlx_lm.serve
 - Three benchmark scripts under `benchmarks/`
 - At least one model downloaded and cached
 
-## Phase 6: Text-Only Benchmark
+## Text-Only Benchmark
 
 ```bash
 bash scripts/benchmark.sh
 ```
 
-This runs `benchmarks/compare.py`. Default report path is `benchmarks/results/phase_6_report.md`.
+This runs `benchmarks/compare.py` and writes its default report under
+`benchmarks/results/`.
 
 Use `bash scripts/benchmark.sh --help` for parser help from `benchmarks/compare.py`.
 
@@ -31,7 +32,7 @@ Defaults come from `benchmarks/compare.py`.
 | `--prefill-step-size` | `2048` | Changes target long-prompt size generation. Larger value means larger long prompts. | Higher values can increase runtime sharply. | Changes long-context stress level and comparability across runs. | Only matters with `--include-long-prompts`. Pair with `--long-prompt-multiplier`. |
 | `--long-prompt-multiplier` | `2` | Changes long-prompt expansion target. Larger multiplier makes long prompts longer. | Higher multiplier increases runtime and memory pressure. | Changes prefill-heavy workload severity. | Only use when tuning long-context stress. Pair with `--include-long-prompts` and document value in report name. |
 | `--max-tokens` | `256` | Caps generated completion length for each sample. | Higher value usually increases runtime. | Higher values weight decode performance more; lower values emphasize prompt/prefill and TTFT. | Lower for smoke, higher for throughput/decode study. Pair with `--prompt` or `--include-long-prompts` depending goal. |
-| `--report-path` | `benchmarks/results/phase_6_report.md` | Writes Markdown report elsewhere. | No material timing effect. | No metric effect. Only output location changes. | Use to keep multiple runs side by side. Pair with descriptive filenames. |
+| `--report-path` | script default | Writes the Markdown report elsewhere. | No material timing effect. | No metric effect. Only output location changes. | Use to keep multiple runs side by side. Pair with descriptive filenames. |
 | `--project-port` | `8000` | Points project benchmark client at different gateway port. | No metric effect by itself. Wrong value causes failures. | No benchmark-shape effect if service is same. | Use when project server already running on non-default port. Pair with matching server launch config. |
 | `--server-port` | `8001` | Points benchmark client at different `mlx_lm.server` port. | No metric effect by itself. Wrong value causes failures. | No benchmark-shape effect if service is same. | Use when `mlx_lm.server` runs on different port. Pair with matching server launch config. |
 | `--warmup-trials` | `1` | Changes untimed-ish warmup passes per case. `0` removes warmup. | Extra warmups add runtime linearly. | More warmup can reduce first-run noise from model/server cold paths. | Use `0` for smoke, `1` for normal comparisons, higher only if cold-start noise is obvious. Pair with `--trials`. |
@@ -72,7 +73,7 @@ bash scripts/benchmark.sh \
   --warmup-trials 0 \
   --trials 1 \
   --max-tokens 8 \
-  --report-path benchmarks/results/phase_6_smoke.md
+  --report-path benchmarks/results/text_smoke.md
 ```
 
 ### Full-Suite
@@ -85,7 +86,7 @@ bash scripts/benchmark.sh \
   --include-long-prompts \
   --warmup-trials 1 \
   --trials 1 \
-  --report-path benchmarks/results/phase_6_report.md
+  --report-path benchmarks/results/text_full.md
 ```
 
 ### Personal Run Suite
@@ -100,13 +101,14 @@ bash scripts/benchmark.sh \
   --report-path benchmarks/results/text_inference_bench.md
 ```
 
-## Phase 9: VLM Benchmark
+## VLM Benchmark
 
 ```bash
 bash scripts/benchmark-vlm.sh
 ```
 
-This runs `benchmarks/compare_vlm.py`. Default Markdown report path is `benchmarks/results/phase_9_vlm_report.md`.
+This runs `benchmarks/compare_vlm.py` and writes its default Markdown report
+under `benchmarks/results/`.
 
 Use `bash scripts/benchmark-vlm.sh --help` for parser help from `benchmarks/compare_vlm.py`.
 
@@ -124,7 +126,7 @@ Defaults come from `benchmarks/compare_vlm.py`.
 | `--benchmark-mode` | `smoke` | Selects default run counts: `smoke=(0 warmup, 1 measured)`, `normal=(1, 3)`, `stable=(1, 5)`. | Major runtime control. | More samples improve stability. | Use `smoke` for newcomer check, `normal` for fast iteration, `stable` for real reporting. Pair with `--order-rounds`. |
 | `--warmup-runs-per-fixture` | unset; inherits from `--benchmark-mode` | Overrides warmup count per fixture. | Higher value increases runtime linearly. | Can reduce cold-start noise. | Use when `--benchmark-mode` is right overall but warmup count is not. Pair with `--measured-runs-per-fixture`. |
 | `--measured-runs-per-fixture` | unset; inherits from `--benchmark-mode` | Overrides measured count per fixture. | Higher value increases runtime linearly. | More stable averages and percentiles. | Use for more statistical confidence without changing other mode defaults. Pair with `--order-rounds`. |
-| `--warmup-trials` | unset | Legacy alias that overrides warmup count after mode resolution. | Same as warmup-runs change. | Same as warmup-runs change. | Prefer `--warmup-runs-per-fixture` in new docs/scripts. Use only for symmetry with phase 6 or older notes. |
+| `--warmup-trials` | unset | Legacy alias that overrides warmup count after mode resolution. | Same as warmup-runs change. | Same as warmup-runs change. | Prefer `--warmup-runs-per-fixture` in new commands. |
 | `--trials` | unset | Legacy alias that overrides measured count after mode resolution. | Same as measured-runs change. | Same as measured-runs change. | Prefer `--measured-runs-per-fixture` in new docs/scripts. |
 | `--scenario` | `baseline` | Chooses what benchmark behavior runs: `baseline`, `streaming`, `cancellation`, `concurrency`, or `all`. `all` expands to four separate scenario sections. | `all` takes longest. Single-scenario runs are much faster. | Changes which metrics matter and which comparisons are fair. | Use `baseline` for end-to-end latency, `streaming` for TTFT/chunks, `cancellation` for lifecycle behavior, `concurrency` for pressure behavior, `all` for full evaluation. Pair with scenario-specific flags below. |
 | `--fixtures` | none; all generated cases used when omitted | Restricts to exact fixture case names. | Fewer fixtures shorten run. | Narrows workload coverage. | Use to reproduce one problematic case. Pair with `--scenario` and `--model`. |
@@ -134,7 +136,7 @@ Defaults come from `benchmarks/compare_vlm.py`.
 | `--randomize-backend-order` | off | Shuffles backend order between rounds. | Minimal direct runtime change. | Can reduce systematic order bias. | Best for serious fair comparisons. Pair with `--order-rounds 3` and `--backend-order-seed`. |
 | `--backend-order-seed` | unset | Makes randomized backend order reproducible. | None. | No metric change except reproducibility of shuffled order. | Use whenever `--randomize-backend-order` is on and you want repeatable order. |
 | `--order-rounds` | `1` | Repeats benchmark rounds with fresh backend orders. | Multiplies runtime approximately linearly. | Better exposes or averages out order effects. | Use `3` for fairness-focused reporting. Pair with `--randomize-backend-order` or deliberate `--backend-order`. |
-| `--output-md` | `benchmarks/results/phase_9_vlm_report.md` | Writes Markdown report elsewhere. | None. | No metric effect. | Use to keep scenario/model variants separate. Pair with `--output-json`. |
+| `--output-md` | script default | Writes the Markdown report elsewhere. | None. | No metric effect. | Use to keep scenario/model variants separate. Pair with `--output-json`. |
 | `--output-json` | unset | Writes structured JSON report in addition to Markdown. | Small file-write overhead only. | No metric effect. | Use for later parsing, dashboards, or diffing. Pair with `--output-md`. |
 | `--report-path` | unset; if set it overrides `--output-md` | Alias for Markdown output path. When both are provided, this value wins. | None. | No metric effect. | Use only for compatibility with older scripts. Prefer `--output-md` in new commands. |
 | `--project-port` | `8000` | Points project backend client at different gateway port. | None unless wrong, then failures. | No benchmark-shape effect if service is same. | Use when gateway runs on non-default port. Pair with matching launch config. |
@@ -184,8 +186,8 @@ bash scripts/benchmark-vlm.sh \
   --scenario baseline \
   --fixture-category single_image \
   --backend-order raw,server,project \
-  --output-json benchmarks/results/phase_9_vlm_smoke.json \
-  --output-md benchmarks/results/phase_9_vlm_smoke.md
+  --output-json benchmarks/results/vlm_smoke.json \
+  --output-md benchmarks/results/vlm_smoke.md
 ```
 
 ### Full-Suite
@@ -202,8 +204,8 @@ bash scripts/benchmark-vlm.sh \
   --order-rounds 3 \
   --concurrency-levels 1,2,4 \
   --measured-runs-per-fixture 7 \
-  --output-json benchmarks/results/phase_9_vlm_full.json \
-  --output-md benchmarks/results/phase_9_vlm_full.md
+  --output-json benchmarks/results/vlm_full.json \
+  --output-md benchmarks/results/vlm_full.md
 ```
 
 ### Personal Run Suite
@@ -218,8 +220,8 @@ bash scripts/benchmark-vlm.sh \
   --order-rounds 3 \
   --concurrency-levels 1,2,4 \
   --measured-runs-per-fixture 7 \
-  --output-json benchmarks/results/phase_9_vlm_full.json \
-  --output-md benchmarks/results/phase_9_vlm_full.md
+  --output-json benchmarks/results/vlm_full.json \
+  --output-md benchmarks/results/vlm_full.md
 ```
 
 ## Benchmark Cases

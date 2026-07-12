@@ -8,6 +8,7 @@ A lightweight MLX inference runtime for Apple Silicon. Rust control plane + Pyth
 |----------|----------|---------|
 | **Tutorial** | [Getting Started](tutorial/getting-started.md) | Walk from zero to your first inference request |
 | **How-to** | [Run Benchmarks](how-to/run-benchmarks.md) | Measure and compare inference performance |
+| **How-to** | [Profile Inference](how-to/profiling.md) | Capture a correlated gateway-to-Metal timing profile |
 | **How-to** | [Add an Endpoint](how-to/add-endpoint.md) | Extend the HTTP API surface |
 | **How-to** | [Debug the Worker](how-to/debug-worker.md) | Inspect and troubleshoot the Python worker |
 | **How-to** | [Deploy](how-to/deploy.md) | Run the runtime as a persistent service |

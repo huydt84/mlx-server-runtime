@@ -17,6 +17,8 @@ Full documentation is in the [`docs/`](docs/) directory:
 | [HTTP API Reference](docs/reference/api.md) | All endpoints, schemas, error codes |
 | [Configuration Reference](docs/reference/configuration.md) | All TOML fields and defaults |
 | [IPC Protocol](docs/reference/protocol.md) | UDS handshake and frame format |
+| [Profile Inference](docs/how-to/profiling.md) | Capture and interpret whole-pipeline timing |
+| [Contributing](CONTRIBUTING.md) | Add model architectures, debug layer output, and profile model graphs |
 
 ## Quick Start
 
@@ -75,8 +77,8 @@ Request logs are structured JSON lines written by the Rust gateway and include:
 
 Benchmark docs live in `docs/how-to/run-benchmarks.md`.
 
-- Phase 6 text-only benchmark: `scripts/benchmark.sh`
-- Phase 9 VLM benchmark: `scripts/benchmark-vlm.sh`
+- Text-only benchmark: `scripts/benchmark.sh`
+- VLM benchmark: `scripts/benchmark-vlm.sh`
 
 Default reports land in `benchmarks/results/`.
 
@@ -89,3 +91,21 @@ Quick start:
 ```bash
 bash scripts/benchmark.sh
 ```
+
+## Profiling
+
+Whole-pipeline profiling helps explain latency across the Rust gateway, worker
+transport, Python runtime, scheduler, executor, cache, model, MLX
+synchronization, detokenization, and response streaming. It is disabled by
+default and must remain off during fair benchmark runs.
+
+Run the bounded profiling workflow on an Apple Silicon host:
+
+```bash
+bash scripts/profile.sh
+```
+
+The workflow writes request-correlated JSONL events, a Chrome Trace/Perfetto
+timeline, and a Markdown summary. For configuration, optional Metal capture,
+artifact interpretation, and failure handling, see
+[Profile inference](docs/how-to/profiling.md).
