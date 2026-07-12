@@ -4,6 +4,11 @@ The runtime is configured via a TOML file. Default path is `config/runtime.toml`
 
 If the config file is missing, all defaults apply.
 
+Native-MLX cache, attention, scheduler, and profiling controls are environment
+variables rather than TOML fields. See [Native MLX v2](native-mlx-v2.md),
+including `MLX_RUNTIME_NATIVE_EXECUTION_BACKEND` and its cache/attention
+compatibility contract.
+
 ## [server]
 
 | Field | Type | Default | Description |

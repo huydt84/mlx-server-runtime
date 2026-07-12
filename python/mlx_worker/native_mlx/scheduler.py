@@ -313,15 +313,16 @@ class NativeContinuousScheduler:
         prefill_states.extend(
             state for state in self._waiting.values() if not state.cancel_requested
         )
-        if selected and self._prioritize_decode:
-            return selected
+        prefill_limit = (
+            1 if selected and self._prioritize_decode else self._prefill_batch_size
+        )
         prefill_states = self._policy.order(
             prefill_states,
             scheduler_round=self._scheduler_round,
             cache_coordinator=self._cache_coordinator,
             timings=timings,
         )
-        for state in prefill_states[: self._prefill_batch_size]:
+        for state in prefill_states[:prefill_limit]:
             request_id = state.work.request_id
             if state.cache_handle is None:
                 self._waiting.pop(request_id, None)

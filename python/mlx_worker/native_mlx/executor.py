@@ -61,15 +61,14 @@ class MlxGenerationExecutor:
                 step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
                 physical_batch_size=0,
                 model_forward_count=0,
-                metrics={
-                    **self.cache_backend.metrics(),
-                    "executor_prepare_ms": prepare_ms,
-                    "executor_reserve_ms": 0,
-                    "executor_forward_ms": 0,
-                    "executor_sample_ms": 0,
-                    "executor_eval_ms": 0,
-                    "executor_commit_ms": 0,
-                },
+                metrics=self._metrics(
+                    executor_prepare_ms=prepare_ms,
+                    executor_reserve_ms=0,
+                    executor_forward_ms=0,
+                    executor_sample_ms=0,
+                    executor_eval_ms=0,
+                    executor_commit_ms=0,
+                ),
             )
         reserve_started = time.perf_counter()
         try:
@@ -136,17 +135,24 @@ class MlxGenerationExecutor:
             step_time_ms=max(1, int((time.perf_counter() - started) * 1000)),
             physical_batch_size=len(layout.requests),
             model_forward_count=1,
-            metrics={
-                **self.cache_backend.metrics(),
-                "executor_prepare_ms": prepare_ms,
-                "executor_reserve_ms": reserve_ms,
-                "executor_forward_ms": forward_ms,
-                "executor_sample_ms": sample_ms,
-                "executor_eval_ms": eval_ms,
-                "executor_commit_ms": commit_ms,
+            metrics=self._metrics(
+                executor_prepare_ms=prepare_ms,
+                executor_reserve_ms=reserve_ms,
+                executor_forward_ms=forward_ms,
+                executor_sample_ms=sample_ms,
+                executor_eval_ms=eval_ms,
+                executor_commit_ms=commit_ms,
                 **graph_profile_metrics,
-            },
+            ),
         )
+
+    def _metrics(self, **execution_metrics: int) -> dict[str, object]:
+        """Compose cache, attention, and executor metrics with one base mapping."""
+
+        metrics = self.cache_backend.metrics()
+        self.attention_backend.add_metrics(metrics)
+        metrics.update(execution_metrics)
+        return metrics
 
     def _prepare(
         self, batch: ExecutionBatch

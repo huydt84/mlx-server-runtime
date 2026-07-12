@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Protocol
 
 import mlx.core as mx
 
@@ -12,19 +12,64 @@ from .cache import (
     BatchCacheReservation,
     DenseBatchReservation,
     DenseLayerCache,
+    DenseKVCacheBackend,
     PagedBatchReservation,
+    PagedKVCacheBackend,
 )
 from .interfaces import ForwardMode, LayerAttentionContext
 
 
+@dataclass(frozen=True)
+class AttentionBackendCapabilities:
+    """Static compatibility contract for one attention implementation."""
+
+    backend_id: str
+    cache_backend_types: tuple[type[Any], ...]
+    reservation_types: tuple[type[Any], ...]
+    supported_masks: frozenset[str | None]
+    supported_forward_modes: frozenset[ForwardMode]
+    requires_metal: bool
+    supports_attention_sinks: bool = False
+    supports_sliding_window: bool = False
+    consumes_page_tables_directly: bool = False
+
+    def validate_cache_backend(self, cache_backend: Any) -> None:
+        """Fail before serving when cache storage is incompatible."""
+
+        if not isinstance(cache_backend, self.cache_backend_types):
+            expected = ", ".join(item.__name__ for item in self.cache_backend_types)
+            raise TypeError(
+                f"{self.backend_id} requires cache backend type: {expected}"
+            )
+
+    def validate_context(
+        self,
+        reservation: BatchCacheReservation,
+        forward_mode: ForwardMode,
+    ) -> None:
+        """Validate per-step reservation and forward-mode compatibility."""
+
+        if not isinstance(reservation, self.reservation_types):
+            expected = ", ".join(item.__name__ for item in self.reservation_types)
+            raise TypeError(f"{self.backend_id} requires reservation type: {expected}")
+        if forward_mode not in self.supported_forward_modes:
+            raise ValueError(
+                f"{self.backend_id} does not support {forward_mode.value} forwards"
+            )
+
+
 class AttentionBackend(Protocol):
     """Build model-facing layer contexts for one cache reservation."""
+
+    capabilities: AttentionBackendCapabilities
 
     def contexts(
         self,
         reservation: BatchCacheReservation,
         forward_mode: ForwardMode,
     ) -> tuple[LayerAttentionContext, ...]: ...
+
+    def add_metrics(self, metrics: dict[str, Any]) -> None: ...
 
 
 @dataclass
@@ -43,6 +88,8 @@ class DenseLayerAttentionContext:
         scale: float,
         mask: str | None,
     ) -> mx.array:
+        if mask != "causal":
+            raise ValueError("dense reference attention supports causal masking only")
         dense_keys, dense_values = self.reservation.layer_views[
             self.layer_index
         ].update_and_fetch(keys, values)
@@ -98,18 +145,38 @@ class DenseTraceAttentionContext:
 class DenseReferenceAttentionBackend:
     """Explicit non-production attention adapter for parity and tests."""
 
+    capabilities: ClassVar[AttentionBackendCapabilities] = AttentionBackendCapabilities(
+        backend_id="dense-reference-sdpa",
+        cache_backend_types=(DenseKVCacheBackend,),
+        reservation_types=(DenseBatchReservation,),
+        supported_masks=frozenset(("causal",)),
+        supported_forward_modes=frozenset(ForwardMode),
+        requires_metal=False,
+    )
+
     def contexts(
         self,
         reservation: BatchCacheReservation,
         forward_mode: ForwardMode,
     ) -> tuple[LayerAttentionContext, ...]:
-        del forward_mode
-        if not isinstance(reservation, DenseBatchReservation):
-            raise TypeError("dense attention requires a dense cache reservation")
+        self.capabilities.validate_context(reservation, forward_mode)
+        assert isinstance(reservation, DenseBatchReservation)
         return tuple(
             DenseLayerAttentionContext(reservation, index)
             for index in range(len(reservation.layer_views))
         )
+
+    def metrics(self) -> dict[str, Any]:
+        """Return diagnostic backend identity without claiming kernel timing."""
+
+        metrics: dict[str, Any] = {}
+        self.add_metrics(metrics)
+        return metrics
+
+    def add_metrics(self, metrics: dict[str, Any]) -> None:
+        """Add backend-owned telemetry without a hot-path temporary mapping."""
+
+        metrics["attention_backend"] = self.capabilities.backend_id
 
 
 @dataclass
@@ -119,6 +186,7 @@ class PagedLayerAttentionContext:
     reservation: PagedBatchReservation
     layer_index: int
     forward_mode: ForwardMode
+    attention_backend: "PagedMetalAttentionBackend"
 
     def append_and_attend(
         self,
@@ -129,7 +197,7 @@ class PagedLayerAttentionContext:
         scale: float,
         mask: str | None,
     ) -> mx.array:
-        if mask not in (None, "causal"):
+        if mask != "causal":
             raise ValueError("native paged attention supports causal masking only")
         if int(queries.shape[1]) % self.reservation.backend.num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
@@ -159,7 +227,7 @@ class PagedLayerAttentionContext:
             scale=scale,
             mask=attention_mask.astype(queries.dtype),
         )
-        self.reservation.backend.record_attention(
+        self.attention_backend.record_attention(
             self.forward_mode.value,
             max(0, int((time.perf_counter() - started) * 1000)),
         )
@@ -222,7 +290,19 @@ class PagedLayerAttentionContext:
 
 @dataclass
 class PagedMetalAttentionBackend:
-    """MLX-native attention over fixed-size paged K/V."""
+    """MLX SDPA over dense rows gathered from fixed-size paged K/V."""
+
+    capabilities: ClassVar[AttentionBackendCapabilities] = AttentionBackendCapabilities(
+        backend_id="native-metal-paged-sdpa",
+        cache_backend_types=(PagedKVCacheBackend,),
+        reservation_types=(PagedBatchReservation,),
+        supported_masks=frozenset(("causal",)),
+        supported_forward_modes=frozenset(ForwardMode),
+        requires_metal=True,
+        consumes_page_tables_directly=False,
+    )
+    _attention_mode: str = field(default="uninitialized", init=False)
+    _attention_time_ms: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if not mx.metal.is_available():
@@ -233,16 +313,37 @@ class PagedMetalAttentionBackend:
         reservation: BatchCacheReservation,
         forward_mode: ForwardMode,
     ) -> tuple[LayerAttentionContext, ...]:
-        if not isinstance(reservation, PagedBatchReservation):
-            raise TypeError("paged attention requires a paged cache reservation")
+        self.capabilities.validate_context(reservation, forward_mode)
+        assert isinstance(reservation, PagedBatchReservation)
         return tuple(
             PagedLayerAttentionContext(
                 reservation=reservation,
                 layer_index=index,
                 forward_mode=forward_mode,
+                attention_backend=self,
             )
             for index in range(reservation.backend.num_layers)
         )
+
+    def record_attention(self, mode: str, elapsed_ms: int) -> None:
+        """Record the latest lazy MLX attention dispatch observation."""
+
+        self._attention_mode = mode
+        self._attention_time_ms = max(0, int(elapsed_ms))
+
+    def metrics(self) -> dict[str, Any]:
+        """Return backend-owned dispatch telemetry."""
+
+        metrics: dict[str, Any] = {}
+        self.add_metrics(metrics)
+        return metrics
+
+    def add_metrics(self, metrics: dict[str, Any]) -> None:
+        """Add backend-owned telemetry without a hot-path temporary mapping."""
+
+        metrics["attention_backend"] = self.capabilities.backend_id
+        metrics["attention_mode"] = self._attention_mode
+        metrics["attention_time_ms"] = self._attention_time_ms
 
 
 def _dense_causal_mask(

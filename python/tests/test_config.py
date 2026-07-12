@@ -74,6 +74,24 @@ def test_load_config_parses_native_kv_page_size(monkeypatch) -> None:
     assert config.native_kv_page_size == 32
 
 
+def test_load_config_defaults_native_execution_backend(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_NATIVE_EXECUTION_BACKEND", raising=False)
+
+    config = load_config()
+
+    assert config.native_execution_backend == "native-metal-paged-sdpa"
+
+
+def test_load_config_parses_native_execution_backend(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "MLX_RUNTIME_NATIVE_EXECUTION_BACKEND", "native-metal-paged-sdpa"
+    )
+
+    config = load_config()
+
+    assert config.native_execution_backend == "native-metal-paged-sdpa"
+
+
 def test_load_config_parses_native_prefix_cache_strategy(monkeypatch) -> None:
     monkeypatch.setenv("MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY", "radix")
 
@@ -126,6 +144,13 @@ def test_load_config_rejects_invalid_native_kv_page_size(monkeypatch) -> None:
     monkeypatch.setenv("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "7")
 
     with pytest.raises(ValueError, match="MLX_RUNTIME_NATIVE_KV_PAGE_SIZE"):
+        load_config()
+
+
+def test_load_config_rejects_invalid_native_execution_backend(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_EXECUTION_BACKEND", "unknown")
+
+    with pytest.raises(ValueError, match="MLX_RUNTIME_NATIVE_EXECUTION_BACKEND"):
         load_config()
 
 

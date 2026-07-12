@@ -86,6 +86,7 @@ Useful native-v2 environment variables:
 | Variable | Values | Purpose |
 | --- | --- | --- |
 | `MLX_RUNTIME_BACKEND` | `v1`, `native-mlx` | Worker backend selector |
+| `MLX_RUNTIME_NATIVE_EXECUTION_BACKEND` | `native-metal-paged-sdpa` | Compatible native cache-and-attention bundle; defaults to the existing production path |
 | `MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` | `8`, `16`, `32` | Native paged-KV page size |
 | `MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY` | `radix`, `block-hash` | Prefix-cache strategy; `radix` is the native-v2 default |
 | `MLX_RUNTIME_NATIVE_SCHEDULING_POLICY` | `fcfs`, `lpm`, `lof`, `priority` | Python scheduler waiting-queue policy |
@@ -99,9 +100,36 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Text KV/prefix-cache byte budget |
 | `MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES` | positive integer | Prefix-cache entry bound |
 
-Invalid native page-size, prefix-cache strategy, or scheduler-policy values must
-fail startup. They must not silently select dense attention, another prefix
-strategy, v1, `mlx-lm`, or `mlx-vlm`.
+Invalid native execution-backend, page-size, prefix-cache strategy, or
+scheduler-policy values must fail startup. They must not silently select dense
+attention, another prefix strategy, v1, `mlx-lm`, or `mlx-vlm`.
+
+## Attention Backend Contract
+
+The native executor selects attention through a registered execution-backend
+bundle. A bundle pairs one KV-cache backend with one compatible attention
+backend and validates that pairing before serving. Architecture models continue
+to depend only on `LayerAttentionContext`; they do not select kernels or inspect
+page tables.
+
+Each attention backend declares a stable identifier, compatible cache and
+reservation types, supported masks and forward modes, Metal requirements, and
+whether it consumes page tables directly. Adding another causal backend with
+the existing model-facing operation requires a new identifier, factory entry,
+and backend contract tests, but no Qwen2 or executor changes. New attention
+semantics such as sinks or sliding windows still require an explicit model
+interface extension.
+
+The current `native-metal-paged-sdpa` bundle preserves the Phase 9 production
+path: KV storage is page managed, then the attention adapter gathers padded
+dense K/V rows and delegates to `mx.fast.scaled_dot_product_attention`. Its
+capability metadata therefore reports that it does **not** consume page tables
+directly. It must not be described as a direct paged-attention kernel.
+
+Attention backend identity and dispatch telemetry are owned by the attention
+adapter. Cache metrics remain owned by the KV backend. Because MLX evaluation
+is lazy, `attention_time_ms` measures attention graph construction/dispatch;
+`executor_eval_ms` contains the synchronized MLX execution boundary.
 
 ## Profiling
 
@@ -161,6 +189,7 @@ request totals.
 ## Known Limitations
 
 - `native-mlx` is experimental and explicit opt-in.
+- The only registered production execution backend is currently `native-metal-paged-sdpa`.
 - Only explicitly implemented architecture classes are supported.
 - Greedy decoding is the validated native path.
 - VLM requests remain outside `native-mlx`.

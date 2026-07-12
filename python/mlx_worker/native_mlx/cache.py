@@ -459,8 +459,6 @@ class PagedKVCacheBackend:
     _caches: dict[str, PagedRequestCache] = field(default_factory=dict, init=False)
     _reserved_pages: set[int] = field(default_factory=set, init=False)
     _allocation_failures: int = field(default=0, init=False)
-    _attention_mode: str = field(default="uninitialized", init=False)
-    _attention_time_ms: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if self.page_size not in (8, 16, 32):
@@ -667,10 +665,6 @@ class PagedKVCacheBackend:
                 self._free_pages.append(page)
         self._free_pages.sort()
 
-    def record_attention(self, mode: str, elapsed_ms: int) -> None:
-        self._attention_mode = mode
-        self._attention_time_ms = max(0, int(elapsed_ms))
-
     def metrics(self) -> dict[str, Any]:
         used_pages = sum(count > 0 for count in self._ref_counts)
         pinned_pages = sum(count > 0 for count in self._pin_counts)
@@ -681,9 +675,6 @@ class PagedKVCacheBackend:
         )
         return {
             "cache_backend": "paged-mlx",
-            "attention_backend": "native-metal-paged-sdpa",
-            "attention_mode": self._attention_mode,
-            "attention_time_ms": self._attention_time_ms,
             "total_pages": self.num_pages,
             "used_pages": used_pages,
             "free_pages": self.num_pages - used_pages,

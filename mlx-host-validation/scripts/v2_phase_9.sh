@@ -39,7 +39,7 @@
 # Expected failure signals:
 #   - non-zero exit
 #   - gateway fails readiness or exits unexpectedly
-#   - public metrics miss `paged-mlx` or `native-metal-paged`
+#   - public metrics miss `paged-mlx` or `native-metal-paged-sdpa`
 #   - direct native executor lacks mixed one-forward evidence
 #   - direct parity, page lifecycle, capacity, cancellation, or config probes fail
 
@@ -328,7 +328,9 @@ decode_metric = 'mlx_scheduled_tokens_by_backend{backend="native-mlx",modality="
 paged_metrics_ok = any(snapshot.get(paged_metric, 0.0) > 0 for snapshot in snapshots)
 attention_ok = any(
     any(
-        key.startswith('mlx_attention_time_by_backend_ms{backend="native-metal-paged"')
+        key.startswith(
+            'mlx_attention_time_by_backend_ms{backend="native-metal-paged-sdpa"'
+        )
         for key in snapshot
     )
     for snapshot in snapshots
@@ -352,7 +354,7 @@ print(f"phase9_public_paged_metrics_ok={int(paged_metrics_ok and attention_ok an
 if not paged_metrics_ok:
     raise SystemExit("public metrics did not expose paged-mlx used pages")
 if not attention_ok:
-    raise SystemExit("public metrics did not expose native-metal-paged attention")
+    raise SystemExit("public metrics did not expose native-metal-paged-sdpa attention")
 if not prefill_decode_ok:
     raise SystemExit("public metrics did not expose prefill and decode phases")
 PY
@@ -536,7 +538,7 @@ try:
         and recorder.calls == 2
         and recorder.batch_sizes[-1] == 2
         and mixed.metrics["cache_backend"] == "paged-mlx"
-        and mixed.metrics["attention_backend"] == "native-metal-paged"
+        and mixed.metrics["attention_backend"] == "native-metal-paged-sdpa"
     )
     if not mixed_ok:
         raise SystemExit("direct mixed native execution did not use one paged forward")

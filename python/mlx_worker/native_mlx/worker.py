@@ -177,6 +177,7 @@ def create_native_worker(
         cache_budget_bytes=config.text_cache_budget_bytes,
         cache_max_entries=config.text_cache_max_entries,
         kv_page_size=config.native_kv_page_size,
+        execution_backend_id=config.native_execution_backend,
         prefix_cache_strategy=config.native_prefix_cache_strategy,
         graph_profile=config.native_graph_profile,
     )

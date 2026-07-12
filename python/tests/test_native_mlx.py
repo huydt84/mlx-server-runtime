@@ -19,12 +19,24 @@ from mlx_worker.native_mlx.bootstrap import (
     detect_native_architecture,
 )
 from mlx_worker.native_mlx.attention import (
+    AttentionBackendCapabilities,
     DenseReferenceAttentionBackend,
     PagedMetalAttentionBackend,
 )
-from mlx_worker.native_mlx.cache import DenseKVCacheBackend, PagedKVCacheBackend
+from mlx_worker.native_mlx.cache import (
+    DenseBatchReservation,
+    DenseKVCacheBackend,
+    KVCacheGeometry,
+    PagedBatchReservation,
+    PagedKVCacheBackend,
+)
 from mlx_worker.native_mlx.cache_coordinator import NativeCacheCoordinator
 from mlx_worker.native_mlx.executor import MlxGenerationExecutor
+from mlx_worker.native_mlx.execution_backends import (
+    DEFAULT_NATIVE_EXECUTION_BACKEND,
+    available_native_execution_backends,
+    build_native_execution_backend,
+)
 from mlx_worker.native_mlx.graph_profile import GraphProfiledModel
 from mlx_worker.native_mlx.interfaces import (
     BatchExecutionError,
@@ -850,7 +862,8 @@ def test_paged_metal_attention_matches_dense_reference() -> None:
         dense_reservation,
         ForwardMode.PREFILL,
     )[0]
-    paged_context = PagedMetalAttentionBackend().contexts(
+    paged_attention = PagedMetalAttentionBackend()
+    paged_context = paged_attention.contexts(
         paged_reservation,
         ForwardMode.PREFILL,
     )[0]
@@ -872,7 +885,70 @@ def test_paged_metal_attention_matches_dense_reference() -> None:
     mx.eval(dense, paged)
 
     assert mx.allclose(dense, paged, atol=1e-3, rtol=1e-3).item()
-    assert paged_backend.metrics()["attention_backend"] == "native-metal-paged-sdpa"
+    assert paged_attention.metrics()["attention_backend"] == "native-metal-paged-sdpa"
+    assert "attention_backend" not in paged_backend.metrics()
+
+
+def test_attention_capabilities_reject_incompatible_cache_backend() -> None:
+    capabilities = AttentionBackendCapabilities(
+        backend_id="test-dense",
+        cache_backend_types=(DenseKVCacheBackend,),
+        reservation_types=(DenseBatchReservation,),
+        supported_masks=frozenset(("causal",)),
+        supported_forward_modes=frozenset(ForwardMode),
+        requires_metal=False,
+    )
+    paged_backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=4,
+        page_size=8,
+        budget_bytes=256,
+        dtype=mx.float16,
+    )
+
+    with pytest.raises(TypeError, match="test-dense requires cache backend type"):
+        capabilities.validate_cache_backend(paged_backend)
+    paged_cache = paged_backend.get(paged_backend.create("paged"), "paged")
+    paged_reservation = paged_backend.reserve_batch((paged_cache,), (1,))
+    with pytest.raises(TypeError, match="test-dense requires reservation type"):
+        capabilities.validate_context(paged_reservation, ForwardMode.PREFILL)
+
+
+def test_native_execution_backend_registry_exposes_stable_default() -> None:
+    assert DEFAULT_NATIVE_EXECUTION_BACKEND in available_native_execution_backends()
+
+
+def test_bootstrap_rejects_unknown_execution_backend_before_model_loading() -> None:
+    with pytest.raises(NativeBootstrapFailure) as caught:
+        build_native_artifacts("missing-model", execution_backend_id="unknown")
+
+    assert caught.value.error.code == "UNSUPPORTED_NATIVE_EXECUTION_BACKEND"
+    assert caught.value.error.stage == "backend_selection"
+    assert caught.value.error.category == "invalid_configuration"
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_native_execution_backend_registry_builds_compatible_bundle() -> None:
+    bundle = build_native_execution_backend(
+        DEFAULT_NATIVE_EXECUTION_BACKEND,
+        KVCacheGeometry(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            dtype=mx.float16,
+        ),
+        page_size=8,
+        cache_budget_bytes=256,
+    )
+
+    bundle.validate()
+    assert isinstance(bundle.cache_backend, PagedKVCacheBackend)
+    assert isinstance(bundle.attention_backend, PagedMetalAttentionBackend)
+    assert bundle.attention_backend.capabilities.reservation_types == (
+        PagedBatchReservation,
+    )
+    assert bundle.attention_backend.capabilities.consumes_page_tables_directly is False
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
@@ -1114,20 +1190,24 @@ def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None
     assert [request.phase for request in mixed.requests] == ["decode", "prefill"]
 
 
-def test_scheduler_prioritizes_active_decode_by_default() -> None:
+def test_scheduler_prioritizes_decode_without_starving_new_prefill() -> None:
     executor = _FakeExecutor()
     scheduler, _ = _scheduler(executor, prefill_step_size=8)
     scheduler.submit(_schedulable("running", (1,)))
     scheduler.tick()
-    scheduler.submit(_schedulable("waiting", (2,)))
+    scheduler.submit(_schedulable("waiting-first", (2,)))
+    scheduler.submit(_schedulable("waiting-second", (3,)))
 
     scheduler.tick()
 
     assert len(executor.batches) == 2
-    decode = executor.batches[-1]
-    assert decode.forward_mode is ForwardMode.DECODE
-    assert [request.phase for request in decode.requests] == ["decode"]
-    assert [request.request_id for request in decode.requests] == ["running"]
+    mixed = executor.batches[-1]
+    assert mixed.forward_mode is ForwardMode.MIXED
+    assert [request.phase for request in mixed.requests] == ["decode", "prefill"]
+    assert [request.request_id for request in mixed.requests] == [
+        "running",
+        "waiting-first",
+    ]
 
 
 def test_scheduler_respects_prefill_batch_size() -> None:

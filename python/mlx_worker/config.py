@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
+from .native_backend_ids import (
+    DEFAULT_NATIVE_EXECUTION_BACKEND,
+    NATIVE_EXECUTION_BACKEND_IDS,
+)
+
 
 @dataclass(frozen=True)
 class WorkerConfig:
@@ -36,6 +41,7 @@ class WorkerConfig:
     text_cache_budget_bytes: int = 8 * 1024 * 1024
     text_cache_max_entries: int = 32
     native_kv_page_size: int = 16
+    native_execution_backend: str = DEFAULT_NATIVE_EXECUTION_BACKEND
     native_prefix_cache_strategy: str = "radix"
     native_scheduling_policy: str = "fcfs"
     native_graph_profile: bool = False
@@ -106,6 +112,15 @@ def load_config() -> WorkerConfig:
     native_kv_page_size = int(os.environ.get("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "16"))
     if native_kv_page_size not in (8, 16, 32):
         raise ValueError("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE must be one of 8, 16, or 32")
+    native_execution_backend = os.environ.get(
+        "MLX_RUNTIME_NATIVE_EXECUTION_BACKEND",
+        DEFAULT_NATIVE_EXECUTION_BACKEND,
+    ).strip()
+    if native_execution_backend not in NATIVE_EXECUTION_BACKEND_IDS:
+        choices = ", ".join(NATIVE_EXECUTION_BACKEND_IDS)
+        raise ValueError(
+            "MLX_RUNTIME_NATIVE_EXECUTION_BACKEND must be one of: " + choices
+        )
     native_prefix_cache_strategy = os.environ.get(
         "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY",
         "radix",
@@ -173,6 +188,7 @@ def load_config() -> WorkerConfig:
         text_cache_budget_bytes=text_cache_budget_bytes,
         text_cache_max_entries=text_cache_max_entries,
         native_kv_page_size=native_kv_page_size,
+        native_execution_backend=native_execution_backend,
         native_prefix_cache_strategy=native_prefix_cache_strategy,
         native_scheduling_policy=native_scheduling_policy,
         native_graph_profile=native_graph_profile,

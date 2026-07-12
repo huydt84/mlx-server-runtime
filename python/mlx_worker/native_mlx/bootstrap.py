@@ -10,11 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from ..ipc import ModelError
-from .attention import PagedMetalAttentionBackend
 from .cache import PagedKVCacheBackend
 from .cache_coordinator import NativeCacheCoordinator
 from .diagnostics import ModelDiagnostics
 from .executor import MlxGenerationExecutor
+from .execution_backends import (
+    DEFAULT_NATIVE_EXECUTION_BACKEND,
+    build_native_execution_backend,
+    validate_native_execution_backend_id,
+)
 from .graph_profile import GraphProfiledModel
 from .interfaces import NativeBackendOptions
 from .mapping import (
@@ -48,6 +52,7 @@ class BootstrapArtifacts:
     """Fully constructed model-independent serving dependencies."""
 
     architecture: NativeArchitecture
+    execution_backend_id: str
     options: NativeBackendOptions
     executor: MlxGenerationExecutor
     cache_coordinator: NativeCacheCoordinator
@@ -72,11 +77,22 @@ def build_native_artifacts(
     cache_budget_bytes: int = 8 * 1024 * 1024,
     cache_max_entries: int = 32,
     kv_page_size: int = 16,
+    execution_backend_id: str = DEFAULT_NATIVE_EXECUTION_BACKEND,
     prefix_cache_strategy: str = "radix",
     graph_profile: bool = False,
 ) -> BootstrapArtifacts:
     """Validate and construct the registered architecture and shared executor."""
 
+    try:
+        validate_native_execution_backend_id(execution_backend_id)
+    except ValueError as exc:
+        raise _failure(
+            "UNSUPPORTED_NATIVE_EXECUTION_BACKEND",
+            str(exc),
+            "backend_selection",
+            "invalid_configuration",
+            execution_backend_id,
+        ) from exc
     architecture = detect_native_architecture(model)
     if stage_callback:
         stage_callback("artifact_validation", "verifying")
@@ -127,15 +143,14 @@ def build_native_artifacts(
         if graph_profile:
             native_model = GraphProfiledModel(native_model)
         geometry = architecture.spec.cache_geometry(config)
-        cache_backend = PagedKVCacheBackend(
-            num_layers=geometry.num_layers,
-            num_kv_heads=geometry.num_kv_heads,
-            head_dim=geometry.head_dim,
+        execution_backend = build_native_execution_backend(
+            execution_backend_id,
+            geometry,
             page_size=kv_page_size,
-            budget_bytes=cache_budget_bytes,
-            dtype=geometry.dtype,
+            cache_budget_bytes=cache_budget_bytes,
         )
-        attention_backend = PagedMetalAttentionBackend()
+        cache_backend = execution_backend.cache_backend
+        attention_backend = execution_backend.attention_backend
         prefix_cache = _build_prefix_cache(
             strategy=prefix_cache_strategy,
             backend=cache_backend,
@@ -172,6 +187,7 @@ def build_native_artifacts(
     tokenizer, decode_target, eos = _load_tokenizer(architecture.model_path)
     return BootstrapArtifacts(
         architecture=architecture,
+        execution_backend_id=execution_backend.backend_id,
         options=NativeBackendOptions(
             model=model,
             architecture_class=architecture.architecture_class,
