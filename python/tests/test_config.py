@@ -127,3 +127,21 @@ def test_load_config_rejects_invalid_native_kv_page_size(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="MLX_RUNTIME_NATIVE_KV_PAGE_SIZE"):
         load_config()
+
+
+def test_load_config_defaults_pipeline_profiling_off(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE", raising=False)
+    monkeypatch.delenv("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR", raising=False)
+
+    config = load_config()
+
+    assert config.native_pipeline_profile is False
+    assert config.native_pipeline_profile_dir is None
+
+
+def test_load_config_requires_pipeline_profile_directory(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE", "1")
+    monkeypatch.delenv("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR", raising=False)
+
+    with pytest.raises(ValueError, match="PIPELINE_PROFILE_DIR"):
+        load_config()

@@ -6,7 +6,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from .interfaces import (
     BatchExecutionError,
@@ -208,6 +208,7 @@ class NativeContinuousScheduler:
         prefill_step_size: int = 256,
         prioritize_decode: bool = True,
         scheduling_policy: str = "fcfs",
+        profiler: Any | None = None,
     ) -> None:
         if prefill_batch_size <= 0:
             raise ValueError("native-mlx prefill batch size must be positive")
@@ -219,6 +220,7 @@ class NativeContinuousScheduler:
         self._prefill_step_size = int(prefill_step_size)
         self._prioritize_decode = bool(prioritize_decode)
         self._policy = _policy_from_name(scheduling_policy)
+        self._profiler = profiler
         self._waiting: OrderedDict[str, _ScheduledState] = OrderedDict()
         self._running: OrderedDict[str, _ScheduledState] = OrderedDict()
         self._pending_events: list[SchedulerEvent] = []
@@ -263,6 +265,17 @@ class NativeContinuousScheduler:
         }
         selected = self._select_work(timings)
         timings["scheduler_select_ms"] = _elapsed_ms(select_started)
+        if self._profiler is not None:
+            for item in selected:
+                self._profiler.record(
+                    item.request.request_id,
+                    "scheduler",
+                    "select_work",
+                    started_ns=int(select_started * 1_000_000_000),
+                    duration_us=timings["scheduler_select_ms"] * 1_000,
+                    phase=item.request.phase,
+                    details={"scheduled_tokens": len(item.request.token_ids)},
+                )
         if selected:
             self._run_step(selected, events, timings)
             self._reap_cancelled(events)
@@ -368,6 +381,30 @@ class NativeContinuousScheduler:
             self._emit_failures(selected, events, "WORKER_ERROR", str(exc))
             return
 
+        if self._profiler is not None:
+            for selected_work in selected:
+                request = selected_work.request
+                shared = {
+                    "forward_mode": result.forward_mode.value,
+                    "physical_batch_size": result.physical_batch_size,
+                    "model_forward_count": result.model_forward_count,
+                }
+                for component, stage, metric in (
+                    ("executor", "batch_prepare", "executor_prepare_ms"),
+                    ("cache", "reserve", "executor_reserve_ms"),
+                    ("model", "forward_dispatch", "executor_forward_ms"),
+                    ("sampling", "sample", "executor_sample_ms"),
+                    ("mlx", "synchronize_eval", "executor_eval_ms"),
+                    ("cache", "commit", "executor_commit_ms"),
+                ):
+                    self._profiler.record(
+                        request.request_id,
+                        component,
+                        stage,
+                        duration_us=int(result.metrics.get(metric, 0)) * 1_000,
+                        phase=request.phase,
+                        details=shared,
+                    )
         results = {item.request_id: item for item in result.results}
         apply_started = time.perf_counter()
         for selected_work in selected:
@@ -534,6 +571,14 @@ class NativeContinuousScheduler:
                 self._waiting.pop(request_id, None)
                 self._running.pop(request_id, None)
                 self._cache_coordinator.release(state.cache_handle)
+                if self._profiler is not None:
+                    self._profiler.record(
+                        request_id,
+                        "scheduler",
+                        "terminal",
+                        state="cancelled",
+                        details={"cancellation_stage": stage},
+                    )
                 events.append(
                     SchedulerEvent(
                         kind="cancelled",

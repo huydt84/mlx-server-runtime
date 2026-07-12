@@ -88,12 +88,14 @@ class NativeRuntime:
         prompt_tokenizer: Any,
         decode_target: Any,
         eos_token_ids: tuple[int, ...],
+        profiler: Any | None = None,
     ) -> None:
         self._scheduler = scheduler
         self._model_ref = model_ref
         self._prompt_tokenizer = prompt_tokenizer
         self._decode_target = decode_target
         self._eos_token_ids = eos_token_ids
+        self._profiler = profiler
         self._requests: dict[str, _RuntimeState] = {}
         self.last_warmup_latency_ms = 0
         self._cancellation_count = 0
@@ -122,6 +124,7 @@ class NativeRuntime:
         )
 
     def submit(self, request: ChatCompletionRequest) -> None:
+        tokenization_started_ns = time.perf_counter_ns()
         prompt = self._build_prompt(request)
         self._validate(request, prompt)
         state = _RuntimeState(
@@ -132,6 +135,18 @@ class NativeRuntime:
             completion_token_ids=[],
         )
         self._requests[request.request_id] = state
+        if self._profiler is not None:
+            self._profiler.begin_metal_capture(request.request_id)
+            self._profiler.record(
+                request.request_id,
+                "runtime",
+                "tokenization",
+                started_ns=tokenization_started_ns,
+                duration_us=(time.perf_counter_ns() - tokenization_started_ns) // 1_000,
+                prompt_tokens=len(prompt),
+                state="submitted",
+                details={"stream": request.stream},
+            )
         self._scheduler.submit(
             SchedulableRequest(
                 request_id=request.request_id,
@@ -158,7 +173,10 @@ class NativeRuntime:
                     else "prefill"
                 )
             )
-        return self._scheduler.cancel(request_id)
+        handled = self._scheduler.cancel(request_id)
+        if handled and self._profiler is not None:
+            self._profiler.record(request_id, "runtime", "cancel_requested")
+        return handled
 
     def tick(self) -> tuple[RuntimeEvent, ...]:
         output: list[RuntimeEvent] = []
@@ -172,6 +190,29 @@ class NativeRuntime:
     def close(self) -> None:
         self._scheduler.close()
         self._requests.clear()
+
+    def record_transport(
+        self, request_id: str, stage: str, *, started_ns: int | None = None
+    ) -> None:
+        """Record a worker-transport boundary without moving IPC ownership."""
+
+        if self._profiler is None:
+            return
+        self._profiler.record(
+            request_id,
+            "transport",
+            stage,
+            started_ns=started_ns,
+            duration_us=(time.perf_counter_ns() - started_ns) // 1_000
+            if started_ns is not None
+            else 0,
+        )
+
+    def flush_profile(self) -> None:
+        """Persist newly recorded transport events after IPC emission."""
+
+        if self._profiler is not None:
+            self._profiler.write_artifacts()
 
     def _apply_scheduler_event(
         self,
@@ -327,6 +368,19 @@ class NativeRuntime:
                     metrics.get("queue_time_ms", 0),
                 )
             )
+            if self._profiler is not None:
+                self._profiler.record(
+                    event.request_id,
+                    "runtime",
+                    "prefill",
+                    duration_us=int(metrics.get("step_time_ms", 0)) * 1_000,
+                    phase="prefill",
+                    prompt_tokens=len(state.prompt_token_ids),
+                    details={
+                        "scheduler_queue_wait_ms": state.scheduler_queue_wait_ms,
+                        "batch_size": state.prompt_batch_size,
+                    },
+                )
             return
         if event.kind == "token":
             if event.metrics:
@@ -367,6 +421,7 @@ class NativeRuntime:
         if token_id in self._eos_token_ids:
             self._finish(state, "stop", output)
             return
+        detokenize_started_ns = time.perf_counter_ns()
         text = str(
             self._decode_target.decode(
                 state.completion_token_ids,
@@ -380,7 +435,18 @@ class NativeRuntime:
         )
         state.decoded_prefix = text
         emitted, stop_hit = state.stop.push(delta)
+        if self._profiler is not None:
+            self._profiler.record(
+                state.request.request_id,
+                "runtime",
+                "detokenization",
+                started_ns=detokenize_started_ns,
+                duration_us=(time.perf_counter_ns() - detokenize_started_ns) // 1_000,
+                phase="decode",
+                completion_tokens=len(state.completion_token_ids),
+            )
         if emitted and state.request.stream:
+            stream_started_ns = time.perf_counter_ns()
             output.append(
                 RuntimeEvent(
                     kind="delta",
@@ -390,6 +456,16 @@ class NativeRuntime:
                     ),
                 )
             )
+            if self._profiler is not None:
+                self._profiler.record(
+                    state.request.request_id,
+                    "streaming",
+                    "emit_delta",
+                    started_ns=stream_started_ns,
+                    duration_us=(time.perf_counter_ns() - stream_started_ns) // 1_000,
+                    phase="decode",
+                    details={"chunk_chars": len(emitted)},
+                )
         if emitted and state.ttft_ms is None:
             state.ttft_ms = max(
                 1, int((time.perf_counter() - state.enqueued_at) * 1000)
@@ -417,6 +493,19 @@ class NativeRuntime:
                 )
             )
         request_id = state.request.request_id
+        if self._profiler is not None:
+            self._profiler.end_metal_capture(request_id)
+            self._profiler.record(
+                request_id,
+                "streaming",
+                "response_assembly",
+                details={
+                    "stream": state.request.stream,
+                    "chunks": len(state.completion_token_ids)
+                    if state.request.stream
+                    else 0,
+                },
+            )
         self._scheduler.finish(request_id)
         self._requests.pop(request_id, None)
         output.append(
@@ -451,6 +540,26 @@ class NativeRuntime:
                 ),
             )
         )
+        if self._profiler is not None:
+            self._profiler.end_metal_capture(request_id)
+            self._profiler.record(
+                request_id,
+                "runtime",
+                "terminal",
+                duration_us=max(
+                    0, int((time.perf_counter() - state.enqueued_at) * 1_000_000)
+                ),
+                prompt_tokens=len(state.prompt_token_ids),
+                completion_tokens=len(state.completion_token_ids),
+                state=reason,
+                details={
+                    "ttft_ms": state.ttft_ms,
+                    "scheduler_queue_wait_ms": state.scheduler_queue_wait_ms,
+                    "prefill_time_ms": state.prefill_time_ms,
+                    "decode_time_ms": state.decode_time_ms,
+                },
+            )
+            self._profiler.write_artifacts()
 
     def _fail(
         self,
@@ -473,6 +582,15 @@ class NativeRuntime:
                 ),
             )
         )
+        if self._profiler is not None:
+            self._profiler.record(
+                request_id,
+                "runtime",
+                "terminal",
+                state="error",
+                error=f"{code}: {message}",
+            )
+            self._profiler.write_artifacts()
 
     def _build_prompt(self, request: ChatCompletionRequest) -> tuple[int, ...]:
         messages: list[dict[str, str]] = []

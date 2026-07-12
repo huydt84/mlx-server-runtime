@@ -463,8 +463,8 @@ fn fail_child_message(
     )
 }
 
-fn worker_env(config: &RuntimeConfig) -> [(&'static str, String); 6] {
-    [
+fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
+    let mut values = vec![
         ("MLX_RUNTIME_SOCKET", config.worker.ipc_path.clone()),
         (
             "MLX_RUNTIME_BACKEND",
@@ -480,7 +480,20 @@ fn worker_env(config: &RuntimeConfig) -> [(&'static str, String); 6] {
             config.limits.max_vlm_images.to_string(),
         ),
         ("PYTHONPATH", "python".to_string()),
-    ]
+    ];
+    for key in [
+        "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE",
+        "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR",
+        "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_RUN_ID",
+        "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_WORKLOAD",
+        "MLX_RUNTIME_NATIVE_METAL_CAPTURE",
+        "MTL_CAPTURE_ENABLED",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            values.push((key, value));
+        }
+    }
+    values
 }
 
 fn spawn_worker(config: &RuntimeConfig) -> Result<Child, GatewayError> {
@@ -526,5 +539,18 @@ mod tests {
         assert!(env.iter().any(|(key, value)| {
             *key == "MLX_RUNTIME_BACKEND" && value == BackendKind::NativeMlx.as_str()
         }));
+    }
+
+    #[test]
+    fn worker_env_forwards_pipeline_profile_configuration() {
+        let config = RuntimeConfig::default();
+        unsafe { std::env::set_var("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE", "1") };
+
+        let env = worker_env(&config);
+
+        unsafe { std::env::remove_var("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE") };
+        assert!(env
+            .iter()
+            .any(|(key, value)| { *key == "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE" && value == "1" }));
     }
 }

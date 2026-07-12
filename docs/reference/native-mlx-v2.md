@@ -90,6 +90,10 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY` | `radix`, `block-hash` | Prefix-cache strategy; `radix` is the native-v2 default |
 | `MLX_RUNTIME_NATIVE_SCHEDULING_POLICY` | `fcfs`, `lpm`, `lof`, `priority` | Python scheduler waiting-queue policy |
 | `MLX_RUNTIME_NATIVE_GRAPH_PROFILE` | `0`, `1` | Enables diagnostic graph-profile metrics; keep off for fair benchmarks |
+| `MLX_RUNTIME_NATIVE_PIPELINE_PROFILE` | `0`, `1` | Enables bounded whole-pipeline diagnostic events; disabled by default |
+| `MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR` | directory path | Required output directory when pipeline profiling is enabled |
+| `MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_RUN_ID` | string | Optional run ID shared by gateway-side and worker-side events |
+| `MLX_RUNTIME_NATIVE_METAL_CAPTURE` | `0`, `1` | Requests optional heavy Metal capture preflight; requires process-start `MTL_CAPTURE_ENABLED=1` |
 | `MLX_RUNTIME_TEXT_PROMPT_CONCURRENCY` | positive integer | Text prompt/prefill admission width |
 | `MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE` | positive integer | Chunked-prefill token budget |
 | `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Text KV/prefix-cache byte budget |
@@ -99,34 +103,15 @@ Invalid native page-size, prefix-cache strategy, or scheduler-policy values must
 fail startup. They must not silently select dense attention, another prefix
 strategy, v1, `mlx-lm`, or `mlx-vlm`.
 
-## Validation Entry Points
+## Profiling
 
-Each native-v2 phase owns a host script under `mlx-host-validation/scripts/`.
-Phase 14 owns the full completion gate:
+Whole-pipeline profiling is an opt-in diagnostic mode. It writes
+request-correlated events across the gateway, worker transport, runtime,
+scheduler, executor, cache, model, MLX synchronization, detokenization, and
+streaming boundaries.
 
-```bash
-bash mlx-host-validation/scripts/v2_phase_14.sh
-```
-
-The Phase 14 gate checks:
-
-- required phase scripts `v2_phase_1.sh` through `v2_phase_12.sh`;
-- Python sync, formatting, linting, and tests;
-- Rust formatting, clippy, and workspace tests;
-- host-only phase workstreams for startup, serving, parity, streaming,
-  batching, chunked prefill, paged KV/attention, prefix strategies, queue
-  policies, cancellation, metrics, unsupported-class behavior, and v1
-  non-regression.
-
-The script writes a durable report to:
-
-```text
-benchmarks/results/v2_phase_14_completion.md
-```
-
-Phase 14 passes only when the full gate actually runs on compatible Apple
-Silicon/Metal and every required workstream succeeds. A blocked report is
-evidence, not a completion claim.
+See [Profile inference](../how-to/profiling.md) for the runnable workflow,
+artifact formats, optional Metal capture, and interpretation guidance.
 
 ## Benchmark and Trace Artifacts
 
@@ -139,6 +124,11 @@ latency, throughput, cache/KV metrics, and scheduler/executor metrics.
 Semantic traces are diagnostic. They compare finalized token IDs through
 bounded checkpoints such as embeddings, attention, MLP, logits, and KV append
 state. Trace output must not be mixed into benchmark leaderboards.
+
+Pipeline profiles are also diagnostic, but cover gateway, worker transport,
+runtime, scheduler, executor/cache/model, MLX synchronization, detokenization,
+and streaming stages. They complement rather than replace semantic traces or
+paged-attention kernel captures.
 
 Native-v2 does not need to beat v1 to be correct. Performance regressions must
 be reported honestly and routed to follow-up optimization work.
@@ -174,10 +164,8 @@ request totals.
 - Only explicitly implemented architecture classes are supported.
 - Greedy decoding is the validated native path.
 - VLM requests remain outside `native-mlx`.
-- Phase 13 overlap scheduling is superseded and does not block Phase 14.
-  Future MLX-safe overlap or measured scheduler-gap reduction work belongs in
-  the Phase 17 appendix.
-- Appendix phases are follow-up work and do not weaken Phase 14 completion.
+- MLX-safe overlap remains experimental and requires measured scheduler-gap and
+  CPU/GPU overlap evidence before it can be enabled by default.
 
 ## v1 Fallback
 

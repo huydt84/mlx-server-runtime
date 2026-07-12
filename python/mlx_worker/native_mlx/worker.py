@@ -34,6 +34,7 @@ from .diagnostics import (
     trace_native_debug_to_mlx_lm,
 )
 from .interfaces import NativeRuntime
+from .pipeline_profile import PipelineProfiler
 from .runtime import NativeRuntime as NativeRequestRuntime
 from .scheduler import NativeContinuousScheduler
 
@@ -117,12 +118,20 @@ def run_native_worker(
                 runtime.close()
                 return 0
             try:
+                decode_started_ns = time.perf_counter_ns()
                 command = decode_command(raw)
                 if command is None:
                     raise ValueError("unsupported worker command")
                 if isinstance(command, CancelRequest):
                     runtime.cancel(command.request_id)
                 else:
+                    record_transport = getattr(runtime, "record_transport", None)
+                    if callable(record_transport):
+                        record_transport(
+                            command.request_id,
+                            "ipc_decode",
+                            started_ns=decode_started_ns,
+                        )
                     runtime.submit(command)
             except Exception as exc:
                 client.sendall(
@@ -139,7 +148,19 @@ def run_native_worker(
             raw = _read_line(client, buffer, block=False)
         if not runtime.idle():
             for event in runtime.tick():
+                send_started_ns = time.perf_counter_ns()
                 client.sendall(encode_event(event.payload))
+                request_id = getattr(event.payload, "request_id", None)
+                record_transport = getattr(runtime, "record_transport", None)
+                if request_id is not None and callable(record_transport):
+                    record_transport(
+                        request_id,
+                        "ipc_encode_send",
+                        started_ns=send_started_ns,
+                    )
+                    flush_profile = getattr(runtime, "flush_profile", None)
+                    if callable(flush_profile):
+                        flush_profile()
 
 
 def create_native_worker(
@@ -160,6 +181,7 @@ def create_native_worker(
         graph_profile=config.native_graph_profile,
     )
     artifacts.executor.load(artifacts.options)
+    profiler = PipelineProfiler.from_environment(config.model)
     scheduler = NativeContinuousScheduler(
         artifacts.executor,
         artifacts.cache_coordinator,
@@ -174,6 +196,7 @@ def create_native_worker(
             getattr(config, "prefill_chunk_size", 256),
         ),
         scheduling_policy=getattr(config, "native_scheduling_policy", "fcfs"),
+        profiler=profiler,
     )
     return NativeRequestRuntime(
         scheduler,
@@ -181,6 +204,7 @@ def create_native_worker(
         prompt_tokenizer=artifacts.tokenizer,
         decode_target=artifacts.decode_target,
         eos_token_ids=artifacts.eos_token_ids,
+        profiler=profiler,
     )
 
 

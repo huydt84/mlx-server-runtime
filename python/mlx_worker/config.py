@@ -39,6 +39,8 @@ class WorkerConfig:
     native_prefix_cache_strategy: str = "radix"
     native_scheduling_policy: str = "fcfs"
     native_graph_profile: bool = False
+    native_pipeline_profile: bool = False
+    native_pipeline_profile_dir: str | None = None
     vlm_apc_cache_budget_bytes: int = 8 * 1024 * 1024
     vlm_apc_cache_max_entries: int = 32
     vision_feature_cache_budget_bytes: int = 8 * 1024 * 1024
@@ -121,6 +123,14 @@ def load_config() -> WorkerConfig:
             "MLX_RUNTIME_NATIVE_SCHEDULING_POLICY must be fcfs, lpm, lof, or priority"
         )
     native_graph_profile = _load_bool("MLX_RUNTIME_NATIVE_GRAPH_PROFILE", "0")
+    native_pipeline_profile = _load_bool("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE", "0")
+    native_pipeline_profile_dir = os.environ.get(
+        "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR"
+    )
+    if native_pipeline_profile and not native_pipeline_profile_dir:
+        raise ValueError(
+            "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR is required when pipeline profiling is enabled"
+        )
     vlm_apc_cache_budget_bytes = _load_int_with_alias(
         "MLX_RUNTIME_VLM_APC_CACHE_BUDGET_BYTES",
         None,
@@ -166,6 +176,8 @@ def load_config() -> WorkerConfig:
         native_prefix_cache_strategy=native_prefix_cache_strategy,
         native_scheduling_policy=native_scheduling_policy,
         native_graph_profile=native_graph_profile,
+        native_pipeline_profile=native_pipeline_profile,
+        native_pipeline_profile_dir=native_pipeline_profile_dir,
         vlm_apc_cache_budget_bytes=vlm_apc_cache_budget_bytes,
         vlm_apc_cache_max_entries=vlm_apc_cache_max_entries,
         vision_feature_cache_budget_bytes=vision_feature_cache_budget_bytes,
