@@ -30,6 +30,15 @@ pub struct ChatCompletionResponse {
     pub prompt_tokens: u32,
     /// Completion token count.
     pub completion_tokens: u32,
+    /// Number of source images in a VLM request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_count: Option<u32>,
+    /// Image preprocessing latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_preprocess_latency_ms: Option<u32>,
+    /// Prompt-template latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_template_latency_ms: Option<u32>,
     /// Whether prompt cache reused prompt tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_hit: Option<bool>,

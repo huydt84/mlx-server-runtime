@@ -78,12 +78,45 @@ pub struct ChatCompletionHttpResponse {
     /// Prompt cache bytes referenced by this request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_bytes: Option<u64>,
+    /// Active batch cache bytes observed for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_batch_cache_bytes: Option<u64>,
     /// Prompt batch size observed for this request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_batch_size: Option<u32>,
     /// Decode batch size observed for this request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_batch_size: Option<u32>,
+    /// Number of source images in a VLM request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_count: Option<u32>,
+    /// Image preprocessing latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_preprocess_latency_ms: Option<u32>,
+    /// Prompt-template latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_template_latency_ms: Option<u32>,
+    /// Whether the VLM vision-feature cache was reused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_hit: Option<bool>,
+    /// Vision-feature cache bytes referenced by this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_bytes: Option<u64>,
+    /// Vision-feature cache entry count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_entries: Option<u32>,
+    /// Vision-feature cache evictions count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_feature_cache_evictions: Option<u32>,
+    /// Generator peak memory in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_memory_bytes: Option<u64>,
+    /// Source image width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_width: Option<u32>,
+    /// Source image height.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_height: Option<u32>,
 }
 
 /// A single response choice.
@@ -222,8 +255,19 @@ impl From<ChatCompletionResponse> for ChatCompletionHttpResponse {
             prompt_cache_hit: value.prompt_cache_hit,
             cached_tokens: value.cached_tokens,
             prompt_cache_bytes: value.prompt_cache_bytes,
+            active_batch_cache_bytes: value.active_batch_cache_bytes,
             prompt_batch_size: value.prompt_batch_size,
             decode_batch_size: value.decode_batch_size,
+            image_count: value.image_count,
+            image_preprocess_latency_ms: value.image_preprocess_latency_ms,
+            prompt_template_latency_ms: value.prompt_template_latency_ms,
+            vision_feature_cache_hit: value.vision_feature_cache_hit,
+            vision_feature_cache_bytes: value.vision_feature_cache_bytes,
+            vision_feature_cache_entries: value.vision_feature_cache_entries,
+            vision_feature_cache_evictions: value.vision_feature_cache_evictions,
+            peak_memory_bytes: value.peak_memory_bytes,
+            image_width: value.image_width,
+            image_height: value.image_height,
         }
     }
 }

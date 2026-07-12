@@ -186,6 +186,10 @@ def _estimate_array_bytes(value: Any) -> int:
 
 def _image_dimensions(model_inputs: dict[str, Any]) -> tuple[int | None, int | None]:
     grid = model_inputs.get("image_grid_thw")
+    if not isinstance(grid, Sequence):
+        tolist = getattr(grid, "tolist", None)
+        if callable(tolist):
+            grid = tolist()
     if isinstance(grid, Sequence) and grid:
         first = grid[0]
         if isinstance(first, Sequence) and len(first) >= 3:
@@ -935,6 +939,7 @@ class _ScheduledVlmRequest:
     vision_feature_cache_bytes: int | None
     image_width: int | None
     image_height: int | None
+    cached_tokens: int = 0
     prompt_batch_size: int = 0
     decode_batch_size: int = 0
     uid: int | None = None
@@ -1068,10 +1073,14 @@ class VlmContinuousBatchScheduler:
                     finish_reason="cancelled",
                     prompt_tokens=len(job.full_prompt_tokens),
                     completion_tokens=len(job.generated_tokens),
-                    prompt_cache_hit=job.cached_prompt is not None,
-                    cached_tokens=len(job.cached_prompt.tokens)
-                    if job.cached_prompt is not None
-                    else None,
+                    prompt_cache_hit=(
+                        job.cached_prompt is not None or job.cached_tokens > 0
+                    ),
+                    cached_tokens=(
+                        len(job.cached_prompt.tokens)
+                        if job.cached_prompt is not None
+                        else job.cached_tokens or None
+                    ),
                     active_batch_cache_bytes=self._active_batch_cache_bytes(),
                     prompt_batch_size=job.prompt_batch_size or None,
                     decode_batch_size=job.decode_batch_size or None,
@@ -1189,6 +1198,10 @@ class VlmContinuousBatchScheduler:
                         cache_bytes=0,
                         match_kind="exact",
                     )
+                job.cached_tokens = max(
+                    job.cached_tokens,
+                    int(getattr(progress, "cached_tokens", 0) or 0),
+                )
         if not responses:
             return
 
@@ -1585,10 +1598,14 @@ class VlmContinuousBatchScheduler:
                 prompt_template_latency_ms=max(
                     1, math.ceil(self._engine._last_prompt_template_ms)
                 ),
-                prompt_cache_hit=job.cached_prompt is not None,
-                cached_tokens=len(job.cached_prompt.tokens)
-                if job.cached_prompt is not None
-                else None,
+                prompt_cache_hit=(
+                    job.cached_prompt is not None or job.cached_tokens > 0
+                ),
+                cached_tokens=(
+                    len(job.cached_prompt.tokens)
+                    if job.cached_prompt is not None
+                    else job.cached_tokens or None
+                ),
                 active_batch_cache_bytes=self._active_batch_cache_bytes(),
                 prompt_batch_size=job.prompt_batch_size or None,
                 decode_batch_size=job.decode_batch_size or None,

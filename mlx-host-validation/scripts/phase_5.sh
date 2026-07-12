@@ -131,6 +131,11 @@ fake_generate = ModuleType("mlx_lm.generate")
 fake_generate.BatchGenerator = FakeBatchGenerator
 sys.modules.setdefault("mlx_lm", ModuleType("mlx_lm"))
 sys.modules["mlx_lm.generate"] = fake_generate
+fake_models = ModuleType("mlx_lm.models")
+fake_cache = ModuleType("mlx_lm.models.cache")
+fake_cache.trim_prompt_cache = lambda prompt_cache, num_tokens: None
+sys.modules["mlx_lm.models"] = fake_models
+sys.modules["mlx_lm.models.cache"] = fake_cache
 
 batch_prompt_cache_store = PromptCacheStore()
 batch_prompt_cache_store.remember([1, 2], ["cached-prefix"])

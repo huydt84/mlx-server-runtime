@@ -151,6 +151,59 @@ def test_continuous_batching_contract_can_be_validated_at_startup(
     validate_continuous_batching_backend()
 
 
+def test_legacy_batch_generator_without_all_tokens_remains_compatible(
+    monkeypatch,
+) -> None:
+    _install_fake_cache_module(monkeypatch)
+
+    class LegacyBatchGenerator(FakeBatchGenerator):
+        def insert(self, prompts, *, max_tokens, caches=None, samplers=None):
+            self.insert_calls.append(
+                {
+                    "prompts": prompts,
+                    "max_tokens": max_tokens,
+                    "caches": caches,
+                    "samplers": samplers,
+                }
+            )
+            self._uids = [42][: len(prompts)]
+            return self._uids
+
+    fake_generate = ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = LegacyBatchGenerator
+    monkeypatch.setitem(sys.modules, "mlx_lm", ModuleType("mlx_lm"))
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+
+    backend = MlxBatchCompletionBackend(
+        BatchBackendContext(
+            model_id="test-model",
+            model=SimpleNamespace(),
+            tokenizer=FakeTokenizer(),
+            prompt_cache_store=PromptCacheStore(),
+            build_prompt_tokens=lambda _request: [1, 2],
+            validate_token_limits=lambda _request, _tokens: None,
+            make_sampler=lambda _temperature, _top_p: None,
+        )
+    )
+    response = backend.complete_many(
+        [
+            ChatCompletionRequest(
+                request_id="legacy",
+                model="test-model",
+                messages=[ChatMessage(role="user", content="hello")],
+                max_tokens=2,
+                temperature=0.0,
+                top_p=1.0,
+                max_prompt_tokens=32,
+                max_completion_tokens=32,
+                max_total_tokens_per_request=64,
+            )
+        ]
+    )[0]
+
+    assert response.text == "<11>"
+
+
 def test_prompt_cache_store_returns_longest_prefix() -> None:
     store = PromptCacheStore()
     store.remember([1, 2], ["layer-a"])

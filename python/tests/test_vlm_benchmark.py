@@ -1887,6 +1887,8 @@ class TestVlmReportFairnessNotes:
         assert "direct Python reference" in content
         assert "raw mlx-vlm" in content
         assert "same model" in content
+        assert "Image sizes" in content
+        assert "do not compare raw latency" in content
 
     def test_fairness_backend_differences(self, tmp_path: Path) -> None:
         comparison_rows = _build_baseline_comparison_rows(

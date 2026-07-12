@@ -748,6 +748,8 @@ def _render_vlm_report(runs: Sequence[BenchmarkRun]) -> str:
         "13. comparison is not contaminated by mixed stress scenario execution",
         "14. measured sample count is sufficient for reported statistic",
         "",
+        "Fairness caveat: Image sizes, prompt templates, and output lengths can differ across fixtures; do not compare raw latency across different image sizes or token workloads.",
+        "",
     ]
 
     for run_index, run in enumerate(runs):

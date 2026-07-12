@@ -374,7 +374,8 @@ class MlxBatchCompletionBackend:
             stop_tokens=[[token] for token in self._context.tokenizer.eos_token_ids],
         )
         try:
-            uids = generator.insert(
+            uids = _insert_text_batch(
+                generator,
                 effective_prompts,
                 max_tokens=max_tokens,
                 caches=cache_inputs,
@@ -722,7 +723,8 @@ class ContinuousBatchScheduler:
             caches.append(job.cached_prompt.prompt_cache)
             cached_prefixes.append(list(job.cached_prompt.tokens))
 
-        uids = self._generator.insert(
+        uids = _insert_text_batch(
+            self._generator,
             prompts,
             max_tokens=max_tokens,
             caches=caches,
@@ -996,7 +998,11 @@ def _validate_batch_generator_contract(
     """Fail fast when the installed mlx-lm batching API is incompatible."""
 
     required_parameters = {
-        "insert": {"prompts", "max_tokens", "caches", "all_tokens", "samplers"},
+        # ``all_tokens`` was added after the pinned legacy mlx-lm release.  It
+        # is an optional cache metadata hint, not a prerequisite for text
+        # generation, so callers must omit it when the installed generator
+        # does not expose the keyword.
+        "insert": {"prompts", "max_tokens", "caches", "samplers"},
         "next_generated": set(),
         "close": set(),
     }
@@ -1024,6 +1030,35 @@ def _validate_batch_generator_contract(
             "installed mlx-lm BatchGenerator is incompatible with the runtime: "
             f"missing {details}"
         )
+
+
+def _insert_text_batch(
+    generator: Any,
+    prompts: Sequence[Sequence[int]],
+    *,
+    max_tokens: Sequence[int],
+    caches: Sequence[Sequence[Any] | None],
+    all_tokens: Sequence[Sequence[int]],
+    samplers: Sequence[Callable[[Any], Any]],
+) -> Sequence[Any]:
+    """Insert text work while tolerating legacy mlx-lm cache metadata APIs."""
+
+    kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "caches": caches,
+        "samplers": samplers,
+    }
+    try:
+        parameters = inspect.signature(generator.insert).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    if any(
+        parameter.name == "all_tokens"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        kwargs["all_tokens"] = all_tokens
+    return generator.insert(prompts, **kwargs)
 
 
 def _estimate_cache_bytes(prompt_cache: Sequence[Any]) -> int:

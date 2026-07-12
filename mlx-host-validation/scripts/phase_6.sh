@@ -26,6 +26,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 REPORT_PATH="$ROOT/benchmarks/results/phase_6_report.md"
 BENCHMARK_LOG="${TMPDIR:-/tmp}/mlx-runtime-phase-6-benchmark.log"
+EXPECTED_MODELS=(
+    "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
+    "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+    "mlx-community/gemma-3-270m-it-qat-8bit"
+)
 
 echo "[1/3] Sync Python dev environment"
 cd "$PYTHON_DIR"
@@ -60,10 +65,9 @@ bash scripts/benchmark.sh \
     --max-tokens 8 >"$BENCHMARK_LOG" 2>&1
 
 grep -qx '# Phase 6 Benchmark Report' "$REPORT_PATH"
-grep -q 'mlx-community/Qwen2.5-7B-Instruct-4bit' "$REPORT_PATH"
-grep -q 'mlx-community/Qwen3-8B-4bit' "$REPORT_PATH"
-grep -q 'mlx-community/Llama-3.1-Nemotron-Nano-4B-v1.1-bf16' "$REPORT_PATH"
-grep -q 'mlx-community/Qwen3.5-9B-4bit' "$REPORT_PATH"
+for model in "${EXPECTED_MODELS[@]}"; do
+    grep -q "$model" "$REPORT_PATH"
+done
 grep -q 'raw mlx-lm' "$REPORT_PATH"
 grep -q 'mlx_lm.server' "$REPORT_PATH"
 grep -q 'this project' "$REPORT_PATH"

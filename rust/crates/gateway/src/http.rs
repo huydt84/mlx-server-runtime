@@ -1212,6 +1212,22 @@ fn stream_chat_completion_with_disconnect<W: Write>(
             "delta": {},
             "finish_reason": response.finish_reason,
         }],
+        "prompt_cache_hit": response.prompt_cache_hit,
+        "cached_tokens": response.cached_tokens,
+        "prompt_cache_bytes": response.prompt_cache_bytes,
+        "active_batch_cache_bytes": response.active_batch_cache_bytes,
+        "prompt_batch_size": response.prompt_batch_size,
+        "decode_batch_size": response.decode_batch_size,
+        "image_count": response.image_count,
+        "image_preprocess_latency_ms": response.image_preprocess_latency_ms,
+        "prompt_template_latency_ms": response.prompt_template_latency_ms,
+        "vision_feature_cache_hit": response.vision_feature_cache_hit,
+        "vision_feature_cache_bytes": response.vision_feature_cache_bytes,
+        "vision_feature_cache_entries": response.vision_feature_cache_entries,
+        "vision_feature_cache_evictions": response.vision_feature_cache_evictions,
+        "peak_memory_bytes": response.peak_memory_bytes,
+        "image_width": response.image_width,
+        "image_height": response.image_height,
     });
     write!(writer, "data: {}\n\n", done_event)?;
     if emit_usage {
