@@ -62,6 +62,20 @@ For a new family, use the closest architecture module as a structural
 reference, but keep the implementation selected by the exact architecture
 class. The Qwen2 module remains the smallest working example.
 
+The registry entry must be lazy: register the module path and startup factory,
+and import that module only after the checkpoint's architecture class has been
+selected. Do not add an architecture-name branch, optional state field, or
+family capability check to the steady-state scheduler, executor, attention, or
+pure-KV cache path. If a family needs convolution state, sliding attention, or
+another non-KV capability, give it a separate execution/cache bundle selected
+once during bootstrap. Adding another family must not change the request path
+for an already-supported family.
+
+Before claiming the family is isolated, run the architecture-count check with
+the normal registry and with 100 synthetic lazy registrations. The selected
+family's hot-path trace and steady-state latency must remain within the
+documented performance-noise threshold.
+
 ### 1. Define the architecture module
 
 Create a module such as:

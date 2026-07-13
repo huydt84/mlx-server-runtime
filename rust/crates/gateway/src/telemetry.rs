@@ -575,6 +575,10 @@ impl MetricsRegistry {
                     "Latest native scheduler waiting-queue policy by backend.",
                 ),
                 (
+                    "mlx_native_execution_mode",
+                    "Startup-selected native execution coordinator.",
+                ),
+                (
                     "mlx_scheduled_tokens_by_backend",
                     "Latest scheduled token counts by backend and phase.",
                 ),
@@ -987,6 +991,7 @@ mod tests {
             "mlx_worker_memory_bytes 0",
             "mlx_kv_cache_bytes 0",
             "mlx_scheduler_tick_latency_by_backend_ms",
+            "mlx_native_execution_mode",
             "mlx_arbitration_delay_by_backend_ms",
             "mlx_peak_memory_by_backend_bytes",
             "mlx_apc_mode_by_backend",
@@ -1027,6 +1032,15 @@ mod tests {
             &[("backend", "vlm"), ("family", "vision_feature")],
             128,
         );
+        metrics.set_labeled_gauge(
+            "mlx_native_execution_mode",
+            &[
+                ("backend", "native-mlx"),
+                ("modality", "text"),
+                ("mode", "overlap"),
+            ],
+            1,
+        );
 
         let output = metrics.render_prometheus(0);
 
@@ -1037,6 +1051,9 @@ mod tests {
             .contains("mlx_batch_size_by_backend{backend=\"vlm\",stage=\"prompt_processing\"} 4"));
         assert!(output
             .contains("mlx_cache_bytes_by_backend{backend=\"vlm\",family=\"vision_feature\"} 128"));
+        assert!(output.contains(
+            "mlx_native_execution_mode{backend=\"native-mlx\",modality=\"text\",mode=\"overlap\"} 1"
+        ));
     }
 
     #[test]

@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from ..ipc import ModelError
-from .cache import PagedKVCacheBackend
+from .cache import KVCacheBackend
 from .cache_coordinator import NativeCacheCoordinator
 from .diagnostics import ModelDiagnostics
-from .executor import MlxGenerationExecutor
+from .executor import MlxGenerationExecutor, MlxOverlapGenerationExecutor
 from .execution_backends import (
     DEFAULT_NATIVE_EXECUTION_BACKEND,
     build_native_execution_backend,
@@ -27,7 +27,7 @@ from .mapping import (
     load_mapped_weights,
     load_weight_index,
 )
-from .registry import ArchitectureSpec, get_architecture_spec
+from .registry import ArchitectureExecutionPlan, ArchitectureSpec, get_architecture_spec
 from .prefix_cache import (
     BlockHashPrefixCache,
     NoPrefixCache,
@@ -45,6 +45,7 @@ class NativeArchitecture:
     architecture_class: str
     raw_config: dict[str, Any]
     spec: ArchitectureSpec
+    execution_plan: ArchitectureExecutionPlan
 
 
 @dataclass(frozen=True)
@@ -78,11 +79,20 @@ def build_native_artifacts(
     cache_max_entries: int = 32,
     kv_page_size: int = 16,
     execution_backend_id: str = DEFAULT_NATIVE_EXECUTION_BACKEND,
+    execution_mode: str = "serial",
     prefix_cache_strategy: str = "radix",
     graph_profile: bool = False,
 ) -> BootstrapArtifacts:
     """Validate and construct the registered architecture and shared executor."""
 
+    if execution_mode not in {"serial", "overlap"}:
+        raise _failure(
+            "INVALID_NATIVE_EXECUTION_MODE",
+            "native execution mode must be serial or overlap",
+            "backend_selection",
+            "invalid_configuration",
+            execution_mode,
+        )
     try:
         validate_native_execution_backend_id(execution_backend_id)
     except ValueError as exc:
@@ -97,7 +107,8 @@ def build_native_artifacts(
     if stage_callback:
         stage_callback("artifact_validation", "verifying")
     try:
-        config = architecture.spec.parse_config(architecture.raw_config)
+        plan = architecture.execution_plan
+        config = plan.parse_config(architecture.raw_config)
     except ValueError as exc:
         raise _failure(
             "INVALID_NATIVE_CONFIG",
@@ -117,7 +128,7 @@ def build_native_artifacts(
             str(architecture.model_path),
         ) from exc
     try:
-        plan = architecture.spec.create_weight_adapter().build_plan(index)
+        mapping_plan = plan.create_weight_adapter().build_plan(index)
     except WeightMappingBug as exc:
         raise _failure(
             "WEIGHT_MAPPING_UNSUPPORTED",
@@ -127,7 +138,7 @@ def build_native_artifacts(
             model,
         ) from exc
     try:
-        weights = load_mapped_weights(index, plan)
+        weights = load_mapped_weights(index, mapping_plan)
     except WeightArtifactValidationError as exc:
         raise _failure(
             "INVALID_WEIGHT_ARTIFACTS",
@@ -139,21 +150,22 @@ def build_native_artifacts(
     if stage_callback:
         stage_callback("weight_mapping", "loading_weights")
     try:
-        native_model = architecture.spec.create_model(config, weights)
+        native_model = plan.create_model(config, weights)
         if graph_profile:
             native_model = GraphProfiledModel(native_model)
-        geometry = architecture.spec.cache_geometry(config)
+        geometry = plan.cache_geometry(config)
         execution_backend = build_native_execution_backend(
             execution_backend_id,
             geometry,
             page_size=kv_page_size,
             cache_budget_bytes=cache_budget_bytes,
+            cache_family=plan.cache_family,
         )
         cache_backend = execution_backend.cache_backend
         attention_backend = execution_backend.attention_backend
         prefix_cache = _build_prefix_cache(
             strategy=prefix_cache_strategy,
-            supports_prefix_cache=architecture.spec.supports_prefix_cache,
+            supports_prefix_cache=plan.supports_prefix_cache,
             backend=cache_backend,
             model=model,
             model_path=architecture.model_path,
@@ -167,7 +179,12 @@ def build_native_artifacts(
             backend=cache_backend,
             prefix_cache=prefix_cache,
         )
-        executor = MlxGenerationExecutor(
+        executor_type = (
+            MlxOverlapGenerationExecutor
+            if execution_mode == "overlap"
+            else MlxGenerationExecutor
+        )
+        executor = executor_type(
             architecture_class=architecture.architecture_class,
             model=native_model,
             cache_backend=cache_backend,
@@ -211,7 +228,7 @@ def _build_prefix_cache(
     *,
     strategy: str,
     supports_prefix_cache: bool,
-    backend: PagedKVCacheBackend,
+    backend: KVCacheBackend,
     model: str,
     model_path: Path,
     architecture_class: str,
@@ -306,7 +323,7 @@ def detect_native_architecture(model: str) -> NativeArchitecture:
             "unsupported_class",
             model,
         )
-    return NativeArchitecture(model, path, name, payload, spec)
+    return NativeArchitecture(model, path, name, payload, spec, spec.resolve())
 
 
 def _load_tokenizer(model_path: Path) -> tuple[Any, Any, tuple[int, ...]]:

@@ -10,7 +10,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..interfaces import ForwardBatch, LayerAttentionContext
+from ..interfaces import ForwardBatch, HybridLayerAttentionContext
 from ..mapping import (
     WeightIndex,
     WeightMappingBug,
@@ -244,7 +244,7 @@ class Lfm2Attention(nn.Module):
         self,
         x: mx.array,
         positions: mx.array,
-        attention_context: LayerAttentionContext,
+        attention_context: HybridLayerAttentionContext,
     ) -> mx.array:
         batch_size, seq_len, _ = x.shape
         queries = self.q_proj(x).reshape(
@@ -315,7 +315,7 @@ class Lfm2ShortConv(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        attention_context: LayerAttentionContext,
+        attention_context: HybridLayerAttentionContext,
     ) -> mx.array:
         projected = self.in_proj(x)
         b_gate, c_gate, value = mx.split(projected, 3, axis=-1)
@@ -397,7 +397,7 @@ class Lfm2DecoderLayer(nn.Module):
         self,
         x: mx.array,
         positions: mx.array,
-        attention_context: LayerAttentionContext,
+        attention_context: HybridLayerAttentionContext,
     ) -> mx.array:
         if self.is_attention_layer:
             residual = self.self_attn(
@@ -424,7 +424,7 @@ class Lfm2Backbone(nn.Module):
         self,
         inputs: mx.array,
         positions: mx.array,
-        layer_attention: tuple[LayerAttentionContext, ...],
+        layer_attention: tuple[HybridLayerAttentionContext, ...],
     ) -> mx.array:
         hidden = self.embed_tokens(inputs)
         if len(layer_attention) != len(self.layers):

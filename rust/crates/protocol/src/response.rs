@@ -201,6 +201,9 @@ pub struct SchedulerMetricsEvent {
     /// Inner waiting-queue scheduling policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduling_policy: Option<String>,
+    /// Startup-selected native execution coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<String>,
     /// Physical model-forward mode selected by the executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_mode: Option<String>,
@@ -234,6 +237,9 @@ pub struct SchedulerMetricsEvent {
     /// Executor sampling graph construction time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_sample_ms: Option<u32>,
+    /// Executor asynchronous dispatch submission time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_dispatch_ms: Option<u32>,
     /// Executor MLX evaluation latency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_eval_ms: Option<u32>,

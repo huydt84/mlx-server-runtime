@@ -699,6 +699,17 @@ impl WorkerClient {
                             1,
                         );
                     }
+                    if let Some(mode) = scheduler.execution_mode.as_deref() {
+                        metrics.set_labeled_gauge(
+                            "mlx_native_execution_mode",
+                            &[
+                                ("backend", scheduler.backend.as_str()),
+                                ("modality", scheduler.modality.as_str()),
+                                ("mode", mode),
+                            ],
+                            1,
+                        );
+                    }
                     if let Some(value) = scheduler.physical_batch_size {
                         metrics.set_labeled_gauge(
                             "mlx_executor_physical_batch_size_by_backend",
@@ -732,6 +743,7 @@ impl WorkerClient {
                         ("reserve", scheduler.executor_reserve_ms),
                         ("forward", scheduler.executor_forward_ms),
                         ("sample", scheduler.executor_sample_ms),
+                        ("dispatch", scheduler.executor_dispatch_ms),
                         ("eval", scheduler.executor_eval_ms),
                         ("commit", scheduler.executor_commit_ms),
                     ] {
@@ -1314,6 +1326,7 @@ mod tests {
                     scheduler_queue_wait_ms: Some(9),
                     cancellation_latency_ms: Some(10),
                     scheduling_policy: Some("lpm".to_string()),
+                    execution_mode: Some("overlap".to_string()),
                     forward_mode: Some("mixed".to_string()),
                     physical_batch_size: Some(2),
                     model_forward_count: Some(1),
@@ -1325,6 +1338,7 @@ mod tests {
                     executor_reserve_ms: Some(6),
                     executor_forward_ms: Some(7),
                     executor_sample_ms: Some(8),
+                    executor_dispatch_ms: Some(1),
                     executor_eval_ms: Some(9),
                     executor_commit_ms: Some(10),
                     model_graph_embedding_ms: Some(11),

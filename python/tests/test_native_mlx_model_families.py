@@ -5,7 +5,11 @@ from __future__ import annotations
 import mlx.core as mx
 
 from mlx_worker.native_mlx.attention import DenseReferenceAttentionBackend
-from mlx_worker.native_mlx.cache import DenseKVCacheBackend
+from mlx_worker.native_mlx.cache import (
+    DenseKVCacheBackend,
+    HybridPagedKVCacheBackend,
+    KVCacheGeometry,
+)
 from mlx_worker.native_mlx.interfaces import ForwardBatch, ForwardMode
 from mlx_worker.native_mlx.models.gemma3 import (
     Gemma3ForCausalLM,
@@ -20,6 +24,7 @@ from mlx_worker.native_mlx.models.qwen3 import (
     parse_qwen3_config,
 )
 from mlx_worker.native_mlx.registry import get_architecture_spec
+from mlx_worker.native_mlx.execution_backends import build_native_execution_backend
 
 
 def test_registered_model_families_match_real_checkpoint_architecture_classes() -> None:
@@ -33,6 +38,25 @@ def test_registered_model_families_match_real_checkpoint_architecture_classes() 
         "mlx-community/gemma-3-270m-it-qat-8bit"
     )
     assert not get_architecture_spec("Lfm2MoeForCausalLM").supports_prefix_cache
+
+
+def test_lfm2_selects_hybrid_cache_bundle_at_startup() -> None:
+    bundle = build_native_execution_backend(
+        "native-metal-paged-sdpa",
+        KVCacheGeometry(
+            num_layers=2,
+            num_kv_heads=1,
+            head_dim=4,
+            dtype=mx.float16,
+        ),
+        page_size=8,
+        cache_budget_bytes=4096,
+        cache_family="hybrid",
+    )
+    assert isinstance(bundle.cache_backend, HybridPagedKVCacheBackend)
+    assert bundle.attention_backend.capabilities.reservation_types[0].__name__ == (
+        "HybridBatchReservation"
+    )
 
 
 def test_qwen3_and_gemma3_tiny_graphs_produce_logits() -> None:

@@ -66,6 +66,7 @@ class _RuntimeState:
     stop: _StopTextAssembler
     enqueued_at: float
     completion_token_ids: list[int]
+    detokenizer: Any | None = None
     decoded_prefix: str = ""
     prefill_time_ms: int = 0
     decode_time_ms: int = 0
@@ -133,6 +134,7 @@ class NativeRuntime:
             stop=_StopTextAssembler(tuple(stop for stop in request.stop if stop)),
             enqueued_at=time.perf_counter(),
             completion_token_ids=[],
+            detokenizer=_new_streaming_detokenizer(self._prompt_tokenizer),
         )
         self._requests[request.request_id] = state
         if self._profiler is not None:
@@ -255,6 +257,7 @@ class NativeRuntime:
                             metrics, "cancellation_latency_ms"
                         ),
                         scheduling_policy=_optional_str(metrics, "scheduling_policy"),
+                        execution_mode=_optional_str(metrics, "execution_mode"),
                         forward_mode=_optional_str(metrics, "forward_mode"),
                         physical_batch_size=_optional_int(
                             metrics, "physical_batch_size"
@@ -276,6 +279,9 @@ class NativeRuntime:
                             metrics, "executor_forward_ms"
                         ),
                         executor_sample_ms=_optional_int(metrics, "executor_sample_ms"),
+                        executor_dispatch_ms=_optional_int(
+                            metrics, "executor_dispatch_ms"
+                        ),
                         executor_eval_ms=_optional_int(metrics, "executor_eval_ms"),
                         executor_commit_ms=_optional_int(metrics, "executor_commit_ms"),
                         model_graph_embedding_ms=_optional_int(
@@ -422,18 +428,22 @@ class NativeRuntime:
             self._finish(state, "stop", output)
             return
         detokenize_started_ns = time.perf_counter_ns()
-        text = str(
-            self._decode_target.decode(
-                state.completion_token_ids,
-                skip_special_tokens=False,
+        if state.detokenizer is not None:
+            state.detokenizer.add_token(token_id)
+            delta = str(state.detokenizer.last_segment)
+        else:
+            text = str(
+                self._decode_target.decode(
+                    state.completion_token_ids,
+                    skip_special_tokens=False,
+                )
             )
-        )
-        delta = (
-            text[len(state.decoded_prefix) :]
-            if text.startswith(state.decoded_prefix)
-            else text
-        )
-        state.decoded_prefix = text
+            delta = (
+                text[len(state.decoded_prefix) :]
+                if text.startswith(state.decoded_prefix)
+                else text
+            )
+            state.decoded_prefix = text
         emitted, stop_hit = state.stop.push(delta)
         if self._profiler is not None:
             self._profiler.record(
@@ -481,6 +491,22 @@ class NativeRuntime:
         reason: str,
         output: list[RuntimeEvent],
     ) -> None:
+        final_emitted = ""
+        if reason != "cancelled" and state.detokenizer is not None:
+            state.detokenizer.finalize()
+            final_segment = str(state.detokenizer.last_segment)
+            if final_segment:
+                final_emitted, _ = state.stop.push(final_segment)
+        if final_emitted and state.request.stream:
+            output.append(
+                RuntimeEvent(
+                    kind="delta",
+                    payload=ChatCompletionDelta(
+                        request_id=state.request.request_id,
+                        delta=final_emitted,
+                    ),
+                )
+            )
         trailing = "" if reason == "cancelled" else state.stop.finish()
         if trailing and state.request.stream:
             output.append(
@@ -634,3 +660,13 @@ def _optional_int(metrics: dict[str, object], name: str) -> int | None:
 def _optional_str(metrics: dict[str, object], name: str) -> str | None:
     value = metrics.get(name)
     return None if value is None else str(value)
+
+
+def _new_streaming_detokenizer(tokenizer: Any) -> Any | None:
+    """Create one request-local streaming detokenizer when supported."""
+
+    try:
+        detokenizer = getattr(tokenizer, "detokenizer")
+    except (AttributeError, TypeError):
+        return None
+    return detokenizer if callable(getattr(detokenizer, "add_token", None)) else None

@@ -118,17 +118,13 @@ class Gemma3Attention(nn.Module):
             scale=self.rope.scale,
             offset=offsets,
         )
-        mask = (
-            f"sliding_window:{self.window_size}"
-            if self.window_size is not None
-            else "causal"
-        )
         output = attention_context.append_and_attend(
             queries,
             keys,
             values,
             scale=self.scale,
-            mask=mask,
+            mask=None,
+            window_size=self.window_size,
         )
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
         return self.o_proj(output)

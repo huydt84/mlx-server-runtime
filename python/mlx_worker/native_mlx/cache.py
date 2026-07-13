@@ -407,7 +407,6 @@ class PagedRequestCache:
     request_id: str
     block_table: list[int] = field(default_factory=list)
     length: int = 0
-    conv_states: dict[int, mx.array] = field(default_factory=dict)
 
     def size(self) -> int:
         return self.length
@@ -426,8 +425,42 @@ class PagedBatchReservation:
     pinned_pages: tuple[int, ...]
     staged_keys: list[mx.array | None]
     staged_values: list[mx.array | None]
-    staged_states: list[mx.array | None]
     _finished: bool = False
+    _block_table_array: mx.array = field(init=False, repr=False)
+    _slot_array: mx.array = field(init=False, repr=False)
+    _page_id_arrays: tuple[mx.array, ...] = field(init=False, repr=False)
+    _total_lengths: tuple[int, ...] = field(init=False, repr=False)
+    _max_total_length: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        width = max((len(table) for table in self.candidate_tables), default=0)
+        rows = [
+            list(table) + [0] * (width - len(table)) for table in self.candidate_tables
+        ]
+        self._block_table_array = mx.array(rows, dtype=mx.int32)
+        self._page_id_arrays = tuple(
+            mx.array(table, dtype=mx.int32) for table in self.candidate_tables
+        )
+        self._total_lengths = tuple(
+            cache.size() + append_length
+            for cache, append_length in zip(
+                self.request_caches, self.append_lengths, strict=True
+            )
+        )
+        self._max_total_length = max(self._total_lengths, default=0)
+        slots: list[int] = []
+        for cache, append_length, table in zip(
+            self.request_caches,
+            self.append_lengths,
+            self.candidate_tables,
+            strict=True,
+        ):
+            for position in range(cache.size(), cache.size() + append_length):
+                page = table[position // self.backend.page_size]
+                slots.append(
+                    page * self.backend.page_size + position % self.backend.page_size
+                )
+        self._slot_array = mx.array(slots, dtype=mx.int32)
 
     @property
     def token_lengths(self) -> tuple[int, ...]:
@@ -439,11 +472,7 @@ class PagedBatchReservation:
 
     @property
     def block_tables(self) -> mx.array:
-        width = max((len(table) for table in self.candidate_tables), default=0)
-        rows = [
-            list(table) + [0] * (width - len(table)) for table in self.candidate_tables
-        ]
-        return mx.array(rows, dtype=mx.int32)
+        return self._block_table_array
 
     def stage_layer(
         self,
@@ -455,8 +484,6 @@ class PagedBatchReservation:
             raise ValueError("cache reservation already finished")
         if self.staged_keys[layer_index] is not None:
             raise ValueError(f"layer {layer_index} staged more than once")
-        if self.staged_states[layer_index] is not None:
-            raise ValueError(f"layer {layer_index} staged both KV and state")
         self.backend.validate_kv_shape(keys, values, self.append_lengths)
         key_cache = self.backend.key_pages[layer_index]
         value_cache = self.backend.value_pages[layer_index]
@@ -465,23 +492,10 @@ class PagedBatchReservation:
             value_cache[new_page] = value_cache[old_page]
         packed_keys: list[mx.array] = []
         packed_values: list[mx.array] = []
-        slots: list[int] = []
-        for index, (cache, append_length, table) in enumerate(
-            zip(
-                self.request_caches,
-                self.append_lengths,
-                self.candidate_tables,
-                strict=True,
-            )
-        ):
+        for index, append_length in enumerate(self.append_lengths):
             packed_keys.append(keys[index, :, :append_length, :].transpose(1, 0, 2))
             packed_values.append(values[index, :, :append_length, :].transpose(1, 0, 2))
-            for position in range(cache.size(), cache.size() + append_length):
-                page = table[position // self.backend.page_size]
-                slots.append(
-                    page * self.backend.page_size + position % self.backend.page_size
-                )
-        slot_array = mx.array(slots, dtype=mx.int32)
+        slot_array = self._slot_array
         flat_shape = (
             self.backend.num_pages * self.backend.page_size,
             self.backend.num_kv_heads,
@@ -497,17 +511,69 @@ class PagedBatchReservation:
         self.staged_values[layer_index] = value_cache
         return key_cache, value_cache
 
+    def commit(self) -> tuple[int, ...]:
+        if self._finished:
+            raise ValueError("cache reservation already finished")
+        for keys, values in zip(self.staged_keys, self.staged_values, strict=True):
+            if (keys is None) != (values is None) or keys is None:
+                raise ValueError("paged cache commit missing one or more layers")
+        staged_keys = tuple(
+            _require_array(value) if value is not None else None
+            for value in self.staged_keys
+        )
+        staged_values = tuple(
+            _require_array(value) if value is not None else None
+            for value in self.staged_values
+        )
+        mx.eval(
+            *(value for value in staged_keys if value is not None),
+            *(value for value in staged_values if value is not None),
+        )
+        lengths = self.backend._commit_reservation(self, staged_keys, staged_values)
+        self._finished = True
+        return lengths
+
+    def abort(self) -> None:
+        if not self._finished:
+            self.backend._abort_reservation(self)
+            self._finished = True
+
+
+@dataclass
+class HybridRequestCache(PagedRequestCache):
+    """Paged request cache with LFM2-only convolution state."""
+
+    conv_states: dict[int, mx.array] = field(default_factory=dict)
+
+
+@dataclass
+class HybridBatchReservation(PagedBatchReservation):
+    """Transactional paged KV plus convolution-state reservation."""
+
+    staged_states: list[mx.array | None] = field(default_factory=list)
+
+    def stage_layer(
+        self,
+        layer_index: int,
+        keys: mx.array,
+        values: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        if self.staged_states[layer_index] is not None:
+            raise ValueError(f"layer {layer_index} staged both state and KV")
+        return super().stage_layer(layer_index, keys, values)
+
     def prepare_conv_state(
         self,
         layer_index: int,
         values: mx.array,
         cache_size: int,
     ) -> mx.array:
-        """Return padded convolution input prefixed with each request state."""
+        """Return values prefixed with the request-local convolution state."""
 
         states = []
         for cache in self.request_caches:
-            state = cache.conv_states.get(layer_index)
+            hybrid = _require_hybrid_cache(cache)
+            state = hybrid.conv_states.get(layer_index)
             if state is None:
                 state = mx.zeros(
                     (cache_size - 1, int(values.shape[-1])), dtype=values.dtype
@@ -527,17 +593,16 @@ class PagedBatchReservation:
         combined: mx.array,
         cache_size: int,
     ) -> None:
-        """Stage per-request convolution state for a transactional commit."""
+        """Stage one convolution state layer for transactional commit."""
 
         if self._finished:
             raise ValueError("cache reservation already finished")
         if self.staged_keys[layer_index] is not None:
             raise ValueError(f"layer {layer_index} staged both state and KV")
-        states = []
-        for index, append_length in enumerate(self.append_lengths):
-            states.append(
-                combined[index, append_length : append_length + cache_size - 1]
-            )
+        states = tuple(
+            combined[index, append_length : append_length + cache_size - 1]
+            for index, append_length in enumerate(self.append_lengths)
+        )
         self.staged_states[layer_index] = mx.stack(states, axis=0)
 
     def commit(self) -> tuple[int, ...]:
@@ -546,8 +611,10 @@ class PagedBatchReservation:
         for keys, values, state in zip(
             self.staged_keys, self.staged_values, self.staged_states, strict=True
         ):
-            if (keys is None) != (values is None) or (keys is None and state is None):
-                raise ValueError("paged cache commit missing one or more layers")
+            kv_complete = keys is not None and values is not None
+            state_complete = state is not None
+            if kv_complete == state_complete:
+                raise ValueError("hybrid cache commit requires one operation per layer")
         staged_keys = tuple(
             _require_array(value) if value is not None else None
             for value in self.staged_keys
@@ -565,16 +632,11 @@ class PagedBatchReservation:
             *(value for value in staged_values if value is not None),
             *(value for value in staged_states if value is not None),
         )
-        lengths = self.backend._commit_reservation(
+        lengths = self.backend._commit_hybrid_reservation(
             self, staged_keys, staged_values, staged_states
         )
         self._finished = True
         return lengths
-
-    def abort(self) -> None:
-        if not self._finished:
-            self.backend._abort_reservation(self)
-            self._finished = True
 
 
 @dataclass
@@ -697,7 +759,7 @@ class PagedKVCacheBackend:
         for page in pinned:
             self._pin_counts[page] += 1
         self._reserved_pages.update(reserved)
-        return PagedBatchReservation(
+        return self._build_reservation(
             backend=self,
             request_caches=paged,
             append_lengths=append_lengths,
@@ -707,7 +769,33 @@ class PagedKVCacheBackend:
             pinned_pages=pinned,
             staged_keys=[None] * self.num_layers,
             staged_values=[None] * self.num_layers,
-            staged_states=[None] * self.num_layers,
+        )
+
+    def _build_reservation(
+        self,
+        *,
+        backend: "PagedKVCacheBackend",
+        request_caches: tuple[PagedRequestCache, ...],
+        append_lengths: tuple[int, ...],
+        candidate_tables: tuple[tuple[int, ...], ...],
+        reserved_pages: tuple[int, ...],
+        copy_pages: tuple[tuple[int, int], ...],
+        pinned_pages: tuple[int, ...],
+        staged_keys: list[mx.array | None],
+        staged_values: list[mx.array | None],
+    ) -> PagedBatchReservation:
+        """Construct the backend-specific reservation type once per step."""
+
+        return PagedBatchReservation(
+            backend=backend,
+            request_caches=request_caches,
+            append_lengths=append_lengths,
+            candidate_tables=candidate_tables,
+            reserved_pages=reserved_pages,
+            copy_pages=copy_pages,
+            pinned_pages=pinned_pages,
+            staged_keys=staged_keys,
+            staged_values=staged_values,
         )
 
     def preflight(
@@ -775,9 +863,6 @@ class PagedKVCacheBackend:
         target = self._caches[new_handle]
         target.block_table = pages
         target.length = fork_length
-        target.conv_states = {
-            index: state for index, state in source.conv_states.items()
-        }
         for page in pages:
             self._ref_counts[page] += 1
         return new_handle
@@ -825,7 +910,6 @@ class PagedKVCacheBackend:
         reservation: PagedBatchReservation,
         staged_keys: tuple[mx.array | None, ...],
         staged_values: tuple[mx.array | None, ...],
-        staged_states: tuple[mx.array | None, ...],
     ) -> tuple[int, ...]:
         old_counts = Counter(
             page for cache in reservation.request_caches for page in cache.block_table
@@ -857,10 +941,6 @@ class PagedKVCacheBackend:
         ):
             cache.block_table = list(table)
             cache.length += append_length
-        for index, state in enumerate(staged_states):
-            if state is not None:
-                for cache, row in zip(reservation.request_caches, state, strict=True):
-                    cache.conv_states[index] = row
         for page in reservation.reserved_pages:
             if page in self._free_pages:
                 self._free_pages.remove(page)
@@ -887,6 +967,80 @@ class PagedKVCacheBackend:
                 raise ValueError("paged KV page pin count became negative")
 
 
+@dataclass
+class HybridPagedKVCacheBackend(PagedKVCacheBackend):
+    """Paged KV backend with convolution state isolated to hybrid models."""
+
+    _caches: dict[str, HybridRequestCache] = field(default_factory=dict, init=False)
+
+    def create(self, request_id: str) -> str:
+        handle = f"paged-hybrid-kv-{request_id}-{uuid.uuid4().hex}"
+        self._caches[handle] = HybridRequestCache(
+            handle=handle,
+            request_id=request_id,
+        )
+        return handle
+
+    def _build_reservation(
+        self,
+        *,
+        backend: PagedKVCacheBackend,
+        request_caches: tuple[PagedRequestCache, ...],
+        append_lengths: tuple[int, ...],
+        candidate_tables: tuple[tuple[int, ...], ...],
+        reserved_pages: tuple[int, ...],
+        copy_pages: tuple[tuple[int, int], ...],
+        pinned_pages: tuple[int, ...],
+        staged_keys: list[mx.array | None],
+        staged_values: list[mx.array | None],
+    ) -> HybridBatchReservation:
+        hybrid = tuple(_require_hybrid_cache(cache) for cache in request_caches)
+        return HybridBatchReservation(
+            backend=backend,
+            request_caches=hybrid,
+            append_lengths=append_lengths,
+            candidate_tables=candidate_tables,
+            reserved_pages=reserved_pages,
+            copy_pages=copy_pages,
+            pinned_pages=pinned_pages,
+            staged_keys=staged_keys,
+            staged_values=staged_values,
+            staged_states=[None] * self.num_layers,
+        )
+
+    def fork(
+        self,
+        handle: str,
+        request_id: str,
+        *,
+        length: int | None = None,
+    ) -> str:
+        source = _require_hybrid_cache(self._caches[handle])
+        new_handle = super().fork(handle, request_id, length=length)
+        target = _require_hybrid_cache(self.get(new_handle, request_id))
+        target.conv_states = dict(source.conv_states)
+        return new_handle
+
+    def _commit_hybrid_reservation(
+        self,
+        reservation: HybridBatchReservation,
+        staged_keys: tuple[mx.array | None, ...],
+        staged_values: tuple[mx.array | None, ...],
+        staged_states: tuple[mx.array | None, ...],
+    ) -> tuple[int, ...]:
+        lengths = super()._commit_reservation(reservation, staged_keys, staged_values)
+        for index, state in enumerate(staged_states):
+            if state is not None:
+                for cache, row in zip(reservation.request_caches, state, strict=True):
+                    _require_hybrid_cache(cache).conv_states[index] = row
+        return lengths
+
+    def metrics(self) -> dict[str, Any]:
+        metrics = super().metrics()
+        metrics["cache_backend"] = "paged-mlx-hybrid"
+        return metrics
+
+
 def _require_array(value: mx.array | None) -> mx.array:
     if value is None:
         raise ValueError("missing staged MLX array")
@@ -902,4 +1056,10 @@ def _require_dense_cache(cache: RequestCache) -> DenseRequestCache:
 def _require_paged_cache(cache: RequestCache) -> PagedRequestCache:
     if not isinstance(cache, PagedRequestCache):
         raise TypeError("paged backend received incompatible request cache")
+    return cache
+
+
+def _require_hybrid_cache(cache: RequestCache) -> HybridRequestCache:
+    if not isinstance(cache, HybridRequestCache):
+        raise TypeError("hybrid backend received incompatible request cache")
     return cache

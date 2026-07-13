@@ -26,12 +26,18 @@ class ForwardMode(str, Enum):
     def from_phases(cls, phases: Sequence[ExecutionPhase]) -> "ForwardMode":
         """Derive one physical forward mode from request-local phases."""
 
-        unique = set(phases)
-        if unique == {"prefill"}:
+        has_prefill = False
+        has_decode = False
+        for phase in phases:
+            if phase == "prefill":
+                has_prefill = True
+            elif phase == "decode":
+                has_decode = True
+        if has_prefill and not has_decode:
             return cls.PREFILL
-        if unique == {"decode"}:
+        if has_decode and not has_prefill:
             return cls.DECODE
-        if unique == {"prefill", "decode"}:
+        if has_prefill and has_decode:
             return cls.MIXED
         raise ValueError("execution batch must contain prefill or decode work")
 
@@ -45,7 +51,12 @@ class SamplingParams:
 
 
 class LayerAttentionContext(Protocol):
-    """Model-facing attention operation independent of physical KV layout."""
+    """Pure-KV model-facing attention operation.
+
+    Hybrid convolution state is deliberately not part of this protocol.  A
+    pure transformer model therefore cannot accidentally pay for hybrid state
+    handling on every layer.
+    """
 
     def append_and_attend(
         self,
@@ -54,15 +65,20 @@ class LayerAttentionContext(Protocol):
         values: mx.array,
         *,
         scale: float,
-        mask: str | None,
+        mask: str | None = None,
+        window_size: int | None = None,
     ) -> mx.array:
         """Stage K/V append and attend over committed plus staged history."""
 
+
+class HybridLayerAttentionContext(LayerAttentionContext, Protocol):
+    """Attention plus request-local state for hybrid architectures only."""
+
     def prepare_conv_state(self, values: mx.array, cache_size: int) -> mx.array:
-        """Prefix values with request-local state for hybrid convolution layers."""
+        """Prefix values with request-local state."""
 
     def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
-        """Stage request-local state for a hybrid convolution layer."""
+        """Stage request-local state for transactional commit."""
 
 
 @dataclass(frozen=True)

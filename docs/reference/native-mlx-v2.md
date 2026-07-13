@@ -87,6 +87,7 @@ Useful native-v2 environment variables:
 | --- | --- | --- |
 | `MLX_RUNTIME_BACKEND` | `v1`, `native-mlx` | Worker backend selector |
 | `MLX_RUNTIME_NATIVE_EXECUTION_BACKEND` | `native-metal-paged-sdpa` | Compatible native cache-and-attention bundle; defaults to the existing production path |
+| `MLX_RUNTIME_NATIVE_EXECUTION_MODE` | `serial`, `overlap` | Startup execution coordinator; `serial` is the default and `overlap` is an explicit experimental same-thread decode pipeline |
 | `MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` | `8`, `16`, `32` | Native paged-KV page size |
 | `MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY` | `radix`, `block-hash` | Prefix-cache strategy; `radix` is the native-v2 default |
 | `MLX_RUNTIME_NATIVE_SCHEDULING_POLICY` | `fcfs`, `lpm`, `lof`, `priority` | Python scheduler waiting-queue policy |
@@ -100,9 +101,17 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Text KV/prefix-cache byte budget |
 | `MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES` | positive integer | Prefix-cache entry bound |
 
-Invalid native execution-backend, page-size, prefix-cache strategy, or
-scheduler-policy values must fail startup. They must not silently select dense
-attention, another prefix strategy, v1, `mlx-lm`, or `mlx-vlm`.
+Invalid native execution-backend, execution-mode, page-size, prefix-cache
+strategy, or scheduler-policy values must fail startup. They must not silently
+select dense attention, another prefix strategy, v1, `mlx-lm`, or `mlx-vlm`.
+The experimental `overlap` mode never silently falls back to serial. It keeps
+latency-sensitive pure prefill synchronous and pipelines decode only. Use
+`mlx-host-validation/scripts/v2_phase_17.sh` to require exact serial/overlap
+output parity, a 2% performance confidence-bound gate, CPU overlap evidence,
+an MLX `.gputrace`, and matched serial/overlap Metal System Traces from the
+Python worker. The Metal gate uses the same sustained four-request concurrent
+decode workload in both modes and rejects a p95 GPU interval-gap regression
+beyond 2% or 50 microseconds, whichever allowance is larger.
 
 ## Attention Backend Contract
 
@@ -193,8 +202,8 @@ request totals.
 - Only explicitly implemented architecture classes are supported.
 - Greedy decoding is the validated native path.
 - VLM requests remain outside `native-mlx`.
-- MLX-safe overlap remains experimental and requires measured scheduler-gap and
-  CPU/GPU overlap evidence before it can be enabled by default.
+- Same-thread overlap remains experimental and explicit opt-in; serial remains
+  the default even though the Phase 17/18 host gates cover it.
 
 ## v1 Fallback
 

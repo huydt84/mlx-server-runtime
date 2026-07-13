@@ -65,17 +65,27 @@ The Python worker now has two serving paths with different ownership splits:
 
 | Backend | Execution primitive | Scheduling behavior |
 |---------|---------------------|---------------------|
-| Text LLM (`native-mlx`) | Repo-owned native runtime, scheduler, executor, and Qwen2 MLX graph | Iteration-level continuous batching with chunked prefill and decode-first scheduling |
+| Text LLM (`native-mlx`) | Repo-owned native runtime, scheduler, executor, and registered MLX architecture plans | Iteration-level continuous batching with chunked prefill and decode-first scheduling |
 | VLM | `mlx_vlm.generate.BatchGenerator` plus repo-owned worker lifecycle/cache policy | Continuous batching with APC reuse and vision-feature caching |
 
 For native text serving, Rust still owns HTTP/SSE, outer admission, worker
 supervision, and telemetry projection. Python owns prompt construction,
 tokenization, request lifecycle, scheduling, KV cache lifecycle policy,
-executor batch preparation, and native MLX model execution. The Qwen2 tensor
-graph, config, and weight rules live in one `models/qwen2.py` module. Shared
-batch packing, sampling, dense KV management, diagnostics orchestration, and
-request lifecycle remain outside `models/`, so another compatible model does
-not require another executor or scheduler.
+executor batch preparation, and native MLX model execution. Bootstrap resolves
+one lazy architecture manifest into a frozen execution plan, so unrelated model
+families are not imported or inspected on the request path. Pure transformer
+families use the pure paged-KV/attention bundle; LFM2 selects its separate
+hybrid convolution-state bundle at startup. Shared batch packing, sampling,
+diagnostics orchestration, and request lifecycle remain outside `models/`, so
+another compatible model does not require another executor or scheduler.
+
+The executor exposes an explicit prepare/dispatch/resolve seam.
+`MLX_RUNTIME_NATIVE_EXECUTION_MODE=serial` remains the default. The explicit
+`overlap` mode keeps pure prefill synchronous for TTFT, then holds at most one
+decode step in flight on the owner thread with MLX asynchronous evaluation.
+It resolves outstanding work before cache commit, cancellation, release, or
+shutdown. Result-independent detokenization and transport work for step N runs
+while step N+1 is outstanding. No background Python executor thread is used.
 
 For VLMs, the runtime still exposes continuous batching, upstream APC reuse,
 and repeated-image feature caching through the worker. This is not

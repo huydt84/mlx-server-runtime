@@ -42,6 +42,7 @@ class WorkerConfig:
     text_cache_max_entries: int = 32
     native_kv_page_size: int = 16
     native_execution_backend: str = DEFAULT_NATIVE_EXECUTION_BACKEND
+    native_execution_mode: str = "serial"
     native_prefix_cache_strategy: str = "radix"
     native_scheduling_policy: str = "fcfs"
     native_graph_profile: bool = False
@@ -121,6 +122,11 @@ def load_config() -> WorkerConfig:
         raise ValueError(
             "MLX_RUNTIME_NATIVE_EXECUTION_BACKEND must be one of: " + choices
         )
+    native_execution_mode = os.environ.get(
+        "MLX_RUNTIME_NATIVE_EXECUTION_MODE", "serial"
+    ).strip()
+    if native_execution_mode not in {"serial", "overlap"}:
+        raise ValueError("MLX_RUNTIME_NATIVE_EXECUTION_MODE must be serial or overlap")
     native_prefix_cache_strategy = os.environ.get(
         "MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY",
         "radix",
@@ -189,6 +195,7 @@ def load_config() -> WorkerConfig:
         text_cache_max_entries=text_cache_max_entries,
         native_kv_page_size=native_kv_page_size,
         native_execution_backend=native_execution_backend,
+        native_execution_mode=native_execution_mode,
         native_prefix_cache_strategy=native_prefix_cache_strategy,
         native_scheduling_policy=native_scheduling_policy,
         native_graph_profile=native_graph_profile,

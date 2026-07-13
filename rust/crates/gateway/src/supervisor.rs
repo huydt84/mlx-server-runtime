@@ -482,6 +482,7 @@ fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
         ("PYTHONPATH", "python".to_string()),
     ];
     for key in [
+        "MLX_RUNTIME_NATIVE_EXECUTION_MODE",
         "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE",
         "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR",
         "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_RUN_ID",
@@ -552,5 +553,18 @@ mod tests {
         assert!(env
             .iter()
             .any(|(key, value)| { *key == "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE" && value == "1" }));
+    }
+
+    #[test]
+    fn worker_env_forwards_native_execution_mode() {
+        let config = RuntimeConfig::default();
+        unsafe { std::env::set_var("MLX_RUNTIME_NATIVE_EXECUTION_MODE", "overlap") };
+
+        let env = worker_env(&config);
+
+        unsafe { std::env::remove_var("MLX_RUNTIME_NATIVE_EXECUTION_MODE") };
+        assert!(env.iter().any(|(key, value)| {
+            *key == "MLX_RUNTIME_NATIVE_EXECUTION_MODE" && value == "overlap"
+        }));
     }
 }

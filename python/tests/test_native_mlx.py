@@ -26,12 +26,16 @@ from mlx_worker.native_mlx.attention import (
 from mlx_worker.native_mlx.cache import (
     DenseBatchReservation,
     DenseKVCacheBackend,
+    HybridPagedKVCacheBackend,
     KVCacheGeometry,
     PagedBatchReservation,
     PagedKVCacheBackend,
 )
 from mlx_worker.native_mlx.cache_coordinator import NativeCacheCoordinator
-from mlx_worker.native_mlx.executor import MlxGenerationExecutor
+from mlx_worker.native_mlx.executor import (
+    MlxGenerationExecutor,
+    MlxOverlapGenerationExecutor,
+)
 from mlx_worker.native_mlx.execution_backends import (
     DEFAULT_NATIVE_EXECUTION_BACKEND,
     available_native_execution_backends,
@@ -292,6 +296,9 @@ def test_registry_composes_shared_model_and_cache_backend() -> None:
     spec = get_architecture_spec("Qwen2ForCausalLM")
     assert spec is not None
     assert spec.create_model is not None
+    execution_plan = spec.resolve()
+    assert execution_plan.architecture_class == "Qwen2ForCausalLM"
+    assert execution_plan.cache_family == "kv"
     geometry = spec.cache_geometry(_tiny_qwen2_config())
     assert geometry.num_layers == 2
     assert geometry.num_kv_heads == 2
@@ -377,6 +384,34 @@ def test_executor_physically_batches_unequal_prefill_rows() -> None:
     assert model.calls == [((2, 3), (3, 1))]
     assert [item.next_token_id for item in result.results] == [3, 3]
     assert [item.cache_length for item in result.results] == [3, 1]
+
+
+def test_hybrid_cache_isolated_from_pure_paged_kv_state() -> None:
+    pure = PagedKVCacheBackend(
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=4096,
+    )
+    pure_handle = pure.create("pure")
+    assert not hasattr(pure.get(pure_handle, "pure"), "conv_states")
+
+    hybrid = HybridPagedKVCacheBackend(
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=4096,
+    )
+    handle = hybrid.create("hybrid")
+    cache = hybrid.get(handle, "hybrid")
+    reservation = hybrid.reserve_batch((cache,), (3,))
+    reservation.stage_conv_state(0, mx.zeros((1, 3, 4), dtype=mx.float16), 2)
+    keys = mx.zeros((1, 1, 3, 2), dtype=mx.float16)
+    reservation.stage_layer(1, keys, keys)
+    reservation.commit()
+    assert 0 in cache.conv_states
 
 
 def test_executor_physically_batches_decode_with_different_cache_lengths() -> None:
@@ -931,6 +966,14 @@ def test_bootstrap_rejects_unknown_execution_backend_before_model_loading() -> N
     assert caught.value.error.category == "invalid_configuration"
 
 
+def test_bootstrap_accepts_overlap_mode_before_model_resolution() -> None:
+    with pytest.raises(NativeBootstrapFailure) as caught:
+        build_native_artifacts("missing-model", execution_mode="overlap")
+
+    assert caught.value.error.code == "MODEL_RESOLUTION_FAILED"
+    assert caught.value.error.stage == "artifact_validation"
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
 def test_native_execution_backend_registry_builds_compatible_bundle() -> None:
     bundle = build_native_execution_backend(
@@ -1132,6 +1175,34 @@ def _scheduler(
     )
 
 
+def _overlap_scheduler(
+    *,
+    max_tokens: int = 2,
+) -> tuple[
+    NativeContinuousScheduler,
+    DenseKVCacheBackend,
+    _RecordingModel,
+    SchedulableRequest,
+]:
+    model = _RecordingModel()
+    cache_backend = DenseKVCacheBackend(num_layers=model.num_layers)
+    cache_coordinator = NativeCacheCoordinator(cache_backend, NoPrefixCache())
+    executor = MlxOverlapGenerationExecutor(
+        architecture_class="FakeForCausalLM",
+        model=model,
+        cache_backend=cache_backend,
+        attention_backend=DenseReferenceAttentionBackend(),
+    )
+    scheduler = NativeContinuousScheduler(
+        executor,
+        cache_coordinator,
+        execution_mode="overlap",
+        terminal_token_ids=(0,),
+    )
+    request = _schedulable("overlap", (1,), max_tokens=max_tokens)
+    return scheduler, cache_backend, model, request
+
+
 def _schedulable(
     request_id: str,
     tokens: tuple[int, ...],
@@ -1311,6 +1382,136 @@ def test_scheduler_cancellation_releases_at_safe_point() -> None:
     assert cache_coordinator.released == ["cache-request"]
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_delays_one_result_and_preserves_cache_lifetime() -> None:
+    scheduler, cache_backend, model, request = _overlap_scheduler(max_tokens=2)
+    scheduler.submit(request)
+
+    first = scheduler.tick()
+    handle = scheduler._running["overlap"].cache_handle
+    assert handle is not None
+    assert [event.token_id for event in first if event.kind == "token"] == [3]
+    assert cache_backend.length(handle) == 1
+
+    second = scheduler.tick()
+    assert second == ()
+    assert cache_backend.length(handle) == 1
+
+    third = scheduler.tick()
+    assert [event.token_id for event in third if event.kind == "token"] == [3]
+    assert cache_backend.length(handle) == 2
+    assert len(model.calls) == 2
+
+    scheduler.finish("overlap")
+    assert scheduler.idle()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_defers_in_flight_cancellation_until_resolve() -> None:
+    scheduler, cache_backend, _, request = _overlap_scheduler(max_tokens=4)
+    scheduler.submit(request)
+    scheduler.tick()
+    scheduler.tick()
+    handle = scheduler._running["overlap"].cache_handle
+    assert handle is not None
+
+    assert scheduler.cancel("overlap")
+    events = scheduler.tick()
+
+    assert not any(event.kind == "token" for event in events)
+    assert any(event.kind == "cancelled" for event in events)
+    assert cache_backend.length(handle) == 0
+    assert scheduler.idle()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_discards_speculative_result_after_finish() -> None:
+    scheduler, cache_backend, model, request = _overlap_scheduler(max_tokens=4)
+    scheduler.submit(request)
+    first_result = scheduler.tick()
+    scheduler.tick()
+    handle = scheduler._running["overlap"].cache_handle
+    assert handle is not None
+    assert any(event.kind == "token" for event in first_result)
+
+    scheduler.finish("overlap")
+    assert not scheduler.idle()
+    discarded = scheduler.tick()
+
+    assert not any(event.kind == "token" for event in discarded)
+    assert cache_backend.length(handle) == 0
+    assert len(model.calls) == 2
+    assert scheduler.idle()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_close_synchronizes_before_cache_release() -> None:
+    scheduler, cache_backend, _, request = _overlap_scheduler(max_tokens=4)
+    scheduler.submit(request)
+    scheduler.tick()
+    scheduler.tick()
+    handle = scheduler._running["overlap"].cache_handle
+    assert handle is not None
+
+    scheduler.close()
+
+    assert cache_backend.length(handle) == 0
+    assert scheduler.idle()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_dispatch_failure_releases_cache_same_tick() -> None:
+    model = _RecordingModel(fail_after_cache_stage=True)
+    cache_backend = DenseKVCacheBackend(num_layers=model.num_layers)
+    scheduler = NativeContinuousScheduler(
+        MlxOverlapGenerationExecutor(
+            architecture_class="FakeForCausalLM",
+            model=model,
+            cache_backend=cache_backend,
+            attention_backend=DenseReferenceAttentionBackend(),
+        ),
+        NativeCacheCoordinator(cache_backend, NoPrefixCache()),
+        execution_mode="overlap",
+    )
+    scheduler.submit(_schedulable("failure", (1,), max_tokens=2))
+
+    events = scheduler.tick()
+
+    error = next(event for event in events if event.kind == "execution_error")
+    assert error.error_code == "MODEL_EXECUTION_FAILED"
+    assert scheduler.idle()
+    assert cache_backend.metrics()["active_kv_bytes"] == 0
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_runtime_runs_overlap_pipeline_to_terminal_response() -> None:
+    scheduler, cache_backend, _, _ = _overlap_scheduler(max_tokens=2)
+    tokenizer = _FakeTokenizer()
+    runtime = NativeRuntime(
+        scheduler,
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+    )
+    runtime.submit(_chat_request(max_tokens=2))
+
+    events = []
+    while not runtime.idle():
+        events.extend(runtime.tick())
+
+    assert [event.kind for event in events if event.kind != "metrics"] == [
+        "delta",
+        "delta",
+        "response",
+    ]
+    response = next(event.payload for event in events if event.kind == "response")
+    assert response.finish_reason == "length"
+    assert response.completion_tokens == 2
+    assert response.text == "cc"
+    assert cache_backend.metrics()["active_kv_bytes"] == 0
+
+
 def test_scheduler_fcfs_policy_orders_by_arrival() -> None:
     executor = _FakeExecutor()
     scheduler, _ = _scheduler(
@@ -1473,6 +1674,31 @@ class _FakeTokenizer:
         return "".join(chr(96 + token) for token in token_ids)
 
 
+class _StreamingFakeTokenizer(_FakeTokenizer):
+    class _Detokenizer:
+        def __init__(self) -> None:
+            self._last = ""
+
+        def add_token(self, token_id: int) -> None:
+            self._last = chr(96 + token_id)
+
+        @property
+        def last_segment(self) -> str:
+            segment, self._last = self._last, ""
+            return segment
+
+        def finalize(self) -> None:
+            return None
+
+    @property
+    def detokenizer(self) -> _Detokenizer:
+        return self._Detokenizer()
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool) -> str:
+        del token_ids, skip_special_tokens
+        raise AssertionError("streaming detokenizer should avoid full-output decode")
+
+
 def _chat_request(**overrides: Any):
     from mlx_worker.ipc import ChatCompletionRequest, ChatMessage
 
@@ -1542,6 +1768,49 @@ def test_runtime_normalizes_public_request_and_owns_terminal_text() -> None:
     assert response.text == "ab"
     assert response.finish_reason == "length"
     assert scheduler.finished == ["request"]
+
+
+def test_runtime_uses_request_local_streaming_detokenizer() -> None:
+    scheduler = _FakeScheduler()
+    tokenizer = _StreamingFakeTokenizer()
+    runtime = NativeRuntime(
+        scheduler,  # type: ignore[arg-type]
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+    )
+    runtime.submit(_chat_request())
+    scheduler.events.extend(
+        [
+            (
+                SchedulerEvent(
+                    kind="token",
+                    request_id="request",
+                    token_id=1,
+                    cache_length=2,
+                    phase="prefill",
+                ),
+            ),
+            (
+                SchedulerEvent(
+                    kind="token",
+                    request_id="request",
+                    token_id=2,
+                    cache_length=3,
+                    phase="decode",
+                ),
+            ),
+        ]
+    )
+
+    first = runtime.tick()
+    second = runtime.tick()
+
+    assert [event.kind for event in first] == ["delta"]
+    assert [event.kind for event in second] == ["delta", "response"]
+    response = next(event.payload for event in second if event.kind == "response")
+    assert response.text == "ab"
 
 
 def test_runtime_passes_scheduler_policy_metadata() -> None:

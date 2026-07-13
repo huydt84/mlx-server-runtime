@@ -20,10 +20,16 @@ from .execution_backends import (
     build_native_execution_backend,
     validate_native_execution_backend_id,
 )
-from .registry import ArchitectureSpec, CompatibilityProbe, get_architecture_spec
+from .registry import (
+    ArchitectureExecutionPlan,
+    ArchitectureSpec,
+    CompatibilityProbe,
+    get_architecture_spec,
+)
 
 __all__ = [
     "ArchitectureSpec",
+    "ArchitectureExecutionPlan",
     "CompatibilityProbe",
     "DEFAULT_NATIVE_EXECUTION_BACKEND",
     "ExecutionBatch",

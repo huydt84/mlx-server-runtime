@@ -15,8 +15,10 @@ from .cache import (
     DenseKVCacheBackend,
     PagedBatchReservation,
     PagedKVCacheBackend,
+    HybridBatchReservation,
+    HybridPagedKVCacheBackend,
 )
-from .interfaces import ForwardMode, LayerAttentionContext
+from .interfaces import ForwardMode, HybridLayerAttentionContext, LayerAttentionContext
 
 
 @dataclass(frozen=True)
@@ -86,10 +88,11 @@ class DenseLayerAttentionContext:
         values: mx.array,
         *,
         scale: float,
-        mask: str | None,
+        mask: str | None = None,
+        window_size: int | None = None,
     ) -> mx.array:
-        window_size = _window_size(mask)
-        if mask != "causal" and window_size is None:
+        window_size = window_size if window_size is not None else _window_size(mask)
+        if mask not in (None, "causal") and window_size is None:
             raise ValueError("dense reference attention received unsupported mask")
         dense_keys, dense_values = self.reservation.layer_views[
             self.layer_index
@@ -129,9 +132,10 @@ class DenseTraceAttentionContext:
         values: mx.array,
         *,
         scale: float,
-        mask: str | None,
+        mask: str | None = None,
+        window_size: int | None = None,
     ) -> mx.array:
-        window_size = _window_size(mask)
+        window_size = window_size if window_size is not None else _window_size(mask)
         old_length = self.cache.size()
         dense_keys, dense_values = self.cache.update_and_fetch(keys, values)
         attention_mask = _dense_causal_mask(
@@ -215,10 +219,11 @@ class PagedLayerAttentionContext:
         values: mx.array,
         *,
         scale: float,
-        mask: str | None,
+        mask: str | None = None,
+        window_size: int | None = None,
     ) -> mx.array:
-        window_size = _window_size(mask)
-        if mask != "causal" and window_size is None:
+        window_size = window_size if window_size is not None else _window_size(mask)
+        if mask not in (None, "causal") and window_size is None:
             raise ValueError("native paged attention received unsupported mask")
         if int(queries.shape[1]) % self.reservation.backend.num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
@@ -255,42 +260,19 @@ class PagedLayerAttentionContext:
         )
         return output
 
-    def prepare_conv_state(self, values: mx.array, cache_size: int) -> mx.array:
-        return self.reservation.prepare_conv_state(self.layer_index, values, cache_size)
-
-    def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
-        self.reservation.stage_conv_state(self.layer_index, combined, cache_size)
-
     def _dense_kv_rows(
         self,
         key_cache: mx.array,
         value_cache: mx.array,
     ) -> tuple[mx.array, mx.array]:
-        max_total = max(
-            cache_length + append_length
-            for cache_length, append_length in zip(
-                self.reservation.cache_lengths,
-                self.reservation.append_lengths,
-                strict=True,
-            )
-        )
+        max_total = self.reservation._max_total_length
         key_rows: list[mx.array] = []
         value_rows: list[mx.array] = []
-        for cache, total_length, table in zip(
-            self.reservation.request_caches,
-            (
-                cache_length + append_length
-                for cache_length, append_length in zip(
-                    self.reservation.cache_lengths,
-                    self.reservation.append_lengths,
-                    strict=True,
-                )
-            ),
-            self.reservation.candidate_tables,
+        for total_length, page_ids in zip(
+            self.reservation._total_lengths,
+            self.reservation._page_id_arrays,
             strict=True,
         ):
-            del cache
-            page_ids = mx.array(list(table), dtype=mx.int32)
             row_keys = key_cache[page_ids].reshape(
                 (
                     -1,
@@ -374,6 +356,51 @@ class PagedMetalAttentionBackend:
         metrics["attention_time_ms"] = self._attention_time_ms
 
 
+@dataclass
+class HybridPagedLayerAttentionContext(PagedLayerAttentionContext):
+    """Paged attention context with convolution state for hybrid layers."""
+
+    reservation: HybridBatchReservation
+
+    def prepare_conv_state(self, values: mx.array, cache_size: int) -> mx.array:
+        return self.reservation.prepare_conv_state(self.layer_index, values, cache_size)
+
+    def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
+        self.reservation.stage_conv_state(self.layer_index, combined, cache_size)
+
+
+@dataclass
+class HybridPagedMetalAttentionBackend(PagedMetalAttentionBackend):
+    """Paged SDPA backend paired with the LFM2 hybrid cache."""
+
+    capabilities: ClassVar[AttentionBackendCapabilities] = AttentionBackendCapabilities(
+        backend_id="native-metal-paged-sdpa",
+        cache_backend_types=(HybridPagedKVCacheBackend,),
+        reservation_types=(HybridBatchReservation,),
+        supported_masks=frozenset(("causal", None)),
+        supported_forward_modes=frozenset(ForwardMode),
+        requires_metal=True,
+        consumes_page_tables_directly=False,
+    )
+
+    def contexts(
+        self,
+        reservation: BatchCacheReservation,
+        forward_mode: ForwardMode,
+    ) -> tuple[HybridLayerAttentionContext, ...]:
+        self.capabilities.validate_context(reservation, forward_mode)
+        assert isinstance(reservation, HybridBatchReservation)
+        return tuple(
+            HybridPagedLayerAttentionContext(
+                reservation=reservation,
+                layer_index=index,
+                forward_mode=forward_mode,
+                attention_backend=self,
+            )
+            for index in range(reservation.backend.num_layers)
+        )
+
+
 def _dense_causal_mask(
     cache_offsets: mx.array,
     token_lengths: tuple[int, ...],
@@ -382,26 +409,22 @@ def _dense_causal_mask(
     *,
     window_size: int | None = None,
 ) -> mx.array:
-    offsets = [int(value) for value in cache_offsets.tolist()]
-    rows: list[list[list[list[float]]]] = []
-    for cache_length, token_length in zip(offsets, token_lengths, strict=True):
-        query_rows = []
-        for query_index in range(max_tokens):
-            query_rows.append(
-                [
-                    0.0
-                    if query_index < token_length
-                    and key_index <= cache_length + query_index
-                    and (
-                        window_size is None
-                        or key_index >= cache_length + query_index - window_size + 1
-                    )
-                    else -1e9
-                    for key_index in range(max_total)
-                ]
-            )
-        rows.append([query_rows])
-    return mx.array(rows, dtype=mx.float32)
+    # Keep mask construction lazy and device-side.  The previous Python loop
+    # called ``tolist`` once per layer, synchronizing MLX and rebuilding a
+    # nested Python list for every request row.
+    offsets = cache_offsets.astype(mx.int32)[:, None, None]
+    query_indices = mx.arange(max_tokens, dtype=mx.int32)[None, :, None]
+    query_positions = offsets + query_indices
+    key_positions = mx.arange(max_total, dtype=mx.int32)[None, None, :]
+    valid_tokens = (
+        query_indices < mx.array(token_lengths, dtype=mx.int32)[:, None, None]
+    )
+    valid = valid_tokens & (key_positions <= query_positions)
+    if window_size is not None:
+        valid = valid & (key_positions >= query_positions - window_size + 1)
+    return mx.where(valid[:, None, :, :], mx.array(0.0), mx.array(-1e9)).astype(
+        mx.float32
+    )
 
 
 def _window_size(mask: str | None) -> int | None:

@@ -178,6 +178,7 @@ def create_native_worker(
         cache_max_entries=config.text_cache_max_entries,
         kv_page_size=config.native_kv_page_size,
         execution_backend_id=config.native_execution_backend,
+        execution_mode=getattr(config, "native_execution_mode", "serial"),
         prefix_cache_strategy=config.native_prefix_cache_strategy,
         graph_profile=config.native_graph_profile,
     )
@@ -197,6 +198,8 @@ def create_native_worker(
             getattr(config, "prefill_chunk_size", 256),
         ),
         scheduling_policy=getattr(config, "native_scheduling_policy", "fcfs"),
+        execution_mode=getattr(config, "native_execution_mode", "serial"),
+        terminal_token_ids=artifacts.eos_token_ids,
         profiler=profiler,
     )
     return NativeRequestRuntime(

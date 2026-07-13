@@ -222,6 +222,7 @@ class SchedulerMetricsEvent:
     scheduler_queue_wait_ms: int | None = None
     cancellation_latency_ms: int | None = None
     scheduling_policy: str | None = None
+    execution_mode: str | None = None
     forward_mode: str | None = None
     physical_batch_size: int | None = None
     model_forward_count: int | None = None
@@ -233,6 +234,7 @@ class SchedulerMetricsEvent:
     executor_reserve_ms: int | None = None
     executor_forward_ms: int | None = None
     executor_sample_ms: int | None = None
+    executor_dispatch_ms: int | None = None
     executor_eval_ms: int | None = None
     executor_commit_ms: int | None = None
     model_graph_embedding_ms: int | None = None
@@ -668,6 +670,7 @@ def decode_event(
             scheduler_queue_wait_ms=metrics.get("scheduler_queue_wait_ms"),
             cancellation_latency_ms=metrics.get("cancellation_latency_ms"),
             scheduling_policy=metrics.get("scheduling_policy"),
+            execution_mode=metrics.get("execution_mode"),
             forward_mode=metrics.get("forward_mode"),
             physical_batch_size=metrics.get("physical_batch_size"),
             model_forward_count=metrics.get("model_forward_count"),
@@ -679,6 +682,7 @@ def decode_event(
             executor_reserve_ms=metrics.get("executor_reserve_ms"),
             executor_forward_ms=metrics.get("executor_forward_ms"),
             executor_sample_ms=metrics.get("executor_sample_ms"),
+            executor_dispatch_ms=metrics.get("executor_dispatch_ms"),
             executor_eval_ms=metrics.get("executor_eval_ms"),
             executor_commit_ms=metrics.get("executor_commit_ms"),
             model_graph_embedding_ms=metrics.get("model_graph_embedding_ms"),

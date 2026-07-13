@@ -306,11 +306,17 @@ for _ in range(240):
     metrics_history.append(snapshot)
     running = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="running"}', 0.0)
     waiting = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="waiting"}', 0.0)
-    # `mlx_decode_batch_size` is a last-step gauge and can be 1 after an
-    # overlapping step has already completed. The backend-labelled batch
-    # gauge records the scheduler/executor membership we need to prove.
+    # A request can join an existing decode batch through a mixed
+    # prefill/decode forward. The decode-only gauge therefore remains 1 for
+    # that admission step even though the physical mixed batch is 2. Inspect
+    # both forward modes, then require a later single-request decode as the
+    # shrink signal.
     decode_batch = snapshot.get(
-        'mlx_batch_size_by_backend{backend="native-mlx",modality="text",stage="decode"}',
+        'mlx_executor_physical_batch_size_by_backend{backend="native-mlx",modality="text",forward_mode="decode"}',
+        0.0,
+    )
+    mixed_batch = snapshot.get(
+        'mlx_executor_physical_batch_size_by_backend{backend="native-mlx",modality="text",forward_mode="mixed"}',
         0.0,
     )
     decode_metric_present = any(
@@ -319,10 +325,10 @@ for _ in range(240):
         for key in snapshot
     )
     max_running = max(max_running, running)
-    max_decode_batch = max(max_decode_batch, decode_batch)
-    if decode_batch >= 2:
+    max_decode_batch = max(max_decode_batch, decode_batch, mixed_batch)
+    if max(decode_batch, mixed_batch) >= 2:
         batch_grow_seen = True
-    if batch_grow_seen and decode_batch < max_decode_batch:
+    if batch_grow_seen and 0 < decode_batch < max_decode_batch:
         batch_shrink_seen = True
     if decode_metric_present:
         metrics_ready_seen = True
