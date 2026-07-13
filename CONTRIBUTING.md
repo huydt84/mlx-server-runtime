@@ -113,6 +113,13 @@ from identical finalized token IDs. Validate direct forward logits first, then
 prefill followed by forced-token decode. If output diverges, use the semantic
 trace workflow below before changing tolerances.
 
+If the model fails to load or execute with `mlx-lm`, use the corresponding
+Hugging Face Transformers implementation as the reference instead. Compare
+direct forward logits first, then prefill followed by forced-token decode from
+the same finalized token IDs. When diagnosing a mismatch, compare equivalent
+intermediate layer outputs and record any expected dtype or quantization
+differences between the implementations.
+
 ### 5. Validate the full serving path
 
 On Apple Silicon, start the gateway with the native backend and the candidate
