@@ -84,6 +84,7 @@ class DenseLayerCache:
     keys: mx.array | None = None
     values: mx.array | None = None
     offset: int = 0
+    conv_state: mx.array | None = None
 
     @property
     def offsets(self) -> mx.array:
@@ -124,6 +125,7 @@ class DenseBatchLayerCache:
     offsets: mx.array = field(init=False)
     _committed_keys: tuple[mx.array, ...] = field(init=False, default=())
     _committed_values: tuple[mx.array, ...] = field(init=False, default=())
+    _committed_conv_states: tuple[mx.array, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
         self.offsets = mx.array(
@@ -177,6 +179,10 @@ class DenseBatchLayerCache:
         return self.keys, self.values
 
     def validate_commit(self) -> None:
+        if self._committed_conv_states:
+            if len(self._committed_conv_states) != len(self.request_layers):
+                raise ValueError("batched cache has incomplete convolution state")
+            return
         if len(self._committed_keys) != len(self.request_layers):
             raise ValueError("batched cache has incomplete committed keys")
         if len(self._committed_values) != len(self.request_layers):
@@ -194,6 +200,14 @@ class DenseBatchLayerCache:
 
     def commit(self) -> None:
         self.validate_commit()
+        if self._committed_conv_states:
+            for layer, state in zip(
+                self.request_layers,
+                self._committed_conv_states,
+                strict=True,
+            ):
+                layer.conv_state = state
+            return
         for layer, keys, values in zip(
             self.request_layers,
             self._committed_keys,
@@ -204,6 +218,11 @@ class DenseBatchLayerCache:
             layer.values = values
             layer.offset = int(keys.shape[2])
 
+    def stage_conv_states(self, states: tuple[mx.array, ...]) -> None:
+        if self._committed_keys or self._committed_values:
+            raise ValueError("dense layer cannot stage both KV and convolution state")
+        self._committed_conv_states = states
+
 
 @dataclass
 class DenseRequestCache:
@@ -212,9 +231,10 @@ class DenseRequestCache:
     handle: str
     request_id: str
     layers: list[DenseLayerCache]
+    length: int = 0
 
     def size(self) -> int:
-        return self.layers[0].size() if self.layers else 0
+        return self.length
 
 
 @dataclass
@@ -233,8 +253,51 @@ class DenseBatchReservation:
             layer.validate_commit()
         for layer in self.layer_views:
             layer.commit()
+        for cache, append_length in zip(
+            self.request_caches, self.append_lengths, strict=True
+        ):
+            cache.length += append_length
         self._finished = True
         return tuple(cache.size() for cache in self.request_caches)
+
+    def prepare_conv_state(
+        self,
+        layer_index: int,
+        values: mx.array,
+        cache_size: int,
+    ) -> mx.array:
+        """Return padded convolution input prefixed with each request state."""
+
+        states = []
+        for cache in self.request_caches:
+            state = cache.layers[layer_index].conv_state
+            if state is None:
+                state = mx.zeros(
+                    (cache_size - 1, int(values.shape[-1])), dtype=values.dtype
+                )
+            states.append(state)
+        state_batch = mx.stack(states, axis=0)
+        valid = (
+            mx.arange(int(values.shape[1]))[None, :]
+            < mx.array(self.append_lengths, dtype=mx.int32)[:, None]
+        )
+        values = mx.where(valid[..., None], values, 0)
+        return mx.concatenate([state_batch, values], axis=1)
+
+    def stage_conv_state(
+        self,
+        layer_index: int,
+        combined: mx.array,
+        cache_size: int,
+    ) -> None:
+        """Stage per-request convolution state for a transactional commit."""
+
+        states = []
+        for index, append_length in enumerate(self.append_lengths):
+            states.append(
+                combined[index, append_length : append_length + cache_size - 1]
+            )
+        self.layer_views[layer_index].stage_conv_states(tuple(states))
 
     def abort(self) -> None:
         self._finished = True
@@ -313,6 +376,7 @@ class DenseKVCacheBackend:
             raise ValueError("fork length is outside source cache")
         new_handle = self.create(request_id)
         target = self._caches[new_handle]
+        target.length = fork_length
         for source_layer, target_layer in zip(
             source.layers, target.layers, strict=True
         ):
@@ -321,6 +385,7 @@ class DenseKVCacheBackend:
             if source_layer.values is not None:
                 target_layer.values = source_layer.values[:, :, :fork_length, :]
             target_layer.offset = fork_length
+            target_layer.conv_state = source_layer.conv_state
         return new_handle
 
     def metrics(self) -> dict[str, Any]:
@@ -342,6 +407,7 @@ class PagedRequestCache:
     request_id: str
     block_table: list[int] = field(default_factory=list)
     length: int = 0
+    conv_states: dict[int, mx.array] = field(default_factory=dict)
 
     def size(self) -> int:
         return self.length
@@ -360,6 +426,7 @@ class PagedBatchReservation:
     pinned_pages: tuple[int, ...]
     staged_keys: list[mx.array | None]
     staged_values: list[mx.array | None]
+    staged_states: list[mx.array | None]
     _finished: bool = False
 
     @property
@@ -388,6 +455,8 @@ class PagedBatchReservation:
             raise ValueError("cache reservation already finished")
         if self.staged_keys[layer_index] is not None:
             raise ValueError(f"layer {layer_index} staged more than once")
+        if self.staged_states[layer_index] is not None:
+            raise ValueError(f"layer {layer_index} staged both KV and state")
         self.backend.validate_kv_shape(keys, values, self.append_lengths)
         key_cache = self.backend.key_pages[layer_index]
         value_cache = self.backend.value_pages[layer_index]
@@ -428,15 +497,77 @@ class PagedBatchReservation:
         self.staged_values[layer_index] = value_cache
         return key_cache, value_cache
 
+    def prepare_conv_state(
+        self,
+        layer_index: int,
+        values: mx.array,
+        cache_size: int,
+    ) -> mx.array:
+        """Return padded convolution input prefixed with each request state."""
+
+        states = []
+        for cache in self.request_caches:
+            state = cache.conv_states.get(layer_index)
+            if state is None:
+                state = mx.zeros(
+                    (cache_size - 1, int(values.shape[-1])), dtype=values.dtype
+                )
+            states.append(state)
+        state_batch = mx.stack(states, axis=0)
+        valid = (
+            mx.arange(int(values.shape[1]))[None, :]
+            < mx.array(self.append_lengths, dtype=mx.int32)[:, None]
+        )
+        values = mx.where(valid[..., None], values, 0)
+        return mx.concatenate([state_batch, values], axis=1)
+
+    def stage_conv_state(
+        self,
+        layer_index: int,
+        combined: mx.array,
+        cache_size: int,
+    ) -> None:
+        """Stage per-request convolution state for a transactional commit."""
+
+        if self._finished:
+            raise ValueError("cache reservation already finished")
+        if self.staged_keys[layer_index] is not None:
+            raise ValueError(f"layer {layer_index} staged both state and KV")
+        states = []
+        for index, append_length in enumerate(self.append_lengths):
+            states.append(
+                combined[index, append_length : append_length + cache_size - 1]
+            )
+        self.staged_states[layer_index] = mx.stack(states, axis=0)
+
     def commit(self) -> tuple[int, ...]:
         if self._finished:
             raise ValueError("cache reservation already finished")
-        if any(value is None for value in self.staged_keys + self.staged_values):
-            raise ValueError("paged cache commit missing one or more layers")
-        staged_keys = tuple(_require_array(value) for value in self.staged_keys)
-        staged_values = tuple(_require_array(value) for value in self.staged_values)
-        mx.eval(*staged_keys, *staged_values)
-        lengths = self.backend._commit_reservation(self, staged_keys, staged_values)
+        for keys, values, state in zip(
+            self.staged_keys, self.staged_values, self.staged_states, strict=True
+        ):
+            if (keys is None) != (values is None) or (keys is None and state is None):
+                raise ValueError("paged cache commit missing one or more layers")
+        staged_keys = tuple(
+            _require_array(value) if value is not None else None
+            for value in self.staged_keys
+        )
+        staged_values = tuple(
+            _require_array(value) if value is not None else None
+            for value in self.staged_values
+        )
+        staged_states = tuple(
+            _require_array(value) if value is not None else None
+            for value in self.staged_states
+        )
+        mx.eval(
+            *(value for value in staged_keys if value is not None),
+            *(value for value in staged_values if value is not None),
+            *(value for value in staged_states if value is not None),
+        )
+        lengths = self.backend._commit_reservation(
+            self, staged_keys, staged_values, staged_states
+        )
         self._finished = True
         return lengths
 
@@ -576,6 +707,7 @@ class PagedKVCacheBackend:
             pinned_pages=pinned,
             staged_keys=[None] * self.num_layers,
             staged_values=[None] * self.num_layers,
+            staged_states=[None] * self.num_layers,
         )
 
     def preflight(
@@ -643,6 +775,9 @@ class PagedKVCacheBackend:
         target = self._caches[new_handle]
         target.block_table = pages
         target.length = fork_length
+        target.conv_states = {
+            index: state for index, state in source.conv_states.items()
+        }
         for page in pages:
             self._ref_counts[page] += 1
         return new_handle
@@ -688,8 +823,9 @@ class PagedKVCacheBackend:
     def _commit_reservation(
         self,
         reservation: PagedBatchReservation,
-        staged_keys: tuple[mx.array, ...],
-        staged_values: tuple[mx.array, ...],
+        staged_keys: tuple[mx.array | None, ...],
+        staged_values: tuple[mx.array | None, ...],
+        staged_states: tuple[mx.array | None, ...],
     ) -> tuple[int, ...]:
         old_counts = Counter(
             page for cache in reservation.request_caches for page in cache.block_table
@@ -705,8 +841,14 @@ class PagedKVCacheBackend:
         if any(count < 0 for count in candidate_ref_counts):
             raise ValueError("paged KV page reference count became negative")
         self._ref_counts = candidate_ref_counts
-        self.key_pages = list(staged_keys)
-        self.value_pages = list(staged_values)
+        self.key_pages = [
+            value if value is not None else current
+            for current, value in zip(self.key_pages, staged_keys, strict=True)
+        ]
+        self.value_pages = [
+            value if value is not None else current
+            for current, value in zip(self.value_pages, staged_values, strict=True)
+        ]
         for cache, table, append_length in zip(
             reservation.request_caches,
             reservation.candidate_tables,
@@ -715,6 +857,10 @@ class PagedKVCacheBackend:
         ):
             cache.block_table = list(table)
             cache.length += append_length
+        for index, state in enumerate(staged_states):
+            if state is not None:
+                for cache, row in zip(reservation.request_caches, state, strict=True):
+                    cache.conv_states[index] = row
         for page in reservation.reserved_pages:
             if page in self._free_pages:
                 self._free_pages.remove(page)

@@ -153,6 +153,7 @@ def build_native_artifacts(
         attention_backend = execution_backend.attention_backend
         prefix_cache = _build_prefix_cache(
             strategy=prefix_cache_strategy,
+            supports_prefix_cache=architecture.spec.supports_prefix_cache,
             backend=cache_backend,
             model=model,
             model_path=architecture.model_path,
@@ -209,6 +210,7 @@ def build_native_artifacts(
 def _build_prefix_cache(
     *,
     strategy: str,
+    supports_prefix_cache: bool,
     backend: PagedKVCacheBackend,
     model: str,
     model_path: Path,
@@ -218,6 +220,8 @@ def _build_prefix_cache(
     cache_budget_bytes: int,
     cache_max_entries: int,
 ) -> NoPrefixCache | BlockHashPrefixCache | RadixPrefixCache:
+    if not supports_prefix_cache:
+        return NoPrefixCache()
     compatibility = PrefixCompatibilityFingerprint(
         checkpoint=_checkpoint_identity(model, model_path),
         architecture_class=architecture_class,
@@ -306,7 +310,9 @@ def detect_native_architecture(model: str) -> NativeArchitecture:
 
 
 def _load_tokenizer(model_path: Path) -> tuple[Any, Any, tuple[int, ...]]:
-    required = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")
+    # Some valid MLX exports (including LFM2) store special-token metadata in
+    # tokenizer.json/tokenizer_config.json and omit the optional sidecar.
+    required = ("tokenizer.json", "tokenizer_config.json")
     missing = [name for name in required if not (model_path / name).exists()]
     if missing:
         raise _failure(

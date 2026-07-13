@@ -5,12 +5,15 @@
 #
 # Usage:
 #   bash mlx-host-validation/scripts/v2_phase_6.sh
+#   MLX_V2_PHASE6_CHECKPOINT=mlx-community/Qwen3-4B-Instruct-2507-4bit \
+#     bash mlx-host-validation/scripts/v2_phase_6.sh
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
 #
 # Probe checkpoints:
 #   - native-v2 public gateway requests against `mlx-community/Qwen2.5-7B-Instruct-4bit`
+#   - set `MLX_V2_PHASE6_CHECKPOINT` to probe the registered Qwen3, Gemma3, or LFM2 family
 #   - default v1 gateway non-regression request against same checkpoint
 #
 # Host requirements:
@@ -42,7 +45,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-CHECKPOINT="mlx-community/Qwen2.5-7B-Instruct-4bit"
+CHECKPOINT="${MLX_V2_PHASE6_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
 NATIVE_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-native.log"
 V1_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-v1.log"
 HEALTH_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-health.txt"
@@ -56,6 +59,7 @@ METRICS_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-metrics.txt"
 V1_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-v1.json"
 REQUEST_DIR="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-requests"
 NATIVE_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-native.toml"
+V1_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-phase-6-v1.toml"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 mkdir -p "$REQUEST_DIR"
 
@@ -168,17 +172,24 @@ print(f"mlx_compute_ok={values}")
 PY
 
 echo "[3/6] Start native-mlx gateway and run real public requests"
-uv --directory "$PYTHON_DIR" run python - <<'PY' "$ROOT/config/runtime.toml" "$NATIVE_CONFIG" "$CHECKPOINT"
+uv --directory "$PYTHON_DIR" run python - <<'PY' "$ROOT/config/runtime.toml" "$NATIVE_CONFIG" "$V1_CONFIG" "$CHECKPOINT"
 from __future__ import annotations
 
 import pathlib
 import sys
 
 source = pathlib.Path(sys.argv[1]).read_text()
-target = pathlib.Path(sys.argv[2])
-checkpoint = sys.argv[3]
-target.write_text(
+native_target = pathlib.Path(sys.argv[2])
+v1_target = pathlib.Path(sys.argv[3])
+checkpoint = sys.argv[4]
+native_target.write_text(
     source.replace('backend = "v1"', 'backend = "native-mlx"').replace(
+        'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
+        f'model = "{checkpoint}"',
+    )
+)
+v1_target.write_text(
+    source.replace(
         'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
         f'model = "{checkpoint}"',
     )
@@ -187,11 +198,16 @@ PY
 
 write_request "$REQUEST_DIR/non_stream.json" "Say hello in one short sentence." 16 false
 write_request "$REQUEST_DIR/stream.json" "Count from one to six with spaces." 16 true
-write_request "$REQUEST_DIR/stop.json" "Reply exactly with HELLO STOP_MARKER NOW." 16 false "STOP_MARKER"
+write_request "$REQUEST_DIR/stop.json" "Reply exactly with HELLO STOP_MARKER NOW." 64 false "STOP_MARKER"
 write_request "$REQUEST_DIR/length.json" "Count upward forever using short tokens." 1 false
 write_request "$REQUEST_DIR/cancel.json" "Write a long alphabetic sequence with many short chunks." 64 true
 
-start_gateway "$NATIVE_LOG" MLX_RUNTIME_CONFIG="$NATIVE_CONFIG"
+# Keep enough paged KV capacity for the larger probe families.  The worker's
+# 8 MiB default is sufficient for the tiny default smoke test but can exhaust
+# before the cancellation request on a 4B model with a 64-token budget.
+start_gateway "$NATIVE_LOG" \
+    MLX_RUNTIME_CONFIG="$NATIVE_CONFIG" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES=$((32 * 1024 * 1024))
 
 NON_STREAM_STATUS=$(curl -sS -o "$NON_STREAM_CAPTURE" -w '%{http_code}' \
     -X POST http://127.0.0.1:8000/v1/chat/completions \
@@ -344,7 +360,7 @@ stop_gateway
 
 echo "[5/6] Start default v1 gateway for non-regression"
 write_request "$REQUEST_DIR/v1.json" "Say hello in one short sentence." 16 false
-start_gateway "$V1_LOG" MLX_RUNTIME_MODEL="$CHECKPOINT"
+start_gateway "$V1_LOG" MLX_RUNTIME_CONFIG="$V1_CONFIG"
 
 V1_STATUS=$(curl -sS -o "$V1_CAPTURE" -w '%{http_code}' \
     -X POST http://127.0.0.1:8000/v1/chat/completions \

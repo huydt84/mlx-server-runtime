@@ -251,11 +251,14 @@ def _commit_dense_tokens(
     reservation.commit()
 
 
-def test_models_directory_has_one_qwen2_module() -> None:
+def test_models_directory_has_registered_architecture_modules() -> None:
     models = Path(__file__).parents[1] / "mlx_worker/native_mlx/models"
     assert sorted(path.name for path in models.glob("*.py")) == [
         "__init__.py",
+        "gemma3.py",
+        "lfm2.py",
         "qwen2.py",
+        "qwen3.py",
     ]
     assert not (models / "Qwen2ForCausalLM").exists()
 

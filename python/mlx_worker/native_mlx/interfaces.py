@@ -58,6 +58,12 @@ class LayerAttentionContext(Protocol):
     ) -> mx.array:
         """Stage K/V append and attend over committed plus staged history."""
 
+    def prepare_conv_state(self, values: mx.array, cache_size: int) -> mx.array:
+        """Prefix values with request-local state for hybrid convolution layers."""
+
+    def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
+        """Stage request-local state for a hybrid convolution layer."""
+
 
 @dataclass(frozen=True)
 class ForwardBatch:

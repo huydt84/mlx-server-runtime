@@ -195,12 +195,14 @@ v1_target.write_text(
 )
 PY
 
-write_request "$REQUEST_DIR/stream_a.json" "Count upward in many short comma-separated tokens until you reach forty." 64 true
-write_request "$REQUEST_DIR/stream_b.json" "List uppercase letters with spaces and keep going until you run out of budget." 64 true
-write_request "$REQUEST_DIR/cancel.json" "Write many short numbered tokens with spaces until budget ends." 96 true
+write_request "$REQUEST_DIR/stream_a.json" "Count upward in many short comma-separated tokens until you reach forty." 128 true
+write_request "$REQUEST_DIR/stream_b.json" "List uppercase letters with spaces and keep going until you run out of budget." 128 true
+write_request "$REQUEST_DIR/cancel.json" "Write many short numbered tokens with spaces until budget ends." 128 true
 write_request "$REQUEST_DIR/v1.json" "Say hello in one short sentence." 16 false
 
-start_gateway "$NATIVE_LOG" "$NATIVE_PORT" MLX_RUNTIME_CONFIG="$NATIVE_CONFIG"
+start_gateway "$NATIVE_LOG" "$NATIVE_PORT" \
+    MLX_RUNTIME_CONFIG="$NATIVE_CONFIG" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES=33554432
 
 uv --directory "$PYTHON_DIR" run python - <<'PY' "$REQUEST_DIR/stream_a.json" "$REQUEST_DIR/stream_b.json" "$REQUEST_DIR/cancel.json" "$OVERLAP_CAPTURE" "$METRICS_CAPTURE" "$NATIVE_PORT"
 from __future__ import annotations
@@ -304,7 +306,13 @@ for _ in range(240):
     metrics_history.append(snapshot)
     running = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="running"}', 0.0)
     waiting = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="waiting"}', 0.0)
-    decode_batch = snapshot.get('mlx_decode_batch_size', 0.0)
+    # `mlx_decode_batch_size` is a last-step gauge and can be 1 after an
+    # overlapping step has already completed. The backend-labelled batch
+    # gauge records the scheduler/executor membership we need to prove.
+    decode_batch = snapshot.get(
+        'mlx_batch_size_by_backend{backend="native-mlx",modality="text",stage="decode"}',
+        0.0,
+    )
     decode_metric_present = any(
         key.startswith('mlx_scheduled_tokens_by_backend{backend="native-mlx"')
         and 'phase="decode"' in key

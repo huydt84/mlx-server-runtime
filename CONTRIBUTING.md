@@ -47,7 +47,20 @@ Do not add a second serving path or delegate native execution to
 
 ## Add a Model Architecture
 
-Use `python/mlx_worker/native_mlx/models/qwen2.py` as the working example.
+Use the architecture module that matches the checkpoint's exact
+`config.json` class. The current native-v2 registry includes:
+
+- `Qwen2ForCausalLM` — `mlx-community/Qwen2.5-7B-Instruct-4bit`;
+- `Qwen3ForCausalLM` — `mlx-community/Qwen3-4B-Instruct-2507-4bit`;
+- `Gemma3ForCausalLM` — `mlx-community/gemma-3-270m-it-qat-8bit`; and
+- `Lfm2MoeForCausalLM` — `mlx-community/LFM2.5-8B-A1B-MLX-4bit`.
+
+LFM2's hybrid convolution state is request-local, so native prefix-cache reuse
+is deliberately disabled for that family until state snapshots are supported.
+
+For a new family, use the closest architecture module as a structural
+reference, but keep the implementation selected by the exact architecture
+class. The Qwen2 module remains the smallest working example.
 
 ### 1. Define the architecture module
 

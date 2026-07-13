@@ -16,6 +16,21 @@ from .models.qwen2 import (
     build_qwen2_model,
     parse_qwen2_config,
 )
+from .models.qwen3 import (
+    Qwen3WeightAdapter,
+    build_qwen3_model,
+    parse_qwen3_config,
+)
+from .models.gemma3 import (
+    Gemma3WeightAdapter,
+    build_gemma3_model,
+    parse_gemma3_config,
+)
+from .models.lfm2 import (
+    Lfm2WeightAdapter,
+    build_lfm2_model,
+    parse_lfm2_config,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +54,7 @@ class ArchitectureSpec:
     create_weight_adapter: Callable[[], WeightMappingAdapter]
     create_model: Callable[[Any, list[tuple[str, Any]]], NativeModel]
     cache_geometry: Callable[[Any], KVCacheGeometry]
+    supports_prefix_cache: bool = True
 
 
 _REGISTRY: dict[str, ArchitectureSpec] = {
@@ -68,7 +84,50 @@ _REGISTRY: dict[str, ArchitectureSpec] = {
             head_dim=int(config.hidden_size // config.num_attention_heads),
             dtype=(mx.bfloat16 if config.kv_cache_dtype == "bfloat16" else mx.float16),
         ),
-    )
+    ),
+    "Qwen3ForCausalLM": ArchitectureSpec(
+        architecture_class="Qwen3ForCausalLM",
+        known_good_checkpoint="mlx-community/Qwen3-4B-Instruct-2507-4bit",
+        compatibility_probes=(),
+        parse_config=parse_qwen3_config,
+        create_weight_adapter=Qwen3WeightAdapter,
+        create_model=build_qwen3_model,
+        cache_geometry=lambda config: KVCacheGeometry(
+            num_layers=int(config.num_hidden_layers),
+            num_kv_heads=int(config.num_key_value_heads),
+            head_dim=int(config.head_dim),
+            dtype=(mx.bfloat16 if config.kv_cache_dtype == "bfloat16" else mx.float16),
+        ),
+    ),
+    "Gemma3ForCausalLM": ArchitectureSpec(
+        architecture_class="Gemma3ForCausalLM",
+        known_good_checkpoint="mlx-community/gemma-3-270m-it-qat-8bit",
+        compatibility_probes=(),
+        parse_config=parse_gemma3_config,
+        create_weight_adapter=Gemma3WeightAdapter,
+        create_model=build_gemma3_model,
+        cache_geometry=lambda config: KVCacheGeometry(
+            num_layers=int(config.num_hidden_layers),
+            num_kv_heads=int(config.num_key_value_heads),
+            head_dim=int(config.head_dim),
+            dtype=(mx.bfloat16 if config.kv_cache_dtype == "bfloat16" else mx.float16),
+        ),
+    ),
+    "Lfm2MoeForCausalLM": ArchitectureSpec(
+        architecture_class="Lfm2MoeForCausalLM",
+        known_good_checkpoint="mlx-community/LFM2.5-8B-A1B-MLX-4bit",
+        compatibility_probes=(),
+        parse_config=parse_lfm2_config,
+        create_weight_adapter=Lfm2WeightAdapter,
+        create_model=build_lfm2_model,
+        cache_geometry=lambda config: KVCacheGeometry(
+            num_layers=int(config.num_hidden_layers),
+            num_kv_heads=int(config.num_key_value_heads),
+            head_dim=int(config.hidden_size // config.num_attention_heads),
+            dtype=(mx.bfloat16 if config.kv_cache_dtype == "bfloat16" else mx.float16),
+        ),
+        supports_prefix_cache=False,
+    ),
 }
 
 

@@ -88,8 +88,9 @@ class DenseLayerAttentionContext:
         scale: float,
         mask: str | None,
     ) -> mx.array:
-        if mask != "causal":
-            raise ValueError("dense reference attention supports causal masking only")
+        window_size = _window_size(mask)
+        if mask != "causal" and window_size is None:
+            raise ValueError("dense reference attention received unsupported mask")
         dense_keys, dense_values = self.reservation.layer_views[
             self.layer_index
         ].update_and_fetch(keys, values)
@@ -98,6 +99,7 @@ class DenseLayerAttentionContext:
             self.reservation.append_lengths,
             int(queries.shape[2]),
             int(dense_keys.shape[2]),
+            window_size=window_size,
         )
         return mx.fast.scaled_dot_product_attention(
             queries,
@@ -106,6 +108,12 @@ class DenseLayerAttentionContext:
             scale=scale,
             mask=attention_mask.astype(queries.dtype),
         )
+
+    def prepare_conv_state(self, values: mx.array, cache_size: int) -> mx.array:
+        return self.reservation.prepare_conv_state(self.layer_index, values, cache_size)
+
+    def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
+        self.reservation.stage_conv_state(self.layer_index, combined, cache_size)
 
 
 @dataclass
@@ -123,7 +131,7 @@ class DenseTraceAttentionContext:
         scale: float,
         mask: str | None,
     ) -> mx.array:
-        del mask
+        window_size = _window_size(mask)
         old_length = self.cache.size()
         dense_keys, dense_values = self.cache.update_and_fetch(keys, values)
         attention_mask = _dense_causal_mask(
@@ -131,6 +139,7 @@ class DenseTraceAttentionContext:
             (int(queries.shape[2]),),
             int(queries.shape[2]),
             int(dense_keys.shape[2]),
+            window_size=window_size,
         )
         return mx.fast.scaled_dot_product_attention(
             queries,
@@ -139,6 +148,17 @@ class DenseTraceAttentionContext:
             scale=scale,
             mask=attention_mask.astype(queries.dtype),
         )
+
+    def prepare_conv_state(self, values: mx.array, cache_size: int) -> mx.array:
+        state = self.cache.conv_state
+        if state is None:
+            state = mx.zeros(
+                (cache_size - 1, int(values.shape[-1])), dtype=values.dtype
+            )
+        return mx.concatenate([state[None, ...], values], axis=1)
+
+    def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
+        self.cache.conv_state = combined[0, -cache_size + 1 :]
 
 
 @dataclass(frozen=True)
@@ -149,7 +169,7 @@ class DenseReferenceAttentionBackend:
         backend_id="dense-reference-sdpa",
         cache_backend_types=(DenseKVCacheBackend,),
         reservation_types=(DenseBatchReservation,),
-        supported_masks=frozenset(("causal",)),
+        supported_masks=frozenset(("causal", None)),
         supported_forward_modes=frozenset(ForwardMode),
         requires_metal=False,
     )
@@ -197,8 +217,9 @@ class PagedLayerAttentionContext:
         scale: float,
         mask: str | None,
     ) -> mx.array:
-        if mask != "causal":
-            raise ValueError("native paged attention supports causal masking only")
+        window_size = _window_size(mask)
+        if mask != "causal" and window_size is None:
+            raise ValueError("native paged attention received unsupported mask")
         if int(queries.shape[1]) % self.reservation.backend.num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
         if int(queries.shape[3]) != self.reservation.backend.head_dim:
@@ -219,6 +240,7 @@ class PagedLayerAttentionContext:
             self.reservation.token_lengths,
             int(queries.shape[2]),
             int(dense_keys.shape[2]),
+            window_size=window_size,
         )
         output = mx.fast.scaled_dot_product_attention(
             queries,
@@ -232,6 +254,12 @@ class PagedLayerAttentionContext:
             max(0, int((time.perf_counter() - started) * 1000)),
         )
         return output
+
+    def prepare_conv_state(self, values: mx.array, cache_size: int) -> mx.array:
+        return self.reservation.prepare_conv_state(self.layer_index, values, cache_size)
+
+    def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
+        self.reservation.stage_conv_state(self.layer_index, combined, cache_size)
 
     def _dense_kv_rows(
         self,
@@ -296,7 +324,7 @@ class PagedMetalAttentionBackend:
         backend_id="native-metal-paged-sdpa",
         cache_backend_types=(PagedKVCacheBackend,),
         reservation_types=(PagedBatchReservation,),
-        supported_masks=frozenset(("causal",)),
+        supported_masks=frozenset(("causal", None)),
         supported_forward_modes=frozenset(ForwardMode),
         requires_metal=True,
         consumes_page_tables_directly=False,
@@ -351,6 +379,8 @@ def _dense_causal_mask(
     token_lengths: tuple[int, ...],
     max_tokens: int,
     max_total: int,
+    *,
+    window_size: int | None = None,
 ) -> mx.array:
     offsets = [int(value) for value in cache_offsets.tolist()]
     rows: list[list[list[list[float]]]] = []
@@ -362,9 +392,26 @@ def _dense_causal_mask(
                     0.0
                     if query_index < token_length
                     and key_index <= cache_length + query_index
+                    and (
+                        window_size is None
+                        or key_index >= cache_length + query_index - window_size + 1
+                    )
                     else -1e9
                     for key_index in range(max_total)
                 ]
             )
         rows.append([query_rows])
     return mx.array(rows, dtype=mx.float32)
+
+
+def _window_size(mask: str | None) -> int | None:
+    """Decode the compact sliding-window mask used by native model adapters."""
+
+    if mask is None or mask == "causal":
+        return None
+    prefix = "sliding_window:"
+    if mask.startswith(prefix):
+        value = int(mask[len(prefix) :])
+        if value > 0:
+            return value
+    return None
