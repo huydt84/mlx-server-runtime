@@ -80,6 +80,17 @@ class _ProfiledModule(nn.Module):
         self.recorder.record(self.category, elapsed_ms, self.layer_index)
         return output
 
+    def __getattr__(self, name: str) -> Any:
+        """Preserve helper methods exposed by specialized MLX modules."""
+
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            target = self.get("target") or self.__dict__.get("target")
+            if target is None:
+                raise
+            return getattr(target, name)
+
 
 class GraphProfiledModel:
     """NativeModel wrapper that profiles an MLX module tree generically."""

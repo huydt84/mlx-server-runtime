@@ -2,6 +2,64 @@
 
 Compare inference performance across three backends: raw `mlx-lm`, `mlx_lm.server`, and this runtime.
 
+## Native-v2 Ultimate Benchmark
+
+Use this gate after every native-v2 optimization:
+
+```bash
+bash scripts/benchmark-v2.sh run
+```
+
+The default `optimization` preset uses all four supported text model families,
+20 target samples per scenario, two rotated configuration-order rounds,
+serial-radix and overlap-radix configurations, and separate whole-pipeline and
+model-graph profiles. Performance rows are collected before the diagnostic
+profiles with all profiling disabled.
+
+Artifacts are written beneath `benchmarks/results/v2/<timestamp>-<label>/`:
+
+- `results.json`: structured manifest, raw samples, aggregates, environment,
+  configuration, and source commit.
+- `report.md`: absolute TTFT, latency, and throughput by model, configuration,
+  and scenario.
+- `models/<model>/<configuration>/system-profile/`: request-correlated pipeline
+  JSONL, Chrome Trace/Perfetto timeline, Markdown stage report, and optional
+  `.gputrace`.
+- `models/<model>/<configuration>/graph-profile/graph-profile.json`: diagnostic
+  attention, MLP, projection, normalization, layer, worst-layer, and executor
+  metrics exposed by the model-agnostic graph profiler.
+
+For a fast wiring check:
+
+```bash
+bash scripts/benchmark-v2.sh run --preset smoke
+```
+
+The smoke preset is not comprehensive enough for an optimization claim.
+
+To capture Metal work, export the required process-start environment variable:
+
+```bash
+MTL_CAPTURE_ENABLED=1 bash scripts/benchmark-v2.sh run --metal
+```
+
+To compare independently checked-out before/after source snapshots:
+
+```bash
+bash scripts/benchmark-v2.sh compare \
+  --baseline /path/to/before/results.json \
+  --candidate /path/to/after/results.json \
+  --max-regression-pct 2
+```
+
+The comparison exits non-zero for output/token parity failures or statistically
+supported regressions beyond the configured noise budget. Latency and TTFT are
+reverse metrics, so the report says `lower` and `better` explicitly. Throughput
+rows say `higher` and `better` explicitly.
+
+Use `bash scripts/benchmark-v2.sh run --help` for model, configuration, preset,
+profiling, output, and baseline options.
+
 ## Prerequisites
 
 - Working Rust and Python builds (see [Getting Started](../tutorial/getting-started.md))

@@ -155,12 +155,28 @@ class _RecordingModel:
         del weights, strict
 
 
+class _TinyGraphAttention(nn.Module):
+    """Attention-like module with a helper used by specialized model families."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        return self.linear(hidden)
+
+    def as_linear(self) -> nn.Linear:
+        """Return the underlying projection helper."""
+
+        return self.linear
+
+
 class _TinyGraphBlock(nn.Module):
     """Synthetic transformer-like block used by graph profiling tests."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.self_attn = nn.Linear(4, 4)
+        self.self_attn = _TinyGraphAttention()
         self.mlp = nn.Linear(4, 4)
         self.input_layernorm = nn.RMSNorm(4)
         self.post_attention_layernorm = nn.RMSNorm(4)
@@ -311,6 +327,8 @@ def test_graph_profile_wraps_model_tree_without_architecture_hooks() -> None:
     model = _TinyGraphModel()
     profiled = GraphProfiledModel(model)
     profiled.reset_graph_profile()
+
+    assert isinstance(profiled._model.layers[0].self_attn.as_linear(), nn.Linear)
 
     logits = profiled(
         mx.array([[1, 2, 3]], dtype=mx.int32),

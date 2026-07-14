@@ -278,6 +278,22 @@ cost visible but changes execution timing and synchronization. Keep it off in
 fair latency or throughput benchmarks, and confirm suspected bottlenecks with
 whole-pipeline or Metal evidence before optimizing.
 
+After every inference optimization, run the native-v2 ultimate benchmark from
+independent before and after source snapshots and compare their `results.json`
+artifacts:
+
+```bash
+bash scripts/benchmark-v2.sh run
+bash scripts/benchmark-v2.sh compare \
+  --baseline /path/to/before/results.json \
+  --candidate /path/to/after/results.json
+```
+
+An optimization claim requires the four-model matrix, equivalent manifests,
+output/token parity, and an explicit regression verdict. A smoke preset,
+profiled wall-clock timing, or two scripts run against the same changed source
+tree is not equivalent evidence.
+
 If a new architecture produces missing categories, add a tiny synthetic model
 test in `python/tests/test_native_mlx.py` before changing the generic path
 classifier. Avoid architecture-name checks in `graph_profile.py`.
