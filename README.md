@@ -82,6 +82,13 @@ optimization work:
 bash scripts/benchmark-v2.sh run
 ```
 
+For hot-path optimization, this is the only accepted user-facing performance
+gate. Keep `scripts/benchmark-v2.sh` and `benchmarks/v2_benchmark.py` unchanged
+across optimization work: run the exact same benchmark files from isolated
+baseline and candidate source worktrees. If the benchmark itself must change,
+make that a separate change and rebaseline both snapshots with the new version;
+results produced by different benchmark versions are not comparable.
+
 It runs four supported model families across serial and overlap
 configurations, rotates configuration order, and covers interactive streaming,
 non-streaming latency, long prefill, sustained decode, shared-prefix reuse,
