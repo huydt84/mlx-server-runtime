@@ -106,6 +106,7 @@ workloads = ["prefill_ttft"]
 [diagnostics.gateway]
 models = ["primary"]
 workloads = ["gateway_latency"]
+profilers = ["pipeline"]
 
 [suites.phase9]
 models = ["primary"]
@@ -118,6 +119,7 @@ focus_required = false
 trials = 2
 max_model_starts = 1
 tail_set = "phase9"
+representative_diagnostic_families = ["gateway"]
 diagnostic_families = ["gateway"]
 coverage = [
   { model = "primary", workloads = ["gateway_latency", "prefill_ttft", "decode_tpot"] },

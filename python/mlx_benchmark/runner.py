@@ -35,6 +35,12 @@ from mlx_benchmark.statistics import analyze_calibration, analyze_run
 _MLX_AIR_VERSION_ENV = "MLX_AIR_VERSION"
 _INVOCATION_DIRECTORY_ENV = "MLX_AIR_INVOCATION_DIRECTORY"
 _WORKER_LOG_ENV = "MLX_AIR_WORKER_LOG"
+_PIPELINE_PROFILE_ENV = "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE"
+_PIPELINE_PROFILE_DIR_ENV = "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR"
+_PIPELINE_PROFILE_RUN_ID_ENV = "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_RUN_ID"
+_PIPELINE_PROFILE_WORKLOAD_ENV = "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_WORKLOAD"
+_GRAPH_PROFILE_ENV = "MLX_RUNTIME_NATIVE_GRAPH_PROFILE"
+_METAL_CAPTURE_ENV = "MLX_RUNTIME_NATIVE_METAL_CAPTURE"
 _SHUTDOWN_TIMEOUT_SECONDS = 15
 _BENCHMARK_EXECUTION_FAILURE = 50
 _REQUIRED_COUNTERS = (
@@ -83,10 +89,14 @@ class _ServerProcess:
         process: subprocess.Popen[bytes],
         log_handle: Any,
         cleanup_paths: tuple[Path, ...],
+        cleanup_directories: tuple[Path, ...],
+        lifecycle: dict[str, Any],
     ) -> None:
         self.process = process
         self.log_handle = log_handle
         self.cleanup_paths = cleanup_paths
+        self.cleanup_directories = cleanup_directories
+        self.lifecycle = lifecycle
 
     def stop(self) -> None:
         """Stop and reap the server process group."""
@@ -108,9 +118,17 @@ class _ServerProcess:
                     pass
             self.process.wait(timeout=5)
         finally:
+            self.lifecycle["stopped_at"] = _utc_now()
+            self.lifecycle["stopped_monotonic_ns"] = time.monotonic_ns()
+            self.lifecycle["exit_code"] = self.process.returncode
             self.log_handle.close()
             for path in self.cleanup_paths:
                 path.unlink(missing_ok=True)
+            for directory in self.cleanup_directories:
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
 
 
 def run_benchmark(
@@ -206,9 +224,28 @@ def run_benchmark(
             results["failure_stage"] = None
             results["completed_at"] = _utc_now()
             _write_artifacts(run_directory, results)
+            diagnostic_exit_status = 0
+            if results["configuration"]["profile"] != "none":
+                try:
+                    diagnostics_ok = _run_configured_diagnostics(
+                        gateway,
+                        run_directory,
+                        results,
+                        selection=results["configuration"]["profile"],
+                    )
+                    if not diagnostics_ok:
+                        diagnostic_exit_status = _BENCHMARK_EXECUTION_FAILURE
+                except _RunInterrupted as interrupted:
+                    _record_diagnostic_interruption(results, interrupted)
+                    _write_artifacts(run_directory, results)
+                    diagnostic_exit_status = 128 + interrupted.signum
+                except Exception as error:
+                    _record_diagnostic_failure(results, error)
+                    _write_artifacts(run_directory, results)
+                    diagnostic_exit_status = _BENCHMARK_EXECUTION_FAILURE
             if emit_result_path:
                 print(run_directory / "results.json")
-            return 0
+            return diagnostic_exit_status
     except _RunInterrupted as interrupted:
         results["status"] = "interrupted"
         results["error"] = {
@@ -240,6 +277,380 @@ def run_benchmark(
     finally:
         if server is not None:
             server.stop()
+            _write_artifacts(run_directory, results)
+
+
+def run_diagnostics(arguments: argparse.Namespace, gateway: Path) -> int:
+    """Collect configured diagnostics for one completed benchmark result.
+
+    Args:
+        arguments: Validated ``mlx-air bench diagnose`` arguments.
+        gateway: Absolute path to the version-matched gateway executable.
+
+    Returns:
+        Zero when every requested diagnostic succeeds, 50 on diagnostic
+        failure, or 128 plus an interrupt signal number.
+    """
+    invocation = Path(os.environ.get(_INVOCATION_DIRECTORY_ENV, os.getcwd()))
+    requested = Path(arguments.result).expanduser()
+    result_path = requested if requested.is_absolute() else invocation / requested
+    try:
+        result_path = result_path.resolve(strict=True)
+        results = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        print(
+            f"error: cannot read benchmark result {result_path}: {error}",
+            file=sys.stderr,
+        )
+        return _BENCHMARK_EXECUTION_FAILURE
+    if result_path.name != "results.json" or results.get("command") != "run":
+        print(
+            f"error: {result_path} is not an mlx-air bench run result",
+            file=sys.stderr,
+        )
+        return _BENCHMARK_EXECUTION_FAILURE
+    if results.get("status") != "succeeded":
+        print(
+            f"error: benchmark result status must be succeeded, got {results.get('status')!r}",
+            file=sys.stderr,
+        )
+        return _BENCHMARK_EXECUTION_FAILURE
+
+    run_directory = result_path.parent
+    requested_families = None if arguments.all else [arguments.workload_family]
+    try:
+        with _interrupts_raise():
+            succeeded = _run_configured_diagnostics(
+                gateway,
+                run_directory,
+                results,
+                selection="all",
+                requested_families=requested_families,
+            )
+    except _RunInterrupted as interrupted:
+        _record_diagnostic_interruption(results, interrupted)
+        _write_artifacts(run_directory, results)
+        print(result_path)
+        return 128 + interrupted.signum
+    except _RunFailure as error:
+        print(f"error: {error}", file=sys.stderr)
+        return _BENCHMARK_EXECUTION_FAILURE
+    print(result_path)
+    return 0 if succeeded else _BENCHMARK_EXECUTION_FAILURE
+
+
+def _run_configured_diagnostics(
+    gateway: Path,
+    run_directory: Path,
+    results: dict[str, Any],
+    *,
+    selection: str,
+    requested_families: list[str] | None = None,
+) -> bool:
+    configuration = results["configuration"]
+    routes = list(configuration.get("diagnostic_routing", []))
+    profile_families = configuration.get("diagnostic_profiles", {}).get(selection, [])
+    routes = [route for route in routes if route["name"] in profile_families]
+    available = {route["name"] for route in routes}
+    if requested_families is not None:
+        unknown = set(requested_families).difference(available)
+        if unknown:
+            raise _RunFailure(
+                "diagnostics",
+                f"diagnostic workload family is not configured: {sorted(unknown)!r}",
+            )
+        routes = [route for route in routes if route["name"] in requested_families]
+    if not routes:
+        raise _RunFailure("diagnostics", "selected benchmark has no diagnostic routes")
+    diagnostics = results.setdefault(
+        "diagnostics",
+        {"requested": selection, "status": "pending", "requests": [], "attempts": []},
+    )
+    diagnostics.setdefault("requests", [])
+    diagnostics.setdefault("attempts", [])
+    diagnostics["requested"] = selection
+    request_record: dict[str, Any] = {
+        "selection": selection,
+        "families": [route["name"] for route in routes],
+        "started_at": _utc_now(),
+        "completed_at": None,
+        "status": "running",
+    }
+    diagnostics["requests"].append(request_record)
+    diagnostics["status"] = "running"
+    _write_artifacts(run_directory, results)
+
+    attempts_before = len(diagnostics["attempts"])
+    try:
+        for route in routes:
+            targets = _diagnostic_targets(configuration, route)
+            if selection == "representative":
+                targets = targets[:1]
+            if not targets:
+                attempt = _new_diagnostic_attempt(route, None, None, None)
+                attempt["status"] = "failed"
+                attempt["error"] = (
+                    "diagnostic route has no runnable model/workload target"
+                )
+                attempt["completed_at"] = _utc_now()
+                diagnostics["attempts"].append(attempt)
+                _write_artifacts(run_directory, results)
+                continue
+            for execution, execution_configuration, workload in targets:
+                _run_diagnostic_attempt(
+                    gateway,
+                    run_directory,
+                    results,
+                    route,
+                    execution,
+                    execution_configuration,
+                    workload,
+                )
+    except _RunInterrupted:
+        request_record["status"] = "interrupted"
+        request_record["completed_at"] = _utc_now()
+        diagnostics["status"] = "interrupted"
+        _write_artifacts(run_directory, results)
+        raise
+
+    new_attempts = diagnostics["attempts"][attempts_before:]
+    succeeded = bool(new_attempts) and all(
+        attempt["status"] == "succeeded" for attempt in new_attempts
+    )
+    request_record["status"] = "succeeded" if succeeded else "failed"
+    request_record["completed_at"] = _utc_now()
+    all_attempts = diagnostics["attempts"]
+    all_successful_count = sum(
+        attempt["status"] == "succeeded" for attempt in all_attempts
+    )
+    if all_attempts and all_successful_count == len(all_attempts):
+        diagnostics["status"] = "succeeded"
+    elif all_successful_count:
+        diagnostics["status"] = "partial"
+    else:
+        diagnostics["status"] = "failed"
+    _write_artifacts(run_directory, results)
+    return succeeded
+
+
+def _diagnostic_targets(
+    configuration: dict[str, Any], route: dict[str, Any]
+) -> list[tuple[dict[str, str], dict[str, Any], dict[str, Any]]]:
+    targets = []
+    seen: set[tuple[str, str]] = set()
+    for execution in _execution_plan(configuration, "self-launched"):
+        if execution["model"] not in route["models"]:
+            continue
+        selected = _configuration_for_execution(configuration, execution)
+        for workload in selected["workloads"]:
+            identity = (execution["model"], workload["name"])
+            if workload["name"] in route["workloads"] and identity not in seen:
+                seen.add(identity)
+                targets.append((execution, selected, workload))
+    return targets
+
+
+def _new_diagnostic_attempt(
+    route: dict[str, Any],
+    execution: dict[str, str] | None,
+    workload: dict[str, Any] | None,
+    artifact_directory: Path | None,
+) -> dict[str, Any]:
+    return {
+        "family": route["name"],
+        "model": execution["model"] if execution else None,
+        "runtime_configuration": execution["runtime_configuration"]
+        if execution
+        else None,
+        "workload": workload["name"] if workload else None,
+        "profilers": list(route["profilers"]),
+        "status": "running",
+        "error": None,
+        "started_at": _utc_now(),
+        "completed_at": None,
+        "artifact_directory": str(artifact_directory) if artifact_directory else None,
+        "process_pid": None,
+        "request": None,
+        "artifacts": [],
+    }
+
+
+def _run_diagnostic_attempt(
+    gateway: Path,
+    run_directory: Path,
+    results: dict[str, Any],
+    route: dict[str, Any],
+    execution: dict[str, str],
+    execution_configuration: dict[str, Any],
+    workload: dict[str, Any],
+) -> None:
+    diagnostics = results["diagnostics"]
+    family_attempt = 1 + sum(
+        attempt["family"] == route["name"] for attempt in diagnostics["attempts"]
+    )
+    relative_directory = (
+        Path("diagnostics") / route["name"] / f"attempt-{family_attempt:03d}"
+    )
+    artifact_directory = run_directory / relative_directory
+    artifact_directory.mkdir(parents=True, exist_ok=False)
+    attempt = _new_diagnostic_attempt(route, execution, workload, relative_directory)
+    diagnostics["attempts"].append(attempt)
+    _write_artifacts(run_directory, results)
+
+    profilers = set(route["profilers"])
+    environment = {
+        _PIPELINE_PROFILE_ENV: "1" if "pipeline" in profilers else "0",
+        _GRAPH_PROFILE_ENV: "1" if "graph" in profilers else "0",
+        _METAL_CAPTURE_ENV: "0",
+        _PIPELINE_PROFILE_DIR_ENV: str(artifact_directory),
+        _PIPELINE_PROFILE_RUN_ID_ENV: (
+            f"{results['run_id']}-{route['name']}-{family_attempt:03d}"
+        ),
+        _PIPELINE_PROFILE_WORKLOAD_ENV: workload["name"],
+    }
+    diagnostic_configuration = json.loads(json.dumps(execution_configuration))
+    diagnostic_workload = next(
+        item
+        for item in diagnostic_configuration["workloads"]
+        if item["name"] == workload["name"]
+    )
+    diagnostic_workload.update({"trials": 1, "requests_per_trial": 1, "concurrency": 1})
+    diagnostic_configuration["workloads"] = [diagnostic_workload]
+    diagnostic_configuration["warmup_groups"] = []
+    prompts = generate_prompt_bank(diagnostic_configuration)
+    server: _ServerProcess | None = None
+    try:
+        base_url, server = _start_server(
+            gateway,
+            run_directory,
+            results,
+            diagnostic_configuration,
+            execution,
+            purpose=f"diagnostic:{route['name']}",
+            artifact_directory=artifact_directory,
+            environment_overrides=environment,
+        )
+        attempt["process_pid"] = server.process.pid
+        _wait_for_readiness(base_url, server, diagnostic_configuration)
+        _reset_benchmark_state(base_url, True, True)
+        trials = asyncio.run(
+            execute_workloads(base_url, diagnostic_configuration, prompts)
+        )
+        attempt["request"] = trials[0]["requests"][0]
+        request_error = trials[0]["error_count"] != 0
+        graph_metrics = {
+            name: value
+            for name, value in _fetch_runtime_counters(base_url).items()
+            if name.startswith(
+                ("mlx_model_graph_", "mlx_executor_stage_latency_by_backend_ms")
+            )
+        }
+        if "graph" in profilers and graph_metrics:
+            _atomic_write_json(
+                artifact_directory / "graph-profile.json",
+                {
+                    "diagnostic_only": True,
+                    "excluded_from_measurements": True,
+                    "family": route["name"],
+                    "model": execution["model"],
+                    "runtime_configuration": execution["runtime_configuration"],
+                    "workload": workload["name"],
+                    "metrics": graph_metrics,
+                },
+            )
+        if request_error:
+            raise _RunFailure(
+                "diagnostics",
+                f"diagnostic request failed for {route['name']} / {workload['name']}",
+            )
+    except _RunInterrupted:
+        attempt["status"] = "interrupted"
+        attempt["error"] = "diagnostic interrupted by signal"
+        raise
+    except Exception as error:
+        attempt["status"] = "failed"
+        attempt["error"] = f"{type(error).__name__}: {error}"
+    finally:
+        if server is not None:
+            server.stop()
+        attempt["artifacts"] = _diagnostic_artifacts(
+            run_directory, artifact_directory, profilers
+        )
+        artifact_failures = [
+            artifact
+            for artifact in attempt["artifacts"]
+            if artifact["status"] != "succeeded"
+        ]
+        if attempt["status"] == "running":
+            if artifact_failures:
+                attempt["status"] = "failed"
+                attempt["error"] = "one or more diagnostic artifacts were not produced"
+            else:
+                attempt["status"] = "succeeded"
+        attempt["completed_at"] = _utc_now()
+        _write_artifacts(run_directory, results)
+
+
+def _diagnostic_artifacts(
+    run_directory: Path, artifact_directory: Path, profilers: set[str]
+) -> list[dict[str, Any]]:
+    expected: list[tuple[str, Path]] = [
+        ("gateway-log", artifact_directory / "gateway.log"),
+        ("worker-log", artifact_directory / "worker.log"),
+    ]
+    if "pipeline" in profilers:
+        expected.extend(
+            [
+                ("pipeline-events", artifact_directory / "pipeline-events.jsonl"),
+                ("pipeline-trace", artifact_directory / "pipeline-trace.json"),
+                ("pipeline-report", artifact_directory / "pipeline-report.md"),
+            ]
+        )
+    if "graph" in profilers:
+        expected.append(("graph-profile", artifact_directory / "graph-profile.json"))
+    return [
+        {
+            "kind": kind,
+            "path": str(path.relative_to(run_directory)),
+            "status": "succeeded" if path.is_file() else "failed",
+            "error": None if path.is_file() else "artifact was not produced",
+        }
+        for kind, path in expected
+    ]
+
+
+def _record_diagnostic_interruption(
+    results: dict[str, Any], interrupted: _RunInterrupted
+) -> None:
+    diagnostics = results["diagnostics"]
+    diagnostics["status"] = "interrupted"
+    if diagnostics.get("requests"):
+        request = diagnostics["requests"][-1]
+        request["status"] = "interrupted"
+        request["completed_at"] = _utc_now()
+        request["signal"] = interrupted.signum
+
+
+def _record_diagnostic_failure(results: dict[str, Any], error: Exception) -> None:
+    diagnostics = results["diagnostics"]
+    diagnostics["status"] = "failed"
+    if (
+        diagnostics.get("requests")
+        and diagnostics["requests"][-1]["status"] == "running"
+    ):
+        request = diagnostics["requests"][-1]
+    else:
+        request = {
+            "selection": results["configuration"]["profile"],
+            "families": [],
+            "started_at": _utc_now(),
+            "completed_at": None,
+            "status": "running",
+        }
+        diagnostics.setdefault("requests", []).append(request)
+    request["status"] = "failed"
+    request["completed_at"] = _utc_now()
+    request["error"] = f"{type(error).__name__}: {error}"
 
 
 def run_calibration(
@@ -446,10 +857,19 @@ def _initial_results(
             ][0]["name"],
         },
         "runtime_counters": {},
+        "processes": [],
         "applied_order": [],
         "warmups": [],
         "trials": [],
         "analysis": None,
+        "diagnostics": {
+            "requested": final_configuration["profile"],
+            "status": "not_requested"
+            if final_configuration["profile"] == "none"
+            else "pending",
+            "requests": [],
+            "attempts": [],
+        },
         "validation_failures": [],
     }
 
@@ -654,7 +1074,12 @@ def _start_server(
     results: dict[str, Any],
     configuration: dict[str, Any],
     execution: dict[str, str],
+    *,
+    purpose: str = "measurement",
+    artifact_directory: Path | None = None,
+    environment_overrides: dict[str, str] | None = None,
 ) -> tuple[str, _ServerProcess]:
+    process_artifacts = artifact_directory or run_directory
     model = configuration["models"][0]
     selected_runtime = configuration["runtime_configurations"][0]
     workloads = configuration["workloads"]
@@ -706,20 +1131,45 @@ def _start_server(
         },
         "telemetry": {"enable_prometheus": True, "metrics_path": "/metrics"},
     }
-    sequence = len(results["applied_order"])
-    config_path = run_directory / f"runtime-{sequence:02d}.toml"
+    processes = results.setdefault("processes", [])
+    sequence = len(processes)
+    config_path = (
+        run_directory / f"runtime-{sequence:02d}.toml"
+        if artifact_directory is None
+        else process_artifacts / "runtime.toml"
+    )
     config_path.write_text(_render_runtime_toml(runtime_config), encoding="utf-8")
-    results["server"]["runtime_configuration"] = runtime_config
-    results["configuration"]["base_url"] = f"http://127.0.0.1:{port}"
-    results["failure_stage"] = "server_startup"
+    if purpose == "measurement":
+        results["server"]["runtime_configuration"] = runtime_config
+        results["configuration"]["base_url"] = f"http://127.0.0.1:{port}"
+        results["failure_stage"] = "server_startup"
     _write_artifacts(run_directory, results)
 
-    log_handle = (run_directory / "logs" / "gateway.log").open("ab", buffering=0)
+    gateway_log = (
+        run_directory / "logs" / "gateway.log"
+        if artifact_directory is None
+        else process_artifacts / "gateway.log"
+    )
+    worker_log = (
+        run_directory / "logs" / "worker.log"
+        if artifact_directory is None
+        else process_artifacts / "worker.log"
+    )
+    log_handle = gateway_log.open("ab", buffering=0)
     environment = os.environ.copy()
     environment["MLX_RUNTIME_CONFIG"] = str(config_path)
     environment["MLX_AIR_BENCHMARK_ENABLED"] = "1"
-    environment[_WORKER_LOG_ENV] = str(run_directory / "logs" / "worker.log")
+    environment[_WORKER_LOG_ENV] = str(worker_log)
     environment.update(selected_runtime["environment"])
+    environment.update(
+        {
+            _PIPELINE_PROFILE_ENV: "0",
+            _GRAPH_PROFILE_ENV: "0",
+            _METAL_CAPTURE_ENV: "0",
+        }
+    )
+    if environment_overrides:
+        environment.update(environment_overrides)
     try:
         process = subprocess.Popen(
             [str(gateway)],
@@ -734,11 +1184,35 @@ def _start_server(
         raise _RunFailure(
             "server_startup", f"failed to launch {gateway}: {error}"
         ) from error
-    results["server"]["selected_model"] = execution["model"]
-    results["server"]["selected_runtime_configuration"] = execution[
-        "runtime_configuration"
-    ]
-    return f"http://127.0.0.1:{port}", _ServerProcess(process, log_handle, (ipc_path,))
+    lifecycle = {
+        "purpose": purpose,
+        "pid": process.pid,
+        "started_at": _utc_now(),
+        "started_monotonic_ns": time.monotonic_ns(),
+        "stopped_at": None,
+        "stopped_monotonic_ns": None,
+        "exit_code": None,
+        "model": execution["model"],
+        "runtime_configuration": execution["runtime_configuration"],
+        "profiling_environment": {
+            key: environment[key]
+            for key in (
+                _PIPELINE_PROFILE_ENV,
+                _GRAPH_PROFILE_ENV,
+                _METAL_CAPTURE_ENV,
+            )
+        },
+    }
+    processes.append(lifecycle)
+    if purpose == "measurement":
+        results["server"]["selected_model"] = execution["model"]
+        results["server"]["selected_runtime_configuration"] = execution[
+            "runtime_configuration"
+        ]
+    _write_artifacts(run_directory, results)
+    return f"http://127.0.0.1:{port}", _ServerProcess(
+        process, log_handle, (ipc_path,), (socket_directory,), lifecycle
+    )
 
 
 def _reserve_loopback_port() -> int:

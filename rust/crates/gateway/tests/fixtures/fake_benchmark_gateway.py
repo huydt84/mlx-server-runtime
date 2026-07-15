@@ -62,6 +62,14 @@ prefill_delay_seconds = (
 decode_delay_seconds = (
     int(os.environ.get("MLX_RUNTIME_TEST_DECODE_DELAY_MS", "0")) / 1000
 )
+pipeline_profile = os.environ.get("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE") == "1"
+graph_profile = os.environ.get("MLX_RUNTIME_NATIVE_GRAPH_PROFILE") == "1"
+diagnostic_process = pipeline_profile or graph_profile
+diagnostic_delay_seconds = (
+    float(os.environ.get("FAKE_GATEWAY_DIAGNOSTIC_DELAY_SECONDS", "0"))
+    if diagnostic_process
+    else 0.0
+)
 
 pid_file = os.environ.get("FAKE_GATEWAY_PID_FILE")
 if pid_file:
@@ -70,6 +78,34 @@ worker_log = os.environ.get("MLX_AIR_WORKER_LOG")
 if worker_log:
     Path(worker_log).write_text("fake worker started\n", encoding="utf-8")
 print(f"fake gateway listening on {port}", file=sys.stderr, flush=True)
+diagnostic_ready_file = os.environ.get("FAKE_GATEWAY_DIAGNOSTIC_READY_FILE")
+if diagnostic_process and diagnostic_ready_file:
+    Path(diagnostic_ready_file).touch()
+
+
+def write_pipeline_artifacts() -> None:
+    """Write the bounded files emitted by the native pipeline profiler."""
+    if not pipeline_profile:
+        return
+    output = Path(os.environ["MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR"])
+    output.mkdir(parents=True, exist_ok=True)
+    event = {
+        "schema_version": 1,
+        "run_id": os.environ.get("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_RUN_ID"),
+        "request_id": "fake-diagnostic",
+        "component": "runtime",
+        "stage": "terminal",
+        "workload": os.environ.get("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_WORKLOAD"),
+    }
+    (output / "pipeline-events.jsonl").write_text(
+        json.dumps(event) + "\n", encoding="utf-8"
+    )
+    (output / "pipeline-trace.json").write_text(
+        json.dumps({"traceEvents": [event]}) + "\n", encoding="utf-8"
+    )
+    (output / "pipeline-report.md").write_text(
+        "# Fake diagnostic pipeline profile\n", encoding="utf-8"
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -103,6 +139,12 @@ class Handler(BaseHTTPRequestHandler):
                     f"mlx_prefix_cache_misses_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_misses']}\n"
                     f"mlx_prefix_cache_reused_tokens_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_reused_tokens']}\n"
                     f"mlx_prefix_cache_evictions_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_evictions']}\n"
+                    + (
+                        "mlx_model_graph_attention_ms 1\n"
+                        "mlx_executor_stage_latency_by_backend_ms{backend=\"fake\",stage=\"decode\"} 1\n"
+                        if graph_profile
+                        else ""
+                    )
                 ).encode()
             self._send(200, "text/plain", body)
         else:
@@ -174,6 +216,9 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._json(500, {"error": {"message": "injected request failure"}})
             return
+        if diagnostic_process and os.environ.get("FAKE_GATEWAY_DIAGNOSTIC_FAILURE") == "1":
+            self._json(500, {"error": {"message": "injected diagnostic failure"}})
+            return
         shared_prefix = content.partition(". Unique suffix ")[0]
         is_prime = "Benchmark-only priming suffix" in content
         with counts_lock:
@@ -198,6 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             "total_tokens": 7,
             "prompt_tokens_details": {"cached_tokens": cached_tokens},
         }
+        time.sleep(diagnostic_delay_seconds)
         time.sleep(gateway_delay_seconds)
         if request.get("stream"):
             events = [
@@ -237,6 +283,7 @@ class Handler(BaseHTTPRequestHandler):
             )
         with counts_lock:
             counts["active"] -= 1
+        write_pipeline_artifacts()
 
     def log_message(self, _format: str, *_args: object) -> None:
         pass

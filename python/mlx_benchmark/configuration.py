@@ -33,6 +33,7 @@ _PROMPT_MATERIALS = {"measured", "warmup"}
 _CACHE_MODES = {"cold", "warm-prefix", "cache-pressure"}
 _METRIC_UNITS = {"ms", "tokens/s"}
 _CACHE_UNITS = {"tokens", "percent", "bytes"}
+_DIAGNOSTIC_PROFILERS = {"pipeline", "graph"}
 
 
 class ConfigurationError(ValueError):
@@ -422,6 +423,14 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
         field = f"diagnostics.{name}"
         _reference_list(path, diagnostic, "models", f"{field}.models", models)
         _reference_list(path, diagnostic, "workloads", f"{field}.workloads", workloads)
+        profilers = _string_list(path, diagnostic, "profilers", f"{field}.profilers")
+        unsupported = set(profilers).difference(_DIAGNOSTIC_PROFILERS)
+        if unsupported:
+            _fail(
+                path,
+                f"{field}.profilers",
+                f"contains unsupported profilers: {sorted(unsupported)!r}",
+            )
 
     suites = _named_tables(path, raw, "suites")
     for name, suite in suites.items():
@@ -520,7 +529,7 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
                 f"must be at least {required_model_starts} for the configured order",
             )
         _reference(path, suite, "tail_set", f"{field}.tail_set", tail_sets)
-        _reference_list(
+        all_diagnostic_families = _reference_list(
             path,
             suite,
             "diagnostic_families",
@@ -528,6 +537,23 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
             diagnostics,
             allow_empty=True,
         )
+        representative_diagnostic_families = _reference_list(
+            path,
+            suite,
+            "representative_diagnostic_families",
+            f"{field}.representative_diagnostic_families",
+            diagnostics,
+            allow_empty=True,
+        )
+        outside_all = set(representative_diagnostic_families).difference(
+            all_diagnostic_families
+        )
+        if outside_all:
+            _fail(
+                path,
+                f"{field}.representative_diagnostic_families",
+                f"contains families outside diagnostic_families: {sorted(outside_all)!r}",
+            )
         coverage = suite.get("coverage")
         if not isinstance(coverage, list) or not coverage:
             _fail(path, f"{field}.coverage", "must be a non-empty array of tables")
@@ -658,8 +684,16 @@ def _select_configuration(
     )
     tail_name = suite["tail_set"]
     diagnostic_names = list(suite["diagnostic_families"])
+    representative_diagnostic_names = list(suite["representative_diagnostic_families"])
     if focus_name not in {None, "all"} and focus_name in diagnostic_names:
         diagnostic_names = [focus_name]
+        representative_diagnostic_names = _ordered_intersection(
+            representative_diagnostic_names, diagnostic_names
+        )
+    if profile == "representative" and not representative_diagnostic_names:
+        _fail(path, "--profile", "selected suite has no representative diagnostics")
+    if profile == "all" and not diagnostic_names:
+        _fail(path, "--profile", "selected suite has no diagnostic families")
     order_names = [
         name
         for name in suite["configuration_orders"]
@@ -736,6 +770,10 @@ def _select_configuration(
             {"name": name, **deepcopy(raw["diagnostics"][name])}
             for name in diagnostic_names
         ],
+        "diagnostic_profiles": {
+            "representative": representative_diagnostic_names,
+            "all": diagnostic_names,
+        },
         "cost_limits": {"max_model_starts": suite["max_model_starts"]},
         "workloads": selected_workload_values,
         "coverage": selected_coverage,

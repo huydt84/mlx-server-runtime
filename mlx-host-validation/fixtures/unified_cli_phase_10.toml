@@ -7,7 +7,7 @@ metric_directions = ["lower", "higher"]
 metric_units = ["ms", "tokens/s"]
 
 [sampling]
-seed = 9009
+seed = 1010
 temperature = 0.0
 top_p = 1.0
 request_timeout_seconds = 300
@@ -19,7 +19,7 @@ maximum_coefficient_of_variation_percent = 10.0
 [prompt_bank.measured]
 kind = "short"
 material = "measured"
-count = 4
+count = 2
 target_tokens = 32
 
 [prompt_bank.warmup]
@@ -47,50 +47,70 @@ revision = "resolve-at-run"
 backend = "native-mlx"
 environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial" }
 
-[workloads.delayed_ttft]
+[workloads.gateway_profile]
 prompt_group = "measured"
 output_tokens = 2
 streaming = true
 load_mode = "sequential"
 concurrency = 1
 cache_state = "cold"
-primary_metric = "ttft"
+primary_metric = "end_to_end_latency"
 metric_direction = "lower"
 metric_unit = "ms"
-secondary_metrics = ["end_to_end_latency", "tpot", "aggregate_output_tokens_per_second"]
+secondary_metrics = ["ttft", "tpot"]
 runtime_configurations = ["serial"]
 trials = 1
-requests_per_trial = 2
+requests_per_trial = 1
+
+[workloads.decode_profile]
+prompt_group = "measured"
+output_tokens = 4
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "tpot"
+metric_direction = "lower"
+metric_unit = "ms"
+secondary_metrics = ["ttft", "end_to_end_latency"]
+runtime_configurations = ["serial"]
+trials = 1
+requests_per_trial = 1
 
 [focuses.all]
 models = ["control"]
-workloads = ["delayed_ttft"]
+workloads = ["gateway_profile", "decode_profile"]
 
 [configuration_orders.control]
 model = "control"
 runtime_configurations = ["serial"]
 
-[tail_sets.phase9]
-workloads = ["delayed_ttft"]
+[tail_sets.none]
+workloads = []
 
 [diagnostics.gateway]
 models = ["control"]
-workloads = ["delayed_ttft"]
+workloads = ["gateway_profile"]
 profilers = ["pipeline"]
 
-[suites.phase9]
+[diagnostics.decode]
 models = ["control"]
-workloads = ["delayed_ttft"]
+workloads = ["decode_profile"]
+profilers = ["graph"]
+
+[suites.phase10]
+models = ["control"]
+workloads = ["gateway_profile", "decode_profile"]
 runtime_configurations = ["serial"]
 warmup_groups = ["compile"]
 configuration_orders = ["control"]
-focuses = ["all"]
+focuses = []
 focus_required = false
-trials = 2
+trials = 1
 max_model_starts = 1
-tail_set = "phase9"
+tail_set = "none"
 representative_diagnostic_families = ["gateway"]
-diagnostic_families = ["gateway"]
+diagnostic_families = ["gateway", "decode"]
 coverage = [
-  { model = "control", workloads = ["delayed_ttft"] },
+  { model = "control", workloads = ["gateway_profile", "decode_profile"] },
 ]

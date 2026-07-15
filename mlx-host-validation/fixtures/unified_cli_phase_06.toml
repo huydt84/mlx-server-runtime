@@ -91,6 +91,7 @@ workloads = []
 [diagnostics.smoke]
 models = ["primary"]
 workloads = ["sequential"]
+profilers = ["pipeline"]
 
 [suites.phase6]
 models = ["primary"]
@@ -103,6 +104,7 @@ focus_required = false
 trials = 1
 max_model_starts = 1
 tail_set = "none"
+representative_diagnostic_families = ["smoke"]
 diagnostic_families = ["smoke"]
 coverage = [
   { model = "primary", workloads = ["sequential", "closed_loop"] },

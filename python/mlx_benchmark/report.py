@@ -89,6 +89,7 @@ def _render_run_report(results: dict[str, Any]) -> str:
             f"{trial['streaming']} | {trial['configured_concurrency']} | "
             f"{trial['request_count']} | {trial['success_count']} | {trial['error_count']} |"
         )
+    _append_diagnostics(lines, results)
     _append_failures_and_error(lines, results)
     return "\n".join(lines) + "\n"
 
@@ -175,6 +176,44 @@ def _append_failures_and_error(lines: list[str], results: dict[str, Any]) -> Non
         )
     if results.get("error") is not None:
         lines.extend(["", "## Error", "", f"`{results['error']['message']}`"])
+
+
+def _append_diagnostics(lines: list[str], results: dict[str, Any]) -> None:
+    diagnostics = results.get("diagnostics")
+    if not diagnostics or not diagnostics.get("attempts"):
+        return
+    lines.extend(
+        [
+            "",
+            "## Diagnostic artifacts",
+            "",
+            f"Diagnostic status: `{diagnostics['status']}`. These artifacts were produced in processes separate from timed measurements; the trial rows above are unchanged.",
+            "",
+        ]
+    )
+    for attempt in diagnostics["attempts"]:
+        target = " / ".join(
+            str(value)
+            for value in (
+                attempt.get("family"),
+                attempt.get("model"),
+                attempt.get("runtime_configuration"),
+                attempt.get("workload"),
+            )
+            if value is not None
+        )
+        lines.append(f"- `{target}`: `{attempt['status']}`")
+        for artifact in attempt.get("artifacts", []):
+            if artifact["status"] == "succeeded":
+                lines.append(
+                    f"  - [{artifact['kind']}]({artifact['path']}): `succeeded`"
+                )
+            else:
+                lines.append(
+                    f"  - `{artifact['kind']}`: `failed` ({artifact['error']})"
+                )
+        if attempt.get("error"):
+            lines.append(f"  - Error: `{attempt['error']}`")
 
 
 def _render_maxima(values: list[dict[str, Any]]) -> str:

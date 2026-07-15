@@ -322,6 +322,7 @@ focus_required = false
 trials = 1
 max_model_starts = 4
 tail_set = "none"
+representative_diagnostic_families = []
 diagnostic_families = []
 coverage = [
   { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "shared_prefix_warm_c4"] },
@@ -338,6 +339,7 @@ focus_required = true
 trials = 4
 max_model_starts = 10
 tail_set = "none"
+representative_diagnostic_families = ["gateway", "prefill", "decode", "scheduler", "cache"]
 diagnostic_families = ["gateway", "prefill", "decode", "scheduler", "cache"]
 coverage = [
   { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
@@ -357,6 +359,7 @@ focus_required = false
 trials = 6
 max_model_starts = 10
 tail_set = "release"
+representative_diagnostic_families = ["gateway"]
 diagnostic_families = ["gateway", "prefill", "decode", "scheduler", "cache"]
 coverage = [
   { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
@@ -376,6 +379,7 @@ focus_required = false
 trials = 8
 max_model_starts = 10
 tail_set = "release"
+representative_diagnostic_families = ["gateway"]
 diagnostic_families = ["gateway", "prefill", "decode", "scheduler", "cache"]
 coverage = [
   { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
@@ -413,19 +417,24 @@ workloads = ["interactive_stream_c1", "steady_short_c8", "mixed_c8"]
 [diagnostics.gateway]
 models = ["runtime_control"]
 workloads = ["interactive_stream_c1"]
+profilers = ["pipeline"]
 
 [diagnostics.prefill]
 models = ["primary", "dense"]
 workloads = ["cold_prefill_2k_c1"]
+profilers = ["pipeline", "graph"]
 
 [diagnostics.decode]
 models = ["primary", "moe"]
 workloads = ["decode_128_c1"]
+profilers = ["graph"]
 
 [diagnostics.scheduler]
 models = ["primary"]
 workloads = ["mixed_c8"]
+profilers = ["pipeline"]
 
 [diagnostics.cache]
 models = ["primary"]
 workloads = ["shared_prefix_warm_c4", "cache_pressure"]
+profilers = ["pipeline"]

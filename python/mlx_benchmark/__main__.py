@@ -9,7 +9,7 @@ import sys
 from typing import Sequence
 
 from mlx_benchmark.configuration import ConfigurationError, load_selected_configuration
-from mlx_benchmark.runner import run_benchmark, run_calibration
+from mlx_benchmark.runner import run_benchmark, run_calibration, run_diagnostics
 
 _GATEWAY_EXECUTABLE_ENV = "MLX_AIR_GATEWAY_EXECUTABLE"
 _DEFAULT_BENCHMARK_CONFIG_ENV = "MLX_AIR_DEFAULT_BENCHMARK_CONFIG"
@@ -79,8 +79,6 @@ def _validate_run_arguments(
         parser.error("--base-url is required with --server-mode external")
     if arguments.server_mode == "self-launched" and arguments.base_url is not None:
         parser.error("--base-url is not valid with --server-mode self-launched")
-    if arguments.profile != "none":
-        parser.error("timed workloads currently require --profile none")
 
 
 def _validate_gateway(parser: argparse.ArgumentParser) -> Path:
@@ -145,8 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.action == "run":
             return run_benchmark(arguments, gateway, selected)
         return run_calibration(arguments, gateway, selected)
-    print("error: benchmark execution is not available in this build", file=sys.stderr)
-    return _BENCHMARK_EXECUTION_FAILURE
+    return run_diagnostics(arguments, gateway)
 
 
 if __name__ == "__main__":

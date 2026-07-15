@@ -284,6 +284,11 @@ fn invalid_configuration_values_report_exact_fields_before_server_startup() {
             "[warmup_groups.short]\nprompt_group = \"warmup_short\"\nconcurrency = 1",
             "warmup_groups.short.output_tokens",
         ),
+        (
+            "profilers = [\"pipeline\"]",
+            "profilers = [\"unsupported\"]",
+            "diagnostics.smoke.profilers",
+        ),
     ];
 
     for (index, (original, replacement, field)) in cases.into_iter().enumerate() {
@@ -569,6 +574,22 @@ fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
     assert!(output_directory.join("report.md").is_file());
     assert!(output_directory.join("logs/gateway.log").is_file());
     assert!(output_directory.join("logs/worker.log").is_file());
+    assert!(!output_directory.join("diagnostics").exists());
+    assert_eq!(results["diagnostics"]["status"], "not_requested");
+    assert_eq!(results["processes"].as_array().unwrap().len(), 1);
+    assert_eq!(results["processes"][0]["purpose"], "measurement");
+    assert_eq!(
+        results["processes"][0]["profiling_environment"]["MLX_RUNTIME_NATIVE_PIPELINE_PROFILE"],
+        "0"
+    );
+    assert_eq!(
+        results["processes"][0]["profiling_environment"]["MLX_RUNTIME_NATIVE_GRAPH_PROFILE"],
+        "0"
+    );
+    assert_eq!(
+        results["processes"][0]["profiling_environment"]["MLX_RUNTIME_NATIVE_METAL_CAPTURE"],
+        "0"
+    );
     assert_processes_reaped(&pid_file);
 }
 
@@ -756,6 +777,252 @@ fn phase9_calibration_repeats_unchanged_configuration_and_reports_variation() {
 }
 
 #[test]
+fn phase10_representative_profile_runs_after_measurement_in_a_separate_process() {
+    let staged = StagedCli::new("phase10-representative");
+    let output_directory = staged.base.join("phase10-representative-artifacts");
+    let config = staged.base.join("phase10.toml");
+    let pid_file = staged.base.join("phase10-representative-pids");
+    fs::write(&config, phase10_configuration()).unwrap();
+
+    let output = staged
+        .command()
+        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "phase9",
+            "--benchmark-config",
+            config.to_str().unwrap(),
+            "--profile",
+            "representative",
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let results = read_results(&output_directory);
+    assert_eq!(results["status"], "succeeded");
+    assert_eq!(results["diagnostics"]["status"], "succeeded");
+    assert_eq!(
+        results["configuration"]["diagnostic_profiles"]["representative"],
+        serde_json::json!(["gateway"])
+    );
+    assert_eq!(
+        results["configuration"]["diagnostic_profiles"]["all"],
+        serde_json::json!(["gateway", "decode"])
+    );
+    let attempts = results["diagnostics"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["family"], "gateway");
+    assert!(attempts[0]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|artifact| artifact["status"] == "succeeded"));
+    let processes = results["processes"].as_array().unwrap();
+    assert_eq!(processes.len(), 2);
+    assert_ne!(processes[0]["pid"], processes[1]["pid"]);
+    assert!(
+        processes[0]["stopped_monotonic_ns"].as_u64().unwrap()
+            <= processes[1]["started_monotonic_ns"].as_u64().unwrap()
+    );
+    assert_eq!(
+        processes[0]["profiling_environment"]["MLX_RUNTIME_NATIVE_PIPELINE_PROFILE"],
+        "0"
+    );
+    assert_eq!(
+        processes[0]["profiling_environment"]["MLX_RUNTIME_NATIVE_GRAPH_PROFILE"],
+        "0"
+    );
+    assert_eq!(
+        processes[0]["profiling_environment"]["MLX_RUNTIME_NATIVE_METAL_CAPTURE"],
+        "0"
+    );
+    assert_eq!(
+        processes[1]["profiling_environment"]["MLX_RUNTIME_NATIVE_PIPELINE_PROFILE"],
+        "1"
+    );
+    let report = fs::read_to_string(output_directory.join("report.md")).unwrap();
+    assert!(report.contains("Diagnostic artifacts"));
+    assert!(report.contains("pipeline-report.md"));
+    assert_processes_reaped(&pid_file);
+}
+
+#[test]
+fn phase10_explicit_diagnose_runs_only_the_requested_family() {
+    let staged = StagedCli::new("phase10-explicit");
+    let output_directory = staged.base.join("phase10-explicit-artifacts");
+    let config = staged.base.join("phase10.toml");
+    fs::write(&config, phase10_configuration()).unwrap();
+    let run = staged.output(&[
+        "bench",
+        "run",
+        "--suite",
+        "phase9",
+        "--benchmark-config",
+        config.to_str().unwrap(),
+        "--output-dir",
+        output_directory.to_str().unwrap(),
+    ]);
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+
+    let result_path = output_directory.join("results.json");
+    let diagnose = staged.output(&[
+        "bench",
+        "diagnose",
+        "--result",
+        result_path.to_str().unwrap(),
+        "--workload-family",
+        "decode",
+    ]);
+
+    assert!(diagnose.status.success(), "stderr: {}", stderr(&diagnose));
+    let results = read_results(&output_directory);
+    assert_eq!(results["status"], "succeeded");
+    assert_eq!(results["diagnostics"]["status"], "succeeded");
+    let attempts = results["diagnostics"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["family"], "decode");
+    assert_eq!(attempts[0]["profilers"], serde_json::json!(["graph"]));
+    assert!(attempts[0]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|artifact| {
+            artifact["kind"] == "graph-profile" && artifact["status"] == "succeeded"
+        }));
+}
+
+#[test]
+fn phase10_explicit_diagnose_all_runs_every_configured_family() {
+    let staged = StagedCli::new("phase10-explicit-all");
+    let output_directory = staged.base.join("phase10-explicit-all-artifacts");
+    let config = staged.base.join("phase10.toml");
+    fs::write(&config, phase10_configuration()).unwrap();
+    let run = staged.output(&[
+        "bench",
+        "run",
+        "--suite",
+        "phase9",
+        "--benchmark-config",
+        config.to_str().unwrap(),
+        "--output-dir",
+        output_directory.to_str().unwrap(),
+    ]);
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+
+    let result_path = output_directory.join("results.json");
+    let diagnose = staged.output(&[
+        "bench",
+        "diagnose",
+        "--result",
+        result_path.to_str().unwrap(),
+        "--all",
+    ]);
+
+    assert!(diagnose.status.success(), "stderr: {}", stderr(&diagnose));
+    let results = read_results(&output_directory);
+    let attempts = results["diagnostics"]["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["family"], "gateway");
+    assert_eq!(attempts[1]["family"], "decode");
+    assert!(attempts
+        .iter()
+        .all(|attempt| attempt["status"] == "succeeded"));
+}
+
+#[test]
+fn phase10_diagnostic_failure_preserves_successful_measurements() {
+    let staged = StagedCli::new("phase10-failure");
+    let output_directory = staged.base.join("phase10-failure-artifacts");
+    let config = staged.base.join("phase10.toml");
+    let pid_file = staged.base.join("phase10-failure-pids");
+    fs::write(&config, phase10_configuration()).unwrap();
+
+    let output = staged
+        .command()
+        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+        .env("FAKE_GATEWAY_DIAGNOSTIC_FAILURE", "1")
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "phase9",
+            "--benchmark-config",
+            config.to_str().unwrap(),
+            "--profile",
+            "representative",
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(50));
+    let results = read_results(&output_directory);
+    assert_eq!(results["status"], "succeeded");
+    assert!(results["analysis"].is_object());
+    assert!(!results["trials"].as_array().unwrap().is_empty());
+    assert_eq!(results["diagnostics"]["status"], "failed");
+    assert_eq!(results["diagnostics"]["attempts"][0]["status"], "failed");
+    assert_processes_reaped(&pid_file);
+}
+
+#[test]
+fn phase10_interrupted_diagnostic_preserves_measurements_and_reaps_processes() {
+    let staged = StagedCli::new("phase10-interrupt");
+    let output_directory = staged.base.join("phase10-interrupt-artifacts");
+    let config = staged.base.join("phase10.toml");
+    let pid_file = staged.base.join("phase10-interrupt-pids");
+    let diagnostic_ready = staged.base.join("phase10-diagnostic-ready");
+    fs::write(&config, phase10_configuration()).unwrap();
+    let mut child = staged
+        .command()
+        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+        .env("FAKE_GATEWAY_DIAGNOSTIC_READY_FILE", &diagnostic_ready)
+        .env("FAKE_GATEWAY_DIAGNOSTIC_DELAY_SECONDS", "60")
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "phase9",
+            "--benchmark-config",
+            config.to_str().unwrap(),
+            "--profile",
+            "representative",
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_file(&diagnostic_ready);
+
+    let result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(result, 0);
+    let status = child.wait().unwrap();
+
+    assert_eq!(status.code(), Some(130));
+    let results = read_results(&output_directory);
+    assert_eq!(results["status"], "succeeded");
+    assert_eq!(results["diagnostics"]["status"], "interrupted");
+    assert_eq!(
+        results["diagnostics"]["attempts"][0]["status"],
+        "interrupted"
+    );
+    assert!(results["processes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|process| process["stopped_monotonic_ns"].is_number()));
+    assert_processes_reaped(&pid_file);
+}
+
+#[test]
 fn repeated_runs_preserve_workload_prompt_trial_and_request_order() {
     let staged = StagedCli::new("deterministic-order");
     let first_directory = staged.base.join("first");
@@ -928,6 +1195,20 @@ fn external_mode_records_server_identity_without_stopping_server() {
     assert!(server.wait().unwrap().success());
 }
 
+fn phase10_configuration() -> String {
+    include_str!("fixtures/phase9_benchmark.toml")
+        .replacen(
+            "\n[suites.phase9]",
+            "\n[diagnostics.decode]\nmodels = [\"primary\"]\nworkloads = [\"decode_tpot\"]\nprofilers = [\"graph\"]\n\n[suites.phase9]",
+            1,
+        )
+        .replacen(
+            "\ndiagnostic_families = [\"gateway\"]",
+            "\ndiagnostic_families = [\"gateway\", \"decode\"]",
+            1,
+        )
+}
+
 fn temp_path(label: &str) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -990,7 +1271,7 @@ exec "$UV_PROJECT_ENVIRONMENT/bin/python" "$@"
 }
 
 fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while !path.is_file() {
         assert!(Instant::now() < deadline, "timed out waiting for fake uv");
         thread::sleep(Duration::from_millis(20));

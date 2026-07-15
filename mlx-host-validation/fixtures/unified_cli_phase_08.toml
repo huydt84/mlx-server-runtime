@@ -130,6 +130,7 @@ workloads = []
 [diagnostics.cache]
 models = ["primary"]
 workloads = ["shared", "pressure"]
+profilers = ["pipeline"]
 
 [suites.phase8]
 models = ["primary"]
@@ -142,6 +143,7 @@ focus_required = false
 trials = 1
 max_model_starts = 1
 tail_set = "none"
+representative_diagnostic_families = ["cache"]
 diagnostic_families = ["cache"]
 coverage = [
   { model = "primary", workloads = ["cold", "shared", "pressure"] },
