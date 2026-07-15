@@ -87,6 +87,16 @@ impl StagedCli {
             include_str!("../../../../python/mlx_benchmark/prompts.py"),
         )
         .unwrap();
+        fs::write(
+            root.join("python/mlx_benchmark/report.py"),
+            include_str!("../../../../python/mlx_benchmark/report.py"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("python/mlx_benchmark/statistics.py"),
+            include_str!("../../../../python/mlx_benchmark/statistics.py"),
+        )
+        .unwrap();
 
         let fake_uv = fake_bin.join("uv");
         fs::write(&fake_uv, fake_uv_script()).unwrap();
@@ -628,6 +638,121 @@ fn phase8_run_applies_order_cache_state_and_trial_metric_deltas() {
             );
         }
     }
+}
+
+#[test]
+fn phase9_run_reports_trial_statistics_configured_tails_and_controlled_delays() {
+    let staged = StagedCli::new("phase9-statistics");
+    let output_directory = staged.base.join("phase9-artifacts");
+    let config = staged.base.join("phase9.toml");
+    fs::write(&config, include_str!("fixtures/phase9_benchmark.toml")).unwrap();
+
+    let output = staged
+        .command()
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "phase9",
+            "--benchmark-config",
+            config.to_str().unwrap(),
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let results = read_results(&output_directory);
+    let primary = results["analysis"]["primary_metrics"].as_array().unwrap();
+    assert_eq!(primary.len(), 3);
+    assert!(primary.iter().all(|summary| {
+        summary["independent_trial_count"] == 2
+            && summary["request_count"] == 4
+            && summary["bootstrap_95_interval"]["resampling_unit"] == "trial"
+    }));
+    let gateway = primary
+        .iter()
+        .find(|summary| summary["workload"] == "gateway_latency")
+        .unwrap();
+    assert_eq!(gateway["better_direction"], "lower");
+    assert!(gateway["mean"].as_f64().unwrap() >= 70.0);
+    let prefill = primary
+        .iter()
+        .find(|summary| summary["workload"] == "prefill_ttft")
+        .unwrap();
+    assert!(prefill["mean"].as_f64().unwrap() >= 40.0);
+    let decode = primary
+        .iter()
+        .find(|summary| summary["workload"] == "decode_tpot")
+        .unwrap();
+    assert!(decode["mean"].as_f64().unwrap() >= 35.0);
+    let tails = results["analysis"]["tails"].as_array().unwrap();
+    assert_eq!(tails.len(), 1);
+    assert_eq!(tails[0]["workload"], "prefill_ttft");
+    assert_eq!(tails[0]["request_ttft_p95"]["sample_count"], 4);
+    assert_eq!(tails[0]["trial_wall_time_p95"]["sample_count"], 2);
+    let report = fs::read_to_string(output_directory.join("report.md")).unwrap();
+    assert!(report.contains("Lower latency, TTFT, and TPOT are better"));
+    assert!(report.contains("Requests within a trial are correlated"));
+}
+
+#[test]
+fn phase9_calibration_repeats_unchanged_configuration_and_reports_variation() {
+    let staged = StagedCli::new("phase9-calibration");
+    let config = staged.base.join("phase9.toml");
+    let pid_file = staged.base.join("phase9-calibration-pids");
+    fs::write(&config, include_str!("fixtures/phase9_benchmark.toml")).unwrap();
+
+    let output = staged
+        .command()
+        .current_dir(&staged.base)
+        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+        .args([
+            "bench",
+            "calibrate",
+            "--suite",
+            "phase9",
+            "--benchmark-config",
+            config.to_str().unwrap(),
+            "--repetitions",
+            "2",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let result_path = PathBuf::from(stdout(&output).trim());
+    let calibration_directory = result_path.parent().unwrap();
+    let results = read_results(calibration_directory);
+    assert_eq!(results["command"], "calibrate");
+    assert_eq!(results["status"], "succeeded");
+    assert_eq!(results["repetitions"]["requested"], 2);
+    assert_eq!(results["repetitions"]["completed"], 2);
+    assert_eq!(results["configuration"]["suite"], "phase9");
+    assert_eq!(results["configuration"]["workloads"][0]["trials"], 2);
+    assert_eq!(results["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(results["host_observations"].as_array().unwrap().len(), 4);
+    assert!(results["host_observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|observation| {
+            observation["thermal_state"].is_string()
+                && observation["power_state"].is_string()
+                && observation["memory_pressure"].is_string()
+        }));
+    let repeated = results["repeated_measurements"].as_array().unwrap();
+    assert_eq!(repeated.len(), 3);
+    assert!(repeated.iter().all(|summary| {
+        summary["completed_repetition_count"] == 2
+            && summary["repetition_values"].as_array().unwrap().len() == 2
+            && summary["bootstrap_95_interval"]["resampling_unit"] == "run"
+            && summary["run_to_run_range"]["unit"].is_string()
+    }));
+    assert!(!results["unstable_workloads"].as_array().unwrap().is_empty());
+    assert!(calibration_directory.join("report.md").is_file());
+    assert_processes_reaped(&pid_file);
 }
 
 #[test]

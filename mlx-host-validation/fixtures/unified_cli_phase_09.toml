@@ -1,0 +1,94 @@
+schema_version = 1
+
+[execution]
+server_modes = ["self-launched", "external"]
+load_modes = ["sequential", "burst", "closed-loop"]
+metric_directions = ["lower", "higher"]
+metric_units = ["ms", "tokens/s"]
+
+[sampling]
+seed = 9009
+temperature = 0.0
+top_p = 1.0
+request_timeout_seconds = 300
+readiness_timeout_seconds = 1800
+
+[calibration]
+maximum_coefficient_of_variation_percent = 10.0
+
+[prompt_bank.measured]
+kind = "short"
+material = "measured"
+count = 4
+target_tokens = 32
+
+[prompt_bank.warmup]
+kind = "short"
+material = "warmup"
+count = 1
+target_tokens = 32
+
+[cache_states.cold]
+mode = "cold"
+unit = "tokens"
+value = 0
+
+[warmup_groups.compile]
+prompt_group = "warmup"
+concurrency = 1
+output_tokens = 2
+
+[models.control]
+checkpoint = "mlx-community/gemma-3-270m-it-qat-8bit"
+tokenizer = "mlx-community/gemma-3-270m-it-qat-8bit"
+revision = "resolve-at-run"
+
+[runtime_configurations.serial]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial" }
+
+[workloads.delayed_ttft]
+prompt_group = "measured"
+output_tokens = 2
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "ttft"
+metric_direction = "lower"
+metric_unit = "ms"
+secondary_metrics = ["end_to_end_latency", "tpot", "aggregate_output_tokens_per_second"]
+runtime_configurations = ["serial"]
+trials = 1
+requests_per_trial = 2
+
+[focuses.all]
+models = ["control"]
+workloads = ["delayed_ttft"]
+
+[configuration_orders.control]
+model = "control"
+runtime_configurations = ["serial"]
+
+[tail_sets.phase9]
+workloads = ["delayed_ttft"]
+
+[diagnostics.gateway]
+models = ["control"]
+workloads = ["delayed_ttft"]
+
+[suites.phase9]
+models = ["control"]
+workloads = ["delayed_ttft"]
+runtime_configurations = ["serial"]
+warmup_groups = ["compile"]
+configuration_orders = ["control"]
+focuses = ["all"]
+focus_required = false
+trials = 2
+max_model_starts = 1
+tail_set = "phase9"
+diagnostic_families = ["gateway"]
+coverage = [
+  { model = "control", workloads = ["delayed_ttft"] },
+]

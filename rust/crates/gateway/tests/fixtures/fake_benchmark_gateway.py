@@ -53,6 +53,15 @@ counts_lock = threading.Lock()
 wire_requests = 0
 dropped_connection = False
 worker = subprocess.Popen(["/bin/sleep", "60"])
+gateway_delay_seconds = (
+    int(os.environ.get("MLX_RUNTIME_TEST_GATEWAY_DELAY_MS", "0")) / 1000
+)
+prefill_delay_seconds = (
+    int(os.environ.get("MLX_RUNTIME_TEST_PREFILL_DELAY_MS", "0")) / 1000
+)
+decode_delay_seconds = (
+    int(os.environ.get("MLX_RUNTIME_TEST_DECODE_DELAY_MS", "0")) / 1000
+)
 
 pid_file = os.environ.get("FAKE_GATEWAY_PID_FILE")
 if pid_file:
@@ -189,6 +198,7 @@ class Handler(BaseHTTPRequestHandler):
             "total_tokens": 7,
             "prompt_tokens_details": {"cached_tokens": cached_tokens},
         }
+        time.sleep(gateway_delay_seconds)
         if request.get("stream"):
             events = [
                 {"choices": [{"delta": {"content": "fake"}, "finish_reason": None}]},
@@ -196,10 +206,23 @@ class Handler(BaseHTTPRequestHandler):
                 {"choices": [{"delta": {}, "finish_reason": "stop"}]},
                 {"choices": [], "usage": usage},
             ]
-            body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
-            body += "data: [DONE]\n\n"
-            self._send(200, "text/event-stream", body.encode())
+            encoded_events = [
+                f"data: {json.dumps(event)}\n\n".encode() for event in events
+            ] + [b"data: [DONE]\n\n"]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header(
+                "Content-Length", str(sum(len(event) for event in encoded_events))
+            )
+            self.end_headers()
+            time.sleep(prefill_delay_seconds)
+            for index, event in enumerate(encoded_events):
+                self.wfile.write(event)
+                self.wfile.flush()
+                if index == 0:
+                    time.sleep(decode_delay_seconds)
         else:
+            time.sleep(prefill_delay_seconds + decode_delay_seconds)
             self._json(
                 200,
                 {

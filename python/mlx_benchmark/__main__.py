@@ -9,7 +9,7 @@ import sys
 from typing import Sequence
 
 from mlx_benchmark.configuration import ConfigurationError, load_selected_configuration
-from mlx_benchmark.runner import run_benchmark
+from mlx_benchmark.runner import run_benchmark, run_calibration
 
 _GATEWAY_EXECUTABLE_ENV = "MLX_AIR_GATEWAY_EXECUTABLE"
 _DEFAULT_BENCHMARK_CONFIG_ENV = "MLX_AIR_DEFAULT_BENCHMARK_CONFIG"
@@ -17,10 +17,10 @@ _INVOCATION_DIRECTORY_ENV = "MLX_AIR_INVOCATION_DIRECTORY"
 _BENCHMARK_EXECUTION_FAILURE = 50
 
 
-def _positive_integer(value: str) -> int:
+def _calibration_repetitions(value: str) -> int:
     parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
+    if not 1 <= parsed <= 100:
+        raise argparse.ArgumentTypeError("must be between 1 and 100")
     return parsed
 
 
@@ -59,13 +59,13 @@ def _build_parser() -> argparse.ArgumentParser:
     workload.add_argument("--all", action="store_true")
 
     calibrate = actions.add_parser(
-        "calibrate", help="calibrate benchmark repetition counts"
+        "calibrate", help="measure benchmark run-to-run repeatability"
     )
     calibrate.add_argument("--suite", required=True)
     calibrate.add_argument("--focus")
     calibrate.add_argument("--benchmark-config", metavar="PATH")
     calibrate.add_argument(
-        "--repetitions", required=True, type=_positive_integer, metavar="N"
+        "--repetitions", required=True, type=_calibration_repetitions, metavar="N"
     )
     return parser
 
@@ -125,20 +125,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     _validate_run_arguments(parser, arguments)
     gateway = _validate_gateway(parser)
-    if arguments.action == "run":
+    if arguments.action in {"run", "calibrate"}:
         config_path = _resolve_benchmark_config(parser, arguments.benchmark_config)
         try:
             selected = load_selected_configuration(
                 config_path,
                 suite_name=arguments.suite,
                 focus_name=arguments.focus,
-                profile=arguments.profile,
-                server_mode=arguments.server_mode,
+                profile=arguments.profile if arguments.action == "run" else "none",
+                server_mode=(
+                    arguments.server_mode
+                    if arguments.action == "run"
+                    else "self-launched"
+                ),
             )
         except ConfigurationError as error:
             print(f"error: {error}", file=sys.stderr)
             return _BENCHMARK_EXECUTION_FAILURE
-        return run_benchmark(arguments, gateway, selected)
+        if arguments.action == "run":
+            return run_benchmark(arguments, gateway, selected)
+        return run_calibration(arguments, gateway, selected)
     print("error: benchmark execution is not available in this build", file=sys.stderr)
     return _BENCHMARK_EXECUTION_FAILURE
 

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mlx_benchmark.statistics import metric_definition, supported_metrics
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
@@ -145,6 +147,16 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
         "sampling.request_timeout_seconds",
         1,
         3_600,
+    )
+
+    calibration = _table(path, raw, "calibration", "calibration")
+    _number(
+        path,
+        calibration,
+        "maximum_coefficient_of_variation_percent",
+        "calibration.maximum_coefficient_of_variation_percent",
+        minimum=0.0,
+        maximum=100.0,
     )
     _bounded_integer(
         path,
@@ -291,7 +303,15 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
             _MAX_CONCURRENCY,
         )
         _reference(path, workload, "cache_state", f"{field}.cache_state", cache_states)
-        _string(path, workload, "primary_metric", f"{field}.primary_metric")
+        primary_metric = _string(
+            path, workload, "primary_metric", f"{field}.primary_metric"
+        )
+        if primary_metric not in supported_metrics():
+            _fail(
+                path,
+                f"{field}.primary_metric",
+                f"unsupported metric {primary_metric!r}",
+            )
         direction = _string(
             path, workload, "metric_direction", f"{field}.metric_direction"
         )
@@ -304,6 +324,39 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
         unit = _string(path, workload, "metric_unit", f"{field}.metric_unit")
         if unit not in units:
             _fail(path, f"{field}.metric_unit", f"unsupported unit {unit!r}")
+        definition = metric_definition(primary_metric)
+        if direction != definition["better_direction"]:
+            _fail(
+                path,
+                f"{field}.metric_direction",
+                f"must be {definition['better_direction']!r} for {primary_metric!r}",
+            )
+        if unit != definition["unit"]:
+            _fail(
+                path,
+                f"{field}.metric_unit",
+                f"must be {definition['unit']!r} for {primary_metric!r}",
+            )
+        secondary_metrics = _string_list(
+            path,
+            workload,
+            "secondary_metrics",
+            f"{field}.secondary_metrics",
+            allow_empty=True,
+        )
+        unsupported_secondary = set(secondary_metrics).difference(supported_metrics())
+        if unsupported_secondary:
+            _fail(
+                path,
+                f"{field}.secondary_metrics",
+                f"contains unsupported metrics {sorted(unsupported_secondary)!r}",
+            )
+        if primary_metric in secondary_metrics:
+            _fail(
+                path,
+                f"{field}.secondary_metrics",
+                "must not repeat the primary metric",
+            )
         _reference_list(
             path,
             workload,
@@ -654,6 +707,7 @@ def _select_configuration(
         "server_mode": server_mode,
         "execution": deepcopy(execution),
         "sampling": deepcopy(raw["sampling"]),
+        "calibration": deepcopy(raw["calibration"]),
         "models": [
             {"name": name, **deepcopy(raw["models"][name])} for name in selected_models
         ],

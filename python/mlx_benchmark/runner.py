@@ -28,6 +28,8 @@ from mlx_benchmark.prompts import (
     generate_prompt_bank,
     shared_prefix_prime_prompts,
 )
+from mlx_benchmark.report import render_report
+from mlx_benchmark.statistics import analyze_calibration, analyze_run
 
 
 _MLX_AIR_VERSION_ENV = "MLX_AIR_VERSION"
@@ -115,6 +117,8 @@ def run_benchmark(
     arguments: argparse.Namespace,
     gateway: Path,
     selected: SelectedConfiguration,
+    *,
+    emit_result_path: bool = True,
 ) -> int:
     """Run the selected benchmark configuration.
 
@@ -197,11 +201,13 @@ def run_benchmark(
             _validate_final_results(results)
             if any(trial["error_count"] for trial in results["trials"]):
                 raise _RunFailure("measurement", "one or more requests failed")
+            results["analysis"] = analyze_run(results)
             results["status"] = "succeeded"
             results["failure_stage"] = None
             results["completed_at"] = _utc_now()
             _write_artifacts(run_directory, results)
-            print(run_directory / "results.json")
+            if emit_result_path:
+                print(run_directory / "results.json")
             return 0
     except _RunInterrupted as interrupted:
         results["status"] = "interrupted"
@@ -236,6 +242,127 @@ def run_benchmark(
             server.stop()
 
 
+def run_calibration(
+    arguments: argparse.Namespace,
+    gateway: Path,
+    selected: SelectedConfiguration,
+) -> int:
+    """Repeat one selected benchmark configuration and quantify variation.
+
+    Args:
+        arguments: Validated ``mlx-air bench calibrate`` arguments.
+        gateway: Absolute path to the version-matched gateway executable.
+        selected: Loaded and fully selected benchmark configuration.
+
+    Returns:
+        Zero on success or the first unsuccessful repetition's exit status.
+    """
+    calibration_directory = _resolve_calibration_directory()
+    try:
+        (calibration_directory / "runs").mkdir(parents=True, exist_ok=False)
+    except OSError as error:
+        print(
+            f"error: failed to create calibration directory {calibration_directory}: {error}",
+            file=sys.stderr,
+        )
+        return _BENCHMARK_EXECUTION_FAILURE
+
+    configuration = json.loads(json.dumps(selected.values))
+    configuration.update(
+        {
+            "benchmark_config": str(selected.source_path),
+            "output_directory": str(calibration_directory),
+        }
+    )
+    results: dict[str, Any] = {
+        "schema_version": 1,
+        "command": "calibrate",
+        "run_id": calibration_directory.name,
+        "status": "running",
+        "error": None,
+        "started_at": _utc_now(),
+        "completed_at": None,
+        "configuration": configuration,
+        "host": _host_information(),
+        "repetitions": {
+            "requested": int(arguments.repetitions),
+            "completed": 0,
+        },
+        "runs": [],
+        "repeated_measurements": [],
+        "unstable_workloads": [],
+        "host_observations": [],
+        "validation_failures": [],
+    }
+    _write_artifacts(calibration_directory, results)
+    successful_runs: list[dict[str, Any]] = []
+    exit_status = 0
+
+    for repetition in range(1, int(arguments.repetitions) + 1):
+        results["host_observations"].append(_host_observation(repetition, "before"))
+        repetition_directory = (
+            calibration_directory / "runs" / f"repetition-{repetition:03d}"
+        )
+        run_arguments = argparse.Namespace(
+            output_dir=str(repetition_directory),
+            server_mode="self-launched",
+            base_url=None,
+        )
+        exit_status = run_benchmark(
+            run_arguments,
+            gateway,
+            selected,
+            emit_result_path=False,
+        )
+        run_result = json.loads(
+            (repetition_directory / "results.json").read_text(encoding="utf-8")
+        )
+        results["host_observations"].append(_host_observation(repetition, "after"))
+        results["runs"].append(
+            {
+                "repetition": repetition,
+                "result_path": str(
+                    Path("runs") / f"repetition-{repetition:03d}" / "results.json"
+                ),
+                "status": run_result["status"],
+                "primary_metrics": (run_result.get("analysis") or {}).get(
+                    "primary_metrics", []
+                ),
+            }
+        )
+        if exit_status != 0:
+            results["status"] = "interrupted" if exit_status in {130, 143} else "failed"
+            results["error"] = {
+                "kind": "repetition",
+                "message": f"calibration repetition {repetition} ended with status {exit_status}",
+                "repetition": repetition,
+                "exit_status": exit_status,
+            }
+            break
+        successful_runs.append(run_result)
+        results["repetitions"]["completed"] = len(successful_runs)
+        _write_artifacts(calibration_directory, results)
+
+    if successful_runs:
+        threshold = float(
+            configuration["calibration"]["maximum_coefficient_of_variation_percent"]
+        )
+        results["repeated_measurements"] = analyze_calibration(
+            successful_runs, threshold
+        )
+        results["unstable_workloads"] = [
+            summary
+            for summary in results["repeated_measurements"]
+            if summary["unstable"]
+        ]
+    if exit_status == 0:
+        results["status"] = "succeeded"
+    results["completed_at"] = _utc_now()
+    _write_artifacts(calibration_directory, results)
+    print(calibration_directory / "results.json")
+    return exit_status
+
+
 def _resolve_run_directory(output_dir: str | None) -> Path:
     invocation = Path(os.environ.get(_INVOCATION_DIRECTORY_ENV, os.getcwd()))
     if output_dir is not None:
@@ -243,6 +370,17 @@ def _resolve_run_directory(output_dir: str | None) -> Path:
         return requested if requested.is_absolute() else invocation / requested
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return invocation / "artifacts" / "benchmark" / f"{timestamp}-{os.getpid()}"
+
+
+def _resolve_calibration_directory() -> Path:
+    invocation = Path(os.environ.get(_INVOCATION_DIRECTORY_ENV, os.getcwd()))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return (
+        invocation
+        / "artifacts"
+        / "benchmark"
+        / f"{timestamp}-calibration-{os.getpid()}"
+    )
 
 
 def _create_artifact_tree(run_directory: Path) -> None:
@@ -274,6 +412,7 @@ def _initial_results(
     model = final_configuration["models"][0]
     return {
         "schema_version": 1,
+        "command": "run",
         "run_id": run_directory.name,
         "status": "running",
         "failure_stage": "artifact_setup",
@@ -310,6 +449,7 @@ def _initial_results(
         "applied_order": [],
         "warmups": [],
         "trials": [],
+        "analysis": None,
         "validation_failures": [],
     }
 
@@ -322,6 +462,17 @@ def _host_information() -> dict[str, Any]:
         or _command_output(["sysctl", "-n", "machdep.cpu.brand_string"]),
         "macos_version": platform.mac_ver()[0] or "not_macos",
         "power_state": _command_output(["pmset", "-g", "batt"]),
+    }
+
+
+def _host_observation(repetition: int, phase: str) -> dict[str, Any]:
+    return {
+        "repetition": repetition,
+        "phase": phase,
+        "recorded_at": _utc_now(),
+        "thermal_state": _command_output(["pmset", "-g", "therm"]),
+        "power_state": _command_output(["pmset", "-g", "batt"]),
+        "memory_pressure": _command_output(["memory_pressure", "-Q"]),
     }
 
 
@@ -953,7 +1104,7 @@ def _validation_failure(results: dict[str, Any], code: str, message: str) -> Non
 
 def _write_artifacts(run_directory: Path, results: dict[str, Any]) -> None:
     _atomic_write_json(run_directory / "results.json", results)
-    _atomic_write_text(run_directory / "report.md", _render_report(results))
+    _atomic_write_text(run_directory / "report.md", render_report(results))
 
 
 def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
@@ -967,37 +1118,6 @@ def _atomic_write_text(path: Path, text: str) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
-
-
-def _render_report(results: dict[str, Any]) -> str:
-    lines = [
-        "# MLX Air Benchmark Report",
-        "",
-        f"- Run: `{results['run_id']}`",
-        f"- Status: `{results['status']}`",
-        f"- Suite: `{results['configuration']['suite']}`",
-        f"- Focus: `{results['configuration']['focus']}`",
-        f"- Server mode: `{results['server']['mode']}`",
-        f"- Model: `{results['versions']['model']['name']}`",
-        "",
-        "| workload | trial | load mode | streaming | concurrency | requested | succeeded | errors |",
-        "| --- | ---: | --- | --- | ---: | ---: | ---: | ---: |",
-    ]
-    for trial in results["trials"]:
-        lines.append(
-            f"| {trial['workload_name']} | {trial['trial_index']} | {trial['load_mode']} | "
-            f"{trial['streaming']} | {trial['configured_concurrency']} | "
-            f"{trial['request_count']} | {trial['success_count']} | {trial['error_count']} |"
-        )
-    if results["validation_failures"]:
-        lines.extend(["", "## Validation failures", ""])
-        lines.extend(
-            f"- `{failure['code']}`: {failure['message']}"
-            for failure in results["validation_failures"]
-        )
-    if results["error"] is not None:
-        lines.extend(["", "## Error", "", f"`{results['error']['message']}`"])
-    return "\n".join(lines) + "\n"
 
 
 @contextmanager

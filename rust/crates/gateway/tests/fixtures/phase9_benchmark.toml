@@ -1,0 +1,124 @@
+schema_version = 1
+
+[execution]
+server_modes = ["self-launched", "external"]
+load_modes = ["sequential", "burst", "closed-loop"]
+metric_directions = ["lower", "higher"]
+metric_units = ["ms", "tokens/s"]
+
+[sampling]
+seed = 9
+temperature = 0.0
+top_p = 1.0
+request_timeout_seconds = 30
+readiness_timeout_seconds = 30
+
+[calibration]
+maximum_coefficient_of_variation_percent = 0.0
+
+[prompt_bank.measured]
+kind = "short"
+material = "measured"
+count = 4
+target_tokens = 16
+
+[prompt_bank.warmup]
+kind = "short"
+material = "warmup"
+count = 1
+target_tokens = 16
+
+[cache_states.cold]
+mode = "cold"
+unit = "tokens"
+value = 0
+
+[warmup_groups.compile]
+prompt_group = "warmup"
+concurrency = 1
+output_tokens = 2
+
+[models.primary]
+checkpoint = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+tokenizer = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+revision = "resolve-at-run"
+
+[runtime_configurations.delayed]
+backend = "v1"
+environment = { MLX_RUNTIME_TEST_GATEWAY_DELAY_MS = "15", MLX_RUNTIME_TEST_PREFILL_DELAY_MS = "25", MLX_RUNTIME_TEST_DECODE_DELAY_MS = "35" }
+
+[workloads.gateway_latency]
+prompt_group = "measured"
+output_tokens = 2
+streaming = false
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "end_to_end_latency"
+metric_direction = "lower"
+metric_unit = "ms"
+secondary_metrics = ["aggregate_output_tokens_per_second"]
+runtime_configurations = ["delayed"]
+trials = 1
+requests_per_trial = 2
+
+[workloads.prefill_ttft]
+prompt_group = "measured"
+output_tokens = 2
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "ttft"
+metric_direction = "lower"
+metric_unit = "ms"
+secondary_metrics = ["end_to_end_latency", "tpot", "aggregate_output_tokens_per_second"]
+runtime_configurations = ["delayed"]
+trials = 1
+requests_per_trial = 2
+
+[workloads.decode_tpot]
+prompt_group = "measured"
+output_tokens = 2
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "tpot"
+metric_direction = "lower"
+metric_unit = "ms"
+secondary_metrics = ["ttft", "end_to_end_latency", "aggregate_output_tokens_per_second"]
+runtime_configurations = ["delayed"]
+trials = 1
+requests_per_trial = 2
+
+[focuses.all]
+models = ["primary"]
+workloads = ["gateway_latency", "prefill_ttft", "decode_tpot"]
+
+[configuration_orders.primary]
+model = "primary"
+runtime_configurations = ["delayed"]
+
+[tail_sets.phase9]
+workloads = ["prefill_ttft"]
+
+[diagnostics.gateway]
+models = ["primary"]
+workloads = ["gateway_latency"]
+
+[suites.phase9]
+models = ["primary"]
+workloads = ["gateway_latency", "prefill_ttft", "decode_tpot"]
+runtime_configurations = ["delayed"]
+warmup_groups = ["compile"]
+configuration_orders = ["primary"]
+focuses = ["all"]
+focus_required = false
+trials = 2
+max_model_starts = 1
+tail_set = "phase9"
+diagnostic_families = ["gateway"]
+coverage = [
+  { model = "primary", workloads = ["gateway_latency", "prefill_ttft", "decode_tpot"] },
+]

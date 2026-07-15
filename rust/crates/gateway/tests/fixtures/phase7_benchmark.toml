@@ -13,6 +13,9 @@ top_p = 1.0
 request_timeout_seconds = 30
 readiness_timeout_seconds = 30
 
+[calibration]
+maximum_coefficient_of_variation_percent = 5.0
+
 [prompt_bank.measured_short]
 kind = "short"
 material = "measured"
@@ -54,6 +57,7 @@ cache_state = "cold"
 primary_metric = "ttft"
 metric_direction = "lower"
 metric_unit = "ms"
+secondary_metrics = ["end_to_end_latency", "tpot", "aggregate_output_tokens_per_second"]
 runtime_configurations = ["serial"]
 trials = 1
 requests_per_trial = 2
@@ -68,6 +72,7 @@ cache_state = "cold"
 primary_metric = "end_to_end_latency"
 metric_direction = "lower"
 metric_unit = "ms"
+secondary_metrics = ["aggregate_output_tokens_per_second"]
 runtime_configurations = ["serial"]
 trials = 1
 requests_per_trial = 3
@@ -82,6 +87,7 @@ cache_state = "cold"
 primary_metric = "aggregate_output_tokens_per_second"
 metric_direction = "higher"
 metric_unit = "tokens/s"
+secondary_metrics = ["ttft", "end_to_end_latency", "tpot"]
 runtime_configurations = ["serial"]
 trials = 1
 requests_per_trial = 6

@@ -622,7 +622,9 @@ async def _body_chunks(
     elif "content-length" in headers:
         remaining = int(headers["content-length"])
         while remaining:
-            chunk = await reader.readexactly(min(65_536, remaining))
+            chunk = await reader.read(min(65_536, remaining))
+            if not chunk:
+                raise ConnectionError("server closed a fixed-length response")
             remaining -= len(chunk)
             yield chunk
     else:
