@@ -351,10 +351,21 @@ impl RuntimeConfig {
 }
 
 fn strip_comment(line: &str) -> &str {
-    match line.split_once('#') {
-        Some((left, _)) => left,
-        None => line,
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..index],
+            _ => {}
+        }
     }
+    line
 }
 
 fn parse_section(line: &str) -> Option<String> {
@@ -371,7 +382,7 @@ enum Value {
 
 fn parse_value(raw: &str) -> io::Result<Value> {
     if let Some(value) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        return Ok(Value::String(value.to_string()));
+        return Ok(Value::String(parse_basic_string(value)?));
     }
 
     if let Ok(value) = raw.parse::<i64>() {
@@ -390,6 +401,34 @@ fn parse_value(raw: &str) -> io::Result<Value> {
             format!("unsupported value: {other}"),
         )),
     }
+}
+
+fn parse_basic_string(raw: &str) -> io::Result<String> {
+    let mut parsed = String::with_capacity(raw.len());
+    let mut characters = raw.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            parsed.push(character);
+            continue;
+        }
+        let escaped = characters.next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "unterminated string escape")
+        })?;
+        parsed.push(match escaped {
+            '\\' => '\\',
+            '"' => '"',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported string escape: \\{other}"),
+                ));
+            }
+        });
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -492,5 +531,27 @@ mod tests {
         assert!(rendered.contains("model=native-model"));
         assert!(rendered.contains("vlm_model=vlm-model"));
         assert!(rendered.contains("ipc_path=/tmp/native.sock"));
+    }
+
+    #[test]
+    fn load_preserves_hashes_and_escaped_characters_inside_strings() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "mlx-runtime-config-escaped-{}.toml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &temp_path,
+            "[worker]\nmodel = \"model#one\\\"quoted\" # comment\nipc_path = \"/tmp/back\\\\slash.sock\"\n",
+        )
+        .unwrap();
+
+        let config = RuntimeConfig::load(&temp_path).unwrap();
+        fs::remove_file(temp_path).unwrap();
+
+        assert_eq!(config.worker.model, "model#one\"quoted");
+        assert_eq!(config.worker.ipc_path, "/tmp/back\\slash.sock");
     }
 }

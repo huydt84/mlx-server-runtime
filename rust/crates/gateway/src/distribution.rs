@@ -189,13 +189,13 @@ fn require_directory(path: &Path, label: &str) -> Result<(), PathError> {
 }
 
 #[cfg(unix)]
-fn effective_user_id() -> u32 {
+pub(crate) fn effective_user_id() -> u32 {
     // SAFETY: `geteuid` takes no pointers and has no preconditions.
     unsafe { libc::geteuid() }
 }
 
 #[cfg(not(unix))]
-fn effective_user_id() -> u32 {
+pub(crate) fn effective_user_id() -> u32 {
     0
 }
 

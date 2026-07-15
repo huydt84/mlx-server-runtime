@@ -5,6 +5,9 @@ use crate::configuration::{resolve_runtime_config, CliConfigOverrides};
 use crate::distribution::{ApplicationPaths, DistributionPaths};
 use crate::doctor::{run_doctor, DoctorReport, PlatformInfo};
 use crate::environment::{ensure_runtime_environment, select_runtime_environment};
+use crate::instances::{
+    HttpReadinessProbe, InstanceError, InstanceErrorKind, InstanceManager, StartResult,
+};
 use crate::{BackendKind, GatewayError};
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -223,9 +226,12 @@ fn dispatch(cli: Cli, runtime: &dyn RuntimeOperations) -> CliOutput {
             ExitCode::NormalTermination,
             format!("mlx-air {}\n", env!("CARGO_PKG_VERSION")),
         ),
-        Some(Command::Serve(args)) if args.detach => {
-            stub_output("serve --detach", ExitCode::LaunchdFailure)
-        }
+        Some(Command::Serve(args)) if args.detach => match runtime.serve_detached(&args) {
+            Ok(result) => CliOutput::stdout(ExitCode::NormalTermination, result.render()),
+            Err(failure) => {
+                CliOutput::stderr(failure.code, format!("error: {}\n", failure.message))
+            }
+        },
         Some(Command::Serve(args)) => match runtime.serve(&args) {
             Ok(()) => CliOutput::stdout(ExitCode::NormalTermination, String::new()),
             Err(failure) => {
@@ -239,15 +245,24 @@ fn dispatch(cli: Cli, runtime: &dyn RuntimeOperations) -> CliOutput {
                 format!("error: {message}\n"),
             ),
         },
-        Some(Command::Ps) => stub_output("ps", ExitCode::LaunchdFailure),
-        Some(Command::Attach { name }) => {
-            let _ = name;
-            stub_output("attach", ExitCode::LaunchdFailure)
-        }
-        Some(Command::Stop { name }) => {
-            let _ = name;
-            stub_output("stop", ExitCode::LaunchdFailure)
-        }
+        Some(Command::Ps) => match runtime.ps() {
+            Ok(output) => CliOutput::stdout(ExitCode::NormalTermination, output),
+            Err(failure) => {
+                CliOutput::stderr(failure.code, format!("error: {}\n", failure.message))
+            }
+        },
+        Some(Command::Attach { name }) => match runtime.attach(&name) {
+            Ok(()) => CliOutput::stdout(ExitCode::NormalTermination, String::new()),
+            Err(failure) => {
+                CliOutput::stderr(failure.code, format!("error: {}\n", failure.message))
+            }
+        },
+        Some(Command::Stop { name }) => match runtime.stop(&name) {
+            Ok(output) => CliOutput::stdout(ExitCode::NormalTermination, output),
+            Err(failure) => {
+                CliOutput::stderr(failure.code, format!("error: {}\n", failure.message))
+            }
+        },
         Some(Command::Bench {
             command: Some(command),
         }) => {
@@ -272,6 +287,10 @@ fn dispatch(cli: Cli, runtime: &dyn RuntimeOperations) -> CliOutput {
 
 trait RuntimeOperations {
     fn serve(&self, args: &ServeArgs) -> Result<(), RuntimeFailure>;
+    fn serve_detached(&self, args: &ServeArgs) -> Result<StartResult, RuntimeFailure>;
+    fn ps(&self) -> Result<String, RuntimeFailure>;
+    fn attach(&self, name: &str) -> Result<(), RuntimeFailure>;
+    fn stop(&self, name: &str) -> Result<String, RuntimeFailure>;
     fn doctor(&self) -> Result<DoctorReport, String>;
 }
 
@@ -300,47 +319,91 @@ impl RuntimeFailure {
             message: error.to_string(),
         }
     }
+
+    fn instance(error: InstanceError) -> Self {
+        let code = match error.kind() {
+            InstanceErrorKind::Conflict => ExitCode::InstanceNameOrPortConflict,
+            InstanceErrorKind::Launchd => ExitCode::LaunchdFailure,
+            InstanceErrorKind::Serving => ExitCode::ServingStartupOrReadinessFailure,
+        };
+        Self {
+            code,
+            message: error.to_string(),
+        }
+    }
+
+    fn launchd(message: impl Into<String>) -> Self {
+        Self {
+            code: ExitCode::LaunchdFailure,
+            message: message.into(),
+        }
+    }
 }
 
 struct ProductionRuntime;
 
 impl RuntimeOperations for ProductionRuntime {
     fn serve(&self, args: &ServeArgs) -> Result<(), RuntimeFailure> {
-        let distribution = DistributionPaths::from_current_executable()
-            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        let application = ApplicationPaths::from_environment()
-            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        let selected = select_runtime_environment(&distribution, &application)
-            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        let environment_config = std::env::var_os("MLX_RUNTIME_CONFIG").map(PathBuf::from);
-        let overrides = CliConfigOverrides {
-            model: args.model.clone(),
-            backend: args.backend.map(Into::into),
-            port: args.port,
-        };
-        let mut config = resolve_runtime_config(
-            &distribution.default_config,
-            environment_config.as_deref(),
-            args.config.as_deref(),
-            &overrides,
-            &selected.python,
-        )
-        .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        if config.server.host != "127.0.0.1" {
-            return Err(RuntimeFailure::serving(GatewayError::WorkerStartup(
-                format!(
-                    "mlx-air serves only on 127.0.0.1; configured host is {}",
-                    config.server.host
-                ),
-            )));
-        }
-        ensure_runtime_environment(&distribution, &application, &ProcessCommandRunner)
-            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+        let (_distribution, application, mut config) = resolve_serve_context(args)?;
         let socket_path = application
             .create_foreground_socket_path()
             .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
         config.worker.ipc_path = socket_path.to_string_lossy().into_owned();
         crate::run(config).map_err(RuntimeFailure::serving)
+    }
+
+    fn serve_detached(&self, args: &ServeArgs) -> Result<StartResult, RuntimeFailure> {
+        let name = args.name.as_deref().ok_or_else(|| {
+            RuntimeFailure::instance(InstanceError::new(
+                InstanceErrorKind::Conflict,
+                "--detach requires --name",
+            ))
+        })?;
+        if args.port.is_none() {
+            return Err(RuntimeFailure::instance(InstanceError::new(
+                InstanceErrorKind::Conflict,
+                "--detach requires an explicit --port",
+            )));
+        }
+        let (distribution, application, config) = resolve_serve_context(args)?;
+        let readiness = HttpReadinessProbe;
+        InstanceManager::new(&application, &ProcessCommandRunner, &readiness)
+            .start(name, &config, &distribution.gateway_executable)
+            .map_err(RuntimeFailure::instance)
+    }
+
+    fn ps(&self) -> Result<String, RuntimeFailure> {
+        let application = ApplicationPaths::from_environment()
+            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+        let readiness = HttpReadinessProbe;
+        InstanceManager::new(&application, &ProcessCommandRunner, &readiness)
+            .list()
+            .map_err(RuntimeFailure::instance)
+    }
+
+    fn attach(&self, name: &str) -> Result<(), RuntimeFailure> {
+        let application = ApplicationPaths::from_environment()
+            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+        let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal_id =
+            signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone()).map_err(
+                |err| RuntimeFailure::launchd(format!("register attach interrupt: {err}")),
+            )?;
+        let readiness = HttpReadinessProbe;
+        let result = InstanceManager::new(&application, &ProcessCommandRunner, &readiness)
+            .attach(name, &interrupted)
+            .map_err(RuntimeFailure::instance);
+        signal_hook::low_level::unregister(signal_id);
+        result
+    }
+
+    fn stop(&self, name: &str) -> Result<String, RuntimeFailure> {
+        let application = ApplicationPaths::from_environment()
+            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+        let readiness = HttpReadinessProbe;
+        InstanceManager::new(&application, &ProcessCommandRunner, &readiness)
+            .stop(name)
+            .map_err(RuntimeFailure::instance)
     }
 
     fn doctor(&self) -> Result<DoctorReport, String> {
@@ -366,6 +429,42 @@ impl RuntimeOperations for ProductionRuntime {
             PlatformInfo::current(),
         ))
     }
+}
+
+fn resolve_serve_context(
+    args: &ServeArgs,
+) -> Result<(DistributionPaths, ApplicationPaths, crate::RuntimeConfig), RuntimeFailure> {
+    let distribution = DistributionPaths::from_current_executable()
+        .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    let application = ApplicationPaths::from_environment()
+        .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    let selected = select_runtime_environment(&distribution, &application)
+        .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    let environment_config = std::env::var_os("MLX_RUNTIME_CONFIG").map(PathBuf::from);
+    let overrides = CliConfigOverrides {
+        model: args.model.clone(),
+        backend: args.backend.map(Into::into),
+        port: args.port,
+    };
+    let config = resolve_runtime_config(
+        &distribution.default_config,
+        environment_config.as_deref(),
+        args.config.as_deref(),
+        &overrides,
+        &selected.python,
+    )
+    .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    if config.server.host != "127.0.0.1" {
+        return Err(RuntimeFailure::serving(GatewayError::WorkerStartup(
+            format!(
+                "mlx-air serves only on 127.0.0.1; configured host is {}",
+                config.server.host
+            ),
+        )));
+    }
+    ensure_runtime_environment(&distribution, &application, &ProcessCommandRunner)
+        .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    Ok((distribution, application, config))
 }
 
 fn doctor_output(report: &DoctorReport) -> CliOutput {
@@ -432,6 +531,30 @@ mod tests {
         fn serve(&self, _args: &ServeArgs) -> Result<(), RuntimeFailure> {
             self.calls.set(self.calls.get() + 1);
             Ok(())
+        }
+
+        fn serve_detached(&self, _args: &ServeArgs) -> Result<StartResult, RuntimeFailure> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(StartResult {
+                name: "test".to_string(),
+                url: "http://127.0.0.1:9000".to_string(),
+                pid: 42,
+            })
+        }
+
+        fn ps(&self) -> Result<String, RuntimeFailure> {
+            self.calls.set(self.calls.get() + 1);
+            Ok("NAME PID MODEL URL LAUNCHD READY STALE\n".to_string())
+        }
+
+        fn attach(&self, _name: &str) -> Result<(), RuntimeFailure> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(())
+        }
+
+        fn stop(&self, name: &str) -> Result<String, RuntimeFailure> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(format!("Stopped {name}\n"))
         }
 
         fn doctor(&self) -> Result<DoctorReport, String> {
@@ -625,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_serve_remains_an_explicit_stub() {
+    fn detached_serve_prints_managed_instance_details() {
         let result = output(&[
             "mlx-air",
             "serve",
@@ -638,11 +761,25 @@ mod tests {
             "9000",
         ]);
 
-        assert_eq!(result.code, ExitCode::LaunchdFailure);
+        assert_eq!(result.code, ExitCode::NormalTermination);
         assert_eq!(
-            result.stderr,
-            "error: 'mlx-air serve --detach' is not implemented yet\n"
+            result.stdout,
+            "Started test at http://127.0.0.1:9000 (PID 42)\n"
         );
+    }
+
+    #[test]
+    fn managed_lifecycle_commands_dispatch_to_runtime() {
+        let runtime = FakeRuntime::new();
+
+        let ps = execute(["mlx-air", "ps"], &runtime);
+        let attach = execute(["mlx-air", "attach", "test"], &runtime);
+        let stop = execute(["mlx-air", "stop", "test"], &runtime);
+
+        assert_eq!(ps.code, ExitCode::NormalTermination);
+        assert_eq!(attach.code, ExitCode::NormalTermination);
+        assert_eq!(stop.stdout, "Stopped test\n");
+        assert_eq!(runtime.calls.get(), 3);
     }
 
     #[test]

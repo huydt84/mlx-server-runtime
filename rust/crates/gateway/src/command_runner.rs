@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -91,68 +92,103 @@ impl std::error::Error for CommandError {}
 
 pub(crate) trait CommandRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandResult, CommandError>;
+
+    fn run_interruptible(
+        &self,
+        spec: &CommandSpec,
+        interrupted: &AtomicBool,
+    ) -> Result<CommandResult, CommandError> {
+        if interrupted.load(Ordering::Relaxed) {
+            return Ok(CommandResult {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+        self.run(spec)
+    }
 }
 
 pub(crate) struct ProcessCommandRunner;
 
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandResult, CommandError> {
-        let mut command = Command::new(&spec.program);
-        command.args(&spec.args).envs(&spec.env);
-        if let Some(current_dir) = &spec.current_dir {
-            command.current_dir(current_dir);
-        }
-
-        match spec.output_mode {
-            OutputMode::Capture => {
-                command.stdout(Stdio::piped()).stderr(Stdio::piped());
-            }
-            OutputMode::Inherit => {
-                command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-            }
-        }
-
-        let mut child = command.spawn().map_err(|err| {
-            CommandError::new(format!(
-                "failed to start {}: {err}",
-                spec.program.to_string_lossy()
-            ))
-        })?;
-
-        let stdout_reader = child.stdout.take().map(read_pipe);
-        let stderr_reader = child.stderr.take().map(read_pipe);
-        let deadline = Instant::now() + spec.timeout;
-
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(CommandError::new(format!(
-                        "{} timed out after {} seconds",
-                        spec.program.to_string_lossy(),
-                        spec.timeout.as_secs()
-                    )));
-                }
-                Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(CommandError::new(format!(
-                        "failed while waiting for {}: {err}",
-                        spec.program.to_string_lossy()
-                    )));
-                }
-            }
-        };
-
-        Ok(CommandResult {
-            success: status.success(),
-            stdout: join_pipe(stdout_reader, "stdout")?,
-            stderr: join_pipe(stderr_reader, "stderr")?,
-        })
+        run_process(spec, None)
     }
+
+    fn run_interruptible(
+        &self,
+        spec: &CommandSpec,
+        interrupted: &AtomicBool,
+    ) -> Result<CommandResult, CommandError> {
+        run_process(spec, Some(interrupted))
+    }
+}
+
+fn run_process(
+    spec: &CommandSpec,
+    interrupted: Option<&AtomicBool>,
+) -> Result<CommandResult, CommandError> {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args).envs(&spec.env);
+    if let Some(current_dir) = &spec.current_dir {
+        command.current_dir(current_dir);
+    }
+
+    match spec.output_mode {
+        OutputMode::Capture => {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        OutputMode::Inherit => {
+            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        }
+    }
+
+    let mut child = command.spawn().map_err(|err| {
+        CommandError::new(format!(
+            "failed to start {}: {err}",
+            spec.program.to_string_lossy()
+        ))
+    })?;
+
+    let stdout_reader = child.stdout.take().map(read_pipe);
+    let stderr_reader = child.stderr.take().map(read_pipe);
+    let deadline = Instant::now() + spec.timeout;
+
+    let success = loop {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break true;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandError::new(format!(
+                    "{} timed out after {} seconds",
+                    spec.program.to_string_lossy(),
+                    spec.timeout.as_secs()
+                )));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandError::new(format!(
+                    "failed while waiting for {}: {err}",
+                    spec.program.to_string_lossy()
+                )));
+            }
+        }
+    };
+
+    Ok(CommandResult {
+        success,
+        stdout: join_pipe(stdout_reader, "stdout")?,
+        stderr: join_pipe(stderr_reader, "stderr")?,
+    })
 }
 
 fn read_pipe<R>(mut pipe: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
@@ -190,4 +226,34 @@ pub(crate) fn display_command(spec: &CommandSpec) -> String {
 
 pub(crate) fn path_arg(path: &Path) -> OsString {
     path.as_os_str().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn interruptible_command_stops_a_running_child() {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let trigger = interrupted.clone();
+        let trigger_thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            trigger.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+
+        let result = ProcessCommandRunner
+            .run_interruptible(
+                &CommandSpec::new("/bin/sleep")
+                    .args(["60"])
+                    .timeout(Duration::from_secs(2)),
+                &interrupted,
+            )
+            .unwrap();
+        trigger_thread.join().unwrap();
+
+        assert!(result.success);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

@@ -10,6 +10,7 @@ mod environment;
 mod errors;
 mod foreground;
 mod http;
+mod instances;
 mod ipc;
 mod openai;
 mod supervisor;
