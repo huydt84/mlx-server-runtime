@@ -278,21 +278,27 @@ cost visible but changes execution timing and synchronization. Keep it off in
 fair latency or throughput benchmarks, and confirm suspected bottlenecks with
 whole-pipeline or Metal evidence before optimizing.
 
-After every inference optimization, run the native-v2 ultimate benchmark from
-independent before and after source snapshots and compare their `results.json`
-artifacts:
+## Evaluate Performance
+
+For performance work, first select the evidence scope from
+[`benchmarks/POLICY.md`](benchmarks/POLICY.md). The policy defines which suite,
+focus, model roles, workloads, sampling, execution order, and primary metrics
+support the intended conclusion.
+
+After `mlx-air bench` is implemented, run the selected benchmark against the
+staged or installed distribution:
 
 ```bash
-bash scripts/benchmark-v2.sh run
-bash scripts/benchmark-v2.sh compare \
-  --baseline /path/to/before/results.json \
-  --candidate /path/to/after/results.json
+mlx-air bench run --suite optimization --focus scheduler
 ```
 
-An optimization claim requires the four-model matrix, equivalent manifests,
-output/token parity, and an explicit regression verdict. A smoke preset,
-profiled wall-clock timing, or two scripts run against the same changed source
-tree is not equivalent evidence.
+The command measures one runtime and stores the selected benchmark
+configuration with its measurements.
+For a two-version evaluation, prepare each distribution independently, run the
+same suite, focus, and configuration values against both, and apply the
+repository performance-comparison workflow to their results. Require matching
+workload inputs and output/token parity. State the exact suite, focus, models,
+and workloads covered by the verdict.
 
 If a new architecture produces missing categories, add a tiny synthetic model
 test in `python/tests/test_native_mlx.py` before changing the generic path

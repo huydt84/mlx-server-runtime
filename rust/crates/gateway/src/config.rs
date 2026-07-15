@@ -169,7 +169,22 @@ impl RuntimeConfig {
             Err(err) => return Err(err),
         };
 
-        let mut config = Self::default();
+        Self::apply_contents(Self::default(), &contents)
+    }
+
+    /// Loads a required runtime config, returning an error when it is missing.
+    pub fn load_required(path: impl AsRef<Path>) -> io::Result<Self> {
+        let contents = fs::read_to_string(path)?;
+        Self::apply_contents(Self::default(), &contents)
+    }
+
+    /// Applies values from a required config file over this configuration.
+    pub fn overlay(path: impl AsRef<Path>, base: Self) -> io::Result<Self> {
+        let contents = fs::read_to_string(path)?;
+        Self::apply_contents(base, &contents)
+    }
+
+    fn apply_contents(mut config: Self, contents: &str) -> io::Result<Self> {
         let mut section = String::new();
 
         for raw_line in contents.lines() {

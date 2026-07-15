@@ -227,37 +227,96 @@ impl RequestAdmission {
     }
 }
 
-/// Serves the Phase 1 HTTP surface.
-pub fn serve(config: RuntimeConfig, runtime: RuntimeState) -> Result<(), GatewayError> {
-    let listener = TcpListener::bind(format!("{}:{}", config.server.host, config.server.port))?;
-    let admission = Arc::new(RequestAdmission::new(
-        config.limits.max_pending_requests,
-        config.limits.max_active_requests,
-        Duration::from_secs(config.limits.request_timeout_seconds),
-    ));
+/// Bound HTTP server with cooperative acceptance shutdown and bounded draining.
+pub struct HttpServer {
+    listener: TcpListener,
+    config: RuntimeConfig,
+    runtime: RuntimeState,
+    admission: Arc<RequestAdmission>,
+}
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let state = AppState {
-                    runtime: runtime.clone(),
-                    generation: config.generation.clone(),
-                    limits: config.limits.clone(),
-                    telemetry: config.telemetry.clone(),
-                    admission: admission.clone(),
-                    model: config.worker.model.clone(),
-                    vlm_model: config.worker.vlm_model.clone(),
-                    test_backend: None,
-                };
-                thread::spawn(move || {
-                    let _ = handle_connection(stream, state);
-                });
-            }
-            Err(err) => return Err(GatewayError::Io(err)),
-        }
+impl HttpServer {
+    /// Binds the configured address without accepting traffic yet.
+    pub fn bind(config: RuntimeConfig, runtime: RuntimeState) -> Result<Self, GatewayError> {
+        let listener = TcpListener::bind(format!("{}:{}", config.server.host, config.server.port))?;
+        listener.set_nonblocking(true)?;
+        let admission = Arc::new(RequestAdmission::new(
+            config.limits.max_pending_requests,
+            config.limits.max_active_requests,
+            Duration::from_secs(config.limits.request_timeout_seconds),
+        ));
+        Ok(Self {
+            listener,
+            config,
+            runtime,
+            admission,
+        })
     }
 
-    Ok(())
+    /// Accepts requests until shutdown, then gives active connections time to finish.
+    pub fn serve_until(
+        &self,
+        shutdown: &AtomicBool,
+        drain_timeout: Duration,
+    ) -> Result<(), GatewayError> {
+        let mut connections = Vec::new();
+        while !shutdown.load(Ordering::Relaxed) {
+            match self.listener.accept() {
+                Ok((stream, _address)) => {
+                    let state = AppState {
+                        runtime: self.runtime.clone(),
+                        generation: self.config.generation.clone(),
+                        limits: self.config.limits.clone(),
+                        telemetry: self.config.telemetry.clone(),
+                        admission: self.admission.clone(),
+                        model: self.config.worker.model.clone(),
+                        vlm_model: self.config.worker.vlm_model.clone(),
+                        test_backend: None,
+                    };
+                    connections.push(thread::spawn(move || {
+                        let _ = handle_connection(stream, state);
+                    }));
+                    reap_finished_connections(&mut connections);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    reap_finished_connections(&mut connections);
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(GatewayError::Io(err)),
+            }
+        }
+
+        drain_connections(&mut connections, drain_timeout);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn local_addr(&self) -> std::net::SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
+}
+
+fn reap_finished_connections(connections: &mut Vec<thread::JoinHandle<()>>) {
+    let mut pending = Vec::with_capacity(connections.len());
+    for connection in connections.drain(..) {
+        if connection.is_finished() {
+            let _ = connection.join();
+        } else {
+            pending.push(connection);
+        }
+    }
+    *connections = pending;
+}
+
+fn drain_connections(connections: &mut Vec<thread::JoinHandle<()>>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !connections.is_empty() && Instant::now() < deadline {
+        reap_finished_connections(connections);
+        if !connections.is_empty() {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    reap_finished_connections(connections);
 }
 
 fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), GatewayError> {
@@ -1561,6 +1620,8 @@ mod tests {
         ModelState, ModelStatus,
     };
     use std::io::Cursor;
+    use std::net::TcpStream;
+    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
 
     #[test]
@@ -3864,5 +3925,53 @@ mod tests {
         assert_eq!(vlm_status.state, ModelState::Ready);
         assert!(vlm_status.ready);
         assert_eq!(vlm_status.last_warmup_latency_ms, Some(6));
+    }
+
+    #[test]
+    fn bound_port_cannot_be_reused_by_second_server() {
+        let mut config = RuntimeConfig::default();
+        config.server.port = 0;
+        let first = HttpServer::bind(config.clone(), RuntimeState::new("model")).unwrap();
+        config.server.port = first.local_addr().port();
+
+        let error = match HttpServer::bind(config, RuntimeState::new("model")) {
+            Ok(_) => panic!("second server unexpectedly reused active port"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            match error {
+                GatewayError::Io(error) => Some(error.kind()),
+                _ => None,
+            },
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+    }
+
+    #[test]
+    fn shutdown_during_active_request_is_bounded() {
+        let mut config = RuntimeConfig::default();
+        config.server.port = 0;
+        let server = HttpServer::bind(config, RuntimeState::new("model")).unwrap();
+        let address = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server_thread = thread::spawn(move || {
+            server
+                .serve_until(&server_shutdown, Duration::from_millis(100))
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 100\r\n\r\n{")
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        shutdown.store(true, Ordering::Relaxed);
+        server_thread.join().unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(client);
     }
 }

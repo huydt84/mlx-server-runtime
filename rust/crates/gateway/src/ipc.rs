@@ -27,7 +27,9 @@ pub struct WorkerClient {
 impl WorkerClient {
     /// Creates client from established worker connection.
     pub fn new(stream: UnixStream, metrics: Arc<MetricsRegistry>) -> Result<Self, GatewayError> {
+        stream.set_read_timeout(None)?;
         let reader_stream = stream.try_clone()?;
+        reader_stream.set_read_timeout(None)?;
         let inflight = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
         Self::spawn_reader(
@@ -68,6 +70,11 @@ impl WorkerClient {
         self.send_command(GatewayCommand::CancelRequest {
             request_id: request_id.to_string(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 
     fn execute_chat(

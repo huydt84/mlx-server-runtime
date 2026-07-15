@@ -4,12 +4,14 @@ use crate::ipc::WorkerClient;
 use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
     decode_worker_message, ChatCompletionRequest, ChatMessage, MessageContent, MessageRole,
-    ModelError, ModelState, ModelStatus, WorkerError, WorkerMessage, WorkerReady,
+    ModelError, ModelState, ModelStatus, WorkerMessage, WorkerReady,
 };
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -87,6 +89,9 @@ impl RuntimeState {
                 "model_state_transition model={} from={:?} to={:?}",
                 status.model, previous_state, new_state
             );
+        }
+        if let Some(progress) = model_progress_log(&status) {
+            eprintln!("{progress}");
         }
         self.metrics.set_worker_up(status.ready);
         *guard = status;
@@ -236,108 +241,246 @@ impl RuntimeState {
     }
 }
 
-/// Background worker supervision for the current runtime slice.
-pub struct Supervisor;
+fn model_progress_log(status: &ModelStatus) -> Option<String> {
+    let progress = status.progress.as_ref()?;
+    Some(format!(
+        "model_load_progress model={} phase={} downloaded_bytes={} total_bytes={} loaded_tensors={} total_tensors={}",
+        status.model,
+        progress.current_phase.as_deref().unwrap_or("unknown"),
+        progress
+            .downloaded_bytes
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        progress
+            .total_bytes
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        progress
+            .loaded_tensors
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        progress
+            .total_tensors
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+    ))
+}
+
+pub(crate) trait WorkerLauncher: Send + Sync {
+    fn spawn(&self, config: &RuntimeConfig) -> Result<Child, GatewayError>;
+}
+
+struct ProcessWorkerLauncher;
+
+impl WorkerLauncher for ProcessWorkerLauncher {
+    fn spawn(&self, config: &RuntimeConfig) -> Result<Child, GatewayError> {
+        spawn_worker(config)
+    }
+}
+
+/// Owns worker bootstrap, monitoring, termination, and socket cleanup.
+pub struct Supervisor {
+    runtime: RuntimeState,
+    shutdown: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    worker_thread: Option<thread::JoinHandle<()>>,
+    socket_path: PathBuf,
+}
 
 impl Supervisor {
-    /// Starts the worker bootstrap flow on a background thread.
-    pub fn start(config: RuntimeConfig) -> Result<RuntimeState, GatewayError> {
-        let runtime = RuntimeState::new(config.worker.model.clone());
+    /// Starts the worker bootstrap flow while retaining lifecycle ownership.
+    pub fn start(config: RuntimeConfig, shutdown: Arc<AtomicBool>) -> Result<Self, GatewayError> {
+        Self::start_with(
+            config,
+            shutdown,
+            Duration::from_secs(1_800),
+            Arc::new(ProcessWorkerLauncher),
+        )
+    }
 
-        // Initialize VLM model lifecycle if configured.
+    pub(crate) fn start_with(
+        config: RuntimeConfig,
+        shutdown: Arc<AtomicBool>,
+        startup_timeout: Duration,
+        launcher: Arc<dyn WorkerLauncher>,
+    ) -> Result<Self, GatewayError> {
+        let runtime = RuntimeState::new(config.worker.model.clone());
         if let Some(ref vlm) = config.worker.vlm_model {
             runtime.set_vlm_model(vlm.clone());
         }
 
-        let bootstrap_runtime = runtime.clone();
-
-        thread::spawn(move || {
-            if let Err(err) = bootstrap_worker(&config, bootstrap_runtime.clone()) {
-                eprintln!("worker bootstrap failed: {err}");
-                if let Ok(mut guard) = bootstrap_runtime.worker_client.lock() {
+        let socket_path = PathBuf::from(&config.worker.ipc_path);
+        let listener = UnixListener::bind(&socket_path)?;
+        listener.set_nonblocking(true)?;
+        let child = match launcher.spawn(&config) {
+            Ok(child) => Arc::new(Mutex::new(Some(child))),
+            Err(err) => {
+                let _ = fs::remove_file(&socket_path);
+                return Err(err);
+            }
+        };
+        let worker_child = child.clone();
+        let worker_runtime = runtime.clone();
+        let worker_shutdown = shutdown.clone();
+        let worker_socket = socket_path.clone();
+        let worker_thread = thread::spawn(move || {
+            if let Err(err) = bootstrap_worker(
+                listener,
+                &config,
+                worker_runtime.clone(),
+                &worker_child,
+                &worker_shutdown,
+                startup_timeout,
+            ) {
+                let interrupted = worker_shutdown.load(Ordering::Relaxed);
+                if !interrupted {
+                    eprintln!("worker bootstrap failed: {err}");
+                }
+                if let Ok(mut guard) = worker_runtime.worker_client.lock() {
                     *guard = None;
                 }
-                let _ = bootstrap_runtime.mark_failed("WORKER_BOOTSTRAP_FAILED", err.to_string());
+                let already_failed = worker_runtime
+                    .snapshot()
+                    .is_ok_and(|status| status.state == ModelState::Failed);
+                if !interrupted && !already_failed {
+                    let _ = worker_runtime.mark_failed("WORKER_BOOTSTRAP_FAILED", err.to_string());
+                }
+                let _ = terminate_worker(&worker_child, Duration::from_secs(1));
+                let _ = fs::remove_file(&worker_socket);
+                return;
             }
+
+            monitor_worker(worker_child, worker_runtime, worker_shutdown);
         });
 
-        Ok(runtime)
+        Ok(Self {
+            runtime,
+            shutdown,
+            child,
+            worker_thread: Some(worker_thread),
+            socket_path,
+        })
+    }
+
+    /// Returns a shared runtime snapshot for the HTTP layer.
+    pub fn runtime(&self) -> RuntimeState {
+        self.runtime.clone()
+    }
+
+    /// Waits until the worker handshake succeeds, fails, or is interrupted.
+    pub fn wait_until_ready(&self) -> Result<bool, GatewayError> {
+        loop {
+            let status = self.runtime.snapshot()?;
+            if status.ready {
+                return Ok(true);
+            }
+            if status.state == ModelState::Failed {
+                let message = status.last_error.map_or_else(
+                    || "worker startup failed".to_string(),
+                    |error| error.message,
+                );
+                return Err(GatewayError::WorkerStartup(message));
+            }
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Gracefully terminates and reaps the worker, then removes its socket.
+    pub fn shutdown(&mut self, timeout: Duration) -> Result<(), GatewayError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Ok(mut guard) = self.runtime.worker_client.lock() {
+            *guard = None;
+        }
+        terminate_worker(&self.child, timeout)?;
+        if let Some(handle) = self.worker_thread.take() {
+            handle
+                .join()
+                .map_err(|_| GatewayError::WorkerStartup("worker monitor panicked".to_string()))?;
+        }
+        match fs::remove_file(&self.socket_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(GatewayError::Io(err)),
+        }
+    }
+
+    #[cfg(test)]
+    fn child_id(&self) -> Option<u32> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(Child::id))
     }
 }
 
-fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(), GatewayError> {
-    let socket_path = &config.worker.ipc_path;
-    let _ = fs::remove_file(socket_path);
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        let _ = self.shutdown(Duration::from_secs(1));
+    }
+}
 
-    let listener = UnixListener::bind(socket_path)?;
-    listener.set_nonblocking(true)?;
-    let mut child = spawn_worker(config)?;
-    let deadline = Instant::now() + Duration::from_secs(1800);
+fn bootstrap_worker(
+    listener: UnixListener,
+    config: &RuntimeConfig,
+    runtime: RuntimeState,
+    child: &Arc<Mutex<Option<Child>>>,
+    shutdown: &Arc<AtomicBool>,
+    startup_timeout: Duration,
+) -> Result<(), GatewayError> {
+    let deadline = Instant::now() + startup_timeout;
     let _ = runtime.set_state(ModelState::LoadingWeights);
 
     let connection = loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(GatewayError::WorkerStartup(
+                "worker startup interrupted".to_string(),
+            ));
+        }
         match listener.accept() {
             Ok((stream, _addr)) => break stream,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        return fail_child_message(
-                            &mut child,
-                            format!("worker exited before ready: {status}"),
-                            &runtime,
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(err) => return fail_child_message(&mut child, err.to_string(), &runtime),
-                }
+                ensure_worker_running(child)?;
                 if Instant::now() >= deadline {
-                    return fail_child_message(
-                        &mut child,
+                    return Err(GatewayError::WorkerStartup(
                         "worker did not become ready in time".to_string(),
-                        &runtime,
-                    );
+                    ));
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(err) => return fail_child_message(&mut child, err.to_string(), &runtime),
+            Err(err) => return Err(GatewayError::Io(err)),
         }
     };
 
-    if let Err(err) = connection.set_nonblocking(false) {
-        return fail_child_message(&mut child, err.to_string(), &runtime);
-    }
-
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .unwrap_or_else(|| Duration::from_secs(0));
-
-    let reader_stream = connection.try_clone()?;
-    if let Err(err) = reader_stream.set_read_timeout(Some(remaining)) {
-        return fail_child_message(&mut child, err.to_string(), &runtime);
-    }
-    let mut reader = BufReader::new(reader_stream);
+    connection.set_nonblocking(false)?;
+    connection.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let mut reader = BufReader::new(connection.try_clone()?);
     let mut line = String::new();
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Err(GatewayError::WorkerStartup(
+                "worker startup interrupted".to_string(),
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(GatewayError::WorkerStartup(
+                "worker did not become ready in time".to_string(),
+            ));
+        }
+        ensure_worker_running(child)?;
+        line.clear();
         let bytes = match reader.read_line(&mut line) {
             Ok(bytes) => bytes,
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
-                return fail_child_message(
-                    &mut child,
-                    "worker did not become ready in time".to_string(),
-                    &runtime,
-                );
+                continue;
             }
-            Err(err) => return fail_child_message(&mut child, err.to_string(), &runtime),
+            Err(err) => return Err(GatewayError::Io(err)),
         };
         if bytes == 0 {
-            return fail_child_message(
-                &mut child,
+            return Err(GatewayError::WorkerStartup(
                 "worker closed the bootstrap socket".to_string(),
-                &runtime,
-            );
+            ));
         }
 
         match decode_worker_message(&line) {
@@ -348,6 +491,7 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
                 let _ = runtime.set_status(*status);
             }
             Some(WorkerMessage::Ready(WorkerReady)) => {
+                connection.set_read_timeout(None)?;
                 let client = Arc::new(WorkerClient::new(
                     connection.try_clone()?,
                     runtime.metrics.clone(),
@@ -368,32 +512,118 @@ fn bootstrap_worker(config: &RuntimeConfig, runtime: RuntimeState) -> Result<(),
                 break;
             }
             Some(WorkerMessage::Error(error)) => {
-                return fail_child(&mut child, error, &runtime);
+                let message = error.message.clone();
+                if let Some(model_error) = error.error {
+                    let _ = runtime.mark_failed_with_error(model_error);
+                }
+                return Err(GatewayError::WorkerStartup(message));
             }
             None => {
-                return fail_child_message(
-                    &mut child,
-                    format!("unrecognized bootstrap message: {}", line.trim()),
-                    &runtime,
-                );
+                return Err(GatewayError::WorkerStartup(format!(
+                    "unrecognized bootstrap message: {}",
+                    line.trim()
+                )));
             }
         }
-        line.clear();
     }
 
-    thread::spawn(move || {
-        let wait_result = child.wait();
-        if let Ok(mut guard) = runtime.worker_client.lock() {
-            *guard = None;
-        }
-        let _ = runtime.mark_failed("WORKER_EXITED", "worker process exited");
-        let _ = runtime.mark_vlm_failed("WORKER_EXITED", "worker process exited");
-        if let Ok(status) = wait_result {
-            eprintln!("worker exited: {status}");
-        }
-    });
-
     Ok(())
+}
+
+fn monitor_worker(
+    child: Arc<Mutex<Option<Child>>>,
+    runtime: RuntimeState,
+    shutdown: Arc<AtomicBool>,
+) {
+    while !shutdown.load(Ordering::Relaxed) {
+        let exited = match child.lock() {
+            Ok(mut guard) => match guard.as_mut().map(Child::try_wait) {
+                Some(Ok(Some(status))) => {
+                    eprintln!("worker exited: {status}");
+                    *guard = None;
+                    true
+                }
+                Some(Ok(None)) | None => false,
+                Some(Err(err)) => {
+                    eprintln!("failed to monitor worker: {err}");
+                    true
+                }
+            },
+            Err(_) => true,
+        };
+        if exited {
+            if let Ok(mut guard) = runtime.worker_client.lock() {
+                *guard = None;
+            }
+            let _ = runtime.mark_failed("WORKER_EXITED", "worker process exited");
+            let _ = runtime.mark_vlm_failed("WORKER_EXITED", "worker process exited");
+            shutdown.store(true, Ordering::Relaxed);
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn ensure_worker_running(child: &Arc<Mutex<Option<Child>>>) -> Result<(), GatewayError> {
+    let mut guard = child
+        .lock()
+        .map_err(|_| GatewayError::WorkerStartup("worker process lock poisoned".to_string()))?;
+    let Some(child) = guard.as_mut() else {
+        return Err(GatewayError::WorkerStartup(
+            "worker process is not running".to_string(),
+        ));
+    };
+    match child.try_wait()? {
+        Some(status) => {
+            *guard = None;
+            Err(GatewayError::WorkerStartup(format!(
+                "worker exited before ready: {status}"
+            )))
+        }
+        None => Ok(()),
+    }
+}
+
+fn terminate_worker(
+    child: &Arc<Mutex<Option<Child>>>,
+    timeout: Duration,
+) -> Result<(), GatewayError> {
+    let pid = child
+        .lock()
+        .map_err(|_| GatewayError::WorkerStartup("worker process lock poisoned".to_string()))?
+        .as_ref()
+        .map(Child::id);
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+
+    let pid = i32::try_from(pid)
+        .map_err(|_| GatewayError::WorkerStartup("worker pid is out of range".to_string()))?;
+    // SAFETY: `pid` belongs to the child retained above and SIGTERM is a valid signal.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut guard = child
+            .lock()
+            .map_err(|_| GatewayError::WorkerStartup("worker process lock poisoned".to_string()))?;
+        let Some(process) = guard.as_mut() else {
+            return Ok(());
+        };
+        if process.try_wait()?.is_some() {
+            *guard = None;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            process.kill()?;
+            process.wait()?;
+            *guard = None;
+            return Ok(());
+        }
+        drop(guard);
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn warmup_vlm_model(runtime: RuntimeState, client: Arc<WorkerClient>, vlm_model: String) {
@@ -427,42 +657,6 @@ fn warmup_vlm_model(runtime: RuntimeState, client: Arc<WorkerClient>, vlm_model:
     }
 }
 
-fn terminate_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn fail_child(
-    child: &mut Child,
-    error: WorkerError,
-    runtime: &RuntimeState,
-) -> Result<(), GatewayError> {
-    let message = error.message.clone();
-    terminate_child(child);
-    if let Some(model_error) = error.error {
-        let _ = runtime.mark_failed_with_error(model_error);
-    } else {
-        let _ = runtime.mark_failed("WORKER_BOOTSTRAP_FAILED", message.clone());
-    }
-    let _ = runtime.mark_vlm_failed("WORKER_BOOTSTRAP_FAILED", message.clone());
-    Err(GatewayError::WorkerStartup(message))
-}
-
-fn fail_child_message(
-    child: &mut Child,
-    message: String,
-    runtime: &RuntimeState,
-) -> Result<(), GatewayError> {
-    fail_child(
-        child,
-        WorkerError {
-            message,
-            error: None,
-        },
-        runtime,
-    )
-}
-
 fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
     let mut values = vec![
         ("MLX_RUNTIME_SOCKET", config.worker.ipc_path.clone()),
@@ -479,7 +673,6 @@ fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
             "MLX_RUNTIME_MAX_VLM_IMAGES",
             config.limits.max_vlm_images.to_string(),
         ),
-        ("PYTHONPATH", "python".to_string()),
     ];
     for key in [
         "MLX_RUNTIME_NATIVE_EXECUTION_MODE",
@@ -517,6 +710,54 @@ fn spawn_worker(config: &RuntimeConfig) -> Result<Child, GatewayError> {
 mod tests {
     use super::*;
     use crate::config::BackendKind;
+    use mlx_runtime_protocol::ModelLoadProgress;
+    use std::io::Write as _;
+    use std::os::unix::net::UnixStream;
+
+    struct SleepLauncher;
+
+    impl WorkerLauncher for SleepLauncher {
+        fn spawn(&self, _config: &RuntimeConfig) -> Result<Child, GatewayError> {
+            Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(GatewayError::Io)
+        }
+    }
+
+    fn supervisor_config(_label: &str) -> (PathBuf, RuntimeConfig) {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = PathBuf::from(format!("/tmp/ma-sup-{}-{suffix}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut config = RuntimeConfig::default();
+        config.worker.ipc_path = root.join("worker.sock").to_string_lossy().into_owned();
+        (root, config)
+    }
+
+    fn send_bootstrap_message(
+        socket_path: PathBuf,
+        message: &'static str,
+        shutdown: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut stream = loop {
+                match UnixStream::connect(&socket_path) {
+                    Ok(stream) => break stream,
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            };
+            writeln!(stream, "{message}").unwrap();
+            while !shutdown.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(10));
+            }
+        })
+    }
 
     #[test]
     fn worker_env_defaults_to_v1_backend() {
@@ -540,6 +781,169 @@ mod tests {
         assert!(env.iter().any(|(key, value)| {
             *key == "MLX_RUNTIME_BACKEND" && value == BackendKind::NativeMlx.as_str()
         }));
+    }
+
+    #[test]
+    fn worker_env_does_not_force_repository_pythonpath() {
+        let env = worker_env(&RuntimeConfig::default());
+
+        assert!(!env.iter().any(|(key, _)| *key == "PYTHONPATH"));
+    }
+
+    #[test]
+    fn model_progress_log_reports_available_download_progress() {
+        let mut status = ModelStatus::new("test-model");
+        status.set_progress(Some(ModelLoadProgress {
+            downloaded_bytes: Some(64),
+            total_bytes: Some(128),
+            loaded_tensors: None,
+            total_tensors: None,
+            current_phase: Some("downloading".to_string()),
+        }));
+
+        let rendered = model_progress_log(&status).unwrap();
+
+        assert_eq!(
+            rendered,
+            "model_load_progress model=test-model phase=downloading downloaded_bytes=64 total_bytes=128 loaded_tensors=unknown total_tensors=unknown"
+        );
+    }
+
+    #[test]
+    fn supervisor_reaches_readiness_and_reaps_worker_on_shutdown() {
+        let (root, config) = supervisor_config("supervisor-ready");
+        let socket_path = PathBuf::from(&config.worker.ipc_path);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connector = send_bootstrap_message(socket_path.clone(), "READY", shutdown.clone());
+        let mut supervisor = Supervisor::start_with(
+            config,
+            shutdown.clone(),
+            Duration::from_secs(1),
+            Arc::new(SleepLauncher),
+        )
+        .unwrap();
+
+        assert!(supervisor.wait_until_ready().unwrap());
+        thread::sleep(Duration::from_millis(100));
+        let client = supervisor
+            .runtime()
+            .worker_client
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(!client.is_closed());
+        assert!(supervisor.child_id().is_some());
+        supervisor.shutdown(Duration::from_secs(1)).unwrap();
+        connector.join().unwrap();
+
+        assert!(supervisor.child_id().is_none());
+        assert!(!socket_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supervisor_reports_worker_bootstrap_failure_and_cleans_up() {
+        let (root, config) = supervisor_config("supervisor-failure");
+        let socket_path = PathBuf::from(&config.worker.ipc_path);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let connector =
+            send_bootstrap_message(socket_path.clone(), "ERROR\tfailed", shutdown.clone());
+        let mut supervisor = Supervisor::start_with(
+            config,
+            shutdown.clone(),
+            Duration::from_secs(1),
+            Arc::new(SleepLauncher),
+        )
+        .unwrap();
+
+        let error = supervisor.wait_until_ready().unwrap_err();
+        supervisor.shutdown(Duration::from_secs(1)).unwrap();
+        connector.join().unwrap();
+
+        assert!(error.to_string().contains("failed"));
+        assert!(!socket_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supervisor_times_out_and_reaps_worker() {
+        let (root, config) = supervisor_config("supervisor-timeout");
+        let socket_path = PathBuf::from(&config.worker.ipc_path);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut supervisor = Supervisor::start_with(
+            config,
+            shutdown,
+            Duration::from_millis(100),
+            Arc::new(SleepLauncher),
+        )
+        .unwrap();
+
+        let error = supervisor.wait_until_ready().unwrap_err();
+        supervisor.shutdown(Duration::from_secs(1)).unwrap();
+
+        assert!(error.to_string().contains("did not become ready"));
+        assert!(supervisor.child_id().is_none());
+        assert!(!socket_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_socket_cannot_be_reused_by_second_supervisor() {
+        let (root, config) = supervisor_config("supervisor-socket-conflict");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut first = Supervisor::start_with(
+            config.clone(),
+            shutdown,
+            Duration::from_secs(5),
+            Arc::new(SleepLauncher),
+        )
+        .unwrap();
+
+        let error = match Supervisor::start_with(
+            config,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(1),
+            Arc::new(SleepLauncher),
+        ) {
+            Ok(mut supervisor) => {
+                supervisor.shutdown(Duration::from_secs(1)).unwrap();
+                panic!("second supervisor unexpectedly reused active socket")
+            }
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            match error {
+                GatewayError::Io(error) => Some(error.kind()),
+                _ => None,
+            },
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+        first.shutdown(Duration::from_secs(1)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_during_startup_is_normal_and_cleans_up() {
+        let (root, config) = supervisor_config("supervisor-interrupt");
+        let socket_path = PathBuf::from(&config.worker.ipc_path);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut supervisor = Supervisor::start_with(
+            config,
+            shutdown.clone(),
+            Duration::from_secs(5),
+            Arc::new(SleepLauncher),
+        )
+        .unwrap();
+        shutdown.store(true, Ordering::Relaxed);
+
+        assert!(!supervisor.wait_until_ready().unwrap());
+        supervisor.shutdown(Duration::from_secs(1)).unwrap();
+
+        assert!(supervisor.child_id().is_none());
+        assert!(!socket_path.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
