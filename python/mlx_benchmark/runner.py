@@ -352,8 +352,11 @@ def _execution_plan(
         for order in configuration["configuration_orders"]
         for runtime in order["runtime_configurations"]
     ]
-    if server_mode == "external":
-        return plan[:1]
+    if server_mode == "external" and len(plan) != 1:
+        raise _RunFailure(
+            "configuration_validation",
+            "external server mode requires exactly one declared execution",
+        )
     return plan
 
 
@@ -509,13 +512,21 @@ def _start_server(
     socket_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     socket_suffix = hashlib.sha256(str(run_directory).encode()).hexdigest()[:12]
     ipc_path = socket_directory / f"benchmark-{os.getpid()}-{socket_suffix}.sock"
-    maximum_concurrency = max(int(workload["concurrency"]) for workload in workloads)
+    warmups = configuration["warmup_groups"]
+    maximum_concurrency = max(
+        [int(workload["concurrency"]) for workload in workloads]
+        + [int(warmup["concurrency"]) for warmup in warmups]
+    )
+    prompt_groups = [workload["prompt_group"] for workload in workloads] + [
+        warmup["prompt_group"] for warmup in warmups
+    ]
     maximum_prompt_tokens = max(
-        int(configuration["prompt_bank"][workload["prompt_group"]]["target_tokens"])
-        for workload in workloads
+        int(configuration["prompt_bank"][group]["target_tokens"])
+        for group in prompt_groups
     )
     maximum_output_tokens = max(
-        int(workload["output_tokens"]) for workload in workloads
+        [int(workload["output_tokens"]) for workload in workloads]
+        + [int(warmup["output_tokens"]) for warmup in warmups]
     )
     sampling = configuration["sampling"]
     runtime_config = {

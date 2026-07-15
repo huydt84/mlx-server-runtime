@@ -245,6 +245,12 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
         _bounded_integer(
             path, warmup, "concurrency", f"{field}.concurrency", 1, _MAX_CONCURRENCY
         )
+        if warmup["concurrency"] > prompt_bank[prompt_group]["count"]:
+            _fail(
+                path,
+                f"{field}.concurrency",
+                "must not exceed the referenced warmup prompt count",
+            )
         _bounded_integer(
             path,
             warmup,
@@ -367,9 +373,11 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
     suites = _named_tables(path, raw, "suites")
     for name, suite in suites.items():
         field = f"suites.{name}"
-        _reference_list(path, suite, "models", f"{field}.models", models)
-        _reference_list(path, suite, "workloads", f"{field}.workloads", workloads)
-        _reference_list(
+        suite_models = _reference_list(path, suite, "models", f"{field}.models", models)
+        suite_workloads = _reference_list(
+            path, suite, "workloads", f"{field}.workloads", workloads
+        )
+        suite_runtimes = _reference_list(
             path,
             suite,
             "runtime_configurations",
@@ -384,13 +392,52 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
             warmup_groups,
             allow_empty=True,
         )
-        _reference_list(
+        suite_orders = _reference_list(
             path,
             suite,
             "configuration_orders",
             f"{field}.configuration_orders",
             configuration_orders,
         )
+        ordered_models: set[str] = set()
+        ordered_runtimes: set[str] = set()
+        model_runtimes: dict[str, set[str]] = {}
+        for order_name in suite_orders:
+            order = configuration_orders[order_name]
+            model = order["model"]
+            if model not in suite_models:
+                _fail(
+                    path,
+                    f"{field}.configuration_orders",
+                    f"order {order_name!r} uses model {model!r} outside the suite",
+                )
+            outside_suite = set(order["runtime_configurations"]).difference(
+                suite_runtimes
+            )
+            if outside_suite:
+                _fail(
+                    path,
+                    f"{field}.configuration_orders",
+                    f"order {order_name!r} uses runtime configurations outside the suite: "
+                    f"{sorted(outside_suite)!r}",
+                )
+            ordered_models.add(model)
+            ordered_runtimes.update(order["runtime_configurations"])
+            model_runtimes.setdefault(model, set()).update(
+                order["runtime_configurations"]
+            )
+        if ordered_models != set(suite_models):
+            _fail(
+                path,
+                f"{field}.configuration_orders",
+                "must schedule every suite model",
+            )
+        if ordered_runtimes != set(suite_runtimes):
+            _fail(
+                path,
+                f"{field}.configuration_orders",
+                "must schedule every suite runtime configuration",
+            )
         _reference_list(
             path,
             suite,
@@ -445,9 +492,9 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
                 f"{entry_field}.workloads",
                 workloads,
             )
-            if model not in suite["models"]:
+            if model not in suite_models:
                 _fail(path, f"{entry_field}.model", "is not selected by the suite")
-            outside_suite = set(selected).difference(suite["workloads"])
+            outside_suite = set(selected).difference(suite_workloads)
             if outside_suite:
                 _fail(
                     path,
@@ -456,9 +503,38 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
                 )
             covered_models.add(model)
             covered_workloads.update(selected)
-        if covered_models != set(suite["models"]):
+            unrunnable = [
+                workload
+                for workload in selected
+                if not model_runtimes[model].intersection(
+                    workloads[workload]["runtime_configurations"]
+                )
+            ]
+            if unrunnable:
+                _fail(
+                    path,
+                    f"{entry_field}.workloads",
+                    "has no scheduled runtime configuration for workloads "
+                    f"{sorted(unrunnable)!r}",
+                )
+            unused_runtimes = [
+                runtime
+                for runtime in model_runtimes[model]
+                if not any(
+                    runtime in workloads[workload]["runtime_configurations"]
+                    for workload in selected
+                )
+            ]
+            if unused_runtimes:
+                _fail(
+                    path,
+                    f"{entry_field}.workloads",
+                    "does not assign workloads to scheduled runtime configurations "
+                    f"{unused_runtimes!r}",
+                )
+        if covered_models != set(suite_models):
             _fail(path, f"{field}.coverage", "must cover every suite model")
-        if covered_workloads != set(suite["workloads"]):
+        if covered_workloads != set(suite_workloads):
             _fail(path, f"{field}.coverage", "must cover every suite workload")
 
 
@@ -545,6 +621,29 @@ def _select_configuration(
             selected_coverage.append(
                 {"model": entry["model"], "workloads": workload_names}
             )
+    covered_models = {entry["model"] for entry in selected_coverage}
+    covered_workloads = {
+        workload for entry in selected_coverage for workload in entry["workloads"]
+    }
+    if covered_models != set(selected_models):
+        _fail(path, "--focus", "selected models do not all have workload coverage")
+    if covered_workloads != set(selected_workloads):
+        _fail(path, "--focus", "selected workloads do not all have model coverage")
+
+    selected_orders = [
+        {"name": name, **deepcopy(raw["configuration_orders"][name])}
+        for name in order_names
+    ]
+    if server_mode == "external":
+        execution_count = sum(
+            len(order["runtime_configurations"]) for order in selected_orders
+        )
+        if execution_count != 1:
+            _fail(
+                path,
+                "--server-mode",
+                "external server mode requires exactly one declared execution",
+            )
 
     return {
         "schema_version": raw["schema_version"],
@@ -574,10 +673,7 @@ def _select_configuration(
             {"name": name, **deepcopy(raw["warmup_groups"][name])}
             for name in warmup_names
         ],
-        "configuration_orders": [
-            {"name": name, **deepcopy(raw["configuration_orders"][name])}
-            for name in order_names
-        ],
+        "configuration_orders": selected_orders,
         "tail_selection": {
             "name": tail_name,
             **deepcopy(raw["tail_sets"][tail_name]),

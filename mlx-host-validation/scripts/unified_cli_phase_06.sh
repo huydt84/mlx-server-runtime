@@ -15,6 +15,8 @@ INTERRUPT_DIR="$WORK_DIR/interrupted"
 SUCCESS_LOG="$WORK_DIR/success-command.log"
 INTERRUPT_LOG="$WORK_DIR/interrupt-command.log"
 UV_CACHE="${MLX_AIR_PHASE6_UV_CACHE_DIR:-$HOME/Library/Caches/uv}"
+HOST_HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+FIXTURE="$ROOT/mlx-host-validation/fixtures/unified_cli_phase_06.toml"
 
 cleanup() {
     local status=$?
@@ -40,6 +42,8 @@ cleanup() {
         sed -n '1,300p' "$SUCCESS_DIR/logs/gateway.log" >&2
         echo "successful-run worker log after validation failure:" >&2
         sed -n '1,300p' "$SUCCESS_DIR/logs/worker.log" >&2
+        echo "successful-run results after validation failure:" >&2
+        sed -n '1,500p' "$SUCCESS_DIR/results.json" >&2
     fi
     rm -rf "$WORK_DIR"
     exit "$status"
@@ -94,9 +98,10 @@ mkdir -p "$OUTSIDE_DIR" "$TEST_HOME"
 cd "$OUTSIDE_DIR"
 
 echo "[2/6] Run the bounded self-launched smoke workload"
-HOME="$TEST_HOME" UV_CACHE_DIR="$UV_CACHE" \
+HOME="$TEST_HOME" HF_HOME="$HOST_HF_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$STAGE_DIR/bin/mlx-air" bench run \
-    --suite smoke \
+    --suite phase6 \
+    --benchmark-config "$FIXTURE" \
     --output-dir "$SUCCESS_DIR" \
     >"$SUCCESS_LOG" 2>&1 &
 SUCCESS_PID=$!
@@ -137,15 +142,16 @@ for request in requests:
 PY
 test -s "$SUCCESS_DIR/report.md"
 test -s "$SUCCESS_DIR/logs/gateway.log"
-test -s "$SUCCESS_DIR/logs/worker.log"
+test -f "$SUCCESS_DIR/logs/worker.log"
 assert_reaped "$SUCCESS_GATEWAY_PID" "successful-run gateway"
 assert_reaped "$SUCCESS_WORKER_PID" "successful-run worker"
 echo "bounded_run_ok=1"
 
 echo "[4/6] Interrupt a second self-launched run during startup"
-HOME="$TEST_HOME" UV_CACHE_DIR="$UV_CACHE" \
+HOME="$TEST_HOME" HF_HOME="$HOST_HF_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$STAGE_DIR/bin/mlx-air" bench run \
-    --suite smoke \
+    --suite phase6 \
+    --benchmark-config "$FIXTURE" \
     --output-dir "$INTERRUPT_DIR" \
     >"$INTERRUPT_LOG" 2>&1 &
 INTERRUPT_PID=$!

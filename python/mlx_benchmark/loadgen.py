@@ -39,14 +39,10 @@ class _HttpConnection:
     async def post_json(
         self, path: str, payload: dict[str, Any], streaming: bool
     ) -> tuple[dict[str, Any], bool]:
-        for attempt in range(2):
-            try:
-                return await self._post_json(path, payload, streaming)
-            except (ConnectionError, OSError, asyncio.IncompleteReadError):
-                await self.close()
-                if attempt == 1:
-                    raise
-        raise AssertionError("unreachable")
+        # A transport failure after write/drain is ambiguous: the server may
+        # already have executed the request. Retrying would duplicate measured
+        # inference work and corrupt request, cache, and runtime-counter totals.
+        return await self._post_json(path, payload, streaming)
 
     async def _post_json(
         self, path: str, payload: dict[str, Any], streaming: bool

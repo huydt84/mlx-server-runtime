@@ -143,11 +143,11 @@ revision = "resolve-at-run"
 
 [runtime_configurations.serial]
 backend = "native-mlx"
-environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial" }
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "268435456" }
 
 [runtime_configurations.overlap]
 backend = "native-mlx"
-environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap" }
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "268435456" }
 
 [workloads.interactive_stream_c1]
 prompt_group = "short"

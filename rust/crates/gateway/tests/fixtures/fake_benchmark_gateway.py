@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake gateway used by Python benchmark lifecycle tests."""
+"""Fake gateway used by command-level benchmark lifecycle tests."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -49,6 +50,8 @@ counts = {
 }
 primed_prefixes: set[str] = set()
 counts_lock = threading.Lock()
+wire_requests = 0
+dropped_connection = False
 worker = subprocess.Popen(["/bin/sleep", "60"])
 
 pid_file = os.environ.get("FAKE_GATEWAY_PID_FILE")
@@ -87,16 +90,17 @@ class Handler(BaseHTTPRequestHandler):
                     f"mlx_prompt_tokens_total {counts['prompt_tokens']}\n"
                     f"mlx_completion_tokens_total {counts['completion_tokens']}\n"
                     f"mlx_requests_active {counts['active']}\n"
-                    f'mlx_prefix_cache_hits_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_hits"]}\n'
-                    f'mlx_prefix_cache_misses_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_misses"]}\n'
-                    f'mlx_prefix_cache_reused_tokens_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_reused_tokens"]}\n'
-                    f'mlx_prefix_cache_evictions_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_evictions"]}\n'
+                    f"mlx_prefix_cache_hits_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_hits']}\n"
+                    f"mlx_prefix_cache_misses_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_misses']}\n"
+                    f"mlx_prefix_cache_reused_tokens_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_reused_tokens']}\n"
+                    f"mlx_prefix_cache_evictions_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_evictions']}\n"
                 ).encode()
             self._send(200, "text/plain", body)
         else:
             self._send(404, "text/plain", b"not found")
 
     def do_POST(self) -> None:
+        global dropped_connection, wire_requests
         content_length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(content_length))
         if self.path == "/internal/benchmark/reset":
@@ -133,6 +137,28 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         content = str(request.get("messages", [{}])[0].get("content", ""))
+        with counts_lock:
+            wire_requests += 1
+            request_count_file = os.environ.get("FAKE_GATEWAY_REQUEST_COUNT_FILE")
+            if request_count_file:
+                Path(request_count_file).write_text(
+                    f"{wire_requests}\n", encoding="utf-8"
+                )
+            should_drop = (
+                os.environ.get("FAKE_GATEWAY_RUN_MODE") == "drop-first-request"
+                and " warmup " not in content
+                and not dropped_connection
+            )
+            if should_drop:
+                dropped_connection = True
+        if should_drop:
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.connection.close()
+            return
         if (
             os.environ.get("FAKE_GATEWAY_RUN_MODE") == "request-failure"
             and " warmup " not in content

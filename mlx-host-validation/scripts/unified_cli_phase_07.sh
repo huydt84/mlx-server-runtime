@@ -14,6 +14,7 @@ RESULT_DIR="$WORK_DIR/result"
 COMMAND_LOG="$WORK_DIR/command.log"
 FIXTURE="$ROOT/mlx-host-validation/fixtures/unified_cli_phase_07.toml"
 UV_CACHE="${MLX_AIR_PHASE7_UV_CACHE_DIR:-$HOME/Library/Caches/uv}"
+HOST_HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 cleanup() {
     local status=$?
@@ -90,7 +91,7 @@ mkdir -p "$OUTSIDE_DIR" "$TEST_HOME"
 cd "$OUTSIDE_DIR"
 
 echo "[2/4] Run one model start and exactly 11 configured requests"
-HOME="$TEST_HOME" UV_CACHE_DIR="$UV_CACHE" \
+HOME="$TEST_HOME" HF_HOME="$HOST_HF_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$STAGE_DIR/bin/mlx-air" bench run \
     --suite smoke \
     --benchmark-config "$FIXTURE" \
