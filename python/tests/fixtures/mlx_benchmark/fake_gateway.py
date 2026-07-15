@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake gateway used by command-level benchmark lifecycle tests."""
+"""Fake gateway used by Python benchmark lifecycle tests."""
 
 from __future__ import annotations
 
@@ -87,10 +87,10 @@ class Handler(BaseHTTPRequestHandler):
                     f"mlx_prompt_tokens_total {counts['prompt_tokens']}\n"
                     f"mlx_completion_tokens_total {counts['completion_tokens']}\n"
                     f"mlx_requests_active {counts['active']}\n"
-                    f"mlx_prefix_cache_hits_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_hits']}\n"
-                    f"mlx_prefix_cache_misses_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_misses']}\n"
-                    f"mlx_prefix_cache_reused_tokens_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_reused_tokens']}\n"
-                    f"mlx_prefix_cache_evictions_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_evictions']}\n"
+                    f'mlx_prefix_cache_hits_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_hits"]}\n'
+                    f'mlx_prefix_cache_misses_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_misses"]}\n'
+                    f'mlx_prefix_cache_reused_tokens_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_reused_tokens"]}\n'
+                    f'mlx_prefix_cache_evictions_by_backend{{backend="fake",modality="text",strategy="fake"}} {counts["prefix_evictions"]}\n'
                 ).encode()
             self._send(200, "text/plain", body)
         else:
