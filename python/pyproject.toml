@@ -15,7 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-bench = []
+bench = [
+    "tomli>=2.2.1; python_version < '3.11'",
+]
 
 [dependency-groups]
 dev = [

@@ -51,7 +51,7 @@ print(f"fake gateway listening on {port}", file=sys.stderr, flush=True)
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.0"
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
         if self.path == "/ready":
@@ -83,7 +83,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(content_length)
+        request = json.loads(self.rfile.read(content_length))
         if os.environ.get("FAKE_GATEWAY_RUN_MODE") == "request-failure":
             self._json(500, {"error": {"message": "injected request failure"}})
             return
@@ -91,22 +91,34 @@ class Handler(BaseHTTPRequestHandler):
             counts["requests"] += 1
             counts["prompt_tokens"] += 5
             counts["completion_tokens"] += 2
-        events = [
-            {"choices": [{"delta": {"content": "fake"}, "finish_reason": None}]},
-            {"choices": [{"delta": {"content": " output"}, "finish_reason": None}]},
-            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
-            {
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": 5,
-                    "completion_tokens": 2,
-                    "total_tokens": 7,
+        usage = {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+        }
+        if request.get("stream"):
+            events = [
+                {"choices": [{"delta": {"content": "fake"}, "finish_reason": None}]},
+                {"choices": [{"delta": {"content": " output"}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": usage},
+            ]
+            body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+            body += "data: [DONE]\n\n"
+            self._send(200, "text/event-stream", body.encode())
+        else:
+            self._json(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "fake output"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": usage,
                 },
-            },
-        ]
-        body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
-        body += "data: [DONE]\n\n"
-        self._send(200, "text/event-stream", body.encode())
+            )
 
     def log_message(self, _format: str, *_args: object) -> None:
         pass

@@ -1,13 +1,12 @@
-"""Execute the bounded MLX Air benchmark and persist self-contained results."""
+"""Execute selected MLX Air workloads and persist self-contained results."""
 
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
-import http.client
 import json
 import os
 from pathlib import Path
@@ -23,25 +22,14 @@ from typing import Any, Iterator
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from mlx_benchmark.configuration import SelectedConfiguration
+from mlx_benchmark.loadgen import execute_workloads
+from mlx_benchmark.prompts import generate_prompt_bank
+
+
 _MLX_AIR_VERSION_ENV = "MLX_AIR_VERSION"
 _INVOCATION_DIRECTORY_ENV = "MLX_AIR_INVOCATION_DIRECTORY"
 _WORKER_LOG_ENV = "MLX_AIR_WORKER_LOG"
-_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-_WORKLOAD = "bounded_stream_smoke"
-_PROMPTS = (
-    "Reply with the single word amber.",
-    "Reply with the single word cedar.",
-    "Reply with the single word indigo.",
-    "Reply with the single word quartz.",
-    "Reply with the single word silver.",
-    "Reply with the single word violet.",
-)
-_TRIALS = (
-    {"trial_index": 0, "load_mode": "sequential", "request_count": 2},
-    {"trial_index": 1, "load_mode": "concurrent", "request_count": 4},
-)
-_REQUEST_TIMEOUT_SECONDS = 300
-_READINESS_TIMEOUT_SECONDS = 1800
 _SHUTDOWN_TIMEOUT_SECONDS = 15
 _BENCHMARK_EXECUTION_FAILURE = 50
 _REQUIRED_COUNTERS = (
@@ -99,12 +87,17 @@ class _ServerProcess:
                 path.unlink(missing_ok=True)
 
 
-def run_benchmark(arguments: argparse.Namespace, gateway: Path) -> int:
-    """Run the built-in benchmark selected by parsed CLI arguments.
+def run_benchmark(
+    arguments: argparse.Namespace,
+    gateway: Path,
+    selected: SelectedConfiguration,
+) -> int:
+    """Run the selected benchmark configuration.
 
     Args:
         arguments: Validated ``mlx-air bench run`` arguments.
         gateway: Absolute path to the version-matched gateway executable.
+        selected: Loaded and fully selected benchmark configuration.
 
     Returns:
         Zero on success, 50 on benchmark failure, or 128 plus the interrupt
@@ -112,12 +105,13 @@ def run_benchmark(arguments: argparse.Namespace, gateway: Path) -> int:
     """
     run_directory = _resolve_run_directory(arguments.output_dir)
     _create_artifact_tree(run_directory)
-    results = _initial_results(arguments, gateway, run_directory)
+    results = _initial_results(arguments, gateway, run_directory, selected)
     _write_artifacts(run_directory, results)
     server: _ServerProcess | None = None
 
     try:
         with _interrupts_raise():
+            prompts = generate_prompt_bank(results["configuration"])
             if arguments.server_mode == "self-launched":
                 results["failure_stage"] = "server_configuration"
                 base_url, server = _start_server(gateway, run_directory, results)
@@ -125,17 +119,25 @@ def run_benchmark(arguments: argparse.Namespace, gateway: Path) -> int:
                 base_url = _normalize_base_url(arguments.base_url)
 
             results["server"]["base_url"] = base_url
+            results["configuration"]["base_url"] = base_url
             results["failure_stage"] = "readiness"
-            readiness = _wait_for_readiness(base_url, server)
+            readiness = _wait_for_readiness(base_url, server, results["configuration"])
             _record_server_identity(results, base_url, readiness, gateway, arguments)
             results["failure_stage"] = "measurement"
 
-            for trial_definition in _TRIALS:
-                trial = _execute_trial(base_url, trial_definition)
+            def completed_trial(trial: dict[str, Any]) -> None:
                 results["trials"].append(trial)
-                _validate_completed_trial(results, trial, trial_definition)
+                _validate_completed_trial(results, trial)
                 _write_artifacts(run_directory, results)
 
+            asyncio.run(
+                execute_workloads(
+                    base_url,
+                    results["configuration"],
+                    prompts,
+                    on_trial=completed_trial,
+                )
+            )
             results["runtime_counters"] = _fetch_runtime_counters(base_url)
             _validate_final_results(results)
             if any(trial["error_count"] for trial in results["trials"]):
@@ -201,30 +203,20 @@ def _create_artifact_tree(run_directory: Path) -> None:
 
 
 def _initial_results(
-    arguments: argparse.Namespace, gateway: Path, run_directory: Path
+    arguments: argparse.Namespace,
+    gateway: Path,
+    run_directory: Path,
+    selected: SelectedConfiguration,
 ) -> dict[str, Any]:
-    final_configuration = {
-        "suite": arguments.suite,
-        "focus": arguments.focus,
-        "benchmark_config": arguments.benchmark_config,
-        "profile": arguments.profile,
-        "server_mode": arguments.server_mode,
-        "base_url": arguments.base_url,
-        "output_directory": str(run_directory),
-        "model": _MODEL,
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "max_tokens": 8,
-        "readiness_timeout_seconds": _READINESS_TIMEOUT_SECONDS,
-        "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
-        "workloads": [
-            {
-                "name": _WORKLOAD,
-                "streaming": True,
-                "trials": [dict(trial) for trial in _TRIALS],
-            }
-        ],
-    }
+    final_configuration = json.loads(json.dumps(selected.values))
+    final_configuration.update(
+        {
+            "benchmark_config": str(selected.source_path),
+            "base_url": arguments.base_url,
+            "output_directory": str(run_directory),
+        }
+    )
+    model = final_configuration["models"][0]
     return {
         "schema_version": 1,
         "run_id": run_directory.name,
@@ -237,8 +229,14 @@ def _initial_results(
         "versions": {
             "mlx_air": os.environ.get(_MLX_AIR_VERSION_ENV, "not_exposed"),
             "gateway": "not_exposed",
-            "model": {"name": _MODEL, "revision": "not_exposed"},
-            "tokenizer": {"name": _MODEL, "revision": "not_exposed"},
+            "model": {
+                "name": model["checkpoint"],
+                "revision": model["revision"],
+            },
+            "tokenizer": {
+                "name": model["tokenizer"],
+                "revision": model["revision"],
+            },
         },
         "host": _host_information(),
         "server": {
@@ -248,6 +246,10 @@ def _initial_results(
             if arguments.server_mode == "self-launched"
             else None,
             "runtime_configuration": None,
+            "selected_model": model["name"],
+            "selected_runtime_configuration": final_configuration[
+                "runtime_configurations"
+            ][0]["name"],
         },
         "runtime_counters": {},
         "trials": [],
@@ -284,28 +286,47 @@ def _command_output(command: list[str]) -> str:
 def _start_server(
     gateway: Path, run_directory: Path, results: dict[str, Any]
 ) -> tuple[str, _ServerProcess]:
+    configuration = results["configuration"]
+    model = configuration["models"][0]
+    selected_runtime = configuration["runtime_configurations"][0]
+    workloads = configuration["workloads"]
     port = _reserve_loopback_port()
     socket_directory = Path("/tmp") / f"mlx-air-{os.getuid()}"
     socket_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     socket_suffix = hashlib.sha256(str(run_directory).encode()).hexdigest()[:12]
     ipc_path = socket_directory / f"benchmark-{os.getpid()}-{socket_suffix}.sock"
+    maximum_concurrency = max(int(workload["concurrency"]) for workload in workloads)
+    maximum_prompt_tokens = max(
+        int(configuration["prompt_bank"][workload["prompt_group"]]["target_tokens"])
+        for workload in workloads
+    )
+    maximum_output_tokens = max(
+        int(workload["output_tokens"]) for workload in workloads
+    )
+    sampling = configuration["sampling"]
     runtime_config = {
         "server": {"host": "127.0.0.1", "port": port},
         "worker": {
             "python": sys.executable,
             "module": "mlx_worker.main",
-            "backend": "v1",
-            "model": _MODEL,
+            "backend": selected_runtime["backend"],
+            "model": model["checkpoint"],
             "ipc_path": str(ipc_path),
         },
-        "generation": {"temperature": 0.0, "top_p": 1.0, "max_tokens": 8},
+        "generation": {
+            "temperature": sampling["temperature"],
+            "top_p": sampling["top_p"],
+            "max_tokens": maximum_output_tokens,
+        },
         "limits": {
-            "max_pending_requests": 8,
-            "max_active_requests": 4,
-            "max_prompt_tokens": 1024,
-            "max_completion_tokens": 8,
-            "max_total_tokens_per_request": 1032,
-            "request_timeout_seconds": _REQUEST_TIMEOUT_SECONDS,
+            "max_pending_requests": max(maximum_concurrency * 2, 8),
+            "max_active_requests": maximum_concurrency,
+            "max_prompt_tokens": min(maximum_prompt_tokens * 2 + 256, 65_536),
+            "max_completion_tokens": maximum_output_tokens,
+            "max_total_tokens_per_request": min(
+                maximum_prompt_tokens * 2 + maximum_output_tokens + 256, 65_536
+            ),
+            "request_timeout_seconds": sampling["request_timeout_seconds"],
         },
         "telemetry": {"enable_prometheus": True, "metrics_path": "/metrics"},
     }
@@ -320,6 +341,7 @@ def _start_server(
     environment = os.environ.copy()
     environment["MLX_RUNTIME_CONFIG"] = str(config_path)
     environment[_WORKER_LOG_ENV] = str(run_directory / "logs" / "worker.log")
+    environment.update(selected_runtime["environment"])
     try:
         process = subprocess.Popen(
             [str(gateway)],
@@ -368,8 +390,8 @@ def _render_runtime_toml(configuration: dict[str, Any]) -> str:
         f"model = {json.dumps(worker['model'])}\n"
         f"ipc_path = {json.dumps(worker['ipc_path'])}\n\n"
         "[generation]\n"
-        f"temperature = {generation['temperature']:.1f}\n"
-        f"top_p = {generation['top_p']:.1f}\n"
+        f"temperature = {float(generation['temperature']):.1f}\n"
+        f"top_p = {float(generation['top_p']):.1f}\n"
         f"max_tokens = {generation['max_tokens']}\n\n"
         "[limits]\n"
         + "".join(f"{key} = {value}\n" for key, value in limits.items())
@@ -390,8 +412,13 @@ def _normalize_base_url(value: str | None) -> str:
     return value.rstrip("/")
 
 
-def _wait_for_readiness(base_url: str, server: _ServerProcess | None) -> dict[str, Any]:
-    deadline = time.monotonic() + _READINESS_TIMEOUT_SECONDS
+def _wait_for_readiness(
+    base_url: str,
+    server: _ServerProcess | None,
+    configuration: dict[str, Any],
+) -> dict[str, Any]:
+    timeout_seconds = int(configuration["sampling"]["readiness_timeout_seconds"])
+    deadline = time.monotonic() + timeout_seconds
     last_error = "readiness endpoint did not respond"
     while time.monotonic() < deadline:
         if server is not None:
@@ -410,7 +437,7 @@ def _wait_for_readiness(base_url: str, server: _ServerProcess | None) -> dict[st
         time.sleep(0.2)
     raise _RunFailure(
         "readiness",
-        f"server did not become ready within {_READINESS_TIMEOUT_SECONDS} seconds: {last_error}",
+        f"server did not become ready within {timeout_seconds} seconds: {last_error}",
     )
 
 
@@ -425,11 +452,16 @@ def _record_server_identity(
         gateway_version = _command_output([str(gateway), "--version"])
     else:
         gateway_version = _optional_gateway_version(base_url)
-    model = str(readiness.get("model") or _MODEL)
-    revision = str(readiness.get("revision") or "not_exposed")
+    configured_model = results["configuration"]["models"][0]
+    model = str(readiness.get("model") or configured_model["checkpoint"])
+    revision = str(readiness.get("revision") or configured_model["revision"])
+    tokenizer_revision = str(readiness.get("tokenizer_revision") or revision)
     results["versions"]["gateway"] = gateway_version
     results["versions"]["model"] = {"name": model, "revision": revision}
-    results["versions"]["tokenizer"] = {"name": model, "revision": revision}
+    results["versions"]["tokenizer"] = {
+        "name": configured_model["tokenizer"],
+        "revision": tokenizer_revision,
+    }
     results["server"]["readiness"] = readiness
 
 
@@ -460,165 +492,6 @@ def _get_json(url: str, timeout: int) -> tuple[int, dict[str, Any]]:
         raise
 
 
-def _execute_trial(base_url: str, definition: dict[str, Any]) -> dict[str, Any]:
-    trial_index = int(definition["trial_index"])
-    request_count = int(definition["request_count"])
-    started = time.monotonic_ns()
-    if definition["load_mode"] == "sequential":
-        requests = [
-            _execute_request(base_url, trial_index, request_index)
-            for request_index in range(request_count)
-        ]
-    else:
-        executor = ThreadPoolExecutor(max_workers=request_count)
-        try:
-            futures = {
-                executor.submit(
-                    _execute_request, base_url, trial_index, request_index
-                ): request_index
-                for request_index in range(request_count)
-            }
-            requests = [future.result() for future in as_completed(futures)]
-        except BaseException:
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown()
-        requests.sort(key=lambda request: request["request_index"])
-    completed = time.monotonic_ns()
-    return {
-        "workload_name": _WORKLOAD,
-        "trial_index": trial_index,
-        "load_mode": definition["load_mode"],
-        "request_count": request_count,
-        "started_monotonic_ns": started,
-        "completed_monotonic_ns": completed,
-        "success_count": sum(request["status"] == "succeeded" for request in requests),
-        "error_count": sum(request["status"] == "failed" for request in requests),
-        "requests": requests,
-    }
-
-
-def _execute_request(
-    base_url: str, trial_index: int, request_index: int
-) -> dict[str, Any]:
-    global_index = (
-        sum(int(trial["request_count"]) for trial in _TRIALS[:trial_index])
-        + request_index
-    )
-    prompt_index = global_index % len(_PROMPTS)
-    prompt = _PROMPTS[prompt_index]
-    submission = time.monotonic_ns()
-    record: dict[str, Any] = {
-        "workload_name": _WORKLOAD,
-        "trial_index": trial_index,
-        "request_index": request_index,
-        "prompt_group": "bounded_smoke",
-        "prompt_name": f"prompt-{prompt_index}",
-        "prompt_index": prompt_index,
-        "request_order": global_index,
-        "submitted_monotonic_ns": submission,
-        "first_byte_monotonic_ns": None,
-        "first_token_monotonic_ns": None,
-        "final_token_monotonic_ns": None,
-        "completed_monotonic_ns": None,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-        "output_sha256": None,
-        "finish_reason": None,
-        "status": "running",
-        "error": None,
-    }
-    try:
-        _stream_completion(base_url, prompt, record)
-        record["status"] = "succeeded"
-    except Exception as error:
-        now = time.monotonic_ns()
-        record["first_byte_monotonic_ns"] = record["first_byte_monotonic_ns"] or now
-        record["first_token_monotonic_ns"] = record["first_token_monotonic_ns"] or now
-        record["final_token_monotonic_ns"] = record["final_token_monotonic_ns"] or now
-        record["completed_monotonic_ns"] = now
-        record["output_sha256"] = hashlib.sha256(b"").hexdigest()
-        record["status"] = "failed"
-        record["error"] = f"{type(error).__name__}: {error}"
-    return record
-
-
-def _stream_completion(base_url: str, prompt: str, record: dict[str, Any]) -> None:
-    parsed = urlsplit(base_url)
-    connection_type = (
-        http.client.HTTPSConnection
-        if parsed.scheme == "https"
-        else http.client.HTTPConnection
-    )
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    connection = connection_type(
-        parsed.hostname, port, timeout=_REQUEST_TIMEOUT_SECONDS
-    )
-    path_prefix = parsed.path.rstrip("/")
-    payload = json.dumps(
-        {
-            "model": _MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 8,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-    ).encode("utf-8")
-    output_parts: list[str] = []
-    try:
-        connection.request(
-            "POST",
-            f"{path_prefix}/v1/chat/completions",
-            body=payload,
-            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
-        )
-        response = connection.getresponse()
-        record["first_byte_monotonic_ns"] = time.monotonic_ns()
-        if response.status != 200:
-            detail = response.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {response.status}: {detail}")
-        while True:
-            line = response.readline()
-            if not line:
-                break
-            if not line.startswith(b"data:"):
-                continue
-            data = line[5:].strip()
-            if data == b"[DONE]":
-                break
-            event = json.loads(data)
-            choices = event.get("choices") or []
-            if choices:
-                delta = choices[0].get("delta") or {}
-                content = delta.get("content")
-                if content:
-                    now = time.monotonic_ns()
-                    if record["first_token_monotonic_ns"] is None:
-                        record["first_token_monotonic_ns"] = now
-                    record["final_token_monotonic_ns"] = now
-                    output_parts.append(str(content))
-                finish_reason = choices[0].get("finish_reason")
-                if finish_reason is not None:
-                    record["finish_reason"] = finish_reason
-            usage = event.get("usage")
-            if usage is not None:
-                record["prompt_tokens"] = int(usage.get("prompt_tokens", 0))
-                record["completion_tokens"] = int(usage.get("completion_tokens", 0))
-                record["total_tokens"] = int(usage.get("total_tokens", 0))
-        if record["first_token_monotonic_ns"] is None:
-            raise RuntimeError("stream completed without a generated token")
-        record["completed_monotonic_ns"] = time.monotonic_ns()
-        record["output_sha256"] = hashlib.sha256(
-            "".join(output_parts).encode("utf-8")
-        ).hexdigest()
-    finally:
-        connection.close()
-
-
 def _fetch_runtime_counters(base_url: str) -> dict[str, float]:
     request = Request(f"{base_url}/metrics", headers={"Accept": "text/plain"})
     try:
@@ -640,17 +513,19 @@ def _fetch_runtime_counters(base_url: str) -> dict[str, float]:
     return counters
 
 
-def _validate_completed_trial(
-    results: dict[str, Any],
-    trial: dict[str, Any],
-    definition: dict[str, Any],
-) -> None:
-    expected_count = int(definition["request_count"])
+def _validate_completed_trial(results: dict[str, Any], trial: dict[str, Any]) -> None:
+    workload = next(
+        workload
+        for workload in results["configuration"]["workloads"]
+        if workload["name"] == trial["workload_name"]
+    )
+    expected_count = int(workload["requests_per_trial"])
     if len(trial["requests"]) != expected_count:
         _validation_failure(
             results,
             "request_count",
-            f"trial {trial['trial_index']} expected {expected_count} requests, recorded {len(trial['requests'])}",
+            f"{trial['workload_name']} trial {trial['trial_index']} expected "
+            f"{expected_count} requests, recorded {len(trial['requests'])}",
         )
     expected_indexes = list(range(expected_count))
     indexes = [request["request_index"] for request in trial["requests"]]
@@ -658,7 +533,22 @@ def _validate_completed_trial(
         _validation_failure(
             results,
             "request_order",
-            f"trial {trial['trial_index']} request indexes were {indexes}",
+            f"{trial['workload_name']} trial {trial['trial_index']} request indexes were {indexes}",
+        )
+    mode = workload["load_mode"]
+    expected_maximum = 1 if mode == "sequential" else int(workload["concurrency"])
+    if trial["maximum_observed_in_flight"] != expected_maximum:
+        _validation_failure(
+            results,
+            "load_concurrency",
+            f"{trial['workload_name']} trial {trial['trial_index']} expected maximum "
+            f"in-flight {expected_maximum}, observed {trial['maximum_observed_in_flight']}",
+        )
+    if trial["streaming"] != workload["streaming"]:
+        _validation_failure(
+            results,
+            "streaming_mode",
+            f"{trial['workload_name']} recorded the wrong streaming mode",
         )
     for request in trial["requests"]:
         _validate_request(results, request)
@@ -678,20 +568,23 @@ def _validate_request(results: dict[str, Any], request: dict[str, Any]) -> None:
         _validation_failure(
             results,
             "request_timestamps",
-            f"trial {request['trial_index']} request {request['request_index']} has invalid timestamps",
+            f"{request['workload_name']} trial {request['trial_index']} request "
+            f"{request['request_index']} has invalid timestamps",
         )
     token_total = request["prompt_tokens"] + request["completion_tokens"]
     if request["total_tokens"] != token_total:
         _validation_failure(
             results,
             "token_totals",
-            f"trial {request['trial_index']} request {request['request_index']} token total mismatch",
+            f"{request['workload_name']} trial {request['trial_index']} request "
+            f"{request['request_index']} token total mismatch",
         )
     if request["output_sha256"] is None:
         _validation_failure(
             results,
             "output_hash",
-            f"trial {request['trial_index']} request {request['request_index']} has no output hash",
+            f"{request['workload_name']} trial {request['trial_index']} request "
+            f"{request['request_index']} has no output hash",
         )
 
 
@@ -700,9 +593,12 @@ def _validate_final_results(results: dict[str, Any]) -> None:
         _validation_failure(
             results, "gateway_version", "gateway version was not exposed"
         )
-    if results["versions"]["model"]["revision"] == "not_exposed":
+    if results["versions"]["model"]["revision"] in {"not_exposed", "resolve-at-run"}:
         _validation_failure(results, "model_revision", "model revision was not exposed")
-    if results["versions"]["tokenizer"]["revision"] == "not_exposed":
+    if results["versions"]["tokenizer"]["revision"] in {
+        "not_exposed",
+        "resolve-at-run",
+    }:
         _validation_failure(
             results, "tokenizer_revision", "tokenizer revision was not exposed"
         )
@@ -751,15 +647,17 @@ def _render_report(results: dict[str, Any]) -> str:
         f"- Run: `{results['run_id']}`",
         f"- Status: `{results['status']}`",
         f"- Suite: `{results['configuration']['suite']}`",
+        f"- Focus: `{results['configuration']['focus']}`",
         f"- Server mode: `{results['server']['mode']}`",
         f"- Model: `{results['versions']['model']['name']}`",
         "",
-        "| workload | trial | load mode | requested | succeeded | errors |",
-        "| --- | ---: | --- | ---: | ---: | ---: |",
+        "| workload | trial | load mode | streaming | concurrency | requested | succeeded | errors |",
+        "| --- | ---: | --- | --- | ---: | ---: | ---: | ---: |",
     ]
     for trial in results["trials"]:
         lines.append(
             f"| {trial['workload_name']} | {trial['trial_index']} | {trial['load_mode']} | "
+            f"{trial['streaming']} | {trial['configured_concurrency']} | "
             f"{trial['request_count']} | {trial['success_count']} | {trial['error_count']} |"
         )
     if results["validation_failures"]:

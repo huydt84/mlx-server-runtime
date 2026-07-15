@@ -14,6 +14,7 @@ pub(crate) struct DistributionPaths {
     pub(crate) uv_lock: PathBuf,
     pub(crate) python_package: PathBuf,
     pub(crate) benchmark_package: PathBuf,
+    pub(crate) benchmark_config: PathBuf,
     pub(crate) default_config: PathBuf,
     pub(crate) licenses: PathBuf,
     pub(crate) gateway_executable: PathBuf,
@@ -75,6 +76,7 @@ impl DistributionPaths {
             uv_lock: root.join("python/uv.lock"),
             python_package: root.join("python/mlx_worker"),
             benchmark_package: root.join("python/mlx_benchmark"),
+            benchmark_config: root.join("config/benchmark.toml"),
             default_config: root.join("config/runtime.toml"),
             licenses: root.join("licenses"),
             gateway_executable: bin_dir.join("mlx_runtime_gateway"),
@@ -121,7 +123,11 @@ impl DistributionPaths {
     }
 
     pub(crate) fn validate_benchmark_resources(&self) -> Result<(), PathError> {
-        require_directory(&self.benchmark_package, "bundled mlx_benchmark package")
+        require_directory(&self.benchmark_package, "bundled mlx_benchmark package")?;
+        require_file(
+            &self.benchmark_config,
+            "bundled default benchmark configuration",
+        )
     }
 }
 
@@ -240,6 +246,7 @@ pub(crate) mod tests {
         fs::write(root.join("python/uv.lock"), "lock").unwrap();
         fs::write(root.join("python/mlx_worker/__init__.py"), "").unwrap();
         fs::write(root.join("python/mlx_benchmark/__init__.py"), "").unwrap();
+        fs::write(root.join("config/benchmark.toml"), "schema_version = 1\n").unwrap();
         fs::write(
             root.join("config/runtime.toml"),
             "[worker]\nmodel = \"default-model\"\n",
@@ -261,6 +268,7 @@ pub(crate) mod tests {
         );
         assert_eq!(paths.python_package, root.join("python/mlx_worker"));
         assert_eq!(paths.benchmark_package, root.join("python/mlx_benchmark"));
+        assert_eq!(paths.benchmark_config, root.join("config/benchmark.toml"));
         assert_eq!(paths.default_config, root.join("config/runtime.toml"));
 
         fs::remove_dir_all(root).unwrap();

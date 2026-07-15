@@ -48,6 +48,11 @@ impl StagedCli {
         )
         .unwrap();
         fs::write(root.join("config/runtime.toml"), "[worker]\n").unwrap();
+        fs::write(
+            root.join("config/benchmark.toml"),
+            include_str!("fixtures/phase7_benchmark.toml"),
+        )
+        .unwrap();
         fs::write(root.join("licenses/LICENSE"), "license").unwrap();
         fs::write(
             root.join("python/pyproject.toml"),
@@ -65,6 +70,21 @@ impl StagedCli {
         fs::write(
             root.join("python/mlx_benchmark/runner.py"),
             include_str!("../../../../python/mlx_benchmark/runner.py"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("python/mlx_benchmark/configuration.py"),
+            include_str!("../../../../python/mlx_benchmark/configuration.py"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("python/mlx_benchmark/loadgen.py"),
+            include_str!("../../../../python/mlx_benchmark/loadgen.py"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("python/mlx_benchmark/prompts.py"),
+            include_str!("../../../../python/mlx_benchmark/prompts.py"),
         )
         .unwrap();
 
@@ -209,6 +229,90 @@ fn missing_bundled_python_project_fails_before_uv_delegation() {
 }
 
 #[test]
+fn missing_bundled_benchmark_config_fails_before_uv_delegation() {
+    let staged = StagedCli::new("missing-benchmark-config");
+    fs::remove_file(staged.root.join("config/benchmark.toml")).unwrap();
+
+    let output = staged.output(&["bench", "run", "--suite", "smoke"]);
+
+    assert_eq!(output.status.code(), Some(10));
+    assert!(stderr(&output).contains("missing bundled default benchmark configuration"));
+}
+
+#[test]
+fn invalid_configuration_values_report_exact_fields_before_server_startup() {
+    let staged = StagedCli::new("invalid-config");
+    let pid_file = staged.base.join("invalid-pids");
+    let cases = [
+        (
+            "cache_state = \"cold\"",
+            "cache_state = \"missing\"",
+            "workloads.sequential_stream.cache_state",
+        ),
+        (
+            "metric_unit = \"ms\"",
+            "metric_unit = \"furlongs\"",
+            "workloads.sequential_stream.metric_unit",
+        ),
+        (
+            "metric_direction = \"lower\"",
+            "metric_direction = \"sideways\"",
+            "workloads.sequential_stream.metric_direction",
+        ),
+        (
+            "requests_per_trial = 2",
+            "requests_per_trial = 0",
+            "workloads.sequential_stream.requests_per_trial",
+        ),
+        (
+            "load_mode = \"sequential\"",
+            "load_mode = \"ramp\"",
+            "workloads.sequential_stream.load_mode",
+        ),
+        (
+            "[warmup_groups.short]\nprompt_group = \"warmup_short\"\nconcurrency = 1\noutput_tokens = 4",
+            "[warmup_groups.short]\nprompt_group = \"warmup_short\"\nconcurrency = 1",
+            "warmup_groups.short.output_tokens",
+        ),
+    ];
+
+    for (index, (original, replacement, field)) in cases.into_iter().enumerate() {
+        let invalid = staged.base.join(format!("invalid-{index}.toml"));
+        fs::write(
+            &invalid,
+            include_str!("fixtures/phase7_benchmark.toml").replacen(original, replacement, 1),
+        )
+        .unwrap();
+        let output = staged
+            .command()
+            .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+            .args([
+                "bench",
+                "run",
+                "--suite",
+                "smoke",
+                "--benchmark-config",
+                invalid.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(50),
+            "stderr: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(field),
+            "stderr: {}",
+            stderr(&output)
+        );
+    }
+    assert!(!pid_file.exists());
+}
+
+#[test]
 fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
     let staged = StagedCli::new("successful-run");
     let output_directory = staged.base.join("successful-artifacts");
@@ -231,10 +335,42 @@ fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let results = read_results(&output_directory);
     assert_eq!(results["status"], "succeeded");
-    assert_eq!(results["trials"].as_array().unwrap().len(), 2);
+    assert_eq!(results["configuration"]["suite"], "smoke");
+    assert_eq!(
+        results["configuration"]["benchmark_config"],
+        staged
+            .root
+            .join("config/benchmark.toml")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(results["configuration"]["sampling"]["seed"], 7);
+    assert_eq!(
+        results["configuration"]["workloads"][2]["load_mode"],
+        "closed-loop"
+    );
+    assert_eq!(results["trials"].as_array().unwrap().len(), 3);
     assert_eq!(results["trials"][0]["request_count"], 2);
-    assert_eq!(results["trials"][1]["request_count"], 4);
-    assert_eq!(all_requests(&results).len(), 6);
+    assert_eq!(results["trials"][1]["request_count"], 3);
+    assert_eq!(results["trials"][2]["request_count"], 6);
+    assert_eq!(results["trials"][0]["maximum_observed_in_flight"], 1);
+    assert_eq!(results["trials"][1]["maximum_observed_in_flight"], 3);
+    assert_eq!(results["trials"][2]["maximum_observed_in_flight"], 2);
+    assert_eq!(
+        results["trials"][0]["submission_policy"],
+        "submit-one-after-previous-completes"
+    );
+    assert_eq!(
+        results["trials"][1]["submission_policy"],
+        "submit-declared-count-at-once"
+    );
+    assert_eq!(
+        results["trials"][2]["submission_policy"],
+        "replace-each-completed-request"
+    );
+    assert_eq!(all_requests(&results).len(), 11);
     assert!(all_requests(&results).iter().all(|request| {
         request["first_byte_monotonic_ns"].is_number()
             && request["first_token_monotonic_ns"].is_number()
@@ -242,8 +378,19 @@ fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
             && request["completed_monotonic_ns"].is_number()
             && request["prompt_tokens"] == 5
             && request["completion_tokens"] == 2
+            && request["total_tokens"] == 7
             && request["output_sha256"].as_str().is_some()
     }));
+    assert!(results["trials"][0]["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|request| request["streaming"] == true));
+    assert!(results["trials"][1]["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|request| request["streaming"] == false));
     assert!(output_directory.join("report.md").is_file());
     assert!(output_directory.join("logs/gateway.log").is_file());
     assert!(output_directory.join("logs/worker.log").is_file());
@@ -302,7 +449,7 @@ fn request_failure_preserves_measurements_and_reaps_process_group() {
     let results = read_results(&output_directory);
     assert_eq!(results["status"], "failed");
     assert_eq!(results["failure_stage"], "measurement");
-    assert_eq!(all_requests(&results).len(), 6);
+    assert_eq!(all_requests(&results).len(), 11);
     assert!(all_requests(&results)
         .iter()
         .all(|request| request["status"] == "failed"));
@@ -498,7 +645,7 @@ fn all_requests(results: &serde_json::Value) -> Vec<&serde_json::Value> {
         .collect()
 }
 
-fn request_identity(results: &serde_json::Value) -> Vec<(String, u64, u64, u64)> {
+fn request_identity(results: &serde_json::Value) -> Vec<(String, u64, u64, u64, u64, String)> {
     all_requests(results)
         .into_iter()
         .map(|request| {
@@ -507,6 +654,8 @@ fn request_identity(results: &serde_json::Value) -> Vec<(String, u64, u64, u64)>
                 request["trial_index"].as_u64().unwrap(),
                 request["request_index"].as_u64().unwrap(),
                 request["prompt_index"].as_u64().unwrap(),
+                request["prompt_target_tokens"].as_u64().unwrap(),
+                request["prompt_sha256"].as_str().unwrap().to_string(),
             )
         })
         .collect()

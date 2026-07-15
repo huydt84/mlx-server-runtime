@@ -1059,6 +1059,11 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.optional-dependencies]
+bench = [
+    { name = "tomli", marker = "python_full_version < '3.11'" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -1070,6 +1075,7 @@ requires-dist = [
     { name = "mlx", specifier = ">=0.31.2" },
     { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
     { name = "mlx-vlm", specifier = ">=0.6.0,<0.7" },
+    { name = "tomli", marker = "python_full_version < '3.11' and extra == 'bench'", specifier = ">=2.2.1" },
     { name = "tqdm", specifier = ">=4.68.2" },
 ]
 provides-extras = ["bench"]

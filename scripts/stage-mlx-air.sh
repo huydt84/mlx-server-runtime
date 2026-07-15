@@ -36,6 +36,7 @@ mkdir -p \
 cp "$ROOT/target/release/mlx-air" "$OUTPUT_DIR/bin/mlx-air"
 cp "$ROOT/target/release/mlx_runtime_gateway" "$OUTPUT_DIR/bin/mlx_runtime_gateway"
 cp "$ROOT/config/runtime.toml" "$OUTPUT_DIR/config/runtime.toml"
+cp "$ROOT/benchmarks/config/default.toml" "$OUTPUT_DIR/config/benchmark.toml"
 cp "$ROOT/LICENSE" "$OUTPUT_DIR/licenses/LICENSE"
 cp "$ROOT/python/pyproject.toml" "$OUTPUT_DIR/python/pyproject.toml"
 cp "$ROOT/python/uv.lock" "$OUTPUT_DIR/python/uv.lock"

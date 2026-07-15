@@ -1,0 +1,419 @@
+schema_version = 1
+
+[execution]
+server_modes = ["self-launched", "external"]
+load_modes = ["sequential", "burst", "closed-loop"]
+metric_directions = ["lower", "higher"]
+metric_units = ["ms", "tokens/s"]
+
+[sampling]
+seed = 20260715
+temperature = 0.0
+top_p = 1.0
+request_timeout_seconds = 300
+readiness_timeout_seconds = 1800
+
+[prompt_bank.short]
+kind = "short"
+material = "measured"
+count = 48
+target_tokens = 32
+
+[prompt_bank.medium]
+kind = "medium"
+material = "measured"
+count = 24
+target_tokens = 512
+
+[prompt_bank.long]
+kind = "long"
+material = "measured"
+count = 24
+target_tokens = 2048
+
+[prompt_bank.decode_promoting]
+kind = "decode-promoting"
+material = "measured"
+count = 24
+target_tokens = 32
+
+[prompt_bank.shared_prefix]
+kind = "shared-prefix"
+material = "measured"
+count = 64
+target_tokens = 512
+prefix_groups = 8
+suffixes_per_group = 8
+
+[prompt_bank.cache_pressure]
+kind = "cache-pressure"
+material = "measured"
+count = 16
+target_tokens = 2048
+
+[prompt_bank.warmup_short]
+kind = "short"
+material = "warmup"
+count = 8
+target_tokens = 32
+
+[prompt_bank.warmup_long]
+kind = "long"
+material = "warmup"
+count = 4
+target_tokens = 2048
+
+[prompt_bank.warmup_decode]
+kind = "decode-promoting"
+material = "warmup"
+count = 4
+target_tokens = 32
+
+[prompt_bank.warmup_batch4]
+kind = "short"
+material = "warmup"
+count = 4
+target_tokens = 32
+
+[prompt_bank.warmup_mixed8]
+kind = "medium"
+material = "warmup"
+count = 8
+target_tokens = 512
+
+[cache_states.cold]
+mode = "cold"
+unit = "tokens"
+value = 0
+
+[cache_states.warm_prefix]
+mode = "warm-prefix"
+unit = "tokens"
+value = 512
+
+[cache_states.cache_pressure]
+mode = "cache-pressure"
+unit = "percent"
+value = 125
+
+[warmup_groups.short_single]
+prompt_group = "warmup_short"
+concurrency = 1
+output_tokens = 32
+
+[warmup_groups.long_prefill]
+prompt_group = "warmup_long"
+concurrency = 1
+output_tokens = 16
+
+[warmup_groups.long_decode]
+prompt_group = "warmup_decode"
+concurrency = 1
+output_tokens = 128
+
+[warmup_groups.batch4]
+prompt_group = "warmup_batch4"
+concurrency = 4
+output_tokens = 32
+
+[warmup_groups.mixed_batch8]
+prompt_group = "warmup_mixed8"
+concurrency = 8
+output_tokens = 32
+
+[models.primary]
+checkpoint = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+tokenizer = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+revision = "resolve-at-run"
+
+[models.dense]
+checkpoint = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+tokenizer = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+revision = "resolve-at-run"
+
+[models.moe]
+checkpoint = "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
+tokenizer = "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
+revision = "resolve-at-run"
+
+[models.runtime_control]
+checkpoint = "mlx-community/gemma-3-270m-it-qat-8bit"
+tokenizer = "mlx-community/gemma-3-270m-it-qat-8bit"
+revision = "resolve-at-run"
+
+[runtime_configurations.serial]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial" }
+
+[runtime_configurations.overlap]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap" }
+
+[workloads.interactive_stream_c1]
+prompt_group = "short"
+output_tokens = 32
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "ttft"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 6
+
+[workloads.short_nonstream_c1]
+prompt_group = "short"
+output_tokens = 32
+streaming = false
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "end_to_end_latency"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 6
+
+[workloads.cold_prefill_2k_c1]
+prompt_group = "long"
+output_tokens = 16
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "ttft"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 4
+
+[workloads.decode_128_c1]
+prompt_group = "decode_promoting"
+output_tokens = 128
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "tpot"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 4
+
+[workloads.steady_short_c4]
+prompt_group = "short"
+output_tokens = 32
+streaming = true
+load_mode = "closed-loop"
+concurrency = 4
+cache_state = "cold"
+primary_metric = "aggregate_output_tokens_per_second"
+metric_direction = "higher"
+metric_unit = "tokens/s"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 16
+
+[workloads.steady_short_c8]
+prompt_group = "short"
+output_tokens = 32
+streaming = true
+load_mode = "closed-loop"
+concurrency = 8
+cache_state = "cold"
+primary_metric = "aggregate_output_tokens_per_second"
+metric_direction = "higher"
+metric_unit = "tokens/s"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 32
+
+[workloads.mixed_c8]
+prompt_group = "medium"
+output_tokens = 32
+streaming = true
+load_mode = "closed-loop"
+concurrency = 8
+cache_state = "cold"
+primary_metric = "aggregate_output_tokens_per_second"
+metric_direction = "higher"
+metric_unit = "tokens/s"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 32
+
+[workloads.shared_prefix_warm_c4]
+prompt_group = "shared_prefix"
+output_tokens = 32
+streaming = true
+load_mode = "burst"
+concurrency = 16
+cache_state = "warm_prefix"
+primary_metric = "ttft"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 16
+
+[workloads.cache_pressure]
+prompt_group = "cache_pressure"
+output_tokens = 16
+streaming = false
+load_mode = "burst"
+concurrency = 16
+cache_state = "cache_pressure"
+primary_metric = "end_to_end_latency"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial", "overlap"]
+trials = 1
+requests_per_trial = 16
+
+[focuses.gateway]
+models = ["runtime_control", "primary"]
+workloads = ["interactive_stream_c1", "short_nonstream_c1"]
+
+[focuses.prefill]
+models = ["primary", "dense"]
+workloads = ["cold_prefill_2k_c1", "mixed_c8"]
+
+[focuses.decode]
+models = ["primary", "moe"]
+workloads = ["decode_128_c1", "mixed_c8"]
+
+[focuses.scheduler]
+models = ["primary", "moe"]
+workloads = ["steady_short_c4", "steady_short_c8", "mixed_c8"]
+
+[focuses.cache]
+models = ["primary", "dense"]
+workloads = ["cold_prefill_2k_c1", "shared_prefix_warm_c4", "cache_pressure"]
+
+[focuses.all]
+models = ["primary", "dense", "moe", "runtime_control"]
+workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"]
+
+[suites.smoke]
+models = ["primary"]
+workloads = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "shared_prefix_warm_c4"]
+runtime_configurations = ["serial", "overlap"]
+warmup_groups = ["short_single", "batch4"]
+configuration_orders = ["primary_round_1", "primary_round_2"]
+focuses = []
+focus_required = false
+trials = 1
+max_model_starts = 2
+tail_set = "none"
+diagnostic_families = []
+coverage = [
+  { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "shared_prefix_warm_c4"] },
+]
+
+[suites.optimization]
+models = ["primary", "dense", "moe", "runtime_control"]
+workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"]
+runtime_configurations = ["serial", "overlap"]
+warmup_groups = ["short_single", "long_prefill", "long_decode", "batch4", "mixed_batch8"]
+configuration_orders = ["primary_round_1", "primary_round_2", "dense", "moe", "runtime_control"]
+focuses = ["gateway", "prefill", "decode", "scheduler", "cache", "all"]
+focus_required = true
+trials = 4
+max_model_starts = 8
+tail_set = "none"
+diagnostic_families = ["gateway", "prefill", "decode", "scheduler", "cache"]
+coverage = [
+  { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
+  { model = "dense", workloads = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
+  { model = "moe", workloads = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"] },
+  { model = "runtime_control", workloads = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] },
+]
+
+[suites.release]
+models = ["primary", "dense", "moe", "runtime_control"]
+workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"]
+runtime_configurations = ["serial", "overlap"]
+warmup_groups = ["short_single", "long_prefill", "long_decode", "batch4", "mixed_batch8"]
+configuration_orders = ["primary_round_1", "primary_round_2", "dense", "moe", "runtime_control"]
+focuses = []
+focus_required = false
+trials = 6
+max_model_starts = 10
+tail_set = "release"
+diagnostic_families = ["gateway", "prefill", "decode", "scheduler", "cache"]
+coverage = [
+  { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
+  { model = "dense", workloads = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c4"] },
+  { model = "moe", workloads = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"] },
+  { model = "runtime_control", workloads = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] },
+]
+
+[suites.exhaustive]
+models = ["primary", "dense", "moe", "runtime_control"]
+workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"]
+runtime_configurations = ["serial", "overlap"]
+warmup_groups = ["short_single", "long_prefill", "long_decode", "batch4", "mixed_batch8"]
+configuration_orders = ["primary_round_1", "primary_round_2", "dense", "moe", "runtime_control"]
+focuses = []
+focus_required = false
+trials = 8
+max_model_starts = 8
+tail_set = "release"
+diagnostic_families = ["gateway", "prefill", "decode", "scheduler", "cache"]
+coverage = [
+  { model = "primary", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
+  { model = "dense", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
+  { model = "moe", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
+  { model = "runtime_control", workloads = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c4", "cache_pressure"] },
+]
+
+[configuration_orders.primary_round_1]
+model = "primary"
+runtime_configurations = ["serial", "overlap"]
+
+[configuration_orders.primary_round_2]
+model = "primary"
+runtime_configurations = ["overlap", "serial"]
+
+[configuration_orders.dense]
+model = "dense"
+runtime_configurations = ["serial", "overlap"]
+
+[configuration_orders.moe]
+model = "moe"
+runtime_configurations = ["overlap", "serial"]
+
+[configuration_orders.runtime_control]
+model = "runtime_control"
+runtime_configurations = ["serial", "overlap"]
+
+[tail_sets.none]
+workloads = []
+
+[tail_sets.release]
+workloads = ["interactive_stream_c1", "steady_short_c8", "mixed_c8"]
+
+[diagnostics.gateway]
+models = ["runtime_control"]
+workloads = ["interactive_stream_c1"]
+
+[diagnostics.prefill]
+models = ["primary", "dense"]
+workloads = ["cold_prefill_2k_c1"]
+
+[diagnostics.decode]
+models = ["primary", "moe"]
+workloads = ["decode_128_c1"]
+
+[diagnostics.scheduler]
+models = ["primary"]
+workloads = ["mixed_c8"]
+
+[diagnostics.cache]
+models = ["primary"]
+workloads = ["shared_prefix_warm_c4", "cache_pressure"]

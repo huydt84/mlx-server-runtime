@@ -15,6 +15,7 @@ use crate::environment::output_detail;
 const BENCHMARK_EXTRA: &str = "bench";
 const DISTRIBUTION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const GATEWAY_EXECUTABLE_ENV: &str = "MLX_AIR_GATEWAY_EXECUTABLE";
+pub(crate) const DEFAULT_BENCHMARK_CONFIG_ENV: &str = "MLX_AIR_DEFAULT_BENCHMARK_CONFIG";
 pub(crate) const INVOCATION_DIRECTORY_ENV: &str = "MLX_AIR_INVOCATION_DIRECTORY";
 pub(crate) const MLX_AIR_VERSION_ENV: &str = "MLX_AIR_VERSION";
 
@@ -184,6 +185,10 @@ pub(crate) fn benchmark_command(
             distribution.gateway_executable.as_os_str().to_owned(),
         )
         .env(
+            DEFAULT_BENCHMARK_CONFIG_ENV,
+            distribution.benchmark_config.as_os_str().to_owned(),
+        )
+        .env(
             INVOCATION_DIRECTORY_ENV,
             invocation_directory.as_os_str().to_owned(),
         )
@@ -340,6 +345,10 @@ mod tests {
         assert_eq!(
             command.env.get(OsStr::new(GATEWAY_EXECUTABLE_ENV)),
             Some(&distribution.gateway_executable.as_os_str().to_owned())
+        );
+        assert_eq!(
+            command.env.get(OsStr::new(DEFAULT_BENCHMARK_CONFIG_ENV)),
+            Some(&distribution.benchmark_config.as_os_str().to_owned())
         );
         assert_eq!(
             command.env.get(OsStr::new(INVOCATION_DIRECTORY_ENV)),
