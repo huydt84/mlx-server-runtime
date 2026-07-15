@@ -8,6 +8,8 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+from mlx_benchmark.runner import run_benchmark
+
 _GATEWAY_EXECUTABLE_ENV = "MLX_AIR_GATEWAY_EXECUTABLE"
 _BENCHMARK_EXECUTION_FAILURE = 50
 
@@ -74,6 +76,16 @@ def _validate_run_arguments(
         parser.error("--base-url is required with --server-mode external")
     if arguments.server_mode == "self-launched" and arguments.base_url is not None:
         parser.error("--base-url is not valid with --server-mode self-launched")
+    if arguments.suite != "smoke":
+        parser.error("only the built-in --suite smoke workload is currently supported")
+    if arguments.focus is not None:
+        parser.error("--focus is not available until benchmark configuration support")
+    if arguments.benchmark_config is not None:
+        parser.error(
+            "--benchmark-config is not available until benchmark configuration support"
+        )
+    if arguments.profile != "none":
+        parser.error("timed workloads currently require --profile none")
 
 
 def _validate_gateway(parser: argparse.ArgumentParser) -> Path:
@@ -101,7 +113,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     arguments = parser.parse_args(argv)
     _validate_run_arguments(parser, arguments)
-    _validate_gateway(parser)
+    gateway = _validate_gateway(parser)
+    if arguments.action == "run":
+        return run_benchmark(arguments, gateway)
     print("error: benchmark execution is not available in this build", file=sys.stderr)
     return _BENCHMARK_EXECUTION_FAILURE
 

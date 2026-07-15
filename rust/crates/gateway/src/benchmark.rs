@@ -15,6 +15,8 @@ use crate::environment::output_detail;
 const BENCHMARK_EXTRA: &str = "bench";
 const DISTRIBUTION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const GATEWAY_EXECUTABLE_ENV: &str = "MLX_AIR_GATEWAY_EXECUTABLE";
+pub(crate) const INVOCATION_DIRECTORY_ENV: &str = "MLX_AIR_INVOCATION_DIRECTORY";
+pub(crate) const MLX_AIR_VERSION_ENV: &str = "MLX_AIR_VERSION";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BenchmarkEnvironment {
@@ -153,6 +155,7 @@ pub(crate) fn ensure_benchmark_environment(
 pub(crate) fn benchmark_command(
     distribution: &DistributionPaths,
     environment: &BenchmarkEnvironment,
+    invocation_directory: &Path,
     action: &str,
     args: &[OsString],
 ) -> CommandSpec {
@@ -180,6 +183,11 @@ pub(crate) fn benchmark_command(
             GATEWAY_EXECUTABLE_ENV,
             distribution.gateway_executable.as_os_str().to_owned(),
         )
+        .env(
+            INVOCATION_DIRECTORY_ENV,
+            invocation_directory.as_os_str().to_owned(),
+        )
+        .env(MLX_AIR_VERSION_ENV, DISTRIBUTION_VERSION)
         .current_dir(&distribution.root)
         .output_mode(OutputMode::Inherit)
 }
@@ -308,6 +316,7 @@ mod tests {
         let command = benchmark_command(
             &distribution,
             &selected,
+            Path::new("/invocation"),
             "run",
             &["--suite".into(), "smoke".into()],
         );
@@ -331,6 +340,14 @@ mod tests {
         assert_eq!(
             command.env.get(OsStr::new(GATEWAY_EXECUTABLE_ENV)),
             Some(&distribution.gateway_executable.as_os_str().to_owned())
+        );
+        assert_eq!(
+            command.env.get(OsStr::new(INVOCATION_DIRECTORY_ENV)),
+            Some(&OsString::from("/invocation"))
+        );
+        assert_eq!(
+            command.env.get(OsStr::new(MLX_AIR_VERSION_ENV)),
+            Some(&OsString::from(DISTRIBUTION_VERSION))
         );
         assert_eq!(command.current_dir, Some(distribution.root.clone()));
         assert_eq!(command.output_mode, OutputMode::Inherit);

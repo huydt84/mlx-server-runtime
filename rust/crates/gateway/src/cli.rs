@@ -463,7 +463,16 @@ impl RuntimeOperations for ProductionRuntime {
         let environment =
             ensure_benchmark_environment(&distribution, &application, &ProcessCommandRunner)
                 .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        let command = benchmark_command(&distribution, &environment, action.as_str(), args);
+        let invocation_directory = std::env::current_dir().map_err(|err| {
+            RuntimeFailure::environment(format!("resolve current directory: {err}"))
+        })?;
+        let command = benchmark_command(
+            &distribution,
+            &environment,
+            &invocation_directory,
+            action.as_str(),
+            args,
+        );
         ProcessCommandRunner
             .replace(&command)
             .map_err(|err| RuntimeFailure::benchmark(err.to_string()))

@@ -402,6 +402,7 @@ fn response_for_request(request_line: &str, body: &[u8], state: &AppState) -> Ht
         ("GET", "/startup") => startup_response(&state.runtime),
         ("GET", "/ready") => readiness_response(&state.runtime),
         ("GET", "/health") => health_response(&state.runtime),
+        ("GET", "/version") => version_response(),
         ("GET", path)
             if state.telemetry.enable_prometheus && path == state.telemetry.metrics_path =>
         {
@@ -416,6 +417,14 @@ fn response_for_request(request_line: &str, body: &[u8], state: &AppState) -> Ht
             model_ready_response(&state.runtime, &path, state.vlm_model.as_deref())
         }
         _ => not_found_response(),
+    }
+}
+
+fn version_response() -> HttpResponse {
+    HttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "application/json",
+        body: json!({ "gateway_version": env!("CARGO_PKG_VERSION") }).to_string(),
     }
 }
 
@@ -1635,6 +1644,16 @@ mod tests {
             .status,
             "200 OK"
         );
+    }
+
+    #[test]
+    fn version_endpoint_exposes_gateway_package_version() {
+        let state = test_state(ModelState::NotLoaded, Arc::new(FakeService::default()));
+
+        let response = response_for_request("GET /version HTTP/1.1\r\n", &[], &state);
+
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

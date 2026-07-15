@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,16 @@ impl StagedCli {
         fs::create_dir_all(&fake_bin).unwrap();
 
         fs::copy(env!("CARGO_BIN_EXE_mlx-air"), &executable).unwrap();
-        fs::write(root.join("bin/mlx_runtime_gateway"), "gateway").unwrap();
+        fs::write(
+            root.join("bin/mlx_runtime_gateway"),
+            include_str!("fixtures/fake_benchmark_gateway.py"),
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.join("bin/mlx_runtime_gateway"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fs::write(root.join("config/runtime.toml"), "[worker]\n").unwrap();
         fs::write(root.join("licenses/LICENSE"), "license").unwrap();
         fs::write(
@@ -50,6 +60,11 @@ impl StagedCli {
         fs::write(
             root.join("python/mlx_benchmark/__main__.py"),
             include_str!("../../../../python/mlx_benchmark/__main__.py"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("python/mlx_benchmark/runner.py"),
+            include_str!("../../../../python/mlx_benchmark/runner.py"),
         )
         .unwrap();
 
@@ -193,6 +208,190 @@ fn missing_bundled_python_project_fails_before_uv_delegation() {
     assert!(stderr(&output).contains("missing bundled Python project"));
 }
 
+#[test]
+fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
+    let staged = StagedCli::new("successful-run");
+    let output_directory = staged.base.join("successful-artifacts");
+    let pid_file = staged.base.join("successful-pids");
+
+    let output = staged
+        .command()
+        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "smoke",
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let results = read_results(&output_directory);
+    assert_eq!(results["status"], "succeeded");
+    assert_eq!(results["trials"].as_array().unwrap().len(), 2);
+    assert_eq!(results["trials"][0]["request_count"], 2);
+    assert_eq!(results["trials"][1]["request_count"], 4);
+    assert_eq!(all_requests(&results).len(), 6);
+    assert!(all_requests(&results).iter().all(|request| {
+        request["first_byte_monotonic_ns"].is_number()
+            && request["first_token_monotonic_ns"].is_number()
+            && request["final_token_monotonic_ns"].is_number()
+            && request["completed_monotonic_ns"].is_number()
+            && request["prompt_tokens"] == 5
+            && request["completion_tokens"] == 2
+            && request["output_sha256"].as_str().is_some()
+    }));
+    assert!(output_directory.join("report.md").is_file());
+    assert!(output_directory.join("logs/gateway.log").is_file());
+    assert!(output_directory.join("logs/worker.log").is_file());
+    assert_processes_reaped(&pid_file);
+}
+
+#[test]
+fn repeated_runs_preserve_workload_prompt_trial_and_request_order() {
+    let staged = StagedCli::new("deterministic-order");
+    let first_directory = staged.base.join("first");
+    let second_directory = staged.base.join("second");
+
+    for directory in [&first_directory, &second_directory] {
+        let output = staged
+            .command()
+            .args([
+                "bench",
+                "run",
+                "--suite",
+                "smoke",
+                "--output-dir",
+                directory.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+    }
+
+    let first = request_identity(&read_results(&first_directory));
+    let second = request_identity(&read_results(&second_directory));
+    assert_eq!(first, second);
+}
+
+#[test]
+fn request_failure_preserves_measurements_and_reaps_process_group() {
+    let staged = StagedCli::new("request-failure");
+    let output_directory = staged.base.join("failure-artifacts");
+    let pid_file = staged.base.join("failure-pids");
+
+    let output = staged
+        .command()
+        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+        .env("FAKE_GATEWAY_RUN_MODE", "request-failure")
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "smoke",
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(50));
+    let results = read_results(&output_directory);
+    assert_eq!(results["status"], "failed");
+    assert_eq!(results["failure_stage"], "measurement");
+    assert_eq!(all_requests(&results).len(), 6);
+    assert!(all_requests(&results)
+        .iter()
+        .all(|request| request["status"] == "failed"));
+    assert_processes_reaped(&pid_file);
+}
+
+#[test]
+fn sigint_preserves_failure_stage_and_reaps_process_group() {
+    let staged = StagedCli::new("interrupt-run");
+    let output_directory = staged.base.join("interrupt-artifacts");
+    let pid_file = staged.base.join("interrupt-pids");
+    let mut child = staged
+        .command()
+        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+        .env("FAKE_GATEWAY_DELAY_READY", "1")
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "smoke",
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_file(&pid_file);
+
+    let result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    assert_eq!(result, 0);
+    let status = child.wait().unwrap();
+
+    assert_eq!(status.code(), Some(130));
+    let results = read_results(&output_directory);
+    assert_eq!(results["status"], "interrupted");
+    assert_eq!(results["failure_stage"], "readiness");
+    assert!(output_directory.join("logs/gateway.log").is_file());
+    assert!(output_directory.join("logs/worker.log").is_file());
+    assert_processes_reaped(&pid_file);
+}
+
+#[test]
+fn external_mode_records_server_identity_without_stopping_server() {
+    let staged = StagedCli::new("external-server");
+    let output_directory = staged.base.join("external-artifacts");
+    let port = reserve_port();
+    let config = staged.base.join("external.toml");
+    fs::write(
+        &config,
+        format!(
+            "[server]\nport = {port}\n[worker]\nmodel = \"mlx-community/Qwen3-4B-Instruct-2507-4bit\"\n"
+        ),
+    )
+    .unwrap();
+    let mut server = Command::new(staged.root.join("bin/mlx_runtime_gateway"))
+        .env("MLX_RUNTIME_CONFIG", &config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_port(port);
+
+    let output = staged
+        .command()
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "smoke",
+            "--server-mode",
+            "external",
+            "--base-url",
+            &format!("http://127.0.0.1:{port}"),
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(server.try_wait().unwrap().is_none());
+    let results = read_results(&output_directory);
+    assert_eq!(results["server"]["mode"], "external");
+    assert_eq!(results["versions"]["gateway"], "0.1.0");
+    unsafe { libc::kill(server.id() as i32, libc::SIGTERM) };
+    assert!(server.wait().unwrap().success());
+}
+
 fn temp_path(label: &str) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -262,10 +461,70 @@ fn wait_for_file(path: &Path) {
     }
 }
 
+fn reserve_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn wait_for_port(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for port {port}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn read_results(directory: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(directory.join("results.json")).unwrap()).unwrap()
+}
+
+fn all_requests(results: &serde_json::Value) -> Vec<&serde_json::Value> {
+    results["trials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|trial| trial["requests"].as_array().unwrap())
+        .collect()
+}
+
+fn request_identity(results: &serde_json::Value) -> Vec<(String, u64, u64, u64)> {
+    all_requests(results)
+        .into_iter()
+        .map(|request| {
+            (
+                request["workload_name"].as_str().unwrap().to_string(),
+                request["trial_index"].as_u64().unwrap(),
+                request["request_index"].as_u64().unwrap(),
+                request["prompt_index"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn assert_processes_reaped(pid_file: &Path) {
+    let pids = fs::read_to_string(pid_file)
+        .unwrap()
+        .lines()
+        .map(|line| line.parse::<i32>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 2);
+    for pid in pids {
+        let result = unsafe { libc::kill(pid, 0) };
+        assert_eq!(result, -1, "process {pid} was not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
 }

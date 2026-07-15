@@ -696,11 +696,17 @@ fn spawn_worker(config: &RuntimeConfig) -> Result<Child, GatewayError> {
     for (key, value) in worker_env(config) {
         command.env(key, value);
     }
-    command
-        .env("PYTHONUNBUFFERED", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    command.env("PYTHONUNBUFFERED", "1").stdin(Stdio::null());
+    if let Some(log_path) = std::env::var_os("MLX_AIR_WORKER_LOG") {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        command.stdout(Stdio::from(log.try_clone()?));
+        command.stderr(Stdio::from(log));
+    } else {
+        command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
 
     let child = command.spawn()?;
     Ok(child)

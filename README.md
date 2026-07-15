@@ -43,6 +43,7 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 - `GET /ready` checks whether current model can serve requests.
 - `GET /startup` reports startup phase.
 - `GET /health` remains backwards-compatible with liveness-style checks.
+- `GET /version` reports the gateway package version.
 - `GET /models` lists configured model state.
 - `GET /models/{model}/status` returns detailed model lifecycle state.
 - `GET /models/{model}/ready` returns model-specific readiness.

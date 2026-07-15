@@ -99,6 +99,20 @@ Legacy health check. Plain text, backward-compatible.
 
 ---
 
+### GET /version
+
+Gateway package version used by clients that need to record the serving binary.
+
+**Response 200:**
+
+```json
+{
+  "gateway_version": "0.1.0"
+}
+```
+
+---
+
 ### GET /models
 
 List configured models and their status.
