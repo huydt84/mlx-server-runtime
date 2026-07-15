@@ -14,6 +14,9 @@ dependencies = [
     "tqdm>=4.68.2",
 ]
 
+[project.optional-dependencies]
+bench = []
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
@@ -25,4 +28,4 @@ package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mlx_worker*"]
+include = ["mlx_benchmark*", "mlx_worker*"]

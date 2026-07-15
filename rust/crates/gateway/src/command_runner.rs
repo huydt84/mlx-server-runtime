@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Read;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,6 +94,18 @@ impl std::error::Error for CommandError {}
 pub(crate) trait CommandRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandResult, CommandError>;
 
+    fn replace(&self, spec: &CommandSpec) -> Result<(), CommandError> {
+        let result = self.run(spec)?;
+        if result.success {
+            Ok(())
+        } else {
+            Err(CommandError::new(format!(
+                "{} exited unsuccessfully",
+                display_command(spec)
+            )))
+        }
+    }
+
     fn run_interruptible(
         &self,
         spec: &CommandSpec,
@@ -123,26 +136,22 @@ impl CommandRunner for ProcessCommandRunner {
     ) -> Result<CommandResult, CommandError> {
         run_process(spec, Some(interrupted))
     }
+
+    fn replace(&self, spec: &CommandSpec) -> Result<(), CommandError> {
+        let mut command = configured_command(spec);
+        let error = command.exec();
+        Err(CommandError::new(format!(
+            "failed to replace process with {}: {error}",
+            spec.program.to_string_lossy()
+        )))
+    }
 }
 
 fn run_process(
     spec: &CommandSpec,
     interrupted: Option<&AtomicBool>,
 ) -> Result<CommandResult, CommandError> {
-    let mut command = Command::new(&spec.program);
-    command.args(&spec.args).envs(&spec.env);
-    if let Some(current_dir) = &spec.current_dir {
-        command.current_dir(current_dir);
-    }
-
-    match spec.output_mode {
-        OutputMode::Capture => {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        }
-        OutputMode::Inherit => {
-            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        }
-    }
+    let mut command = configured_command(spec);
 
     let mut child = command.spawn().map_err(|err| {
         CommandError::new(format!(
@@ -189,6 +198,24 @@ fn run_process(
         stdout: join_pipe(stdout_reader, "stdout")?,
         stderr: join_pipe(stderr_reader, "stderr")?,
     })
+}
+
+fn configured_command(spec: &CommandSpec) -> Command {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args).envs(&spec.env);
+    if let Some(current_dir) = &spec.current_dir {
+        command.current_dir(current_dir);
+    }
+
+    match spec.output_mode {
+        OutputMode::Capture => {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        OutputMode::Inherit => {
+            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        }
+    }
+    command
 }
 
 fn read_pipe<R>(mut pipe: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>>

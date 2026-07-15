@@ -13,6 +13,7 @@ pub(crate) struct DistributionPaths {
     pub(crate) pyproject: PathBuf,
     pub(crate) uv_lock: PathBuf,
     pub(crate) python_package: PathBuf,
+    pub(crate) benchmark_package: PathBuf,
     pub(crate) default_config: PathBuf,
     pub(crate) licenses: PathBuf,
     pub(crate) gateway_executable: PathBuf,
@@ -22,6 +23,7 @@ pub(crate) struct DistributionPaths {
 pub(crate) struct ApplicationPaths {
     pub(crate) root: PathBuf,
     pub(crate) runtime_environments: PathBuf,
+    pub(crate) benchmark_environments: PathBuf,
     pub(crate) instances: PathBuf,
     pub(crate) logs: PathBuf,
     pub(crate) sockets: PathBuf,
@@ -72,6 +74,7 @@ impl DistributionPaths {
             pyproject: root.join("python/pyproject.toml"),
             uv_lock: root.join("python/uv.lock"),
             python_package: root.join("python/mlx_worker"),
+            benchmark_package: root.join("python/mlx_benchmark"),
             default_config: root.join("config/runtime.toml"),
             licenses: root.join("licenses"),
             gateway_executable: bin_dir.join("mlx_runtime_gateway"),
@@ -116,6 +119,10 @@ impl DistributionPaths {
         })?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
+
+    pub(crate) fn validate_benchmark_resources(&self) -> Result<(), PathError> {
+        require_directory(&self.benchmark_package, "bundled mlx_benchmark package")
+    }
 }
 
 impl ApplicationPaths {
@@ -129,6 +136,7 @@ impl ApplicationPaths {
         let root = home.join("Library/Application Support/mlx-air");
         Self {
             runtime_environments: root.join("environments/runtime"),
+            benchmark_environments: root.join("environments/benchmark"),
             instances: root.join("instances"),
             logs: home.join("Library/Logs/mlx-air"),
             sockets: PathBuf::from(format!("/tmp/mlx-air-{}", effective_user_id())),
@@ -138,6 +146,10 @@ impl ApplicationPaths {
 
     pub(crate) fn runtime_environment(&self, version: &str, lock_hash: &str) -> PathBuf {
         self.runtime_environments.join(version).join(lock_hash)
+    }
+
+    pub(crate) fn benchmark_environment(&self, version: &str, lock_hash: &str) -> PathBuf {
+        self.benchmark_environments.join(version).join(lock_hash)
     }
 
     pub(crate) fn create_foreground_socket_path(&self) -> Result<PathBuf, PathError> {
@@ -219,6 +231,7 @@ pub(crate) mod tests {
         let root = temp_path(label);
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("python/mlx_worker")).unwrap();
+        fs::create_dir_all(root.join("python/mlx_benchmark")).unwrap();
         fs::create_dir_all(root.join("config")).unwrap();
         fs::create_dir_all(root.join("licenses")).unwrap();
         fs::write(root.join("bin/mlx-air"), "binary").unwrap();
@@ -226,6 +239,7 @@ pub(crate) mod tests {
         fs::write(root.join("python/pyproject.toml"), "[project]\n").unwrap();
         fs::write(root.join("python/uv.lock"), "lock").unwrap();
         fs::write(root.join("python/mlx_worker/__init__.py"), "").unwrap();
+        fs::write(root.join("python/mlx_benchmark/__init__.py"), "").unwrap();
         fs::write(
             root.join("config/runtime.toml"),
             "[worker]\nmodel = \"default-model\"\n",
@@ -246,6 +260,7 @@ pub(crate) mod tests {
             root.join("bin/mlx_runtime_gateway")
         );
         assert_eq!(paths.python_package, root.join("python/mlx_worker"));
+        assert_eq!(paths.benchmark_package, root.join("python/mlx_benchmark"));
         assert_eq!(paths.default_config, root.join("config/runtime.toml"));
 
         fs::remove_dir_all(root).unwrap();
@@ -270,6 +285,17 @@ pub(crate) mod tests {
         assert_eq!(
             paths.runtime_environment("1.2.3", "abc123"),
             home.join("Library/Application Support/mlx-air/environments/runtime/1.2.3/abc123")
+        );
+    }
+
+    #[test]
+    fn benchmark_environment_path_uses_version_and_lock_hash() {
+        let home = temp_path("benchmark-application-paths");
+        let paths = ApplicationPaths::from_home(&home);
+
+        assert_eq!(
+            paths.benchmark_environment("1.2.3", "abc123"),
+            home.join("Library/Application Support/mlx-air/environments/benchmark/1.2.3/abc123")
         );
     }
 

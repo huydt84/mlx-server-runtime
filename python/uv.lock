@@ -1072,6 +1072,7 @@ requires-dist = [
     { name = "mlx-vlm", specifier = ">=0.6.0,<0.7" },
     { name = "tqdm", specifier = ">=4.68.2" },
 ]
+provides-extras = ["bench"]
 
 [package.metadata.requires-dev]
 dev = [

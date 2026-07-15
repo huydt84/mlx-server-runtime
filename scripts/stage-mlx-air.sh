@@ -44,6 +44,7 @@ COPYFILE_DISABLE=1 tar \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     -cf - \
+    mlx_benchmark \
     mlx_worker | tar -C "$OUTPUT_DIR/python" -xf -
 
 echo "MLX Air distribution staged at $OUTPUT_DIR"

@@ -1,6 +1,7 @@
 //! Parser and dispatch for the public `mlx-air` CLI.
 
-use crate::command_runner::ProcessCommandRunner;
+use crate::benchmark::{benchmark_command, ensure_benchmark_environment};
+use crate::command_runner::{CommandRunner, ProcessCommandRunner};
 use crate::configuration::{resolve_runtime_config, CliConfigOverrides};
 use crate::distribution::{ApplicationPaths, DistributionPaths};
 use crate::doctor::{run_doctor, DoctorReport, PlatformInfo};
@@ -154,11 +155,31 @@ impl HelpTopic {
 #[derive(Debug, Subcommand)]
 enum BenchCommand {
     /// Run a benchmark suite.
+    #[command(disable_help_flag = true)]
     Run(BenchmarkArgs),
     /// Collect diagnostics for an existing benchmark result.
+    #[command(disable_help_flag = true)]
     Diagnose(BenchmarkArgs),
     /// Calibrate benchmark repetition counts.
+    #[command(disable_help_flag = true)]
     Calibrate(BenchmarkArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkAction {
+    Run,
+    Diagnose,
+    Calibrate,
+}
+
+impl BenchmarkAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Diagnose => "diagnose",
+            Self::Calibrate => "calibrate",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -266,21 +287,17 @@ fn dispatch(cli: Cli, runtime: &dyn RuntimeOperations) -> CliOutput {
         Some(Command::Bench {
             command: Some(command),
         }) => {
-            let action = match command {
-                BenchCommand::Run(args) => {
-                    let _ = args.args;
-                    "bench run"
-                }
-                BenchCommand::Diagnose(args) => {
-                    let _ = args.args;
-                    "bench diagnose"
-                }
-                BenchCommand::Calibrate(args) => {
-                    let _ = args.args;
-                    "bench calibrate"
-                }
+            let (action, args) = match command {
+                BenchCommand::Run(args) => (BenchmarkAction::Run, args.args),
+                BenchCommand::Diagnose(args) => (BenchmarkAction::Diagnose, args.args),
+                BenchCommand::Calibrate(args) => (BenchmarkAction::Calibrate, args.args),
             };
-            stub_output(action, ExitCode::BenchmarkExecutionFailure)
+            match runtime.benchmark(action, &args) {
+                Ok(()) => CliOutput::stdout(ExitCode::NormalTermination, String::new()),
+                Err(failure) => {
+                    CliOutput::stderr(failure.code, format!("error: {}\n", failure.message))
+                }
+            }
         }
     }
 }
@@ -292,6 +309,7 @@ trait RuntimeOperations {
     fn attach(&self, name: &str) -> Result<(), RuntimeFailure>;
     fn stop(&self, name: &str) -> Result<String, RuntimeFailure>;
     fn doctor(&self) -> Result<DoctorReport, String>;
+    fn benchmark(&self, action: BenchmarkAction, args: &[OsString]) -> Result<(), RuntimeFailure>;
 }
 
 struct RuntimeFailure {
@@ -335,6 +353,13 @@ impl RuntimeFailure {
     fn launchd(message: impl Into<String>) -> Self {
         Self {
             code: ExitCode::LaunchdFailure,
+            message: message.into(),
+        }
+    }
+
+    fn benchmark(message: impl Into<String>) -> Self {
+        Self {
+            code: ExitCode::BenchmarkExecutionFailure,
             message: message.into(),
         }
     }
@@ -429,6 +454,20 @@ impl RuntimeOperations for ProductionRuntime {
             PlatformInfo::current(),
         ))
     }
+
+    fn benchmark(&self, action: BenchmarkAction, args: &[OsString]) -> Result<(), RuntimeFailure> {
+        let distribution = DistributionPaths::from_current_executable()
+            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+        let application = ApplicationPaths::from_environment()
+            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+        let environment =
+            ensure_benchmark_environment(&distribution, &application, &ProcessCommandRunner)
+                .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+        let command = benchmark_command(&distribution, &environment, action.as_str(), args);
+        ProcessCommandRunner
+            .replace(&command)
+            .map_err(|err| RuntimeFailure::benchmark(err.to_string()))
+    }
 }
 
 fn resolve_serve_context(
@@ -502,13 +541,6 @@ fn clap_output(error: clap::Error) -> CliOutput {
     }
 }
 
-fn stub_output(command: &str, code: ExitCode) -> CliOutput {
-    CliOutput::stderr(
-        code,
-        format!("error: 'mlx-air {command}' is not implemented yet\n"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +598,15 @@ mod tests {
                     detail: "ok".to_string(),
                 }],
             })
+        }
+
+        fn benchmark(
+            &self,
+            _action: BenchmarkAction,
+            _args: &[OsString],
+        ) -> Result<(), RuntimeFailure> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(())
         }
     }
 
@@ -737,6 +778,29 @@ mod tests {
         ]);
 
         assert!(result.is_ok(), "unexpected parse error: {result:?}");
+    }
+
+    #[test]
+    fn parser_forwards_benchmark_leaf_help_instead_of_rendering_rust_help() {
+        let result = Cli::try_parse_from(["mlx-air", "bench", "run", "--help"]).unwrap();
+        let Some(Command::Bench {
+            command: Some(BenchCommand::Run(args)),
+        }) = result.command
+        else {
+            panic!("expected bench run command");
+        };
+
+        assert_eq!(args.args, [OsString::from("--help")]);
+    }
+
+    #[test]
+    fn benchmark_action_dispatches_to_runtime() {
+        let runtime = FakeRuntime::new();
+
+        let result = execute(["mlx-air", "bench", "run", "--suite", "smoke"], &runtime);
+
+        assert_eq!(result.code, ExitCode::NormalTermination);
+        assert_eq!(runtime.calls.get(), 1);
     }
 
     #[test]
