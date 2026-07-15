@@ -10,6 +10,8 @@ from typing import Callable
 
 from ..config import WorkerConfig
 from ..ipc import (
+    BenchmarkResetRequest,
+    BenchmarkResetState,
     CancelRequest,
     ModelLoadProgress,
     ModelStatus,
@@ -124,6 +126,22 @@ def run_native_worker(
                     raise ValueError("unsupported worker command")
                 if isinstance(command, CancelRequest):
                     runtime.cancel(command.request_id)
+                elif isinstance(command, BenchmarkResetRequest):
+                    if not runtime.idle():
+                        raise RuntimeError("benchmark reset requires an idle scheduler")
+                    cache_state = runtime.benchmark_reset(
+                        clear_cache=command.clear_cache,
+                        reset_counters=command.reset_counters,
+                    )
+                    client.sendall(
+                        encode_event(
+                            BenchmarkResetState(
+                                request_id=command.request_id,
+                                scheduler_idle=True,
+                                cache_state=cache_state,
+                            )
+                        )
+                    )
                 else:
                     record_transport = getattr(runtime, "record_transport", None)
                     if callable(record_transport):
@@ -137,7 +155,13 @@ def run_native_worker(
                 client.sendall(
                     encode_event(
                         WorkerCommandError(
-                            code="INVALID_REQUEST",
+                            code=(
+                                "BENCHMARK_BUSY"
+                                if isinstance(
+                                    locals().get("command"), BenchmarkResetRequest
+                                )
+                                else "INVALID_REQUEST"
+                            ),
                             request_id=getattr(command, "request_id", "unknown")
                             if "command" in locals()
                             else "unknown",

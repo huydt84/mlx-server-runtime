@@ -1,8 +1,8 @@
 use crate::errors::GatewayError;
 use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
-    decode_worker_event, encode_gateway_command, ChatCompletionRequest, ChatCompletionResponse,
-    GatewayCommand, WorkerEvent,
+    decode_worker_event, encode_gateway_command, BenchmarkResetState, ChatCompletionRequest,
+    ChatCompletionResponse, GatewayCommand, WorkerEvent,
 };
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -10,6 +10,9 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+
+static BENCHMARK_RESET_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 enum RoutedWorkerEvent {
     Event(Box<WorkerEvent>),
@@ -72,6 +75,60 @@ impl WorkerClient {
         })
     }
 
+    /// Reset idle worker cache and benchmark-counter state.
+    pub fn benchmark_reset(
+        &self,
+        clear_cache: bool,
+        reset_counters: bool,
+    ) -> Result<BenchmarkResetState, GatewayError> {
+        let sequence = BENCHMARK_RESET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let request_id = format!("benchmark-reset-{}-{sequence}", std::process::id());
+        let (sender, receiver) = mpsc::channel();
+        self.register_request(&request_id, sender)?;
+        if let Err(error) = self.send_command(GatewayCommand::BenchmarkReset {
+            request_id: request_id.clone(),
+            clear_cache,
+            reset_counters,
+        }) {
+            self.unregister_request(&request_id);
+            return Err(error);
+        }
+
+        loop {
+            match receiver.recv() {
+                Ok(RoutedWorkerEvent::Failure(message)) => {
+                    self.unregister_request(&request_id);
+                    return Err(GatewayError::Protocol(message));
+                }
+                Ok(RoutedWorkerEvent::Event(event)) => match *event {
+                    WorkerEvent::BenchmarkReset { state } if state.request_id == request_id => {
+                        self.unregister_request(&request_id);
+                        return Ok(state);
+                    }
+                    WorkerEvent::Error {
+                        code,
+                        request_id: response_id,
+                        message,
+                    } if response_id == request_id => {
+                        self.unregister_request(&request_id);
+                        return if code == "BENCHMARK_BUSY" {
+                            Err(GatewayError::BenchmarkBusy(message))
+                        } else {
+                            Err(GatewayError::Protocol(message))
+                        };
+                    }
+                    _ => continue,
+                },
+                Err(_) => {
+                    self.unregister_request(&request_id);
+                    return Err(GatewayError::Protocol(
+                        "worker closed the inference socket".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
@@ -97,6 +154,7 @@ impl WorkerClient {
                 }
                 Ok(RoutedWorkerEvent::Event(event)) => match *event {
                     WorkerEvent::SchedulerMetrics { .. } => continue,
+                    WorkerEvent::BenchmarkReset { .. } => continue,
                     WorkerEvent::ChatCompletionDelta { delta } => {
                         if !stream {
                             self.unregister_request(&request_id);
@@ -1056,6 +1114,7 @@ impl WorkerClient {
 
                 let request_id = match &event {
                     WorkerEvent::SchedulerMetrics { .. } => unreachable!(),
+                    WorkerEvent::BenchmarkReset { state } => state.request_id.clone(),
                     WorkerEvent::ChatCompletionDelta { delta } => delta.request_id.clone(),
                     WorkerEvent::ChatCompletion { response, .. } => response.request_id.clone(),
                     WorkerEvent::Error { request_id, .. } => request_id.clone(),

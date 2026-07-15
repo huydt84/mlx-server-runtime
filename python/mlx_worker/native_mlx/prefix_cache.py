@@ -56,6 +56,11 @@ class NoPrefixCache:
             "prefix_evictions": 0,
         }
 
+    def reset(self, *, clear_cache: bool, reset_counters: bool) -> None:
+        """Accept reset requests for the no-cache adapter."""
+
+        del clear_cache, reset_counters
+
 
 @dataclass(frozen=True)
 class PrefixCompatibilityFingerprint:
@@ -256,6 +261,24 @@ class BlockHashPrefixCache:
             "prefix_collisions_rejected": self._collisions_rejected,
             "prefix_evictions": self._evictions,
         }
+
+    def reset(self, *, clear_cache: bool, reset_counters: bool) -> None:
+        """Clear reusable snapshots and cumulative prefix counters."""
+
+        if self._active_handles:
+            raise RuntimeError("cannot reset prefix cache while entries are pinned")
+        if clear_cache:
+            for entry in self._entries.values():
+                self.backend.release(entry.cache_handle)
+            self._entries.clear()
+        if reset_counters:
+            self._queries = 0
+            self._hits = 0
+            self._misses = 0
+            self._reused_tokens = 0
+            self._reused_pages = 0
+            self._collisions_rejected = 0
+            self._evictions = 0
 
     def _lookup(
         self, token_ids: tuple[int, ...], *, mutate: bool
@@ -503,6 +526,27 @@ class RadixPrefixCache:
         }
         self._metrics_dirty = False
         return dict(self._metrics_cache)
+
+    def reset(self, *, clear_cache: bool, reset_counters: bool) -> None:
+        """Clear reusable radix snapshots and cumulative prefix counters."""
+
+        if self._active_handles:
+            raise RuntimeError("cannot reset prefix cache while entries are pinned")
+        if clear_cache:
+            for node in self._walk_nodes():
+                if node.cache_handle is not None:
+                    self.backend.release(node.cache_handle)
+            self._root = _RadixNode()
+            self._published_lengths_by_handle.clear()
+        if reset_counters:
+            self._queries = 0
+            self._hits = 0
+            self._misses = 0
+            self._reused_tokens = 0
+            self._reused_pages = 0
+            self._splits = 0
+            self._evictions = 0
+        self._metrics_dirty = True
 
     def _lookup(self, token_ids: tuple[int, ...], *, mutate: bool) -> _RadixNode | None:
         max_reusable = ((max(0, len(token_ids) - 1)) // self.page_size) * self.page_size

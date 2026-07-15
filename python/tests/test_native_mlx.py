@@ -679,6 +679,30 @@ def test_block_hash_prefix_cache_reuses_only_exact_full_pages() -> None:
     assert cache.metrics()["prefix_misses"] == 2
 
 
+def test_native_cache_coordinator_benchmark_reset_clears_prefix_state() -> None:
+    backend = DenseKVCacheBackend(num_layers=1)
+    cache = BlockHashPrefixCache(
+        backend=backend,
+        compatibility=_fingerprint(),
+        page_size=2,
+        max_entries=8,
+        max_bytes=4096,
+    )
+    coordinator = NativeCacheCoordinator(backend, cache)
+    handle = coordinator.acquire("source", (1, 2, 3, 4)).cache_handle
+    _commit_dense_tokens(backend, handle, "source", 4)
+    coordinator.publish_committed(handle, (1, 2, 3, 4), 4)
+    coordinator.release(handle)
+    assert coordinator.probe((1, 2, 3, 4, 5)).matched_tokens == 4
+
+    state = coordinator.reset(clear_cache=True, reset_counters=True)
+
+    assert state["prefix_entries"] == 0
+    assert state["prefix_hits"] == 0
+    assert state["prefix_misses"] == 0
+    assert state["active_kv_bytes"] == 0
+
+
 def test_block_hash_prefix_cache_rejects_incompatible_fingerprint() -> None:
     backend = DenseKVCacheBackend(num_layers=1)
     handle = backend.create("source")
@@ -1359,6 +1383,8 @@ def test_scheduler_prefix_hit_reduces_scheduled_prefill_tokens() -> None:
         and event.metrics["scheduled_tokens"] == 1
         for event in events
     )
+    prefill = next(event for event in events if event.kind == "prefill_progress")
+    assert prefill.metrics["cached_tokens"] == 4
 
 
 def test_scheduler_isolates_request_local_executor_failure() -> None:
@@ -1870,6 +1896,7 @@ def test_runtime_reports_scheduler_queue_wait_separately() -> None:
                     "step_time_ms": 1,
                     "batch_size": 1,
                     "scheduler_queue_wait_ms": 12,
+                    "cached_tokens": 1,
                 },
             ),
             SchedulerEvent(
@@ -1887,6 +1914,8 @@ def test_runtime_reports_scheduler_queue_wait_separately() -> None:
 
     assert response.scheduler_queue_wait_ms == 12
     assert response.queue_time_ms == 12
+    assert response.prompt_cache_hit is True
+    assert response.cached_tokens == 1
 
 
 def test_runtime_cancellation_terminal_response_carries_stage_and_latency() -> None:

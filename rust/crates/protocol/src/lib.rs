@@ -14,6 +14,7 @@ pub use request::{
     MessageRole,
 };
 pub use response::{
-    ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent, WorkerError, WorkerReady,
+    BenchmarkResetState, ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent,
+    WorkerError, WorkerReady,
 };
 pub use status::{ModelError, ModelLoadProgress, ModelState, ModelStatus, ModelSummary};

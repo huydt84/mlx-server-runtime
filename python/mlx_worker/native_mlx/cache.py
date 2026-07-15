@@ -76,6 +76,8 @@ class KVCacheBackend(Protocol):
 
     def metrics(self) -> dict[str, Any]: ...
 
+    def reset(self, *, reset_counters: bool) -> None: ...
+
 
 @dataclass
 class DenseLayerCache:
@@ -397,6 +399,12 @@ class DenseKVCacheBackend:
                 for layer in cache.layers
             ),
         }
+
+    def reset(self, *, reset_counters: bool) -> None:
+        """Release every dense request cache."""
+
+        del reset_counters
+        self._caches.clear()
 
 
 @dataclass
@@ -904,6 +912,19 @@ class PagedKVCacheBackend:
             "allocation_failures": self._allocation_failures,
             "page_size": self.page_size,
         }
+
+    def reset(self, *, reset_counters: bool) -> None:
+        """Release every page mapping and optionally reset allocation failures."""
+
+        if self._reserved_pages or any(self._pin_counts):
+            raise RuntimeError(
+                "cannot reset KV cache while pages are reserved or pinned"
+            )
+        self._caches.clear()
+        self._free_pages = list(range(self.num_pages))
+        self._ref_counts = [0] * self.num_pages
+        if reset_counters:
+            self._allocation_failures = 0
 
     def _commit_reservation(
         self,

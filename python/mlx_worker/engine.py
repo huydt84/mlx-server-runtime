@@ -123,6 +123,24 @@ class MlxWorkerEngine:
             make_sampler=self._make_sampler,
         )
 
+    def benchmark_reset(
+        self, *, clear_cache: bool, reset_counters: bool
+    ) -> dict[str, int]:
+        """Reset benchmark cache state while retaining model weights."""
+
+        self._prompt_cache_store.reset(
+            clear_cache=clear_cache,
+            reset_counters=reset_counters,
+        )
+        stats = self._prompt_cache_store.stats_snapshot
+        return {
+            "prefix_entries": stats.entries,
+            "prefix_bytes": stats.bytes,
+            "prefix_hits": stats.hits,
+            "prefix_misses": stats.misses,
+            "prefix_evictions": stats.evictions,
+        }
+
     def stream_chat(
         self,
         request: ChatCompletionRequest,

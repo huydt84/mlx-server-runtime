@@ -56,6 +56,41 @@ def generate_prompt_bank(configuration: dict[str, Any]) -> dict[str, list[Prompt
     }
 
 
+def shared_prefix_prime_prompts(
+    prompts: list[Prompt], *, trial_index: int, request_count: int
+) -> list[Prompt]:
+    """Build one non-measured suffix per shared prefix used by a trial."""
+
+    selected = [
+        prompts[(trial_index * request_count + index) % len(prompts)]
+        for index in range(request_count)
+    ]
+    primes: dict[str, Prompt] = {}
+    marker = ". Unique suffix "
+    for prompt in selected:
+        shared, separator, _suffix = prompt.text.partition(marker)
+        if not separator:
+            raise ValueError(
+                f"shared-prefix prompt {prompt.name!r} has no unique-suffix marker"
+            )
+        digest = hashlib.sha256(shared.encode()).hexdigest()
+        if digest in primes:
+            continue
+        text = (
+            f"{shared}. Benchmark-only priming suffix {trial_index}-{len(primes)}; "
+            "this suffix is intentionally absent from measured prompts"
+        )
+        primes[digest] = Prompt(
+            group=prompt.group,
+            name=f"prime-{prompt.name}",
+            index=prompt.index,
+            target_tokens=prompt.target_tokens,
+            text=text,
+            sha256=hashlib.sha256(text.encode()).hexdigest(),
+        )
+    return list(primes.values())
+
+
 def _generate_group(name: str, definition: dict[str, Any], seed: int) -> list[Prompt]:
     group_seed = int.from_bytes(
         hashlib.sha256(f"{seed}:{name}".encode()).digest()[:8], "big"

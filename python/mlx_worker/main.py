@@ -21,6 +21,8 @@ from .batching import (
 )
 from .config import load_config
 from .ipc import (
+    BenchmarkResetRequest,
+    BenchmarkResetState,
     ChatCompletionResponse,
     ChatCompletionDelta,
     CancelRequest,
@@ -285,12 +287,15 @@ def main(
             try:
                 request = decode_command(raw_line)
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                event: ChatCompletionResponse | WorkerCommandError | None = (
-                    WorkerCommandError(
-                        code="INVALID_REQUEST",
-                        request_id="unknown",
-                        message=str(exc),
-                    )
+                event: (
+                    ChatCompletionResponse
+                    | WorkerCommandError
+                    | BenchmarkResetState
+                    | None
+                ) = WorkerCommandError(
+                    code="INVALID_REQUEST",
+                    request_id="unknown",
+                    message=str(exc),
                 )
             else:
                 if request is None:
@@ -301,6 +306,16 @@ def main(
                     )
                 elif isinstance(request, CancelRequest):
                     continue
+                elif isinstance(request, BenchmarkResetRequest):
+                    cache_state = engine.benchmark_reset(
+                        clear_cache=request.clear_cache,
+                        reset_counters=request.reset_counters,
+                    )
+                    event = BenchmarkResetState(
+                        request_id=request.request_id,
+                        scheduler_idle=True,
+                        cache_state=cache_state,
+                    )
                 else:
                     try:
                         # Model-first dispatch: route by model name, not image presence.
@@ -475,6 +490,27 @@ def _run_continuous_text_loop(
                         )
                     elif isinstance(command, CancelRequest):
                         scheduler.cancel(command.request_id)
+                    elif isinstance(command, BenchmarkResetRequest):
+                        if not scheduler.idle():
+                            emit_error(
+                                command.request_id,
+                                "BENCHMARK_BUSY",
+                                "benchmark reset requires an idle scheduler",
+                            )
+                        else:
+                            cache_state = engine.benchmark_reset(  # type: ignore[attr-defined]
+                                clear_cache=command.clear_cache,
+                                reset_counters=command.reset_counters,
+                            )
+                            client.sendall(
+                                encode_event(
+                                    BenchmarkResetState(
+                                        request_id=command.request_id,
+                                        scheduler_idle=True,
+                                        cache_state=cache_state,
+                                    )
+                                )
+                            )
                     else:
                         scheduler.submit(command, stream=command.stream)
 
@@ -694,6 +730,34 @@ def _run_continuous_batch_loop(
                         handled = text_scheduler.cancel(command.request_id)
                         if not handled and vlm_scheduler is not None:
                             handled = vlm_scheduler.cancel(command.request_id)
+                    elif isinstance(command, BenchmarkResetRequest):
+                        schedulers_idle = text_scheduler.idle() and (
+                            vlm_scheduler is None or vlm_scheduler.idle()
+                        )
+                        if not schedulers_idle:
+                            emit_error(
+                                command.request_id,
+                                "BENCHMARK_BUSY",
+                                "benchmark reset requires an idle scheduler",
+                            )
+                        else:
+                            cache_state = engine.benchmark_reset(  # type: ignore[attr-defined]
+                                clear_cache=command.clear_cache,
+                                reset_counters=command.reset_counters,
+                            )
+                            vlm_apc_cache_store.reset(
+                                clear_cache=command.clear_cache,
+                                reset_counters=command.reset_counters,
+                            )
+                            client.sendall(
+                                encode_event(
+                                    BenchmarkResetState(
+                                        request_id=command.request_id,
+                                        scheduler_idle=True,
+                                        cache_state=cache_state,
+                                    )
+                                )
+                            )
                     else:
                         vlm_model = getattr(config, "vlm_model", None)
                         if command.model == getattr(config, "model", None):

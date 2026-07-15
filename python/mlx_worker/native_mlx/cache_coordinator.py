@@ -36,6 +36,8 @@ class PrefixCache(Protocol):
 
     def metrics(self) -> dict[str, Any]: ...
 
+    def reset(self, *, clear_cache: bool, reset_counters: bool) -> None: ...
+
 
 @dataclass
 class NativeCacheCoordinator:
@@ -82,3 +84,14 @@ class NativeCacheCoordinator:
 
     def metrics(self) -> dict[str, Any]:
         return {**self.backend.metrics(), **self.prefix_cache.metrics()}
+
+    def reset(self, *, clear_cache: bool, reset_counters: bool) -> dict[str, Any]:
+        """Reset idle cache state without rebuilding the model or executor."""
+
+        self.prefix_cache.reset(
+            clear_cache=clear_cache,
+            reset_counters=reset_counters,
+        )
+        if clear_cache:
+            self.backend.reset(reset_counters=reset_counters)
+        return self.metrics()

@@ -37,7 +37,17 @@ configuration = config_values(Path(os.environ["MLX_RUNTIME_CONFIG"]))
 port = int(configuration["server.port"])
 model = configuration["worker.model"]
 started = time.monotonic()
-counts = {"requests": 0, "prompt_tokens": 0, "completion_tokens": 0}
+counts = {
+    "requests": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "active": 0,
+    "prefix_hits": 0,
+    "prefix_misses": 0,
+    "prefix_reused_tokens": 0,
+    "prefix_evictions": 0,
+}
+primed_prefixes: set[str] = set()
 counts_lock = threading.Lock()
 worker = subprocess.Popen(["/bin/sleep", "60"])
 
@@ -76,6 +86,11 @@ class Handler(BaseHTTPRequestHandler):
                     f"mlx_requests_total {counts['requests']}\n"
                     f"mlx_prompt_tokens_total {counts['prompt_tokens']}\n"
                     f"mlx_completion_tokens_total {counts['completion_tokens']}\n"
+                    f"mlx_requests_active {counts['active']}\n"
+                    f"mlx_prefix_cache_hits_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_hits']}\n"
+                    f"mlx_prefix_cache_misses_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_misses']}\n"
+                    f"mlx_prefix_cache_reused_tokens_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_reused_tokens']}\n"
+                    f"mlx_prefix_cache_evictions_by_backend{{backend=\"fake\",modality=\"text\",strategy=\"fake\"}} {counts['prefix_evictions']}\n"
                 ).encode()
             self._send(200, "text/plain", body)
         else:
@@ -84,17 +99,69 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(content_length))
-        if os.environ.get("FAKE_GATEWAY_RUN_MODE") == "request-failure":
+        if self.path == "/internal/benchmark/reset":
+            if os.environ.get("MLX_AIR_BENCHMARK_ENABLED") != "1":
+                self._send(404, "text/plain", b"not found")
+                return
+            with counts_lock:
+                if counts["active"]:
+                    self._json(
+                        409,
+                        {"error": {"code": "BENCHMARK_BUSY", "message": "busy"}},
+                    )
+                    return
+                if request.get("clear_cache", True):
+                    primed_prefixes.clear()
+                if request.get("reset_counters", True):
+                    for key in counts:
+                        counts[key] = 0
+                cache_state = {
+                    "prefix_entries": len(primed_prefixes),
+                    "prefix_hits": counts["prefix_hits"],
+                    "prefix_misses": counts["prefix_misses"],
+                    "prefix_evictions": counts["prefix_evictions"],
+                }
+            self._json(
+                200,
+                {
+                    "request_id": "fake-reset",
+                    "scheduler_idle": True,
+                    "cache_state": cache_state,
+                    "model_preserved": True,
+                    "graphs_preserved": True,
+                },
+            )
+            return
+        content = str(request.get("messages", [{}])[0].get("content", ""))
+        if (
+            os.environ.get("FAKE_GATEWAY_RUN_MODE") == "request-failure"
+            and " warmup " not in content
+        ):
             self._json(500, {"error": {"message": "injected request failure"}})
             return
+        shared_prefix = content.partition(". Unique suffix ")[0]
+        is_prime = "Benchmark-only priming suffix" in content
         with counts_lock:
+            counts["active"] += 1
             counts["requests"] += 1
             counts["prompt_tokens"] += 5
             counts["completion_tokens"] += 2
+            cached_tokens = 0
+            if is_prime:
+                primed_prefixes.add(content.partition(". Benchmark-only")[0])
+            elif ". Unique suffix " in content and shared_prefix in primed_prefixes:
+                cached_tokens = 3
+                counts["prefix_hits"] += 1
+                counts["prefix_reused_tokens"] += cached_tokens
+            else:
+                counts["prefix_misses"] += 1
+            if "unique-prefix-" in content:
+                counts["prefix_evictions"] += 1
         usage = {
             "prompt_tokens": 5,
             "completion_tokens": 2,
             "total_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": cached_tokens},
         }
         if request.get("stream"):
             events = [
@@ -119,6 +186,8 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": usage,
                 },
             )
+        with counts_lock:
+            counts["active"] -= 1
 
     def log_message(self, _format: str, *_args: object) -> None:
         pass

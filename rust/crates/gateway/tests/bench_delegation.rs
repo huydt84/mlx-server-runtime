@@ -398,6 +398,74 @@ fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
 }
 
 #[test]
+fn phase8_run_applies_order_cache_state_and_trial_metric_deltas() {
+    let staged = StagedCli::new("phase8-state");
+    let output_directory = staged.base.join("phase8-artifacts");
+    let config = staged.base.join("phase8.toml");
+    fs::write(&config, include_str!("fixtures/phase8_benchmark.toml")).unwrap();
+
+    let output = staged
+        .command()
+        .args([
+            "bench",
+            "run",
+            "--suite",
+            "phase8",
+            "--benchmark-config",
+            config.to_str().unwrap(),
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let results = read_results(&output_directory);
+    assert_eq!(results["applied_order"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        results["applied_order"][0]["runtime_configuration"],
+        "serial"
+    );
+    assert_eq!(
+        results["applied_order"][1]["runtime_configuration"],
+        "overlap"
+    );
+    assert_eq!(results["warmups"].as_array().unwrap().len(), 2);
+    assert!(results["warmups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|warmup| warmup["measured"] == false));
+    assert_eq!(results["trials"].as_array().unwrap().len(), 6);
+    for trial in results["trials"].as_array().unwrap() {
+        assert_eq!(trial["configuration_order"], "round");
+        assert!(trial["runtime_metrics"]
+            .as_object()
+            .unwrap()
+            .contains_key("mlx_requests_total"));
+        if trial["workload_name"] == "cold" {
+            assert!(trial["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|request| request["cached_tokens"] == 0));
+        } else if trial["workload_name"] == "shared" {
+            assert!(trial["requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|request| request["cached_tokens"] == 3));
+            assert_eq!(metric_delta(trial, "mlx_prefix_cache_hits_by_backend"), 2.0);
+        } else if trial["workload_name"] == "pressure" {
+            assert_eq!(
+                metric_delta(trial, "mlx_prefix_cache_evictions_by_backend"),
+                2.0
+            );
+        }
+    }
+}
+
+#[test]
 fn repeated_runs_preserve_workload_prompt_trial_and_request_order() {
     let staged = StagedCli::new("deterministic-order");
     let first_directory = staged.base.join("first");
@@ -507,6 +575,7 @@ fn external_mode_records_server_identity_without_stopping_server() {
     .unwrap();
     let mut server = Command::new(staged.root.join("bin/mlx_runtime_gateway"))
         .env("MLX_RUNTIME_CONFIG", &config)
+        .env("MLX_AIR_BENCHMARK_ENABLED", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -659,6 +728,16 @@ fn request_identity(results: &serde_json::Value) -> Vec<(String, u64, u64, u64, 
             )
         })
         .collect()
+}
+
+fn metric_delta(trial: &serde_json::Value, prefix: &str) -> f64 {
+    trial["runtime_metrics"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(name, _)| name.starts_with(prefix))
+        .and_then(|(_, value)| value["delta"].as_f64())
+        .unwrap()
 }
 
 fn assert_processes_reaped(pid_file: &Path) {

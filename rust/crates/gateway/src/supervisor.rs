@@ -29,6 +29,7 @@ pub struct RuntimeState {
     pub worker_client: Arc<Mutex<Option<Arc<WorkerClient>>>>,
     /// Shared telemetry registry.
     pub metrics: Arc<MetricsRegistry>,
+    benchmark_enabled: Arc<AtomicBool>,
     /// VLM model name if configured (Phase 8).
     pub vlm_model_name: Arc<RwLock<Option<String>>>,
     /// VLM model lifecycle status (Phase 8).
@@ -49,6 +50,9 @@ impl RuntimeState {
                 metrics.set_kv_cache_bytes(0);
                 metrics
             },
+            benchmark_enabled: Arc::new(AtomicBool::new(
+                std::env::var("MLX_AIR_BENCHMARK_ENABLED").as_deref() == Ok("1"),
+            )),
             vlm_model_name: Arc::new(RwLock::new(None)),
             vlm_status: Arc::new(RwLock::new(None)),
         }
@@ -63,9 +67,20 @@ impl RuntimeState {
             model_status: Arc::new(RwLock::new(ModelStatus::new(model))),
             worker_client: Arc::new(Mutex::new(None)),
             metrics,
+            benchmark_enabled: Arc::new(AtomicBool::new(false)),
             vlm_model_name: Arc::new(RwLock::new(None)),
             vlm_status: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Return whether internal benchmark control operations are authorized.
+    pub fn benchmark_enabled(&self) -> bool {
+        self.benchmark_enabled.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_benchmark_enabled_for_test(&self, enabled: bool) {
+        self.benchmark_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Returns the latest model status snapshot.

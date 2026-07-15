@@ -37,6 +37,12 @@ impl Histogram {
         }
     }
 
+    fn reset(&mut self) {
+        self.counts.fill(0);
+        self.sum_ms = 0;
+        self.count = 0;
+    }
+
     fn render(&self, name: &str, help: &str, output: &mut String) {
         let _ = writeln!(output, "# HELP {name} {help}");
         let _ = writeln!(output, "# TYPE {name} histogram");
@@ -292,6 +298,39 @@ impl MetricsRegistry {
         if let Ok(mut guard) = self.labeled_gauges.lock() {
             let key = metric_key(metric_name, labels);
             guard.insert(key, value);
+        }
+    }
+
+    /// Reset cumulative counters after an idle benchmark control operation.
+    pub fn reset_benchmark_counters(&self) {
+        for counter in [
+            &self.requests_total,
+            &self.requests_active,
+            &self.requests_failed_total,
+            &self.requests_cancelled_total,
+            &self.queue_rejected_total,
+            &self.worker_restarts_total,
+            &self.prompt_tokens_total,
+            &self.completion_tokens_total,
+            &self.prompt_cache_hits_total,
+            &self.prompt_cache_misses_total,
+            &self.prompt_cache_cached_tokens_total,
+            &self.ipc_messages_sent_total,
+            &self.ipc_messages_received_total,
+            &self.vlm_requests_total,
+            &self.vlm_image_count_total,
+            &self.vlm_load_errors_total,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+        if let Ok(mut histogram) = self.ttft_histogram.lock() {
+            histogram.reset();
+        }
+        if let Ok(mut histogram) = self.request_latency_histogram.lock() {
+            histogram.reset();
+        }
+        if let Ok(mut counters) = self.labeled_counters.lock() {
+            counters.clear();
         }
     }
 
@@ -926,6 +965,25 @@ mod tests {
         assert!(output.contains("mlx_kv_cache_bytes"));
         assert!(output.contains("mlx_prompt_cache_hits_total"));
         assert!(output.contains("mlx_active_batch_cache_bytes"));
+    }
+
+    #[test]
+    fn benchmark_counter_reset_preserves_gauges_and_clears_counters() {
+        let metrics = MetricsRegistry::new();
+        metrics.increment_requests_total();
+        metrics.add_prompt_tokens(12);
+        metrics.record_ttft_ms(7);
+        metrics.set_worker_up(true);
+        metrics.set_worker_memory_bytes(1024);
+
+        metrics.reset_benchmark_counters();
+        let output = metrics.render_prometheus(0);
+
+        assert!(output.contains("mlx_requests_total 0"));
+        assert!(output.contains("mlx_prompt_tokens_total 0"));
+        assert!(output.contains("mlx_ttft_ms_count 0"));
+        assert!(output.contains("mlx_worker_up 1"));
+        assert!(output.contains("mlx_worker_memory_bytes 1024"));
     }
 
     #[test]

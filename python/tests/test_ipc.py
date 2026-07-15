@@ -4,6 +4,8 @@ import json
 import unittest
 
 from mlx_worker.ipc import (
+    BenchmarkResetRequest,
+    BenchmarkResetState,
     ChatCompletionRequest,
     ChatCompletionDelta,
     ChatCompletionResponse,
@@ -104,6 +106,29 @@ class IpcEncodingTests(unittest.TestCase):
 
         encoded = encode_command(request)
         self.assertEqual(decode_command(encoded), request)
+
+    def test_benchmark_reset_command_and_event_round_trip(self) -> None:
+        command = BenchmarkResetRequest(
+            request_id="benchmark-reset-1",
+            clear_cache=True,
+            reset_counters=True,
+        )
+        encoded_command = json.dumps(
+            {
+                "type": "benchmark_reset",
+                "request_id": command.request_id,
+                "clear_cache": command.clear_cache,
+                "reset_counters": command.reset_counters,
+            }
+        ).encode()
+        self.assertEqual(decode_command(encoded_command), command)
+
+        event = BenchmarkResetState(
+            request_id=command.request_id,
+            scheduler_idle=True,
+            cache_state={"prefix_entries": 0},
+        )
+        self.assertEqual(decode_event(encode_event(event)), event)
 
     def test_chat_completion_event_round_trip(self) -> None:
         response = ChatCompletionResponse(

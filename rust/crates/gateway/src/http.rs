@@ -4,8 +4,8 @@ use crate::openai::{ChatCompletionHttpRequest, ChatCompletionHttpResponse};
 use crate::supervisor::RuntimeState;
 use crate::telemetry::RequestTracker;
 use mlx_runtime_protocol::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart, MessageContent,
-    ModelState, ModelStatus,
+    BenchmarkResetState, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart,
+    MessageContent, ModelState, ModelStatus,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -39,6 +39,17 @@ pub trait ChatCompletionService: Send + Sync {
     fn cancel(&self, _request_id: &str) -> Result<(), GatewayError> {
         Ok(())
     }
+
+    /// Reset idle worker state for an authorized benchmark process.
+    fn benchmark_reset(
+        &self,
+        _clear_cache: bool,
+        _reset_counters: bool,
+    ) -> Result<BenchmarkResetState, GatewayError> {
+        Err(GatewayError::Protocol(
+            "benchmark reset is unavailable".to_string(),
+        ))
+    }
 }
 
 impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
@@ -60,6 +71,14 @@ impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
     fn cancel(&self, request_id: &str) -> Result<(), GatewayError> {
         (**self).cancel(request_id)
     }
+
+    fn benchmark_reset(
+        &self,
+        clear_cache: bool,
+        reset_counters: bool,
+    ) -> Result<BenchmarkResetState, GatewayError> {
+        (**self).benchmark_reset(clear_cache, reset_counters)
+    }
 }
 
 impl ChatCompletionService for crate::ipc::WorkerClient {
@@ -80,6 +99,14 @@ impl ChatCompletionService for crate::ipc::WorkerClient {
 
     fn cancel(&self, request_id: &str) -> Result<(), GatewayError> {
         self.cancel_chat(request_id)
+    }
+
+    fn benchmark_reset(
+        &self,
+        clear_cache: bool,
+        reset_counters: bool,
+    ) -> Result<BenchmarkResetState, GatewayError> {
+        self.benchmark_reset(clear_cache, reset_counters)
     }
 }
 
@@ -410,6 +437,7 @@ fn response_for_request(request_line: &str, body: &[u8], state: &AppState) -> Ht
         }
         ("GET", "/models") => models_response(&state.runtime, state.vlm_model.as_deref()),
         ("POST", "/v1/chat/completions") => handle_chat_completion(body, state, None),
+        ("POST", "/internal/benchmark/reset") => benchmark_reset_response(body, state),
         _ if method == "GET" && path.starts_with("/models/") && path.ends_with("/status") => {
             model_status_response(&state.runtime, &path, state.vlm_model.as_deref())
         }
@@ -537,6 +565,96 @@ fn metrics_response(runtime: &RuntimeState, admission: &Arc<RequestAdmission>) -
         status: "200 OK".to_string(),
         content_type: "text/plain; version=0.0.4; charset=utf-8",
         body,
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct BenchmarkResetRequest {
+    clear_cache: bool,
+    reset_counters: bool,
+}
+
+impl Default for BenchmarkResetRequest {
+    fn default() -> Self {
+        Self {
+            clear_cache: true,
+            reset_counters: true,
+        }
+    }
+}
+
+fn benchmark_reset_response(body: &[u8], state: &AppState) -> HttpResponse {
+    if !state.runtime.benchmark_enabled() {
+        return not_found_response();
+    }
+    let request = if body.is_empty() {
+        BenchmarkResetRequest::default()
+    } else {
+        match serde_json::from_slice::<BenchmarkResetRequest>(body) {
+            Ok(request) => request,
+            Err(error) => {
+                return json_error_response(
+                    "400 Bad Request",
+                    "INVALID_BENCHMARK_RESET",
+                    &error.to_string(),
+                );
+            }
+        }
+    };
+    let (active, waiting) = match state.admission.snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    if active != 0 || waiting != 0 {
+        return json_error_response(
+            "409 Conflict",
+            "BENCHMARK_BUSY",
+            "benchmark reset requires idle gateway admission and scheduler state",
+        );
+    }
+    let backend = if let Some(backend) = &state.test_backend {
+        backend.clone()
+    } else {
+        match state.runtime.worker_client.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(client) => client.clone() as Arc<dyn ChatCompletionService>,
+                None => {
+                    return json_error_response(
+                        "503 Service Unavailable",
+                        "MODEL_NOT_READY",
+                        "worker client is unavailable",
+                    );
+                }
+            },
+            Err(_) => {
+                return json_error_response(
+                    "500 Internal Server Error",
+                    "WORKER_CLIENT_LOCK_POISONED",
+                    "worker client lock poisoned",
+                );
+            }
+        }
+    };
+    match backend.benchmark_reset(request.clear_cache, request.reset_counters) {
+        Ok(reset_state) => {
+            if request.reset_counters {
+                state.runtime.metrics.reset_benchmark_counters();
+            }
+            HttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "application/json",
+                body: serde_json::to_string(&reset_state).unwrap_or_else(|_| "{}".to_string()),
+            }
+        }
+        Err(GatewayError::BenchmarkBusy(message)) => {
+            json_error_response("409 Conflict", "BENCHMARK_BUSY", &message)
+        }
+        Err(error) => json_error_response(
+            "500 Internal Server Error",
+            "BENCHMARK_RESET_FAILED",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -1356,6 +1474,9 @@ fn gateway_error_response(err: &GatewayError) -> HttpResponse {
         GatewayError::WorkerStartup(message) => {
             json_error_response("503 Service Unavailable", "WORKER_UNAVAILABLE", message)
         }
+        GatewayError::BenchmarkBusy(message) => {
+            json_error_response("409 Conflict", "BENCHMARK_BUSY", message)
+        }
         GatewayError::Protocol(message) => {
             json_error_response("500 Internal Server Error", "PROTOCOL_ERROR", message)
         }
@@ -1654,6 +1775,51 @@ mod tests {
 
         assert_eq!(response.status, "200 OK");
         assert!(response.body.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn benchmark_reset_is_hidden_when_process_is_not_enabled() {
+        let state = test_state(ModelState::Ready, Arc::new(FakeService::default()));
+
+        let response =
+            response_for_request("POST /internal/benchmark/reset HTTP/1.1\r\n", b"{}", &state);
+
+        assert_eq!(response.status, "404 Not Found");
+    }
+
+    #[test]
+    fn benchmark_reset_rejects_active_gateway_work() {
+        let state = benchmark_test_state();
+        let Ok(_permit) = state.admission.acquire() else {
+            panic!("test admission should be available");
+        };
+
+        let response =
+            response_for_request("POST /internal/benchmark/reset HTTP/1.1\r\n", b"{}", &state);
+
+        assert_eq!(response.status, "409 Conflict");
+        assert!(response.body.contains("BENCHMARK_BUSY"));
+    }
+
+    #[test]
+    fn benchmark_reset_returns_idle_cache_state_and_clears_counters() {
+        let state = benchmark_test_state();
+        state.runtime.metrics.increment_requests_total();
+
+        let response = response_for_request(
+            "POST /internal/benchmark/reset HTTP/1.1\r\n",
+            br#"{"clear_cache":true,"reset_counters":true}"#,
+            &state,
+        );
+
+        assert_eq!(response.status, "200 OK");
+        assert!(response.body.contains("\"scheduler_idle\":true"));
+        assert!(response.body.contains("\"graphs_preserved\":true"));
+        assert!(state
+            .runtime
+            .metrics
+            .render_prometheus(0)
+            .contains("mlx_requests_total 0"));
     }
 
     #[test]
@@ -2251,6 +2417,12 @@ mod tests {
         }
     }
 
+    fn benchmark_test_state() -> AppState {
+        let state = test_state(ModelState::Ready, Arc::new(FakeService::default()));
+        state.runtime.set_benchmark_enabled_for_test(true);
+        state
+    }
+
     fn test_runtime(state: ModelState) -> RuntimeState {
         let runtime = RuntimeState::new("test-model");
         let mut status = ModelStatus::new("test-model");
@@ -2321,6 +2493,20 @@ mod tests {
                 prompt_tokens: response.prompt_tokens,
                 completion_tokens: response.completion_tokens,
                 ..Default::default()
+            })
+        }
+
+        fn benchmark_reset(
+            &self,
+            _clear_cache: bool,
+            _reset_counters: bool,
+        ) -> Result<BenchmarkResetState, GatewayError> {
+            Ok(BenchmarkResetState {
+                request_id: "benchmark-reset-test".to_string(),
+                scheduler_idle: true,
+                cache_state: json!({"prefix_entries": 0}),
+                model_preserved: true,
+                graphs_preserved: true,
             })
         }
     }

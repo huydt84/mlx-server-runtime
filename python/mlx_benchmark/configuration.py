@@ -401,7 +401,7 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
         )
         _boolean(path, suite, "focus_required", f"{field}.focus_required")
         _bounded_integer(path, suite, "trials", f"{field}.trials", 1, _MAX_TRIALS)
-        _bounded_integer(
+        max_model_starts = _bounded_integer(
             path,
             suite,
             "max_model_starts",
@@ -409,6 +409,16 @@ def _validate_configuration(path: Path, raw: dict[str, Any]) -> None:
             1,
             100,
         )
+        required_model_starts = sum(
+            len(configuration_orders[name]["runtime_configurations"])
+            for name in suite["configuration_orders"]
+        )
+        if required_model_starts > max_model_starts:
+            _fail(
+                path,
+                f"{field}.max_model_starts",
+                f"must be at least {required_model_starts} for the configured order",
+            )
         _reference(path, suite, "tail_set", f"{field}.tail_set", tail_sets)
         _reference_list(
             path,

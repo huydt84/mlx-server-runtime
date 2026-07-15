@@ -241,6 +241,17 @@ class PromptCacheStore:
         self._stats.bytes = self._total_bytes
         return True
 
+    def reset(self, *, clear_cache: bool, reset_counters: bool) -> None:
+        """Reset benchmark-visible cache data without touching model state."""
+
+        if clear_cache:
+            self._entries.clear()
+            self._total_bytes = 0
+        if reset_counters:
+            self._stats = PromptCacheStoreStats()
+        self._stats.entries = len(self._entries)
+        self._stats.bytes = self._total_bytes
+
     @property
     def total_bytes(self) -> int:
         return self._total_bytes

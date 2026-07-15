@@ -194,6 +194,26 @@ class CancelRequest:
 
 
 @dataclass(frozen=True)
+class BenchmarkResetRequest:
+    """An idle-only benchmark state reset request."""
+
+    request_id: str
+    clear_cache: bool
+    reset_counters: bool
+
+
+@dataclass(frozen=True)
+class BenchmarkResetState:
+    """Worker state returned after a benchmark reset."""
+
+    request_id: str
+    scheduler_idle: bool
+    cache_state: dict[str, Any]
+    model_preserved: bool = True
+    graphs_preserved: bool = True
+
+
+@dataclass(frozen=True)
 class WorkerCommandError:
     """A worker-side request failure."""
 
@@ -439,13 +459,21 @@ def _encode_content(
     return serialized
 
 
-def decode_command(raw_line: bytes) -> ChatCompletionRequest | CancelRequest | None:
+def decode_command(
+    raw_line: bytes,
+) -> ChatCompletionRequest | CancelRequest | BenchmarkResetRequest | None:
     """Decode a Phase 1 gateway command."""
 
     payload = json.loads(raw_line.decode("utf-8"))
     if payload.get("type") != "chat_completion":
         if payload.get("type") == "cancel_request":
             return CancelRequest(request_id=payload["request_id"])
+        if payload.get("type") == "benchmark_reset":
+            return BenchmarkResetRequest(
+                request_id=payload["request_id"],
+                clear_cache=bool(payload.get("clear_cache", True)),
+                reset_counters=bool(payload.get("reset_counters", True)),
+            )
         return None
     request = payload["request"]
     return ChatCompletionRequest(
@@ -475,6 +503,7 @@ def encode_event(
         | ChatCompletionDelta
         | WorkerCommandError
         | SchedulerMetricsEvent
+        | BenchmarkResetState
     ),
 ) -> bytes:
     """Encode a Phase 1 worker event."""
@@ -577,10 +606,15 @@ def encode_event(
             "request_id": event.request_id,
             "message": event.message.replace("\n", " "),
         }
-    else:
+    elif isinstance(event, SchedulerMetricsEvent):
         payload = {
             "type": "scheduler_metrics",
             "metrics": asdict(event),
+        }
+    else:
+        payload = {
+            "type": "benchmark_reset",
+            "state": asdict(event),
         }
 
     return (json.dumps(payload) + "\n").encode("utf-8")
@@ -600,6 +634,7 @@ def decode_event(
     | ChatCompletionDelta
     | WorkerCommandError
     | SchedulerMetricsEvent
+    | BenchmarkResetState
     | None
 ):
     """Decode a Phase 1 worker event."""
@@ -722,6 +757,15 @@ def decode_event(
             radix_evictable_pages=metrics.get("radix_evictable_pages"),
             radix_tree_depth=metrics.get("radix_tree_depth"),
             radix_leaf_evictions=metrics.get("radix_leaf_evictions"),
+        )
+    if payload.get("type") == "benchmark_reset":
+        state = payload["state"]
+        return BenchmarkResetState(
+            request_id=state["request_id"],
+            scheduler_idle=state["scheduler_idle"],
+            cache_state=dict(state["cache_state"]),
+            model_preserved=state["model_preserved"],
+            graphs_preserved=state["graphs_preserved"],
         )
     return None
 

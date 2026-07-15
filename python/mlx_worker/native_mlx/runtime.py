@@ -76,6 +76,7 @@ class _RuntimeState:
     cancellation_stage: str | None = None
     scheduler_queue_wait_ms: int = 0
     cancellation_latency_ms: int | None = None
+    cached_tokens: int = 0
 
 
 class NativeRuntime:
@@ -188,6 +189,21 @@ class NativeRuntime:
 
     def idle(self) -> bool:
         return self._scheduler.idle()
+
+    def benchmark_reset(
+        self, *, clear_cache: bool, reset_counters: bool
+    ) -> dict[str, Any]:
+        """Reset idle benchmark state while preserving weights and graphs."""
+
+        if not self.idle() or self._requests:
+            raise RuntimeError("benchmark reset requires an idle scheduler")
+        if reset_counters:
+            self._cancellation_count = 0
+            self._error_count = 0
+        return self._scheduler.benchmark_reset(
+            clear_cache=clear_cache,
+            reset_counters=reset_counters,
+        )
 
     def close(self) -> None:
         self._scheduler.close()
@@ -366,6 +382,9 @@ class NativeRuntime:
             return
         if event.kind == "prefill_progress":
             metrics = event.metrics or {}
+            state.cached_tokens = max(
+                state.cached_tokens, int(metrics.get("cached_tokens", 0))
+            )
             state.prefill_time_ms += int(metrics.get("step_time_ms", 0))
             state.prompt_batch_size = int(metrics.get("batch_size", 0))
             state.scheduler_queue_wait_ms = int(
@@ -544,6 +563,8 @@ class NativeRuntime:
                     finish_reason=reason,
                     prompt_tokens=len(state.prompt_token_ids),
                     completion_tokens=len(state.completion_token_ids),
+                    prompt_cache_hit=state.cached_tokens > 0,
+                    cached_tokens=state.cached_tokens or None,
                     prompt_batch_size=state.prompt_batch_size,
                     decode_batch_size=state.decode_batch_size,
                     backend="native-mlx",

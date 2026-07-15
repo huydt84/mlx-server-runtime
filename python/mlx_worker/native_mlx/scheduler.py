@@ -54,6 +54,7 @@ class _ScheduledState:
     prompt_cursor: int = 0
     cache_handle: str | None = None
     cache_length: int = 0
+    reused_prompt_tokens: int = 0
     last_token_id: int | None = None
     generated_tokens: int = 0
     generation_complete: bool = False
@@ -436,6 +437,22 @@ class NativeContinuousScheduler:
     def idle(self) -> bool:
         return not self._waiting and not self._running and self._in_flight is None
 
+    def benchmark_reset(
+        self, *, clear_cache: bool, reset_counters: bool
+    ) -> dict[str, Any]:
+        """Reset idle scheduler/cache state without rebuilding the executor."""
+
+        if not self.idle():
+            raise RuntimeError("benchmark reset requires an idle scheduler")
+        self._pending_events.clear()
+        if reset_counters:
+            self._arrival_counter = 0
+            self._scheduler_round = 0
+        return self._cache_coordinator.reset(
+            clear_cache=clear_cache,
+            reset_counters=reset_counters,
+        )
+
     def close(self) -> None:
         if self._in_flight is not None:
             try:
@@ -542,7 +559,8 @@ class NativeContinuousScheduler:
                 timings["scheduler_cache_acquire_ms"] += _elapsed_ms(acquire_started)
                 state.cache_handle = admission.cache_handle
                 state.cache_length = admission.cache_length
-                state.prompt_cursor = admission.reused_tokens
+                state.reused_prompt_tokens = admission.reused_tokens
+                state.prompt_cursor = state.reused_prompt_tokens
                 state.running_started_at = time.perf_counter()
                 self._running[request_id] = state
             start = state.prompt_cursor
@@ -781,6 +799,7 @@ class NativeContinuousScheduler:
                         result_item.phase == "prefill" for result_item in result.results
                     ),
                     "scheduled_tokens": len(request.token_ids),
+                    "cached_tokens": state.reused_prompt_tokens,
                     "prompt_complete": state.prompt_cursor
                     == len(state.work.prompt_token_ids),
                     "queue_time_ms": max(

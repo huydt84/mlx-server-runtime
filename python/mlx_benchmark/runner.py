@@ -23,8 +23,11 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from mlx_benchmark.configuration import SelectedConfiguration
-from mlx_benchmark.loadgen import execute_workloads
-from mlx_benchmark.prompts import generate_prompt_bank
+from mlx_benchmark.loadgen import execute_setup_prompts, execute_workloads
+from mlx_benchmark.prompts import (
+    generate_prompt_bank,
+    shared_prefix_prime_prompts,
+)
 
 
 _MLX_AIR_VERSION_ENV = "MLX_AIR_VERSION"
@@ -36,6 +39,27 @@ _REQUIRED_COUNTERS = (
     "mlx_requests_total",
     "mlx_prompt_tokens_total",
     "mlx_completion_tokens_total",
+)
+_RUNTIME_METRIC_PREFIXES = (
+    "mlx_requests_",
+    "mlx_queue_",
+    "mlx_prompt_tokens_",
+    "mlx_completion_tokens_",
+    "mlx_prompt_cache_",
+    "mlx_cache_",
+    "mlx_prefix_cache_",
+    "mlx_kv_cache_",
+    "mlx_scheduler_",
+    "mlx_scheduled_tokens_",
+    "mlx_batch_size_",
+    "mlx_executor_",
+    "mlx_native_execution_mode",
+    "mlx_worker_cancellations_",
+    "mlx_worker_errors_",
+    "mlx_worker_memory_bytes",
+    "mlx_peak_memory_",
+    "mlx_model_graph_",
+    "mlx_ipc_",
 )
 
 
@@ -112,33 +136,64 @@ def run_benchmark(
     try:
         with _interrupts_raise():
             prompts = generate_prompt_bank(results["configuration"])
-            if arguments.server_mode == "self-launched":
-                results["failure_stage"] = "server_configuration"
-                base_url, server = _start_server(gateway, run_directory, results)
-            else:
-                base_url = _normalize_base_url(arguments.base_url)
-
-            results["server"]["base_url"] = base_url
-            results["configuration"]["base_url"] = base_url
-            results["failure_stage"] = "readiness"
-            readiness = _wait_for_readiness(base_url, server, results["configuration"])
-            _record_server_identity(results, base_url, readiness, gateway, arguments)
-            results["failure_stage"] = "measurement"
+            _validate_warmup_material(results["configuration"], prompts)
 
             def completed_trial(trial: dict[str, Any]) -> None:
                 results["trials"].append(trial)
                 _validate_completed_trial(results, trial)
                 _write_artifacts(run_directory, results)
 
-            asyncio.run(
-                execute_workloads(
-                    base_url,
-                    results["configuration"],
-                    prompts,
-                    on_trial=completed_trial,
+            for execution in _execution_plan(
+                results["configuration"], arguments.server_mode
+            ):
+                execution_configuration = _configuration_for_execution(
+                    results["configuration"], execution
                 )
-            )
-            results["runtime_counters"] = _fetch_runtime_counters(base_url)
+                if not execution_configuration["workloads"]:
+                    continue
+                if arguments.server_mode == "self-launched":
+                    results["failure_stage"] = "server_configuration"
+                    base_url, server = _start_server(
+                        gateway,
+                        run_directory,
+                        results,
+                        execution_configuration,
+                        execution,
+                    )
+                else:
+                    base_url = _normalize_base_url(arguments.base_url)
+
+                results["server"]["base_url"] = base_url
+                results["configuration"]["base_url"] = base_url
+                results["failure_stage"] = "readiness"
+                readiness = _wait_for_readiness(
+                    base_url, server, execution_configuration
+                )
+                _record_server_identity(
+                    results, base_url, readiness, gateway, arguments
+                )
+                results["applied_order"].append(
+                    {
+                        **execution,
+                        "sequence": len(results["applied_order"]),
+                        "base_url": base_url,
+                    }
+                )
+                results["failure_stage"] = "measurement"
+                asyncio.run(
+                    _execute_phase8_state(
+                        base_url,
+                        execution_configuration,
+                        prompts,
+                        execution,
+                        results,
+                        completed_trial,
+                    )
+                )
+                results["runtime_counters"] = _fetch_runtime_counters(base_url)
+                if server is not None:
+                    server.stop()
+                    server = None
             _validate_final_results(results)
             if any(trial["error_count"] for trial in results["trials"]):
                 raise _RunFailure("measurement", "one or more requests failed")
@@ -252,6 +307,8 @@ def _initial_results(
             ][0]["name"],
         },
         "runtime_counters": {},
+        "applied_order": [],
+        "warmups": [],
         "trials": [],
         "validation_failures": [],
     }
@@ -283,10 +340,167 @@ def _command_output(command: list[str]) -> str:
     return output if completed.returncode == 0 and output else "unavailable"
 
 
+def _execution_plan(
+    configuration: dict[str, Any], server_mode: str
+) -> list[dict[str, str]]:
+    plan = [
+        {
+            "configuration_order": order["name"],
+            "model": order["model"],
+            "runtime_configuration": runtime,
+        }
+        for order in configuration["configuration_orders"]
+        for runtime in order["runtime_configurations"]
+    ]
+    if server_mode == "external":
+        return plan[:1]
+    return plan
+
+
+def _configuration_for_execution(
+    configuration: dict[str, Any], execution: dict[str, str]
+) -> dict[str, Any]:
+    selected = json.loads(json.dumps(configuration))
+    model_name = execution["model"]
+    runtime_name = execution["runtime_configuration"]
+    covered_workloads = {
+        workload
+        for coverage in configuration["coverage"]
+        if coverage["model"] == model_name
+        for workload in coverage["workloads"]
+    }
+    selected["models"] = [
+        model for model in configuration["models"] if model["name"] == model_name
+    ]
+    selected["runtime_configurations"] = [
+        runtime
+        for runtime in configuration["runtime_configurations"]
+        if runtime["name"] == runtime_name
+    ]
+    selected["workloads"] = [
+        workload
+        for workload in configuration["workloads"]
+        if workload["name"] in covered_workloads
+        and runtime_name in workload["runtime_configurations"]
+    ]
+    return selected
+
+
+def _validate_warmup_material(
+    configuration: dict[str, Any], prompts: dict[str, list[Any]]
+) -> None:
+    measured_groups = {
+        workload["prompt_group"] for workload in configuration["workloads"]
+    }
+    warmup_groups = {
+        warmup["prompt_group"] for warmup in configuration["warmup_groups"]
+    }
+    measured_hashes = {
+        prompt.sha256 for group in measured_groups for prompt in prompts[group]
+    }
+    warmup_hashes = {
+        prompt.sha256 for group in warmup_groups for prompt in prompts[group]
+    }
+    overlap = measured_hashes.intersection(warmup_hashes)
+    if overlap:
+        raise _RunFailure(
+            "configuration_validation",
+            "warmup prompts overlap measured prompt material",
+        )
+
+
+async def _execute_phase8_state(
+    base_url: str,
+    configuration: dict[str, Any],
+    prompts: dict[str, list[Any]],
+    execution: dict[str, str],
+    results: dict[str, Any],
+    completed_trial: Any,
+) -> None:
+    for warmup in configuration["warmup_groups"]:
+        group = prompts[warmup["prompt_group"]]
+        count = min(int(warmup["concurrency"]), len(group))
+        records = await execute_setup_prompts(
+            base_url,
+            configuration,
+            group[:count],
+            output_tokens=int(warmup["output_tokens"]),
+            concurrency=int(warmup["concurrency"]),
+        )
+        results["warmups"].append(
+            {
+                **execution,
+                "group": warmup["name"],
+                "measured": False,
+                "request_count": len(records),
+                "requests": records,
+            }
+        )
+
+    async def before_trial(
+        workload: dict[str, Any], trial_index: int, group: list[Any]
+    ) -> dict[str, Any]:
+        cache_state = configuration["cache_states"][workload["cache_state"]]
+        reset = await asyncio.to_thread(
+            _reset_benchmark_state,
+            base_url,
+            True,
+            False,
+        )
+        priming: list[dict[str, Any]] = []
+        if cache_state["mode"] == "warm-prefix":
+            prime_prompts = shared_prefix_prime_prompts(
+                group,
+                trial_index=trial_index,
+                request_count=int(workload["requests_per_trial"]),
+            )
+            priming = await execute_setup_prompts(
+                base_url,
+                configuration,
+                prime_prompts,
+                output_tokens=1,
+                concurrency=min(len(prime_prompts), int(workload["concurrency"])),
+            )
+        before = await asyncio.to_thread(_fetch_runtime_counters, base_url)
+        return {
+            "reset": reset,
+            "cache_state": cache_state,
+            "priming": priming,
+            "metrics_before": before,
+        }
+
+    async def after_trial(trial: dict[str, Any], context: dict[str, Any]) -> None:
+        after = await asyncio.to_thread(_fetch_runtime_counters, base_url)
+        trial.update(execution)
+        trial["cache_state"] = context["cache_state"]
+        trial["cache_preparation"] = {
+            "reset": context["reset"],
+            "priming": context["priming"],
+        }
+        trial["runtime_metrics"] = _runtime_metric_delta(
+            context["metrics_before"], after
+        )
+
+    await execute_workloads(
+        base_url,
+        configuration,
+        prompts,
+        on_trial=completed_trial,
+        before_trial=before_trial,
+        after_trial=after_trial,
+        initial_request_order=sum(
+            int(trial["request_count"]) for trial in results["trials"]
+        ),
+    )
+
+
 def _start_server(
-    gateway: Path, run_directory: Path, results: dict[str, Any]
+    gateway: Path,
+    run_directory: Path,
+    results: dict[str, Any],
+    configuration: dict[str, Any],
+    execution: dict[str, str],
 ) -> tuple[str, _ServerProcess]:
-    configuration = results["configuration"]
     model = configuration["models"][0]
     selected_runtime = configuration["runtime_configurations"][0]
     workloads = configuration["workloads"]
@@ -330,7 +544,8 @@ def _start_server(
         },
         "telemetry": {"enable_prometheus": True, "metrics_path": "/metrics"},
     }
-    config_path = run_directory / "runtime.toml"
+    sequence = len(results["applied_order"])
+    config_path = run_directory / f"runtime-{sequence:02d}.toml"
     config_path.write_text(_render_runtime_toml(runtime_config), encoding="utf-8")
     results["server"]["runtime_configuration"] = runtime_config
     results["configuration"]["base_url"] = f"http://127.0.0.1:{port}"
@@ -340,6 +555,7 @@ def _start_server(
     log_handle = (run_directory / "logs" / "gateway.log").open("ab", buffering=0)
     environment = os.environ.copy()
     environment["MLX_RUNTIME_CONFIG"] = str(config_path)
+    environment["MLX_AIR_BENCHMARK_ENABLED"] = "1"
     environment[_WORKER_LOG_ENV] = str(run_directory / "logs" / "worker.log")
     environment.update(selected_runtime["environment"])
     try:
@@ -356,6 +572,10 @@ def _start_server(
         raise _RunFailure(
             "server_startup", f"failed to launch {gateway}: {error}"
         ) from error
+    results["server"]["selected_model"] = execution["model"]
+    results["server"]["selected_runtime_configuration"] = execution[
+        "runtime_configuration"
+    ]
     return f"http://127.0.0.1:{port}", _ServerProcess(process, log_handle, (ipc_path,))
 
 
@@ -492,6 +712,41 @@ def _get_json(url: str, timeout: int) -> tuple[int, dict[str, Any]]:
         raise
 
 
+def _reset_benchmark_state(
+    base_url: str, clear_cache: bool, reset_counters: bool
+) -> dict[str, Any]:
+    body = json.dumps(
+        {"clear_cache": clear_cache, "reset_counters": reset_counters}
+    ).encode()
+    request = Request(
+        f"{base_url}/internal/benchmark/reset",
+        data=body,
+        method="POST",
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        if hasattr(error, "code") and hasattr(error, "read"):
+            detail = error.read().decode("utf-8", errors="replace")
+            raise _RunFailure(
+                "cache_reset",
+                f"benchmark reset returned HTTP {error.code}: {detail}",
+            ) from error
+        raise _RunFailure("cache_reset", f"benchmark reset failed: {error}") from error
+    if payload.get("scheduler_idle") is not True:
+        raise _RunFailure("cache_reset", "benchmark reset did not report idle state")
+    if (
+        payload.get("model_preserved") is not True
+        or payload.get("graphs_preserved") is not True
+    ):
+        raise _RunFailure(
+            "cache_reset", "benchmark reset did not preserve model and graph state"
+        )
+    return payload
+
+
 def _fetch_runtime_counters(base_url: str) -> dict[str, float]:
     request = Request(f"{base_url}/metrics", headers={"Accept": "text/plain"})
     try:
@@ -504,13 +759,29 @@ def _fetch_runtime_counters(base_url: str) -> dict[str, float]:
         if not line or line.startswith("#") or " " not in line:
             continue
         name, raw_value = line.rsplit(" ", 1)
-        if "{" in name:
-            continue
         try:
             counters[name] = float(raw_value)
         except ValueError:
             continue
     return counters
+
+
+def _runtime_metric_delta(
+    before: dict[str, float], after: dict[str, float]
+) -> dict[str, dict[str, float]]:
+    names = sorted(
+        name
+        for name in set(before).union(after)
+        if name.startswith(_RUNTIME_METRIC_PREFIXES)
+    )
+    return {
+        name: {
+            "before": before.get(name, 0.0),
+            "after": after.get(name, 0.0),
+            "delta": after.get(name, 0.0) - before.get(name, 0.0),
+        }
+        for name in names
+    }
 
 
 def _validate_completed_trial(results: dict[str, Any], trial: dict[str, Any]) -> None:
@@ -552,6 +823,29 @@ def _validate_completed_trial(results: dict[str, Any], trial: dict[str, Any]) ->
         )
     for request in trial["requests"]:
         _validate_request(results, request)
+    cache_mode = trial["cache_state"]["mode"]
+    cached_tokens = [int(request["cached_tokens"]) for request in trial["requests"]]
+    if cache_mode == "cold" and any(cached_tokens):
+        _validation_failure(
+            results,
+            "cold_cache_hit",
+            f"{trial['workload_name']} cold trial recorded cached tokens {cached_tokens}",
+        )
+    if cache_mode == "warm-prefix" and any(
+        cached <= 0 or cached >= int(request["prompt_tokens"])
+        for cached, request in zip(cached_tokens, trial["requests"], strict=True)
+    ):
+        _validation_failure(
+            results,
+            "shared_prefix_state",
+            f"{trial['workload_name']} did not record partial prefix hits for every request",
+        )
+    if not trial.get("runtime_metrics"):
+        _validation_failure(
+            results,
+            "runtime_metric_delta",
+            f"{trial['workload_name']} trial {trial['trial_index']} has no runtime metric delta",
+        )
 
 
 def _validate_request(results: dict[str, Any], request: dict[str, Any]) -> None:
@@ -616,6 +910,30 @@ def _validate_final_results(results: dict[str, Any]) -> None:
     ]
     if orders != list(range(len(orders))):
         _validation_failure(results, "request_order", f"run request order was {orders}")
+    expected_order = [
+        (
+            entry["configuration_order"],
+            entry["model"],
+            entry["runtime_configuration"],
+        )
+        for entry in _execution_plan(
+            results["configuration"], results["server"]["mode"]
+        )
+    ]
+    applied_order = [
+        (
+            entry["configuration_order"],
+            entry["model"],
+            entry["runtime_configuration"],
+        )
+        for entry in results["applied_order"]
+    ]
+    if applied_order != expected_order:
+        _validation_failure(
+            results,
+            "configuration_order",
+            f"expected applied order {expected_order}, recorded {applied_order}",
+        )
 
 
 def _validation_failure(results: dict[str, Any], code: str, message: str) -> None:

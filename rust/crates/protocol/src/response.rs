@@ -1,5 +1,21 @@
 use crate::status::ModelError;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// State returned after an idle benchmark reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkResetState {
+    /// Correlation id supplied by the gateway.
+    pub request_id: String,
+    /// Whether the worker scheduler was idle when reset was applied.
+    pub scheduler_idle: bool,
+    /// Cache metrics observed after the requested reset.
+    pub cache_state: Value,
+    /// Reset deliberately leaves loaded model weights intact.
+    pub model_preserved: bool,
+    /// Reset deliberately leaves compiled execution graphs intact.
+    pub graphs_preserved: bool,
+}
 
 /// Bootstrap success acknowledgment from the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

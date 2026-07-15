@@ -259,6 +259,21 @@ def test_prompt_cache_store_uses_cache_namespace() -> None:
     assert miss is None
 
 
+def test_prompt_cache_store_benchmark_reset_clears_cache_and_counters() -> None:
+    store = PromptCacheStore()
+    store.remember([1, 2, 3], ["cached"])
+    assert store.lookup([1, 2, 3, 4]) is not None
+
+    store.reset(clear_cache=True, reset_counters=True)
+
+    stats = store.stats_snapshot
+    assert store.total_entries == 0
+    assert store.total_bytes == 0
+    assert stats.hits == 0
+    assert stats.misses == 0
+    assert stats.evictions == 0
+
+
 def test_batch_backend_batches_requests_and_reuses_prompt_cache(monkeypatch) -> None:
     _install_fake_cache_module(monkeypatch)
     fake_generate = ModuleType("mlx_lm.generate")

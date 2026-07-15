@@ -1,6 +1,7 @@
 use super::request::ChatCompletionRequest;
 use super::response::{
-    ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent, WorkerError, WorkerReady,
+    BenchmarkResetState, ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent,
+    WorkerError, WorkerReady,
 };
 use super::status::ModelStatus;
 use core::fmt;
@@ -75,6 +76,12 @@ pub enum GatewayCommand {
     ChatCompletion { request: ChatCompletionRequest },
     /// Cancel an in-flight chat completion request.
     CancelRequest { request_id: String },
+    /// Reset idle worker state for an authorized benchmark process.
+    BenchmarkReset {
+        request_id: String,
+        clear_cache: bool,
+        reset_counters: bool,
+    },
 }
 
 /// Events sent from the worker to the gateway after bootstrap.
@@ -83,6 +90,8 @@ pub enum GatewayCommand {
 pub enum WorkerEvent {
     /// Per-step scheduler metrics not tied to one request id.
     SchedulerMetrics { metrics: SchedulerMetricsEvent },
+    /// Result of an idle benchmark reset.
+    BenchmarkReset { state: BenchmarkResetState },
     /// A streamed chat completion delta.
     ChatCompletionDelta { delta: ChatCompletionDelta },
     /// A non-streaming chat completion result.
@@ -371,6 +380,29 @@ mod tests {
         let encoded = encode_gateway_command(&command).unwrap();
         let decoded = decode_gateway_command(&encoded).unwrap();
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn benchmark_reset_round_trip() {
+        let command = GatewayCommand::BenchmarkReset {
+            request_id: "benchmark-reset-1".to_string(),
+            clear_cache: true,
+            reset_counters: true,
+        };
+        let encoded = encode_gateway_command(&command).unwrap();
+        assert_eq!(decode_gateway_command(&encoded).unwrap(), command);
+
+        let event = WorkerEvent::BenchmarkReset {
+            state: BenchmarkResetState {
+                request_id: "benchmark-reset-1".to_string(),
+                scheduler_idle: true,
+                cache_state: serde_json::json!({"entries": 0}),
+                model_preserved: true,
+                graphs_preserved: true,
+            },
+        };
+        let encoded = encode_worker_event(&event).unwrap();
+        assert_eq!(decode_worker_event(&encoded).unwrap(), event);
     }
 
     #[test]

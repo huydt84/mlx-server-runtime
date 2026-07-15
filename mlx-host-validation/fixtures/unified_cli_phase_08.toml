@@ -1,0 +1,142 @@
+schema_version = 1
+
+[execution]
+server_modes = ["self-launched", "external"]
+load_modes = ["sequential", "burst", "closed-loop"]
+metric_directions = ["lower", "higher"]
+metric_units = ["ms", "tokens/s"]
+
+[sampling]
+seed = 8008
+temperature = 0.0
+top_p = 1.0
+request_timeout_seconds = 300
+readiness_timeout_seconds = 1800
+
+[prompt_bank.cold]
+kind = "short"
+material = "measured"
+count = 2
+target_tokens = 32
+
+[prompt_bank.shared]
+kind = "shared-prefix"
+material = "measured"
+count = 2
+target_tokens = 128
+prefix_groups = 1
+suffixes_per_group = 2
+
+[prompt_bank.pressure]
+kind = "cache-pressure"
+material = "measured"
+count = 4
+target_tokens = 256
+
+[prompt_bank.compile]
+kind = "short"
+material = "warmup"
+count = 1
+target_tokens = 32
+
+[cache_states.cold]
+mode = "cold"
+unit = "tokens"
+value = 0
+
+[cache_states.warm]
+mode = "warm-prefix"
+unit = "tokens"
+value = 64
+
+[cache_states.pressure]
+mode = "cache-pressure"
+unit = "percent"
+value = 125
+
+[warmup_groups.compile]
+prompt_group = "compile"
+concurrency = 1
+output_tokens = 4
+
+[models.primary]
+checkpoint = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+tokenizer = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+revision = "resolve-at-run"
+
+[runtime_configurations.serial]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY = "block-hash", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "268435456", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "2" }
+
+[workloads.cold]
+prompt_group = "cold"
+output_tokens = 4
+streaming = false
+load_mode = "sequential"
+concurrency = 1
+cache_state = "cold"
+primary_metric = "end_to_end_latency"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial"]
+trials = 1
+requests_per_trial = 2
+
+[workloads.shared]
+prompt_group = "shared"
+output_tokens = 4
+streaming = false
+load_mode = "burst"
+concurrency = 2
+cache_state = "warm"
+primary_metric = "ttft"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial"]
+trials = 1
+requests_per_trial = 2
+
+[workloads.pressure]
+prompt_group = "pressure"
+output_tokens = 4
+streaming = false
+load_mode = "burst"
+concurrency = 4
+cache_state = "pressure"
+primary_metric = "end_to_end_latency"
+metric_direction = "lower"
+metric_unit = "ms"
+runtime_configurations = ["serial"]
+trials = 1
+requests_per_trial = 4
+
+[focuses.cache]
+models = ["primary"]
+workloads = ["cold", "shared", "pressure"]
+
+[configuration_orders.primary]
+model = "primary"
+runtime_configurations = ["serial"]
+
+[tail_sets.none]
+workloads = []
+
+[diagnostics.cache]
+models = ["primary"]
+workloads = ["shared", "pressure"]
+
+[suites.phase8]
+models = ["primary"]
+workloads = ["cold", "shared", "pressure"]
+runtime_configurations = ["serial"]
+warmup_groups = ["compile"]
+configuration_orders = ["primary"]
+focuses = ["cache"]
+focus_required = false
+trials = 1
+max_model_starts = 1
+tail_set = "none"
+diagnostic_families = ["cache"]
+coverage = [
+  { model = "primary", workloads = ["cold", "shared", "pressure"] },
+]

@@ -8,7 +8,7 @@ import hashlib
 import json
 import ssl
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 from mlx_benchmark.prompts import Prompt
@@ -165,6 +165,13 @@ async def execute_workloads(
     configuration: dict[str, Any],
     prompt_bank: dict[str, list[Prompt]],
     on_trial: Callable[[dict[str, Any]], None] | None = None,
+    before_trial: (
+        Callable[[dict[str, Any], int, list[Prompt]], Awaitable[dict[str, Any]]] | None
+    ) = None,
+    after_trial: (
+        Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]] | None
+    ) = None,
+    initial_request_order: int = 0,
 ) -> list[dict[str, Any]]:
     """Execute every selected workload with one persistent connection pool.
 
@@ -181,11 +188,20 @@ async def execute_workloads(
         int(workload["concurrency"]) for workload in configuration["workloads"]
     )
     pool = _AsyncHttpPool(base_url, maximum_connections)
-    request_order = 0
+    request_order = initial_request_order
     trials: list[dict[str, Any]] = []
     try:
         for workload in configuration["workloads"]:
             for trial_index in range(int(workload["trials"])):
+                context = (
+                    await before_trial(
+                        workload,
+                        trial_index,
+                        prompt_bank[workload["prompt_group"]],
+                    )
+                    if before_trial is not None
+                    else {}
+                )
                 trial, request_order = await _execute_trial(
                     pool,
                     configuration,
@@ -194,12 +210,60 @@ async def execute_workloads(
                     trial_index,
                     request_order,
                 )
+                if after_trial is not None:
+                    await after_trial(trial, context)
                 trials.append(trial)
                 if on_trial is not None:
                     on_trial(trial)
     finally:
         await pool.close()
     return trials
+
+
+async def execute_setup_prompts(
+    base_url: str,
+    configuration: dict[str, Any],
+    prompts: list[Prompt],
+    *,
+    output_tokens: int,
+    concurrency: int,
+) -> list[dict[str, Any]]:
+    """Execute non-measured warmup or prefix-priming prompts."""
+
+    if not prompts:
+        return []
+    pool = _AsyncHttpPool(base_url, max(1, concurrency))
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def execute(prompt: Prompt) -> dict[str, Any]:
+        async with semaphore:
+            model = configuration["models"][0]
+            sampling = configuration["sampling"]
+            payload = {
+                "model": model["checkpoint"],
+                "messages": [{"role": "user", "content": prompt.text}],
+                "max_tokens": output_tokens,
+                "temperature": sampling["temperature"],
+                "top_p": sampling["top_p"],
+                "stream": False,
+            }
+            response = await pool.post_json(
+                payload,
+                False,
+                int(sampling["request_timeout_seconds"]),
+            )
+            return {
+                "prompt_name": prompt.name,
+                "prompt_sha256": prompt.sha256,
+                "prompt_tokens": response["prompt_tokens"],
+                "completion_tokens": response["completion_tokens"],
+                "cached_tokens": response["cached_tokens"],
+            }
+
+    try:
+        return list(await asyncio.gather(*(execute(prompt) for prompt in prompts)))
+    finally:
+        await pool.close()
 
 
 async def _execute_trial(
@@ -372,6 +436,7 @@ async def _execute_request(
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
+        "cached_tokens": 0,
         "output_sha256": None,
         "finish_reason": None,
         "status": "running",
@@ -524,6 +589,9 @@ def _response_record(
         "prompt_tokens": int(usage.get("prompt_tokens", 0)),
         "completion_tokens": int(usage.get("completion_tokens", 0)),
         "total_tokens": int(usage.get("total_tokens", 0)),
+        "cached_tokens": int(
+            (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+        ),
         "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
         "finish_reason": finish_reason,
     }
