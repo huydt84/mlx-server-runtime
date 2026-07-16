@@ -4,16 +4,42 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: $0 --output-dir PATH" >&2
+    echo "Usage: $0 --output-dir PATH [--version VERSION]" >&2
 }
 
-if [[ $# -ne 2 || "$1" != "--output-dir" || -z "$2" ]]; then
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUTPUT_DIR=""
+VERSION=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --output-dir)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --version)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            VERSION="$2"
+            shift 2
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -z "$OUTPUT_DIR" ]]; then
     usage
     exit 2
 fi
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUTPUT_DIR="$2"
+if [[ -n "$VERSION" ]]; then
+    VERSION="$(python3 "$ROOT/scripts/release_tool.py" version --repo-root "$ROOT" --tag "v$VERSION")"
+else
+    VERSION="$(python3 "$ROOT/scripts/release_tool.py" version --repo-root "$ROOT")"
+fi
 
 if [[ -e "$OUTPUT_DIR" ]]; then
     echo "error: output path already exists: $OUTPUT_DIR" >&2
@@ -47,5 +73,9 @@ COPYFILE_DISABLE=1 tar \
     -cf - \
     mlx_benchmark \
     mlx_worker | tar -C "$OUTPUT_DIR/python" -xf -
+
+python3 "$ROOT/scripts/release_tool.py" metadata \
+    --stage-dir "$OUTPUT_DIR" \
+    --version "$VERSION"
 
 echo "MLX Air distribution staged at $OUTPUT_DIR"

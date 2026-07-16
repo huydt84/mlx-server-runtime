@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fmt;
@@ -17,7 +18,28 @@ pub(crate) struct DistributionPaths {
     pub(crate) benchmark_config: PathBuf,
     pub(crate) default_config: PathBuf,
     pub(crate) licenses: PathBuf,
+    pub(crate) version_metadata: PathBuf,
+    pub(crate) layout_metadata: PathBuf,
     pub(crate) gateway_executable: PathBuf,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct LayoutMetadata {
+    schema_version: u32,
+    distribution: String,
+    version: String,
+    platform: String,
+    paths: LayoutPaths,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct LayoutPaths {
+    cli: String,
+    gateway: String,
+    python_project: String,
+    runtime_config: String,
+    benchmark_config: String,
+    licenses: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +101,8 @@ impl DistributionPaths {
             benchmark_config: root.join("config/benchmark.toml"),
             default_config: root.join("config/runtime.toml"),
             licenses: root.join("licenses"),
+            version_metadata: root.join("metadata/version.txt"),
+            layout_metadata: root.join("metadata/layout.json"),
             gateway_executable: bin_dir.join("mlx_runtime_gateway"),
         };
         paths.validate()?;
@@ -92,6 +116,8 @@ impl DistributionPaths {
         require_directory(&self.python_package, "bundled mlx_worker package")?;
         require_file(&self.default_config, "bundled default configuration")?;
         require_directory(&self.licenses, "bundled licenses")?;
+        require_file(&self.version_metadata, "bundled version metadata")?;
+        require_file(&self.layout_metadata, "bundled layout metadata")?;
         require_file(&self.gateway_executable, "sibling mlx_runtime_gateway")?;
 
         let has_license = fs::read_dir(&self.licenses)
@@ -107,6 +133,57 @@ impl DistributionPaths {
             return Err(PathError::new(format!(
                 "bundled licenses directory is empty: {}",
                 self.licenses.display()
+            )));
+        }
+        self.validate_metadata()?;
+        Ok(())
+    }
+
+    fn validate_metadata(&self) -> Result<(), PathError> {
+        let version = fs::read_to_string(&self.version_metadata).map_err(|err| {
+            PathError::new(format!(
+                "failed to read bundled version metadata at {}: {err}",
+                self.version_metadata.display()
+            ))
+        })?;
+        if version.trim() != env!("CARGO_PKG_VERSION") {
+            return Err(PathError::new(format!(
+                "bundled version metadata {} does not match executable version {}",
+                version.trim(),
+                env!("CARGO_PKG_VERSION")
+            )));
+        }
+
+        let layout_bytes = fs::read(&self.layout_metadata).map_err(|err| {
+            PathError::new(format!(
+                "failed to read bundled layout metadata at {}: {err}",
+                self.layout_metadata.display()
+            ))
+        })?;
+        let layout: LayoutMetadata = serde_json::from_slice(&layout_bytes).map_err(|err| {
+            PathError::new(format!(
+                "failed to parse bundled layout metadata at {}: {err}",
+                self.layout_metadata.display()
+            ))
+        })?;
+        let expected = LayoutMetadata {
+            schema_version: 1,
+            distribution: "mlx-air".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: "darwin-arm64".to_string(),
+            paths: LayoutPaths {
+                cli: "bin/mlx-air".to_string(),
+                gateway: "bin/mlx_runtime_gateway".to_string(),
+                python_project: "python".to_string(),
+                runtime_config: "config/runtime.toml".to_string(),
+                benchmark_config: "config/benchmark.toml".to_string(),
+                licenses: "licenses".to_string(),
+            },
+        };
+        if layout != expected {
+            return Err(PathError::new(format!(
+                "bundled layout metadata does not match executable layout: {}",
+                self.layout_metadata.display()
             )));
         }
         Ok(())
@@ -240,6 +317,7 @@ pub(crate) mod tests {
         fs::create_dir_all(root.join("python/mlx_benchmark")).unwrap();
         fs::create_dir_all(root.join("config")).unwrap();
         fs::create_dir_all(root.join("licenses")).unwrap();
+        fs::create_dir_all(root.join("metadata")).unwrap();
         fs::write(root.join("bin/mlx-air"), "binary").unwrap();
         fs::write(root.join("bin/mlx_runtime_gateway"), "binary").unwrap();
         fs::write(root.join("python/pyproject.toml"), "[project]\n").unwrap();
@@ -253,6 +331,34 @@ pub(crate) mod tests {
         )
         .unwrap();
         fs::write(root.join("licenses/LICENSE"), "license").unwrap();
+        fs::write(
+            root.join("metadata/version.txt"),
+            concat!(env!("CARGO_PKG_VERSION"), "\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("metadata/layout.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"distribution\": \"mlx-air\",\n",
+                    "  \"paths\": {{\n",
+                    "    \"benchmark_config\": \"config/benchmark.toml\",\n",
+                    "    \"cli\": \"bin/mlx-air\",\n",
+                    "    \"gateway\": \"bin/mlx_runtime_gateway\",\n",
+                    "    \"licenses\": \"licenses\",\n",
+                    "    \"python_project\": \"python\",\n",
+                    "    \"runtime_config\": \"config/runtime.toml\"\n",
+                    "  }},\n",
+                    "  \"platform\": \"darwin-arm64\",\n",
+                    "  \"schema_version\": 1,\n",
+                    "  \"version\": \"{}\"\n",
+                    "}}\n"
+                ),
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
         let paths = DistributionPaths::from_executable(&root.join("bin/mlx-air")).unwrap();
         (root, paths)
     }
@@ -270,6 +376,8 @@ pub(crate) mod tests {
         assert_eq!(paths.benchmark_package, root.join("python/mlx_benchmark"));
         assert_eq!(paths.benchmark_config, root.join("config/benchmark.toml"));
         assert_eq!(paths.default_config, root.join("config/runtime.toml"));
+        assert_eq!(paths.version_metadata, root.join("metadata/version.txt"));
+        assert_eq!(paths.layout_metadata, root.join("metadata/layout.json"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -282,6 +390,19 @@ pub(crate) mod tests {
         let error = DistributionPaths::from_executable(&root.join("bin/mlx-air")).unwrap_err();
 
         assert!(error.to_string().contains("missing bundled uv.lock"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolver_rejects_version_metadata_that_disagrees_with_executable() {
+        let (root, _) = staged_distribution("version-mismatch");
+        fs::write(root.join("metadata/version.txt"), "9.9.9\n").unwrap();
+
+        let error = DistributionPaths::from_executable(&root.join("bin/mlx-air")).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match executable version"));
         fs::remove_dir_all(root).unwrap();
     }
 

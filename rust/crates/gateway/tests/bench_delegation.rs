@@ -31,6 +31,7 @@ impl StagedCli {
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("config")).unwrap();
         fs::create_dir_all(root.join("licenses")).unwrap();
+        fs::create_dir_all(root.join("metadata")).unwrap();
         fs::create_dir_all(root.join("python/mlx_worker")).unwrap();
         fs::create_dir_all(root.join("python/mlx_benchmark")).unwrap();
         fs::create_dir_all(&home).unwrap();
@@ -54,6 +55,34 @@ impl StagedCli {
         )
         .unwrap();
         fs::write(root.join("licenses/LICENSE"), "license").unwrap();
+        fs::write(
+            root.join("metadata/version.txt"),
+            concat!(env!("CARGO_PKG_VERSION"), "\n"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("metadata/layout.json"),
+            format!(
+                concat!(
+                    "{{\n",
+                    "  \"distribution\": \"mlx-air\",\n",
+                    "  \"paths\": {{\n",
+                    "    \"benchmark_config\": \"config/benchmark.toml\",\n",
+                    "    \"cli\": \"bin/mlx-air\",\n",
+                    "    \"gateway\": \"bin/mlx_runtime_gateway\",\n",
+                    "    \"licenses\": \"licenses\",\n",
+                    "    \"python_project\": \"python\",\n",
+                    "    \"runtime_config\": \"config/runtime.toml\"\n",
+                    "  }},\n",
+                    "  \"platform\": \"darwin-arm64\",\n",
+                    "  \"schema_version\": 1,\n",
+                    "  \"version\": \"{}\"\n",
+                    "}}\n"
+                ),
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
         fs::write(
             root.join("python/pyproject.toml"),
             "[project]\nname = \"mlx-worker\"\nversion = \"0.1.0\"\nrequires-python = \">=3.10\"\n[project.optional-dependencies]\nbench = []\n",
