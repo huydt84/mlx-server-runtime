@@ -26,6 +26,7 @@ from mlx_benchmark.configuration import SelectedConfiguration
 from mlx_benchmark.loadgen import execute_setup_prompts, execute_workloads
 from mlx_benchmark.prompts import (
     generate_prompt_bank,
+    generate_warmup_prompts,
     shared_prefix_prime_prompts,
 )
 from mlx_benchmark.report import render_report
@@ -158,7 +159,6 @@ def run_benchmark(
     try:
         with _interrupts_raise():
             prompts = generate_prompt_bank(results["configuration"])
-            _validate_warmup_material(results["configuration"], prompts)
 
             def completed_trial(trial: dict[str, Any]) -> None:
                 results["trials"].append(trial)
@@ -348,9 +348,7 @@ def _run_configured_diagnostics(
     requested_families: list[str] | None = None,
 ) -> bool:
     configuration = results["configuration"]
-    routes = list(configuration.get("diagnostic_routing", []))
-    profile_families = configuration.get("diagnostic_profiles", {}).get(selection, [])
-    routes = [route for route in routes if route["name"] in profile_families]
+    routes = list(configuration["diagnostics"])
     available = {route["name"] for route in routes}
     if requested_families is not None:
         unknown = set(requested_families).difference(available)
@@ -516,7 +514,6 @@ def _run_diagnostic_attempt(
     )
     diagnostic_workload.update({"trials": 1, "requests_per_trial": 1, "concurrency": 1})
     diagnostic_configuration["workloads"] = [diagnostic_workload]
-    diagnostic_configuration["warmup_groups"] = []
     prompts = generate_prompt_bank(diagnostic_configuration)
     server: _ServerProcess | None = None
     try:
@@ -736,9 +733,11 @@ def run_calibration(
                     Path("runs") / f"repetition-{repetition:03d}" / "results.json"
                 ),
                 "status": run_result["status"],
-                "primary_metrics": (run_result.get("analysis") or {}).get(
-                    "primary_metrics", []
-                ),
+                "primary_metrics": [
+                    summary
+                    for summary in (run_result.get("analysis") or {}).get("metrics", [])
+                    if summary["primary"]
+                ],
             }
         )
         if exit_status != 0:
@@ -755,9 +754,7 @@ def run_calibration(
         _write_artifacts(calibration_directory, results)
 
     if successful_runs:
-        threshold = float(
-            configuration["calibration"]["maximum_coefficient_of_variation_percent"]
-        )
+        threshold = float(configuration["calibration"]["max_cv_percent"])
         results["repeated_measurements"] = analyze_calibration(
             successful_runs, threshold
         )
@@ -913,16 +910,8 @@ def _command_output(command: list[str]) -> str:
 
 def _execution_plan(
     configuration: dict[str, Any], server_mode: str
-) -> list[dict[str, str]]:
-    plan = [
-        {
-            "configuration_order": order["name"],
-            "model": order["model"],
-            "runtime_configuration": runtime,
-        }
-        for order in configuration["configuration_orders"]
-        for runtime in order["runtime_configurations"]
-    ]
+) -> list[dict[str, Any]]:
+    plan = list(configuration["executions"])
     if server_mode == "external" and len(plan) != 1:
         raise _RunFailure(
             "configuration_validation",
@@ -937,12 +926,7 @@ def _configuration_for_execution(
     selected = json.loads(json.dumps(configuration))
     model_name = execution["model"]
     runtime_name = execution["runtime_configuration"]
-    covered_workloads = {
-        workload
-        for coverage in configuration["coverage"]
-        if coverage["model"] == model_name
-        for workload in coverage["workloads"]
-    }
+    covered_workloads = set(configuration["coverage"][model_name])
     selected["models"] = [
         model for model in configuration["models"] if model["name"] == model_name
     ]
@@ -955,32 +939,8 @@ def _configuration_for_execution(
         workload
         for workload in configuration["workloads"]
         if workload["name"] in covered_workloads
-        and runtime_name in workload["runtime_configurations"]
     ]
     return selected
-
-
-def _validate_warmup_material(
-    configuration: dict[str, Any], prompts: dict[str, list[Any]]
-) -> None:
-    measured_groups = {
-        workload["prompt_group"] for workload in configuration["workloads"]
-    }
-    warmup_groups = {
-        warmup["prompt_group"] for warmup in configuration["warmup_groups"]
-    }
-    measured_hashes = {
-        prompt.sha256 for group in measured_groups for prompt in prompts[group]
-    }
-    warmup_hashes = {
-        prompt.sha256 for group in warmup_groups for prompt in prompts[group]
-    }
-    overlap = measured_hashes.intersection(warmup_hashes)
-    if overlap:
-        raise _RunFailure(
-            "configuration_validation",
-            "warmup prompts overlap measured prompt material",
-        )
 
 
 async def _execute_measured_state(
@@ -991,21 +951,18 @@ async def _execute_measured_state(
     results: dict[str, Any],
     completed_trial: Any,
 ) -> None:
-    for warmup in configuration["warmup_groups"]:
-        group = prompts[warmup["prompt_group"]]
-        count = min(int(warmup["concurrency"]), len(group))
+    for workload in configuration["workloads"]:
         records = await execute_setup_prompts(
             base_url,
             configuration,
-            group[:count],
-            output_tokens=int(warmup["output_tokens"]),
-            concurrency=int(warmup["concurrency"]),
+            generate_warmup_prompts(configuration, workload),
+            output_tokens=int(workload["output_tokens"]),
+            concurrency=int(workload["concurrency"]),
         )
         results["warmups"].append(
             {
                 **execution,
-                "group": warmup["name"],
-                "measured": False,
+                "workload": workload["name"],
                 "request_count": len(records),
                 "requests": records,
             }
@@ -1014,7 +971,7 @@ async def _execute_measured_state(
     async def before_trial(
         workload: dict[str, Any], trial_index: int, group: list[Any]
     ) -> dict[str, Any]:
-        cache_state = configuration["cache_states"][workload["cache_state"]]
+        cache_state = workload["cache_state"]
         reset = await asyncio.to_thread(
             _reset_benchmark_state,
             base_url,
@@ -1022,7 +979,7 @@ async def _execute_measured_state(
             False,
         )
         priming: list[dict[str, Any]] = []
-        if cache_state["mode"] == "warm-prefix":
+        if cache_state == "warm-prefix":
             prime_prompts = shared_prefix_prime_prompts(
                 group,
                 trial_index=trial_index,
@@ -1088,21 +1045,13 @@ def _start_server(
     socket_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     socket_suffix = hashlib.sha256(str(run_directory).encode()).hexdigest()[:12]
     ipc_path = socket_directory / f"benchmark-{os.getpid()}-{socket_suffix}.sock"
-    warmups = configuration["warmup_groups"]
-    maximum_concurrency = max(
-        [int(workload["concurrency"]) for workload in workloads]
-        + [int(warmup["concurrency"]) for warmup in warmups]
-    )
-    prompt_groups = [workload["prompt_group"] for workload in workloads] + [
-        warmup["prompt_group"] for warmup in warmups
-    ]
+    maximum_concurrency = max(int(workload["concurrency"]) for workload in workloads)
     maximum_prompt_tokens = max(
-        int(configuration["prompt_bank"][group]["target_tokens"])
-        for group in prompt_groups
+        int(configuration["prompts"][workload["prompt_group"]]["target_tokens"])
+        for workload in workloads
     )
     maximum_output_tokens = max(
-        [int(workload["output_tokens"]) for workload in workloads]
-        + [int(warmup["output_tokens"]) for warmup in warmups]
+        int(workload["output_tokens"]) for workload in workloads
     )
     sampling = configuration["sampling"]
     runtime_config = {
@@ -1459,7 +1408,7 @@ def _validate_completed_trial(results: dict[str, Any], trial: dict[str, Any]) ->
         )
     for request in trial["requests"]:
         _validate_request(results, request)
-    cache_mode = trial["cache_state"]["mode"]
+    cache_mode = trial["cache_state"]
     cached_tokens = [int(request["cached_tokens"]) for request in trial["requests"]]
     if cache_mode == "cold" and any(cached_tokens):
         _validation_failure(
@@ -1547,27 +1496,19 @@ def _validate_final_results(results: dict[str, Any]) -> None:
     if orders != list(range(len(orders))):
         _validation_failure(results, "request_order", f"run request order was {orders}")
     expected_order = [
-        (
-            entry["configuration_order"],
-            entry["model"],
-            entry["runtime_configuration"],
-        )
+        (entry["round"], entry["model"], entry["runtime_configuration"])
         for entry in _execution_plan(
             results["configuration"], results["server"]["mode"]
         )
     ]
     applied_order = [
-        (
-            entry["configuration_order"],
-            entry["model"],
-            entry["runtime_configuration"],
-        )
+        (entry["round"], entry["model"], entry["runtime_configuration"])
         for entry in results["applied_order"]
     ]
     if applied_order != expected_order:
         _validation_failure(
             results,
-            "configuration_order",
+            "execution_order",
             f"expected applied order {expected_order}, recorded {applied_order}",
         )
 

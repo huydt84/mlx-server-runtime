@@ -243,7 +243,7 @@ class IpcEncodingTests(unittest.TestCase):
 
 
 class VlmIpcTests(unittest.TestCase):
-    """Phase 8 VLM IPC encoding/decoding."""
+    """VLM IPC encoding/decoding."""
 
     def test_image_content_dataclass(self) -> None:
         img = ImageContent(url="path/to/image.jpg", detail="high")

@@ -76,7 +76,7 @@ Request logs are structured JSON lines written by the Rust gateway and include:
 
 ## Benchmarks
 
-`mlx-air bench` is the benchmark entrypoint. Each run measures one runtime:
+`mlx-air bench` is the benchmark entrypoint:
 
 ```bash
 mlx-air bench run --suite smoke

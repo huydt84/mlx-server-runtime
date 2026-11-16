@@ -1,0 +1,70 @@
+schema_version = 2
+
+[sampling]
+seed = 9
+temperature = 0.0
+top_p = 1.0
+request_timeout_seconds = 30
+readiness_timeout_seconds = 30
+
+[calibration]
+max_cv_percent = 0.0
+
+[prompts.short]
+kind = "short"
+count = 4
+target_tokens = 16
+
+[models.primary]
+checkpoint = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+
+[runtime_configurations.delayed]
+backend = "v1"
+environment = { MLX_RUNTIME_TEST_GATEWAY_DELAY_MS = "15", MLX_RUNTIME_TEST_PREFILL_DELAY_MS = "25", MLX_RUNTIME_TEST_DECODE_DELAY_MS = "35" }
+
+[workloads.gateway_latency]
+prompt_group = "short"
+output_tokens = 2
+streaming = false
+load_mode = "sequential"
+concurrency = 1
+requests_per_trial = 2
+cache_state = "cold"
+primary_metric = "end_to_end_latency"
+
+[workloads.prefill_ttft]
+prompt_group = "short"
+output_tokens = 2
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+requests_per_trial = 2
+cache_state = "cold"
+primary_metric = "ttft"
+
+[workloads.decode_tpot]
+prompt_group = "short"
+output_tokens = 2
+streaming = true
+load_mode = "sequential"
+concurrency = 1
+requests_per_trial = 2
+cache_state = "cold"
+primary_metric = "tpot"
+
+[diagnostics.gateway]
+models = ["primary"]
+workloads = ["gateway_latency"]
+profilers = ["pipeline"]
+
+[diagnostics.decode]
+models = ["primary"]
+workloads = ["decode_tpot"]
+profilers = ["graph"]
+
+[suites.statistics]
+rounds = 1
+trials = 2
+runtime_configurations = ["delayed"]
+diagnostics = ["gateway", "decode"]
+coverage = { primary = ["gateway_latency", "prefill_ttft", "decode_tpot"] }

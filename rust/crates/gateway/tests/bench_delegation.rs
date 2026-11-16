@@ -51,7 +51,7 @@ impl StagedCli {
         fs::write(root.join("config/runtime.toml"), "[worker]\n").unwrap();
         fs::write(
             root.join("config/benchmark.toml"),
-            include_str!("fixtures/phase7_benchmark.toml"),
+            include_str!("fixtures/load_modes.toml"),
         )
         .unwrap();
         fs::write(root.join("licenses/LICENSE"), "license").unwrap();
@@ -289,14 +289,9 @@ fn invalid_configuration_values_report_exact_fields_before_server_startup() {
             "workloads.sequential_stream.cache_state",
         ),
         (
-            "metric_unit = \"ms\"",
-            "metric_unit = \"furlongs\"",
-            "workloads.sequential_stream.metric_unit",
-        ),
-        (
-            "metric_direction = \"lower\"",
-            "metric_direction = \"sideways\"",
-            "workloads.sequential_stream.metric_direction",
+            "primary_metric = \"ttft\"",
+            "primary_metric = \"furlongs\"",
+            "workloads.sequential_stream.primary_metric",
         ),
         (
             "requests_per_trial = 2",
@@ -309,9 +304,9 @@ fn invalid_configuration_values_report_exact_fields_before_server_startup() {
             "workloads.sequential_stream.load_mode",
         ),
         (
-            "[warmup_groups.short]\nprompt_group = \"warmup_short\"\nconcurrency = 1\noutput_tokens = 4",
-            "[warmup_groups.short]\nprompt_group = \"warmup_short\"\nconcurrency = 1",
-            "warmup_groups.short.output_tokens",
+            "output_tokens = 4\nstreaming = true",
+            "streaming = true",
+            "workloads.sequential_stream.output_tokens",
         ),
         (
             "profilers = [\"pipeline\"]",
@@ -324,7 +319,7 @@ fn invalid_configuration_values_report_exact_fields_before_server_startup() {
         let invalid = staged.base.join(format!("invalid-{index}.toml"));
         fs::write(
             &invalid,
-            include_str!("fixtures/phase7_benchmark.toml").replacen(original, replacement, 1),
+            include_str!("fixtures/load_modes.toml").replacen(original, replacement, 1),
         )
         .unwrap();
         let output = staged
@@ -357,137 +352,10 @@ fn invalid_configuration_values_report_exact_fields_before_server_startup() {
 }
 
 #[test]
-fn warmup_requirements_size_the_self_launched_server() {
-    let staged = StagedCli::new("warmup-server-limits");
-    let output_directory = staged.base.join("warmup-server-limits-artifacts");
-    let config = staged.base.join("warmup-server-limits.toml");
-    let configuration = include_str!("fixtures/phase7_benchmark.toml")
-        .replacen(
-            "count = 2\ntarget_tokens = 16",
-            "count = 4\ntarget_tokens = 32",
-            1,
-        )
-        .replacen(
-            "concurrency = 1\noutput_tokens = 4",
-            "concurrency = 4\noutput_tokens = 9",
-            1,
-        );
-    fs::write(&config, configuration).unwrap();
-
-    let output = staged
-        .command()
-        .args([
-            "bench",
-            "run",
-            "--suite",
-            "smoke",
-            "--benchmark-config",
-            config.to_str().unwrap(),
-            "--output-dir",
-            output_directory.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    let results = read_results(&output_directory);
-    assert_eq!(
-        results["server"]["runtime_configuration"]["limits"]["max_active_requests"],
-        4
-    );
-    assert_eq!(
-        results["server"]["runtime_configuration"]["limits"]["max_prompt_tokens"],
-        320
-    );
-    assert_eq!(
-        results["server"]["runtime_configuration"]["limits"]["max_completion_tokens"],
-        9
-    );
-}
-
-#[test]
-fn configuration_order_cannot_schedule_a_runtime_outside_the_suite() {
-    let staged = StagedCli::new("order-runtime-outside-suite");
-    let config = staged.base.join("order-runtime-outside-suite.toml");
-    let configuration = include_str!("fixtures/phase7_benchmark.toml")
-        .replacen(
-            "[runtime_configurations.serial]",
-            "[runtime_configurations.overlap]\nbackend = \"v1\"\nenvironment = {}\n\n[runtime_configurations.serial]",
-            1,
-        )
-        .replacen(
-            "runtime_configurations = [\"serial\"]\n\n[tail_sets.none]",
-            "runtime_configurations = [\"serial\", \"overlap\"]\n\n[tail_sets.none]",
-            1,
-        );
-    fs::write(&config, configuration).unwrap();
-
-    let output = staged.output(&[
-        "bench",
-        "run",
-        "--suite",
-        "smoke",
-        "--benchmark-config",
-        config.to_str().unwrap(),
-    ]);
-
-    assert_eq!(output.status.code(), Some(50));
-    assert!(
-        stderr(&output).contains(
-            "suites.smoke.configuration_orders: order 'primary' uses runtime configurations outside the suite: ['overlap']"
-        ),
-        "stderr: {}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn every_scheduled_model_runtime_pair_must_execute_a_workload() {
-    let staged = StagedCli::new("scheduled-runtime-without-workload");
-    let config = staged.base.join("scheduled-runtime-without-workload.toml");
-    let configuration = include_str!("fixtures/phase7_benchmark.toml")
-        .replacen(
-            "[runtime_configurations.serial]",
-            "[runtime_configurations.overlap]\nbackend = \"v1\"\nenvironment = {}\n\n[runtime_configurations.serial]",
-            1,
-        )
-        .replacen(
-            "runtime_configurations = [\"serial\"]\n\n[tail_sets.none]",
-            "runtime_configurations = [\"serial\", \"overlap\"]\n\n[tail_sets.none]",
-            1,
-        )
-        .replacen(
-            "runtime_configurations = [\"serial\"]\nwarmup_groups",
-            "runtime_configurations = [\"serial\", \"overlap\"]\nwarmup_groups",
-            1,
-        )
-        .replacen("max_model_starts = 1", "max_model_starts = 2", 1);
-    fs::write(&config, configuration).unwrap();
-
-    let output = staged.output(&[
-        "bench",
-        "run",
-        "--suite",
-        "smoke",
-        "--benchmark-config",
-        config.to_str().unwrap(),
-    ]);
-
-    assert_eq!(output.status.code(), Some(50));
-    assert!(
-        stderr(&output).contains(
-            "suites.smoke.coverage[0].workloads: does not assign workloads to scheduled runtime configurations ['overlap']"
-        ),
-        "stderr: {}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn external_mode_rejects_a_multi_execution_selection() {
     let staged = StagedCli::new("external-multi-execution");
     let config = staged.base.join("external-multi-execution.toml");
-    let configuration = include_str!("fixtures/phase7_benchmark.toml")
+    let configuration = include_str!("fixtures/load_modes.toml")
         .replacen(
             "[runtime_configurations.serial]",
             "[runtime_configurations.overlap]\nbackend = \"v1\"\nenvironment = {}\n\n[runtime_configurations.serial]",
@@ -496,8 +364,7 @@ fn external_mode_rejects_a_multi_execution_selection() {
         .replace(
             "runtime_configurations = [\"serial\"]",
             "runtime_configurations = [\"serial\", \"overlap\"]",
-        )
-        .replacen("max_model_starts = 1", "max_model_starts = 2", 1);
+        );
     fs::write(&config, configuration).unwrap();
 
     let output = staged.output(&[
@@ -567,6 +434,10 @@ fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
     assert_eq!(results["trials"][0]["maximum_observed_in_flight"], 1);
     assert_eq!(results["trials"][1]["maximum_observed_in_flight"], 3);
     assert_eq!(results["trials"][2]["maximum_observed_in_flight"], 2);
+    let limits = &results["server"]["runtime_configuration"]["limits"];
+    assert_eq!(limits["max_active_requests"], 3);
+    assert_eq!(limits["max_prompt_tokens"], 288);
+    assert_eq!(limits["max_completion_tokens"], 4);
     assert_eq!(
         results["trials"][0]["submission_policy"],
         "submit-one-after-previous-completes"
@@ -623,11 +494,11 @@ fn self_launched_run_writes_exact_trials_and_reaps_process_group() {
 }
 
 #[test]
-fn phase8_run_applies_order_cache_state_and_trial_metric_deltas() {
-    let staged = StagedCli::new("phase8-state");
-    let output_directory = staged.base.join("phase8-artifacts");
-    let config = staged.base.join("phase8.toml");
-    fs::write(&config, include_str!("fixtures/phase8_benchmark.toml")).unwrap();
+fn cache_states_alternate_runtimes_and_record_metric_deltas() {
+    let staged = StagedCli::new("cache-states");
+    let output_directory = staged.base.join("cache-states-artifacts");
+    let config = staged.base.join("cache-states.toml");
+    fs::write(&config, include_str!("fixtures/cache_states.toml")).unwrap();
 
     let output = staged
         .command()
@@ -635,7 +506,7 @@ fn phase8_run_applies_order_cache_state_and_trial_metric_deltas() {
             "bench",
             "run",
             "--suite",
-            "phase8",
+            "cache_states",
             "--benchmark-config",
             config.to_str().unwrap(),
             "--output-dir",
@@ -655,15 +526,23 @@ fn phase8_run_applies_order_cache_state_and_trial_metric_deltas() {
         results["applied_order"][1]["runtime_configuration"],
         "overlap"
     );
-    assert_eq!(results["warmups"].as_array().unwrap().len(), 2);
-    assert!(results["warmups"]
-        .as_array()
-        .unwrap()
+    let warmups = results["warmups"].as_array().unwrap();
+    assert_eq!(warmups.len(), 6);
+    assert!(warmups
         .iter()
-        .all(|warmup| warmup["measured"] == false));
+        .all(|warmup| warmup["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| {
+                request["prompt_name"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("warmup-")
+            })));
     assert_eq!(results["trials"].as_array().unwrap().len(), 6);
     for trial in results["trials"].as_array().unwrap() {
-        assert_eq!(trial["configuration_order"], "round");
+        assert_eq!(trial["round"], 1);
         assert!(trial["runtime_metrics"]
             .as_object()
             .unwrap()
@@ -691,11 +570,11 @@ fn phase8_run_applies_order_cache_state_and_trial_metric_deltas() {
 }
 
 #[test]
-fn phase9_run_reports_trial_statistics_configured_tails_and_controlled_delays() {
-    let staged = StagedCli::new("phase9-statistics");
-    let output_directory = staged.base.join("phase9-artifacts");
-    let config = staged.base.join("phase9.toml");
-    fs::write(&config, include_str!("fixtures/phase9_benchmark.toml")).unwrap();
+fn statistics_summarize_trial_means_under_controlled_delays() {
+    let staged = StagedCli::new("statistics");
+    let output_directory = staged.base.join("statistics-artifacts");
+    let config = staged.base.join("statistics.toml");
+    fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
 
     let output = staged
         .command()
@@ -703,7 +582,7 @@ fn phase9_run_reports_trial_statistics_configured_tails_and_controlled_delays() 
             "bench",
             "run",
             "--suite",
-            "phase9",
+            "statistics",
             "--benchmark-config",
             config.to_str().unwrap(),
             "--output-dir",
@@ -714,12 +593,17 @@ fn phase9_run_reports_trial_statistics_configured_tails_and_controlled_delays() 
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let results = read_results(&output_directory);
-    let primary = results["analysis"]["primary_metrics"].as_array().unwrap();
+    let primary: Vec<_> = results["analysis"]["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|summary| summary["primary"] == true)
+        .collect();
     assert_eq!(primary.len(), 3);
     assert!(primary.iter().all(|summary| {
-        summary["independent_trial_count"] == 2
+        summary["trial_count"] == 2
             && summary["request_count"] == 4
-            && summary["bootstrap_95_interval"]["resampling_unit"] == "trial"
+            && summary["trial_values"].as_array().unwrap().len() == 2
     }));
     let gateway = primary
         .iter()
@@ -737,22 +621,18 @@ fn phase9_run_reports_trial_statistics_configured_tails_and_controlled_delays() 
         .find(|summary| summary["workload"] == "decode_tpot")
         .unwrap();
     assert!(decode["mean"].as_f64().unwrap() >= 35.0);
-    let tails = results["analysis"]["tails"].as_array().unwrap();
-    assert_eq!(tails.len(), 1);
-    assert_eq!(tails[0]["workload"], "prefill_ttft");
-    assert_eq!(tails[0]["request_ttft_p95"]["sample_count"], 4);
-    assert_eq!(tails[0]["trial_wall_time_p95"]["sample_count"], 2);
+    assert!(prefill["request_p95"].as_f64().unwrap() >= 40.0);
     let report = fs::read_to_string(output_directory.join("report.md")).unwrap();
-    assert!(report.contains("Lower latency, TTFT, and TPOT are better"));
-    assert!(report.contains("Requests within a trial are correlated"));
+    assert!(report.contains("Lower ms is better"));
+    assert!(report.contains("**ttft (ms)**"));
 }
 
 #[test]
-fn phase9_calibration_repeats_unchanged_configuration_and_reports_variation() {
-    let staged = StagedCli::new("phase9-calibration");
-    let config = staged.base.join("phase9.toml");
-    let pid_file = staged.base.join("phase9-calibration-pids");
-    fs::write(&config, include_str!("fixtures/phase9_benchmark.toml")).unwrap();
+fn calibration_repeats_unchanged_configuration_and_reports_variation() {
+    let staged = StagedCli::new("calibration");
+    let config = staged.base.join("statistics.toml");
+    let pid_file = staged.base.join("calibration-pids");
+    fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
 
     let output = staged
         .command()
@@ -762,7 +642,7 @@ fn phase9_calibration_repeats_unchanged_configuration_and_reports_variation() {
             "bench",
             "calibrate",
             "--suite",
-            "phase9",
+            "statistics",
             "--benchmark-config",
             config.to_str().unwrap(),
             "--repetitions",
@@ -779,7 +659,7 @@ fn phase9_calibration_repeats_unchanged_configuration_and_reports_variation() {
     assert_eq!(results["status"], "succeeded");
     assert_eq!(results["repetitions"]["requested"], 2);
     assert_eq!(results["repetitions"]["completed"], 2);
-    assert_eq!(results["configuration"]["suite"], "phase9");
+    assert_eq!(results["configuration"]["suite"], "statistics");
     assert_eq!(results["configuration"]["workloads"][0]["trials"], 2);
     assert_eq!(results["runs"].as_array().unwrap().len(), 2);
     assert_eq!(results["host_observations"].as_array().unwrap().len(), 4);
@@ -795,10 +675,9 @@ fn phase9_calibration_repeats_unchanged_configuration_and_reports_variation() {
     let repeated = results["repeated_measurements"].as_array().unwrap();
     assert_eq!(repeated.len(), 3);
     assert!(repeated.iter().all(|summary| {
-        summary["completed_repetition_count"] == 2
-            && summary["repetition_values"].as_array().unwrap().len() == 2
-            && summary["bootstrap_95_interval"]["resampling_unit"] == "run"
-            && summary["run_to_run_range"]["unit"].is_string()
+        summary["run_values"].as_array().unwrap().len() == 2
+            && summary["max_cv_percent"] == 0.0
+            && summary["unit"].is_string()
     }));
     assert!(!results["unstable_workloads"].as_array().unwrap().is_empty());
     assert!(calibration_directory.join("report.md").is_file());
@@ -806,12 +685,12 @@ fn phase9_calibration_repeats_unchanged_configuration_and_reports_variation() {
 }
 
 #[test]
-fn phase10_representative_profile_runs_after_measurement_in_a_separate_process() {
-    let staged = StagedCli::new("phase10-representative");
-    let output_directory = staged.base.join("phase10-representative-artifacts");
-    let config = staged.base.join("phase10.toml");
-    let pid_file = staged.base.join("phase10-representative-pids");
-    fs::write(&config, phase10_configuration()).unwrap();
+fn representative_profile_runs_after_measurement_in_separate_processes() {
+    let staged = StagedCli::new("representative-profile");
+    let output_directory = staged.base.join("representative-profile-artifacts");
+    let config = staged.base.join("statistics.toml");
+    let pid_file = staged.base.join("representative-profile-pids");
+    fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
 
     let output = staged
         .command()
@@ -820,7 +699,7 @@ fn phase10_representative_profile_runs_after_measurement_in_a_separate_process()
             "bench",
             "run",
             "--suite",
-            "phase9",
+            "statistics",
             "--benchmark-config",
             config.to_str().unwrap(),
             "--profile",
@@ -835,24 +714,17 @@ fn phase10_representative_profile_runs_after_measurement_in_a_separate_process()
     let results = read_results(&output_directory);
     assert_eq!(results["status"], "succeeded");
     assert_eq!(results["diagnostics"]["status"], "succeeded");
-    assert_eq!(
-        results["configuration"]["diagnostic_profiles"]["representative"],
-        serde_json::json!(["gateway"])
-    );
-    assert_eq!(
-        results["configuration"]["diagnostic_profiles"]["all"],
-        serde_json::json!(["gateway", "decode"])
-    );
     let attempts = results["diagnostics"]["attempts"].as_array().unwrap();
-    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0]["family"], "gateway");
-    assert!(attempts[0]["artifacts"]
+    assert_eq!(attempts[1]["family"], "decode");
+    assert!(attempts.iter().all(|attempt| attempt["artifacts"]
         .as_array()
         .unwrap()
         .iter()
-        .all(|artifact| artifact["status"] == "succeeded"));
+        .all(|artifact| artifact["status"] == "succeeded")));
     let processes = results["processes"].as_array().unwrap();
-    assert_eq!(processes.len(), 2);
+    assert_eq!(processes.len(), 3);
     assert_ne!(processes[0]["pid"], processes[1]["pid"]);
     assert!(
         processes[0]["stopped_monotonic_ns"].as_u64().unwrap()
@@ -881,16 +753,16 @@ fn phase10_representative_profile_runs_after_measurement_in_a_separate_process()
 }
 
 #[test]
-fn phase10_explicit_diagnose_runs_only_the_requested_family() {
-    let staged = StagedCli::new("phase10-explicit");
-    let output_directory = staged.base.join("phase10-explicit-artifacts");
-    let config = staged.base.join("phase10.toml");
-    fs::write(&config, phase10_configuration()).unwrap();
+fn diagnose_runs_only_the_requested_family() {
+    let staged = StagedCli::new("diagnose-family");
+    let output_directory = staged.base.join("diagnose-family-artifacts");
+    let config = staged.base.join("statistics.toml");
+    fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
     let run = staged.output(&[
         "bench",
         "run",
         "--suite",
-        "phase9",
+        "statistics",
         "--benchmark-config",
         config.to_str().unwrap(),
         "--output-dir",
@@ -926,16 +798,16 @@ fn phase10_explicit_diagnose_runs_only_the_requested_family() {
 }
 
 #[test]
-fn phase10_explicit_diagnose_all_runs_every_configured_family() {
-    let staged = StagedCli::new("phase10-explicit-all");
-    let output_directory = staged.base.join("phase10-explicit-all-artifacts");
-    let config = staged.base.join("phase10.toml");
-    fs::write(&config, phase10_configuration()).unwrap();
+fn diagnose_all_runs_every_configured_family() {
+    let staged = StagedCli::new("diagnose-all");
+    let output_directory = staged.base.join("diagnose-all-artifacts");
+    let config = staged.base.join("statistics.toml");
+    fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
     let run = staged.output(&[
         "bench",
         "run",
         "--suite",
-        "phase9",
+        "statistics",
         "--benchmark-config",
         config.to_str().unwrap(),
         "--output-dir",
@@ -964,12 +836,12 @@ fn phase10_explicit_diagnose_all_runs_every_configured_family() {
 }
 
 #[test]
-fn phase10_diagnostic_failure_preserves_successful_measurements() {
-    let staged = StagedCli::new("phase10-failure");
-    let output_directory = staged.base.join("phase10-failure-artifacts");
-    let config = staged.base.join("phase10.toml");
-    let pid_file = staged.base.join("phase10-failure-pids");
-    fs::write(&config, phase10_configuration()).unwrap();
+fn diagnostic_failure_preserves_successful_measurements() {
+    let staged = StagedCli::new("diagnostic-failure");
+    let output_directory = staged.base.join("diagnostic-failure-artifacts");
+    let config = staged.base.join("statistics.toml");
+    let pid_file = staged.base.join("diagnostic-failure-pids");
+    fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
 
     let output = staged
         .command()
@@ -979,7 +851,7 @@ fn phase10_diagnostic_failure_preserves_successful_measurements() {
             "bench",
             "run",
             "--suite",
-            "phase9",
+            "statistics",
             "--benchmark-config",
             config.to_str().unwrap(),
             "--profile",
@@ -1001,13 +873,13 @@ fn phase10_diagnostic_failure_preserves_successful_measurements() {
 }
 
 #[test]
-fn phase10_interrupted_diagnostic_preserves_measurements_and_reaps_processes() {
-    let staged = StagedCli::new("phase10-interrupt");
-    let output_directory = staged.base.join("phase10-interrupt-artifacts");
-    let config = staged.base.join("phase10.toml");
-    let pid_file = staged.base.join("phase10-interrupt-pids");
-    let diagnostic_ready = staged.base.join("phase10-diagnostic-ready");
-    fs::write(&config, phase10_configuration()).unwrap();
+fn interrupted_diagnostic_preserves_measurements_and_reaps_processes() {
+    let staged = StagedCli::new("diagnostic-interrupt");
+    let output_directory = staged.base.join("diagnostic-interrupt-artifacts");
+    let config = staged.base.join("statistics.toml");
+    let pid_file = staged.base.join("diagnostic-interrupt-pids");
+    let diagnostic_ready = staged.base.join("diagnostic-ready");
+    fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
     let mut child = staged
         .command()
         .env("FAKE_GATEWAY_PID_FILE", &pid_file)
@@ -1017,7 +889,7 @@ fn phase10_interrupted_diagnostic_preserves_measurements_and_reaps_processes() {
             "bench",
             "run",
             "--suite",
-            "phase9",
+            "statistics",
             "--benchmark-config",
             config.to_str().unwrap(),
             "--profile",
@@ -1134,7 +1006,9 @@ fn ambiguous_transport_failure_does_not_duplicate_an_inference_post() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(50));
-    assert_eq!(fs::read_to_string(request_count_file).unwrap().trim(), "12");
+    // 6 warmup requests (one per concurrency slot) plus 11 measured requests,
+    // one of which is dropped and must not be retried.
+    assert_eq!(fs::read_to_string(request_count_file).unwrap().trim(), "17");
     let results = read_results(&output_directory);
     assert_eq!(all_requests(&results).len(), 11);
     assert_processes_reaped(&pid_file);
@@ -1222,20 +1096,6 @@ fn external_mode_records_server_identity_without_stopping_server() {
     assert_eq!(results["versions"]["gateway"], "0.1.0");
     unsafe { libc::kill(server.id() as i32, libc::SIGTERM) };
     assert!(server.wait().unwrap().success());
-}
-
-fn phase10_configuration() -> String {
-    include_str!("fixtures/phase9_benchmark.toml")
-        .replacen(
-            "\n[suites.phase9]",
-            "\n[diagnostics.decode]\nmodels = [\"primary\"]\nworkloads = [\"decode_tpot\"]\nprofilers = [\"graph\"]\n\n[suites.phase9]",
-            1,
-        )
-        .replacen(
-            "\ndiagnostic_families = [\"gateway\"]",
-            "\ndiagnostic_families = [\"gateway\", \"decode\"]",
-            1,
-        )
 }
 
 fn temp_path(label: &str) -> PathBuf {

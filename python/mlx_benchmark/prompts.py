@@ -41,19 +41,29 @@ class Prompt:
 
 
 def generate_prompt_bank(configuration: dict[str, Any]) -> dict[str, list[Prompt]]:
-    """Generate every selected measured and warmup prompt group.
-
-    Args:
-        configuration: Fully selected benchmark configuration.
-
-    Returns:
-        Prompt groups keyed by configuration name.
-    """
+    """Generate every selected measured prompt group, keyed by group name."""
     seed = int(configuration["sampling"]["seed"])
     return {
-        name: _generate_group(name, definition, seed)
-        for name, definition in configuration["prompt_bank"].items()
+        name: _generate_group(name, definition, seed, "measured")
+        for name, definition in configuration["prompts"].items()
     }
+
+
+def generate_warmup_prompts(
+    configuration: dict[str, Any], workload: dict[str, Any]
+) -> list[Prompt]:
+    """Generate one concurrency's worth of warmup prompts shaped like a workload.
+
+    Warmup prompts use a separate seed namespace, so they never match measured
+    prompt text or share a measured prompt's prefix.
+    """
+    group = workload["prompt_group"]
+    definition = {
+        **configuration["prompts"][group],
+        "count": int(workload["concurrency"]),
+    }
+    seed = int(configuration["sampling"]["seed"])
+    return _generate_group(f"warmup-{group}", definition, seed, "warmup")
 
 
 def shared_prefix_prime_prompts(
@@ -91,7 +101,9 @@ def shared_prefix_prime_prompts(
     return list(primes.values())
 
 
-def _generate_group(name: str, definition: dict[str, Any], seed: int) -> list[Prompt]:
+def _generate_group(
+    name: str, definition: dict[str, Any], seed: int, material: str
+) -> list[Prompt]:
     group_seed = int.from_bytes(
         hashlib.sha256(f"{seed}:{name}".encode()).digest()[:8], "big"
     )
@@ -99,7 +111,6 @@ def _generate_group(name: str, definition: dict[str, Any], seed: int) -> list[Pr
     count = int(definition["count"])
     target_tokens = int(definition["target_tokens"])
     kind = str(definition["kind"])
-    material = str(definition["material"])
     prompts: list[Prompt] = []
     for index in range(count):
         words = [rng.choice(_WORDS) for _ in range(max(1, target_tokens - 8))]

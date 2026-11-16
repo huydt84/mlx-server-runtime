@@ -48,4 +48,4 @@ print("DEBUG: prompt tokens =", len(prompt_tokens), flush=True)
 | `ModuleNotFoundError: mlx_lm` | Run `uv sync` in `python/` |
 | Model loads slowly | First load downloads weights; subsequent loads use Hugging Face cache |
 | Worker crashes silently | Check `MLX_RUNTIME_MODEL` is set or passed via config |
-| IPC frame decode errors | Verify JSON line format matches protocol/schema.md |
+| IPC frame decode errors | Verify JSON line format matches [the IPC protocol reference](../reference/protocol.md) |

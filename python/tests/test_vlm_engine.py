@@ -1,4 +1,4 @@
-"""Tests for the Phase 8 VLM worker engine."""
+"""Tests for the VLM worker engine."""
 
 from __future__ import annotations
 

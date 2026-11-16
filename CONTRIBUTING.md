@@ -280,10 +280,9 @@ whole-pipeline or Metal evidence before optimizing.
 
 ## Evaluate Performance
 
-For performance work, first select the evidence scope from
-[`benchmarks/POLICY.md`](benchmarks/POLICY.md). The policy defines which suite,
-focus, model roles, workloads, sampling, execution order, and primary metrics
-support the intended conclusion.
+For performance work, first pick the suite and focus whose models and
+workloads support the intended conclusion; see
+[Run benchmarks](docs/how-to/run-benchmarks.md).
 
 Run the selected benchmark against the staged or installed distribution:
 
@@ -291,8 +290,8 @@ Run the selected benchmark against the staged or installed distribution:
 mlx-air bench run --suite optimization --focus scheduler
 ```
 
-The command measures one runtime and stores the selected benchmark
-configuration with its measurements.
+The command measures each covered model on every runtime configuration of the
+suite and stores the selected benchmark configuration with its measurements.
 For a two-version evaluation, prepare each distribution independently, run the
 same suite, focus, and configuration values against both, and apply the
 repository performance-comparison workflow to their results. Require matching
@@ -321,8 +320,10 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Report any Apple Silicon, Metal, or checkpoint validation that remains to be
-run. Do not replace a required host check with mocks or a direct import test.
+Host-only checks live in `mlx-host-validation/scripts/` and are named by the
+capability they cover: `native_*.sh` for the native runtime and `cli_*.sh` for
+the `mlx-air` CLI. Report any Apple Silicon, Metal, or checkpoint validation
+that remains to be run. Do not replace a required host check with mocks or a direct import test.
 
 ## Keep Changes Reviewable
 

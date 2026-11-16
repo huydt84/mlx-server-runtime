@@ -3187,7 +3187,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("phase_8_local_{unique}.ppm"));
+        let path = std::env::temp_dir().join(format!("vlm_local_{unique}.ppm"));
         std::fs::write(&path, "P3\n1 1\n255\n255 0 0\n").unwrap();
         let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,

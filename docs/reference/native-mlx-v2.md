@@ -106,7 +106,7 @@ strategy, or scheduler-policy values must fail startup. They must not silently
 select dense attention, another prefix strategy, v1, `mlx-lm`, or `mlx-vlm`.
 The experimental `overlap` mode never silently falls back to serial. It keeps
 latency-sensitive pure prefill synchronous and pipelines decode only. Use
-`mlx-host-validation/scripts/v2_phase_17.sh` to require exact serial/overlap
+`mlx-host-validation/scripts/native_overlap.sh` to require exact serial/overlap
 output parity, a 2% performance confidence-bound gate, CPU overlap evidence,
 an MLX `.gputrace`, and matched serial/overlap Metal System Traces from the
 Python worker. The Metal gate uses the same sustained four-request concurrent
@@ -129,7 +129,7 @@ and backend contract tests, but no Qwen2 or executor changes. New attention
 semantics such as sinks or sliding windows still require an explicit model
 interface extension.
 
-The current `native-metal-paged-sdpa` bundle preserves the Phase 9 production
+The current `native-metal-paged-sdpa` bundle preserves the paged-attention production
 path: KV storage is page managed, then the attention adapter gathers padded
 dense K/V rows and delegates to `mx.fast.scaled_dot_product_attention`. Its
 capability metadata therefore reports that it does **not** consume page tables
@@ -203,7 +203,7 @@ request totals.
 - Greedy decoding is the validated native path.
 - VLM requests remain outside `native-mlx`.
 - Same-thread overlap remains experimental and explicit opt-in; serial remains
-  the default even though the Phase 17/18 host gates cover it.
+  the default even though the overlap and architecture-overhead host gates cover it.
 
 ## v1 Fallback
 
