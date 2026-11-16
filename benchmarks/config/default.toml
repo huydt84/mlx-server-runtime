@@ -63,13 +63,17 @@ checkpoint = "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
 [models.runtime_control]
 checkpoint = "mlx-community/gemma-3-270m-it-qat-8bit"
 
+# Native-MLX rejects a request with KV_CAPACITY_EXHAUSTED instead of queueing
+# it, so the KV budget must hold every in-flight request. 2 GiB holds ~14.5k
+# tokens on Qwen3-4B (144 KiB/token), 1.7x the largest working set
+# (shared_prefix_warm_c16, 16 x 544 tokens).
 [runtime_configurations.serial]
 backend = "native-mlx"
-environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "268435456" }
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648" }
 
 [runtime_configurations.overlap]
 backend = "native-mlx"
-environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "268435456" }
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648" }
 
 # load_mode: sequential (concurrency 1), burst (all requests at once), or
 # closed-loop (keep `concurrency` requests in flight).
@@ -157,12 +161,15 @@ requests_per_trial = 16
 cache_state = "warm-prefix"
 primary_metric = "ttft"
 
-[workloads.cache_pressure_c16]
+# Four 2k requests stay in flight (~8.3k tokens) while the 16 unique prompts
+# total ~33k tokens, so the primary model's cache must evict. Models with a
+# smaller KV footprint per token may not reach eviction.
+[workloads.cache_pressure_c4]
 prompt_group = "cache_pressure"
 output_tokens = 16
 streaming = false
-load_mode = "burst"
-concurrency = 16
+load_mode = "closed-loop"
+concurrency = 4
 requests_per_trial = 16
 cache_state = "cache-pressure"
 primary_metric = "end_to_end_latency"
@@ -187,7 +194,7 @@ workloads = ["steady_short_c4", "steady_short_c8", "mixed_c8"]
 
 [focuses.cache]
 models = ["primary", "dense"]
-workloads = ["cold_prefill_2k_c1", "shared_prefix_warm_c16", "cache_pressure_c16"]
+workloads = ["cold_prefill_2k_c1", "shared_prefix_warm_c16", "cache_pressure_c4"]
 
 # Diagnostics run after measurement in separate processes and never produce
 # benchmark rows. `--profile representative` runs the first target of each
@@ -215,7 +222,7 @@ profilers = ["pipeline"]
 
 [diagnostics.cache]
 models = ["primary"]
-workloads = ["shared_prefix_warm_c16", "cache_pressure_c16"]
+workloads = ["shared_prefix_warm_c16", "cache_pressure_c4"]
 profilers = ["pipeline"]
 
 # A suite lists which workloads run on which models. Each (model, runtime
@@ -233,14 +240,14 @@ rounds = 2
 trials = 2
 runtime_configurations = ["serial", "overlap"]
 diagnostics = ["gateway", "prefill", "decode", "scheduler", "cache"]
-coverage = { primary = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c16"], dense = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c16"], moe = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"], runtime_control = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] }
+coverage = { primary = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c4"], dense = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c16"], moe = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"], runtime_control = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] }
 
 [suites.release]
 rounds = 2
 trials = 3
 runtime_configurations = ["serial", "overlap"]
 diagnostics = ["gateway", "prefill", "decode", "scheduler", "cache"]
-coverage = { primary = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c16"], dense = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c16"], moe = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"], runtime_control = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] }
+coverage = { primary = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c4"], dense = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c16"], moe = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"], runtime_control = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] }
 
 [suites.exhaustive]
 rounds = 2
