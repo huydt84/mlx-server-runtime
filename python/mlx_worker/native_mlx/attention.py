@@ -19,6 +19,7 @@ from .cache import (
     HybridPagedKVCacheBackend,
 )
 from .interfaces import ForwardMode, HybridLayerAttentionContext, LayerAttentionContext
+from .paged_decode import paged_decode_attention, simdgroups_for
 
 
 @dataclass(frozen=True)
@@ -241,6 +242,29 @@ class PagedLayerAttentionContext:
             values,
         )
         started = time.perf_counter()
+        if self.forward_mode is ForwardMode.DECODE and simdgroups_for(
+            int(queries.shape[1]),
+            self.reservation.backend.num_kv_heads,
+            int(queries.shape[3]),
+        ):
+            # Decode reads keys straight from the pages instead of gathering
+            # every row's cache into dense K/V first.
+            block_tables, lengths = self.reservation.page_table_inputs()
+            output = paged_decode_attention(
+                queries,
+                key_cache,
+                value_cache,
+                block_tables,
+                lengths,
+                max_length=self.reservation._max_total_length,
+                scale=scale,
+                window_size=window_size,
+            )
+            self.attention_backend.record_attention(
+                self.forward_mode.value,
+                max(0, int((time.perf_counter() - started) * 1000)),
+            )
+            return output
         if self.reservation.cache_lengths == (0,):
             # A single row with no cached prefix attends only to its own new
             # K/V, which are already dense: skip the page gather.
@@ -308,7 +332,11 @@ class PagedLayerAttentionContext:
 
 @dataclass
 class PagedMetalAttentionBackend:
-    """MLX SDPA over dense rows gathered from fixed-size paged K/V."""
+    """Paged-KV attention: a page-table decode kernel, SDPA over gathered rows.
+
+    Decode steps read K/V directly from the page pool. Prefill and mixed steps
+    gather each row's pages into dense K/V for MLX SDPA.
+    """
 
     capabilities: ClassVar[AttentionBackendCapabilities] = AttentionBackendCapabilities(
         backend_id="native-metal-paged-sdpa",
@@ -317,7 +345,7 @@ class PagedMetalAttentionBackend:
         supported_masks=frozenset(("causal", None)),
         supported_forward_modes=frozenset(ForwardMode),
         requires_metal=True,
-        consumes_page_tables_directly=False,
+        consumes_page_tables_directly=True,
     )
     _attention_mode: str = field(default="uninitialized", init=False)
     _attention_time_ms: int = field(default=0, init=False)
@@ -390,7 +418,7 @@ class HybridPagedMetalAttentionBackend(PagedMetalAttentionBackend):
         supported_masks=frozenset(("causal", None)),
         supported_forward_modes=frozenset(ForwardMode),
         requires_metal=True,
-        consumes_page_tables_directly=False,
+        consumes_page_tables_directly=True,
     )
 
     def contexts(

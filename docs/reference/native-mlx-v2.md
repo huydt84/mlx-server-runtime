@@ -136,11 +136,21 @@ and backend contract tests, but no Qwen2 or executor changes. New attention
 semantics such as sinks or sliding windows still require an explicit model
 interface extension.
 
-The current `native-metal-paged-sdpa` bundle preserves the paged-attention production
-path: KV storage is page managed, then the attention adapter gathers padded
-dense K/V rows and delegates to `mx.fast.scaled_dot_product_attention`. Its
-capability metadata therefore reports that it does **not** consume page tables
-directly. It must not be described as a direct paged-attention kernel.
+The current `native-metal-paged-sdpa` bundle stores KV in fixed-size pages and
+uses two attention paths:
+
+- **Decode steps** (every row adds one token) run a Metal kernel that follows
+  each row's block table while it attends, so rows of different lengths need
+  neither a dense copy nor padding. One threadgroup serves one row and KV head
+  together with all query heads that share it. When a step has few rows, long
+  rows are split into key ranges on separate threadgroups and merged by a
+  second kernel. Head dimensions that are not a multiple of 32 fall back to
+  the gather path below.
+- **Prefill and mixed steps** gather each row's pages into padded dense K/V
+  and call `mx.fast.scaled_dot_product_attention`.
+
+Its capability metadata therefore reports that it consumes page tables
+directly.
 
 Attention backend identity and dispatch telemetry are owned by the attention
 adapter. Cache metrics remain owned by the KV backend. Because MLX evaluation

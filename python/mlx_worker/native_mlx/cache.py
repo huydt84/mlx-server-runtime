@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 import uuid
 from collections import Counter
@@ -445,6 +446,9 @@ class PagedBatchReservation:
     _page_id_arrays: tuple[mx.array, ...] = field(init=False, repr=False)
     _total_lengths: tuple[int, ...] = field(init=False, repr=False)
     _max_total_length: int = field(init=False, repr=False)
+    _page_table_inputs: tuple[mx.array, mx.array] | None = field(
+        init=False, default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         self._page_id_arrays = tuple(
@@ -474,6 +478,24 @@ class PagedBatchReservation:
     @property
     def token_lengths(self) -> tuple[int, ...]:
         return self.append_lengths
+
+    def page_table_inputs(self) -> tuple[mx.array, mx.array]:
+        """Return padded int32 block tables and post-append lengths per row.
+
+        Built once per step and shared by every layer's attention.
+        """
+
+        if self._page_table_inputs is None:
+            width = max(len(table) for table in self.candidate_tables)
+            tables = [
+                list(table) + [0] * (width - len(table))
+                for table in self.candidate_tables
+            ]
+            self._page_table_inputs = (
+                mx.array(tables, dtype=mx.int32),
+                mx.array(self._total_lengths, dtype=mx.int32),
+            )
+        return self._page_table_inputs
 
     @property
     def cache_lengths(self) -> tuple[int, ...]:
@@ -733,9 +755,9 @@ class PagedKVCacheBackend:
         if any(length <= 0 for length in append_lengths):
             raise ValueError("paged cache append lengths must be positive")
 
-        available = [
+        available = (
             page for page in self._free_pages if page not in self._reserved_pages
-        ]
+        )
         candidate_tables: list[tuple[int, ...]] = []
         reserved: list[int] = []
         copy_pages: list[tuple[int, int]] = []
@@ -748,17 +770,17 @@ class PagedKVCacheBackend:
                     and table
                     and self._ref_counts[table[-1]] > 1
                 ):
-                    replacement = available.pop(0)
+                    replacement = next(available)
                     reserved.append(replacement)
                     copy_pages.append((table[-1], replacement))
                     table[-1] = replacement
                 required_pages = math.ceil(new_length / self.page_size)
                 while len(table) < required_pages:
-                    page = available.pop(0)
+                    page = next(available)
                     reserved.append(page)
                     table.append(page)
                 candidate_tables.append(tuple(table))
-        except IndexError as exc:
+        except StopIteration as exc:
             self._allocation_failures += 1
             raise ValueError(
                 "native paged KV capacity exhausted before model execution"
@@ -815,8 +837,8 @@ class PagedKVCacheBackend:
         paged = tuple(_require_paged_cache(cache) for cache in caches)
         if len(paged) != len(append_lengths):
             raise ValueError("paged preflight requires matching requests")
-        available = len(
-            [page for page in self._free_pages if page not in self._reserved_pages]
+        available = len(self._free_pages) - sum(
+            1 for page in self._reserved_pages if self._is_free(page)
         )
         results: list[str | None] = []
         for cache, append_length in zip(paged, append_lengths, strict=True):
@@ -886,13 +908,7 @@ class PagedKVCacheBackend:
             self._ref_counts[page] -= 1
             if self._ref_counts[page] < 0:
                 raise ValueError("paged KV page reference count became negative")
-            if (
-                self._ref_counts[page] == 0
-                and self._pin_counts[page] == 0
-                and page not in self._free_pages
-            ):
-                self._free_pages.append(page)
-        self._free_pages.sort()
+            self._free_if_unused(page)
 
     def metrics(self) -> dict[str, Any]:
         used_pages = sum(count > 0 for count in self._ref_counts)
@@ -944,7 +960,7 @@ class PagedKVCacheBackend:
             candidate_ref_counts[page] -= count
         for page, count in new_counts.items():
             candidate_ref_counts[page] += count
-        if any(count < 0 for count in candidate_ref_counts):
+        if any(candidate_ref_counts[page] < 0 for page in old_counts):
             raise ValueError("paged KV page reference count became negative")
         self._ref_counts = candidate_ref_counts
         self.key_pages = [
@@ -964,18 +980,12 @@ class PagedKVCacheBackend:
             cache.block_table = list(table)
             cache.length += append_length
         for page in reservation.reserved_pages:
-            if page in self._free_pages:
-                self._free_pages.remove(page)
-        for page, count in enumerate(self._ref_counts):
-            if (
-                count == 0
-                and self._pin_counts[page] == 0
-                and page not in self._free_pages
-                and page not in reservation.reserved_pages
-            ):
-                self._free_pages.append(page)
+            self._remove_free(page)
+        # Only pages this step stopped referencing can have become unused;
+        # pages whose last pin drops are freed by ``_finish_reservation``.
+        for page in old_counts:
+            self._free_if_unused(page)
         self._finish_reservation(reservation)
-        self._free_pages.sort()
         return tuple(cache.size() for cache in reservation.request_caches)
 
     def _abort_reservation(self, reservation: PagedBatchReservation) -> None:
@@ -991,6 +1001,25 @@ class PagedKVCacheBackend:
             self._pin_counts[page] -= 1
             if self._pin_counts[page] < 0:
                 raise ValueError("paged KV page pin count became negative")
+            self._free_if_unused(page)
+
+    def _is_free(self, page: int) -> bool:
+        index = bisect.bisect_left(self._free_pages, page)
+        return index < len(self._free_pages) and self._free_pages[index] == page
+
+    def _remove_free(self, page: int) -> None:
+        index = bisect.bisect_left(self._free_pages, page)
+        if index < len(self._free_pages) and self._free_pages[index] == page:
+            del self._free_pages[index]
+
+    def _free_if_unused(self, page: int) -> None:
+        """Return an unreferenced, unpinned page to the sorted free list."""
+
+        if self._ref_counts[page] or self._pin_counts[page]:
+            return
+        index = bisect.bisect_left(self._free_pages, page)
+        if index == len(self._free_pages) or self._free_pages[index] != page:
+            self._free_pages.insert(index, page)
 
 
 @dataclass

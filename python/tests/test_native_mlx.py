@@ -720,6 +720,41 @@ def test_paged_backend_copy_on_write_preserves_shared_parent_rows() -> None:
     assert _paged_rows(backend, child) == [1.0, 1.0, 1.0, 5.0]
 
 
+@pytest.mark.parametrize("finish", ["commit", "abort"])
+def test_paged_backend_frees_pages_unpinned_by_a_finished_reservation(
+    finish: str,
+) -> None:
+    backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=256,
+        dtype=mx.float16,
+    )
+    assert backend.num_pages == 4
+    parent_handle = backend.create("parent")
+    parent = backend.get(parent_handle, "parent")
+    _stage_constant(backend, parent, 3, 1.0).commit()
+    child = backend.get(backend.fork(parent_handle, "child"), "child")
+    # The child's append pins the shared page and copies it on write.
+    pending = _stage_constant(backend, child, 1, 5.0)
+    backend.release(parent_handle)
+    assert backend.metrics()["used_pages"] == 1
+
+    getattr(pending, finish)()
+
+    # A commit moves the child off the shared page, which no request now
+    # references; it must be free as soon as the reservation's pin drops.
+    assert backend.metrics()["used_pages"] == 1
+    other = backend.get(backend.create("other"), "other")
+    assert backend.preflight((other,), (24,)) == (None,)
+    assert backend.preflight((other,), (25,)) != (None,)
+    _stage_constant(backend, other, 24, 2.0).commit()
+    assert other.block_table == sorted(other.block_table)
+    assert set(other.block_table).isdisjoint(child.block_table)
+
+
 def test_paged_backend_appends_without_copying_the_page_pool() -> None:
     backend = PagedKVCacheBackend(
         num_layers=2,
@@ -1142,7 +1177,7 @@ def test_native_execution_backend_registry_builds_compatible_bundle() -> None:
     assert bundle.attention_backend.capabilities.reservation_types == (
         PagedBatchReservation,
     )
-    assert bundle.attention_backend.capabilities.consumes_page_tables_directly is False
+    assert bundle.attention_backend.capabilities.consumes_page_tables_directly is True
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")

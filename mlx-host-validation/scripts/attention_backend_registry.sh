@@ -11,6 +11,7 @@
 #   - `attention_backend_registry_ok=1`
 #   - `attention_backend_capabilities_ok=1`
 #   - `attention_backend_parity_ok=1`
+#   - `attention_backend_decode_kernel_parity_ok=1`
 #   - `attention_backend_hot_path_identity_ok=1`
 #   - `attention_backend_validation_ok=1`
 #
@@ -76,10 +77,10 @@ bundle.validate()
 print("attention_backend_registry_ok=1")
 
 capabilities = bundle.attention_backend.capabilities
-if capabilities.supported_masks != frozenset(("causal",)):
+if capabilities.supported_masks != frozenset(("causal", None)):
     raise SystemExit("production attention mask capability is inaccurate")
-if capabilities.consumes_page_tables_directly:
-    raise SystemExit("dense-gather SDPA incorrectly claims direct page-table access")
+if not capabilities.consumes_page_tables_directly:
+    raise SystemExit("paged decode kernel is not reported as reading page tables")
 print("attention_backend_capabilities_ok=1")
 
 dense_backend = DenseKVCacheBackend(num_layers=1)
@@ -105,6 +106,64 @@ mx.eval(dense, paged)
 if not mx.allclose(dense, paged, atol=1e-3, rtol=1e-3).item():
     raise SystemExit("registered backend does not match dense reference")
 print("attention_backend_parity_ok=1")
+
+# Decode steps with a head dimension that is a multiple of 32 run the
+# page-table decode kernel; compare a three-row decode with the dense reference.
+decode_geometry = KVCacheGeometry(1, 2, 64, mx.float16)
+decode_bundle = build_native_execution_backend(
+    DEFAULT_NATIVE_EXECUTION_BACKEND,
+    decode_geometry,
+    page_size=8,
+    cache_budget_bytes=1 << 20,
+)
+decode_dense = DenseKVCacheBackend(num_layers=1)
+cache_lengths = (5, 17, 9)
+
+
+def decode_step(cache_backend, contexts_for):
+    caches = []
+    for row, length in enumerate(cache_lengths):
+        cache = cache_backend.get(cache_backend.create(f"row-{row}"), f"row-{row}")
+        mx.random.seed(row)
+        prefix = mx.random.normal((1, 2, length, 64)).astype(mx.float16)
+        reservation = cache_backend.reserve_batch((cache,), (length,))
+        (context,) = contexts_for(reservation, ForwardMode.PREFILL)
+        mx.eval(
+            context.append_and_attend(
+                mx.random.normal((1, 4, length, 64)).astype(mx.float16),
+                prefix,
+                prefix,
+                scale=0.125,
+                mask="causal",
+            )
+        )
+        reservation.commit()
+        caches.append(cache)
+    mx.random.seed(99)
+    step_keys = mx.random.normal((3, 2, 1, 64)).astype(mx.float16)
+    reservation = cache_backend.reserve_batch(tuple(caches), (1, 1, 1))
+    (context,) = contexts_for(reservation, ForwardMode.DECODE)
+    output = context.append_and_attend(
+        mx.random.normal((3, 4, 1, 64)).astype(mx.float16),
+        step_keys,
+        step_keys,
+        scale=0.125,
+        mask="causal",
+    )
+    mx.eval(output)
+    reservation.commit()
+    return output
+
+
+kernel_output = decode_step(
+    decode_bundle.cache_backend, decode_bundle.attention_backend.contexts
+)
+reference_output = decode_step(
+    decode_dense, DenseReferenceAttentionBackend().contexts
+)
+if not mx.allclose(kernel_output, reference_output, atol=2e-2).item():
+    raise SystemExit("paged decode kernel does not match dense reference")
+print("attention_backend_decode_kernel_parity_ok=1")
 
 if type(bundle.attention_backend) is not PagedMetalAttentionBackend:
     raise SystemExit("registry inserted a production hot-path wrapper")
