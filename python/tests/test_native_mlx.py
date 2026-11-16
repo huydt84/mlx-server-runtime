@@ -30,6 +30,7 @@ from mlx_worker.native_mlx.cache import (
     KVCacheGeometry,
     PagedBatchReservation,
     PagedKVCacheBackend,
+    PagedRequestCache,
 )
 from mlx_worker.native_mlx.cache_coordinator import NativeCacheCoordinator
 from mlx_worker.native_mlx.executor import (
@@ -647,6 +648,111 @@ def test_paged_backend_fork_uses_copy_on_write_for_shared_tail() -> None:
     assert child.size() == 4
     assert parent.block_table != child.block_table
     assert backend.metrics()["used_pages"] == 2
+
+
+def _paged_rows(backend: PagedKVCacheBackend, cache: PagedRequestCache) -> list[float]:
+    """Return the first key element of each committed row of one request."""
+
+    pages = backend.key_pages[0]
+    return [
+        float(
+            pages[
+                cache.block_table[position // backend.page_size],
+                position % backend.page_size,
+                0,
+                0,
+            ].item()
+        )
+        for position in range(cache.size())
+    ]
+
+
+def _stage_constant(
+    backend: PagedKVCacheBackend,
+    cache: PagedRequestCache,
+    length: int,
+    value: float,
+) -> PagedBatchReservation:
+    reservation = backend.reserve_batch((cache,), (length,))
+    rows = mx.full((1, 1, length, 2), value, dtype=mx.float16)
+    reservation.stage_layer(0, rows, rows)
+    return reservation
+
+
+def test_paged_backend_abort_keeps_committed_rows() -> None:
+    backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=256,
+        dtype=mx.float16,
+    )
+    cache = backend.get(backend.create("request"), "request")
+    _stage_constant(backend, cache, 3, 1.0).commit()
+
+    _stage_constant(backend, cache, 2, 7.0).abort()
+
+    assert cache.size() == 3
+    assert _paged_rows(backend, cache) == [1.0, 1.0, 1.0]
+    assert backend.metrics()["used_pages"] == 1
+    assert _stage_constant(backend, cache, 1, 2.0).commit() == (4,)
+    assert _paged_rows(backend, cache) == [1.0, 1.0, 1.0, 2.0]
+
+
+def test_paged_backend_copy_on_write_preserves_shared_parent_rows() -> None:
+    backend = PagedKVCacheBackend(
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=2,
+        page_size=8,
+        budget_bytes=256,
+        dtype=mx.float16,
+    )
+    parent_handle = backend.create("parent")
+    parent = backend.get(parent_handle, "parent")
+    _stage_constant(backend, parent, 3, 1.0).commit()
+    child = backend.get(backend.fork(parent_handle, "child"), "child")
+
+    _stage_constant(backend, child, 1, 5.0).commit()
+
+    assert _paged_rows(backend, parent) == [1.0, 1.0, 1.0]
+    assert _paged_rows(backend, child) == [1.0, 1.0, 1.0, 5.0]
+
+
+def test_paged_backend_appends_without_copying_the_page_pool() -> None:
+    backend = PagedKVCacheBackend(
+        num_layers=2,
+        num_kv_heads=8,
+        head_dim=128,
+        page_size=16,
+        budget_bytes=64 * 1024 * 1024,
+        dtype=mx.float16,
+    )
+    mx.eval(backend.key_pages, backend.value_pages)
+    layer_bytes = backend.key_pages[0].nbytes
+    caches = tuple(
+        backend.get(backend.create(f"request-{index}"), f"request-{index}")
+        for index in range(4)
+    )
+
+    def append_step() -> None:
+        reservation = backend.reserve_batch(caches, (1,) * len(caches))
+        rows = mx.ones((len(caches), 8, 1, 128), dtype=mx.float16)
+        for layer in range(backend.num_layers):
+            reservation.stage_layer(layer, rows, rows)
+        reservation.commit()
+
+    append_step()
+    mx.synchronize()
+    mx.reset_peak_memory()
+    active = mx.get_active_memory()
+    for _ in range(4):
+        append_step()
+    mx.synchronize()
+
+    assert mx.get_peak_memory() - active < layer_bytes // 4
+    assert all(cache.size() == 5 for cache in caches)
 
 
 def test_block_hash_prefix_cache_reuses_only_exact_full_pages() -> None:
@@ -1937,3 +2043,4 @@ def test_runtime_cancellation_terminal_response_carries_stage_and_latency() -> N
     assert response.finish_reason == "cancelled"
     assert response.cancellation_stage == "python_waiting"
     assert response.cancellation_latency_ms == 2
+

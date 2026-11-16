@@ -422,7 +422,14 @@ class PagedRequestCache:
 
 @dataclass
 class PagedBatchReservation:
-    """All-request, all-layer transactional paged append reservation."""
+    """All-request, all-layer transactional paged append reservation.
+
+    K/V rows are written into the backend page pool as each layer is staged, so
+    MLX can update the pool buffer in place instead of copying it every step.
+    Only page ownership and request lengths are transactional: staged rows land
+    in reserved pages or past the committed length of pages the request owns
+    exclusively, so an aborted reservation leaves no visible change.
+    """
 
     backend: "PagedKVCacheBackend"
     request_caches: tuple[PagedRequestCache, ...]
@@ -505,6 +512,10 @@ class PagedBatchReservation:
         flat_values[slot_array] = mx.concatenate(packed_values, axis=0)
         key_cache = flat_keys.reshape(key_cache.shape)
         value_cache = flat_values.reshape(value_cache.shape)
+        # Drop the pool's reference to the previous buffer so the scatter above
+        # can donate it rather than allocate and copy a whole new pool layer.
+        self.backend.key_pages[layer_index] = key_cache
+        self.backend.value_pages[layer_index] = value_cache
         self.staged_keys[layer_index] = key_cache
         self.staged_values[layer_index] = value_cache
         return key_cache, value_cache
@@ -971,6 +982,10 @@ class PagedKVCacheBackend:
         self._finish_reservation(reservation)
 
     def _finish_reservation(self, reservation: PagedBatchReservation) -> None:
+        # A finished reservation must not keep pool buffers alive, or the next
+        # step's in-place page write would fall back to a full copy.
+        reservation.staged_keys[:] = [None] * len(reservation.staged_keys)
+        reservation.staged_values[:] = [None] * len(reservation.staged_values)
         self._reserved_pages.difference_update(reservation.reserved_pages)
         for page in reservation.pinned_pages:
             self._pin_counts[page] -= 1
