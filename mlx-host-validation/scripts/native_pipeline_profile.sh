@@ -68,7 +68,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[1/3] Start native-mlx gateway with bounded pipeline profiling"
-cargo run -p mlx_runtime_gateway >"$GATEWAY_LOG" 2>&1 &
+cargo run -p mlx_runtime_gateway --bin mlx_runtime_gateway >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
 for _ in $(seq 1 300); do
     if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then

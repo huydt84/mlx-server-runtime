@@ -107,7 +107,7 @@ start_gateway() {
         MLX_RUNTIME_NATIVE_METAL_CAPTURE="$metal_capture" \
         MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES=536870912 \
         MTL_CAPTURE_ENABLED="${MTL_CAPTURE_ENABLED:-0}" \
-        cargo run -p mlx_runtime_gateway >"$log" 2>&1 &
+        cargo run -p mlx_runtime_gateway --bin mlx_runtime_gateway >"$log" 2>&1 &
     GATEWAY_PID=$!
     for _ in $(seq 1 300); do
         if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
