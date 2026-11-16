@@ -270,6 +270,7 @@ class NativeContinuousScheduler:
         self._pending_events: list[SchedulerEvent] = []
         self._arrival_counter = 0
         self._scheduler_round = 0
+        self._last_step_prefilled = False
         self._in_flight: _SchedulerInFlight | None = None
 
     def submit(self, request: SchedulableRequest) -> None:
@@ -445,6 +446,7 @@ class NativeContinuousScheduler:
         if not self.idle():
             raise RuntimeError("benchmark reset requires an idle scheduler")
         self._pending_events.clear()
+        self._last_step_prefilled = False
         if reset_counters:
             self._arrival_counter = 0
             self._scheduler_round = 0
@@ -501,7 +503,15 @@ class NativeContinuousScheduler:
             item.state.finish_requested = True
 
     def _select_work(self, timings: dict[str, int]) -> list[_SelectedWork]:
-        selected = [
+        """Select one phase-homogeneous step.
+
+        The executor pads every row to the longest row, so a decode row sharing a
+        step with a prefill chunk would run as many positions as the chunk.
+        Decode and prefill therefore never share a step; when both have work,
+        steps alternate between them.
+        """
+
+        decode_work = [
             _SelectedWork(
                 state=state,
                 request=ExecutionRequest(
@@ -531,9 +541,13 @@ class NativeContinuousScheduler:
             for state in self._waiting.values()
             if not state.cancel_requested and not state.finish_requested
         )
+        if decode_work and (not prefill_states or self._last_step_prefilled):
+            self._last_step_prefilled = False
+            return decode_work
         prefill_limit = (
-            1 if selected and self._prioritize_decode else self._prefill_batch_size
+            1 if decode_work and self._prioritize_decode else self._prefill_batch_size
         )
+        selected: list[_SelectedWork] = []
         prefill_states = self._policy.order(
             prefill_states,
             scheduler_round=self._scheduler_round,
@@ -579,6 +593,7 @@ class NativeContinuousScheduler:
                     ),
                 )
             )
+        self._last_step_prefilled = True
         return selected
 
     def _run_step(

@@ -65,7 +65,7 @@ The Python worker now has two serving paths with different ownership splits:
 
 | Backend | Execution primitive | Scheduling behavior |
 |---------|---------------------|---------------------|
-| Text LLM (`native-mlx`) | Repo-owned native runtime, scheduler, executor, and registered MLX architecture plans | Iteration-level continuous batching with chunked prefill and decode-first scheduling |
+| Text LLM (`native-mlx`) | Repo-owned native runtime, scheduler, executor, and registered MLX architecture plans | Iteration-level continuous batching with chunked prefill, alternating decode and prefill steps |
 | VLM | `mlx_vlm.generate.BatchGenerator` plus repo-owned worker lifecycle/cache policy | Continuous batching with APC reuse and vision-feature caching |
 
 For native text serving, Rust still owns HTTP/SSE, outer admission, worker

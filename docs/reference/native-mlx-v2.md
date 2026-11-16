@@ -71,6 +71,12 @@ The executor is not a whole-request `generate()` abstraction. The scheduler
 chooses token work and cache lifecycle timing; the executor performs one model
 step and returns typed per-request results or structured errors.
 
+The executor pads every row of a step to the longest row, so the scheduler never
+puts decode rows and prefill chunks in the same step. When both kinds of work
+are pending, steps alternate: one step decodes every running request, the next
+prefills one chunk for one request (or up to the prompt concurrency when no
+request is decoding).
+
 ## Configuration
 
 Select the native backend explicitly:

@@ -196,7 +196,7 @@ v1_target.write_text(
 PY
 
 write_request "$REQUEST_DIR/stream_a.json" "Count upward in many short comma-separated tokens until you reach forty." 128 true
-write_request "$REQUEST_DIR/stream_b.json" "List uppercase letters with spaces and keep going until you run out of budget." 128 true
+write_request "$REQUEST_DIR/stream_b.json" "Count downward from two hundred in many short comma-separated tokens." 128 true
 write_request "$REQUEST_DIR/cancel.json" "Write many short numbered tokens with spaces until budget ends." 128 true
 write_request "$REQUEST_DIR/v1.json" "Say hello in one short sentence." 16 false
 
@@ -242,6 +242,9 @@ def post_stream(body: bytes, close_after_first_delta: bool, result: dict[str, An
         lines.append(line)
         if line.startswith("data: ") and line != "data: [DONE]":
             first_delta_seen = True
+            # Publish immediately: the main thread starts the next stream as
+            # soon as this one has produced its first delta.
+            result["first_delta_seen"] = True
             if close_after_first_delta:
                 result["client_closed"] = True
                 result["first_delta_seen"] = True
@@ -306,10 +309,9 @@ for _ in range(240):
     metrics_history.append(snapshot)
     running = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="running"}', 0.0)
     waiting = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="waiting"}', 0.0)
-    # A request can join an existing decode batch through a mixed
-    # prefill/decode forward. The decode-only gauge therefore remains 1 for
-    # that admission step even though the physical mixed batch is 2. Inspect
-    # both forward modes, then require a later single-request decode as the
+    # The scheduler runs decode and prefill in separate steps, so batch growth
+    # shows up on the decode gauge. The mixed gauge is still read in case a
+    # mixed forward is reported. Require a later single-request decode as the
     # shrink signal.
     decode_batch = snapshot.get(
         'mlx_executor_physical_batch_size_by_backend{backend="native-mlx",modality="text",forward_mode="decode"}',

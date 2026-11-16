@@ -1393,42 +1393,55 @@ def test_scheduler_owns_chunking_and_emits_typed_token_events() -> None:
     assert any(event.kind == "token" and event.token_id == 9 for event in third)
 
 
-def test_scheduler_dispatches_decode_and_new_prefill_in_one_mixed_step() -> None:
+def _batch_shapes(executor: _FakeExecutor) -> list[list[tuple[str, str]]]:
+    return [
+        [(request.request_id, request.phase) for request in batch.requests]
+        for batch in executor.batches
+    ]
+
+
+def test_scheduler_alternates_decode_and_prefill_steps_without_mixing() -> None:
     executor = _FakeExecutor()
     scheduler, _ = _scheduler(
         executor,
         prefill_step_size=8,
         prioritize_decode=False,
     )
-    scheduler.submit(_schedulable("running", (1,)))
+    scheduler.submit(_schedulable("running", (1,), max_tokens=4))
     scheduler.tick()
-    scheduler.submit(_schedulable("waiting", (2,)))
+    scheduler.submit(_schedulable("waiting", (2,), max_tokens=4))
 
-    scheduler.tick()
+    for _ in range(3):
+        scheduler.tick()
 
-    assert len(executor.batches) == 2
-    mixed = executor.batches[-1]
-    assert mixed.forward_mode is ForwardMode.MIXED
-    assert [request.phase for request in mixed.requests] == ["decode", "prefill"]
+    assert _batch_shapes(executor) == [
+        [("running", "prefill")],
+        [("running", "decode")],
+        [("waiting", "prefill")],
+        [("running", "decode"), ("waiting", "decode")],
+    ]
+    assert all(
+        batch.forward_mode is not ForwardMode.MIXED for batch in executor.batches
+    )
 
 
 def test_scheduler_prioritizes_decode_without_starving_new_prefill() -> None:
     executor = _FakeExecutor()
     scheduler, _ = _scheduler(executor, prefill_step_size=8)
-    scheduler.submit(_schedulable("running", (1,)))
+    scheduler.submit(_schedulable("running", (1,), max_tokens=8))
     scheduler.tick()
-    scheduler.submit(_schedulable("waiting-first", (2,)))
-    scheduler.submit(_schedulable("waiting-second", (3,)))
+    scheduler.submit(_schedulable("waiting-first", (2,), max_tokens=8))
+    scheduler.submit(_schedulable("waiting-second", (3,), max_tokens=8))
 
-    scheduler.tick()
+    for _ in range(4):
+        scheduler.tick()
 
-    assert len(executor.batches) == 2
-    mixed = executor.batches[-1]
-    assert mixed.forward_mode is ForwardMode.MIXED
-    assert [request.phase for request in mixed.requests] == ["decode", "prefill"]
-    assert [request.request_id for request in mixed.requests] == [
-        "running",
-        "waiting-first",
+    assert _batch_shapes(executor) == [
+        [("running", "prefill")],
+        [("running", "decode")],
+        [("waiting-first", "prefill")],
+        [("running", "decode"), ("waiting-first", "decode")],
+        [("waiting-second", "prefill")],
     ]
 
 
@@ -1441,34 +1454,15 @@ def test_scheduler_respects_prefill_batch_size() -> None:
         prioritize_decode=False,
     )
     for index in range(5):
-        scheduler.submit(_schedulable(f"request-{index}", (index + 1,)))
+        scheduler.submit(_schedulable(f"request-{index}", (index + 1,), max_tokens=4))
 
-    scheduler.tick()
+    for _ in range(3):
+        scheduler.tick()
 
-    first = executor.batches[-1]
-    assert [request.request_id for request in first.requests] == [
-        "request-0",
-        "request-1",
-        "request-2",
-        "request-3",
-    ]
-
-    scheduler.tick()
-
-    second = executor.batches[-1]
-    assert [request.request_id for request in second.requests] == [
-        "request-0",
-        "request-1",
-        "request-2",
-        "request-3",
-        "request-4",
-    ]
-    assert [request.phase for request in second.requests] == [
-        "decode",
-        "decode",
-        "decode",
-        "decode",
-        "prefill",
+    assert _batch_shapes(executor) == [
+        [(f"request-{index}", "prefill") for index in range(4)],
+        [(f"request-{index}", "decode") for index in range(4)],
+        [("request-4", "prefill")],
     ]
 
 
