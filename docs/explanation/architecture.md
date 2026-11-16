@@ -80,9 +80,10 @@ diagnostics orchestration, and request lifecycle remain outside `models/`, so
 another compatible model does not require another executor or scheduler.
 
 The executor exposes an explicit prepare/dispatch/resolve seam.
-`MLX_RUNTIME_NATIVE_EXECUTION_MODE=serial` remains the default. The explicit
-`overlap` mode keeps pure prefill synchronous for TTFT, then holds at most one
-decode step in flight on the owner thread with MLX asynchronous evaluation.
+`MLX_RUNTIME_NATIVE_EXECUTION_MODE=overlap` is the default; `serial` resolves
+every step before building the next. `overlap` mode keeps pure prefill
+synchronous for TTFT, then holds at most one decode step in flight on the
+owner thread with MLX asynchronous evaluation.
 When decode step N would simply be followed by another decode of the same
 rows, step N+1 is dispatched before N resolves: N's cache append is published
 without waiting for the GPU, and N+1 reads N's sampled tokens directly on the

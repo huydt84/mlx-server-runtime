@@ -92,20 +92,20 @@ def test_load_config_parses_native_execution_backend(monkeypatch) -> None:
     assert config.native_execution_backend == "native-metal-paged-sdpa"
 
 
-def test_load_config_defaults_native_execution_mode_to_serial(monkeypatch) -> None:
+def test_load_config_defaults_native_execution_mode_to_overlap(monkeypatch) -> None:
     monkeypatch.delenv("MLX_RUNTIME_NATIVE_EXECUTION_MODE", raising=False)
 
     config = load_config()
 
-    assert config.native_execution_mode == "serial"
+    assert config.native_execution_mode == "overlap"
 
 
 def test_load_config_parses_native_execution_mode(monkeypatch) -> None:
-    monkeypatch.setenv("MLX_RUNTIME_NATIVE_EXECUTION_MODE", "overlap")
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_EXECUTION_MODE", "serial")
 
     config = load_config()
 
-    assert config.native_execution_mode == "overlap"
+    assert config.native_execution_mode == "serial"
 
 
 def test_load_config_rejects_invalid_native_execution_mode(monkeypatch) -> None:

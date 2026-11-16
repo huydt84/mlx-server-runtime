@@ -93,7 +93,7 @@ Useful native-v2 environment variables:
 | --- | --- | --- |
 | `MLX_RUNTIME_BACKEND` | `v1`, `native-mlx` | Worker backend selector |
 | `MLX_RUNTIME_NATIVE_EXECUTION_BACKEND` | `native-metal-paged-sdpa` | Compatible native cache-and-attention bundle; defaults to the existing production path |
-| `MLX_RUNTIME_NATIVE_EXECUTION_MODE` | `serial`, `overlap` | Startup execution coordinator; `serial` is the default and `overlap` is an explicit experimental same-thread decode pipeline |
+| `MLX_RUNTIME_NATIVE_EXECUTION_MODE` | `overlap`, `serial` | Startup execution coordinator; `overlap` (the default) pipelines decode on the owner thread, `serial` resolves every step before building the next |
 | `MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` | `8`, `16`, `32` | Native paged-KV page size |
 | `MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY` | `radix`, `block-hash` | Prefix-cache strategy; `radix` is the native-v2 default |
 | `MLX_RUNTIME_NATIVE_SCHEDULING_POLICY` | `fcfs`, `lpm`, `lof`, `priority` | Python scheduler waiting-queue policy |
@@ -111,7 +111,7 @@ Useful native-v2 environment variables:
 Invalid native execution-backend, execution-mode, page-size, prefix-cache
 strategy, or scheduler-policy values must fail startup. They must not silently
 select dense attention, another prefix strategy, v1, `mlx-lm`, or `mlx-vlm`.
-The experimental `overlap` mode never silently falls back to serial. It keeps
+The default `overlap` mode never silently falls back to serial. It keeps
 latency-sensitive pure prefill synchronous and pipelines decode only:
 consecutive decode steps are chained so the next step is dispatched, fed by
 the previous step's device-resident tokens, before the previous step's tokens
@@ -222,8 +222,8 @@ request totals.
 - Only explicitly implemented architecture classes are supported.
 - Greedy decoding is the validated native path.
 - VLM requests remain outside `native-mlx`.
-- Same-thread overlap remains experimental and explicit opt-in; serial remains
-  the default even though the overlap and architecture-overhead host gates cover it.
+- `overlap` is the default execution mode; set
+  `MLX_RUNTIME_NATIVE_EXECUTION_MODE=serial` for the synchronous coordinator.
 
 ## v1 Fallback
 
