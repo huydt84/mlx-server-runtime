@@ -67,6 +67,9 @@ python3 "$ROOT/scripts/release_tool.py" archive \
     --stage-dir "$STAGE_DIR" \
     --output-dir "$OUTPUT_DIR" \
     --version "$VERSION"
+cp "$ROOT/install.sh" "$OUTPUT_DIR/install.sh"
+chmod 0755 "$OUTPUT_DIR/install.sh"
+sh -n "$OUTPUT_DIR/install.sh"
 
 ARCHIVE="$OUTPUT_DIR/mlx-air-$VERSION-darwin-arm64.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"

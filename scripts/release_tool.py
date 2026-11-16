@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build reproducible MLX Air release metadata, archives, and formula updates."""
+"""Build reproducible MLX Air release metadata and archives."""
 
 from __future__ import annotations
 
@@ -12,8 +12,6 @@ import stat
 import sys
 import tarfile
 from pathlib import Path
-from urllib.parse import urlparse
-
 import tomllib
 
 
@@ -22,7 +20,6 @@ SEMVER_PATTERN = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
-SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 PLATFORM = "darwin-arm64"
 LAYOUT_SCHEMA_VERSION = 1
 LAYOUT_PATHS = {
@@ -215,63 +212,6 @@ def _add_tar_entry(tar: tarfile.TarFile, path: Path, archive_name: str) -> None:
         tar.addfile(info)
 
 
-def update_homebrew_formula(
-    tap_root: Path, version: str, url: str, sha256: str
-) -> Path:
-    """Write only Formula/mlx-air.rb in a checked-out Homebrew tap."""
-    _validate_semver(version)
-    if not SHA256_PATTERN.fullmatch(sha256):
-        raise ReleaseError(
-            "formula SHA-256 must contain exactly 64 lowercase hexadecimal characters"
-        )
-    parsed_url = urlparse(url)
-    expected_asset = f"mlx-air-{version}-{PLATFORM}.tar.gz"
-    if parsed_url.scheme != "https" or Path(parsed_url.path).name != expected_asset:
-        raise ReleaseError(f"formula URL must be HTTPS and end with {expected_asset}")
-    if not tap_root.is_dir():
-        raise ReleaseError(f"tap checkout does not exist: {tap_root}")
-
-    formula_dir = tap_root / "Formula"
-    formula_dir.mkdir(exist_ok=True)
-    formula_path = formula_dir / "mlx-air.rb"
-    formula_path.write_text(_render_formula(version, url, sha256), encoding="utf-8")
-    return formula_path
-
-
-def _render_formula(version: str, url: str, sha256: str) -> str:
-    return f'''require "timeout"
-
-class MlxAir < Formula
-  desc "Native MLX model serving and benchmarking"
-  homepage "https://github.com/huydt84/mlx-server-runtime"
-  url "{url}"
-  version "{version}"
-  sha256 "{sha256}"
-  license "MIT"
-
-  depends_on "uv"
-
-  def install
-    bin.install "bin/mlx-air", "bin/mlx_runtime_gateway"
-    prefix.install "config", "licenses", "metadata", "python"
-  end
-
-  test do
-    assert_match version.to_s, shell_output("#{{bin}}/mlx-air version")
-    shell_output("#{{bin}}/mlx-air help")
-    shell_output("#{{bin}}/mlx-air bench --help")
-
-    ENV["HOME"] = testpath/"home"
-    ENV["UV_CACHE_DIR"] = testpath/"uv-cache"
-    output = Timeout.timeout(900) {{ shell_output("#{{bin}}/mlx-air doctor") }}
-    assert_match "[PASS] Apple Silicon:", output
-    benchmark_root = testpath/"home/Library/Application Support/mlx-air/environments/benchmark"
-    refute_predicate benchmark_root, :exist?
-  end
-end
-'''
-
-
 def _validate_semver(version: str) -> None:
     if not SEMVER_PATTERN.fullmatch(version):
         raise ReleaseError(f"version is not semantic: {version}")
@@ -300,11 +240,6 @@ def _parser() -> argparse.ArgumentParser:
     archive_parser.add_argument("--output-dir", type=Path, required=True)
     archive_parser.add_argument("--version", required=True)
 
-    formula_parser = subparsers.add_parser("formula", help="update the tap formula")
-    formula_parser.add_argument("--tap-root", type=Path, required=True)
-    formula_parser.add_argument("--version", required=True)
-    formula_parser.add_argument("--url", required=True)
-    formula_parser.add_argument("--sha256", required=True)
     return parser
 
 
@@ -322,12 +257,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(archive)
             print(checksum)
-        elif args.command == "formula":
-            print(
-                update_homebrew_formula(
-                    args.tap_root.resolve(), args.version, args.url, args.sha256
-                )
-            )
         else:  # pragma: no cover - argparse enforces the command set.
             raise ReleaseError(f"unsupported command: {args.command}")
     except ReleaseError as error:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host-only archive installation and foreground lifecycle validation for `mlx-air install`.
+# Host-only validation of the release installer (install.sh) and the installed CLI.
 # Run on Apple Silicon with macOS 14+, Metal, uv, curl, and the test model available.
 
 set -euo pipefail
@@ -7,7 +7,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlx-air-cli-install.XXXXXX")"
 RELEASE_DIR="$WORK_DIR/release"
-PREFIX="$WORK_DIR/prefix"
+INSTALL_ROOT="$WORK_DIR/install"
+BIN_DIR="$WORK_DIR/bin"
 OUTSIDE_DIR="$WORK_DIR/outside-repository"
 TEST_HOME="$WORK_DIR/home"
 DOCTOR_LOG="$WORK_DIR/doctor.log"
@@ -15,7 +16,7 @@ SERVER_LOG="$WORK_DIR/server.log"
 VERSION="$(python3 "$ROOT/scripts/release_tool.py" version --repo-root "$ROOT")"
 ARCHIVE="$RELEASE_DIR/mlx-air-$VERSION-darwin-arm64.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
-CLI="$PREFIX/bin/mlx-air"
+CLI="$BIN_DIR/mlx-air"
 MODEL="${MLX_AIR_INSTALL_MODEL:-mlx-community/gemma-3-270m-it-qat-8bit}"
 PORT="${MLX_AIR_INSTALL_PORT:-18111}"
 UV_CACHE="${MLX_AIR_HOST_UV_CACHE_DIR:-$HOME/Library/Caches/uv}"
@@ -64,17 +65,19 @@ echo "[1/7] Build the versioned archive with the release staging implementation"
 test -f "$ARCHIVE"
 test -f "$CHECKSUM"
 
-echo "[2/7] Verify checksum and install into a temporary prefix"
-(
-    cd "$RELEASE_DIR"
-    shasum -a 256 -c "$(basename "$CHECKSUM")"
-)
-mkdir -p "$PREFIX" "$OUTSIDE_DIR" "$TEST_HOME"
-tar -xzf "$ARCHIVE" --strip-components=1 -C "$PREFIX"
-test -x "$PREFIX/bin/mlx-air"
-test -x "$PREFIX/bin/mlx_runtime_gateway"
-test -f "$PREFIX/metadata/version.txt"
-test -f "$PREFIX/metadata/layout.json"
+echo "[2/7] Verify checksum and install with the public installer"
+mkdir -p "$OUTSIDE_DIR" "$TEST_HOME"
+"$ROOT/install.sh" \
+    --version "$VERSION" \
+    --archive "$ARCHIVE" \
+    --checksum "$CHECKSUM" \
+    --install-root "$INSTALL_ROOT" \
+    --bin-dir "$BIN_DIR" \
+    --no-modify-path
+test -x "$CLI"
+test -x "$INSTALL_ROOT/current/bin/mlx_runtime_gateway"
+test -f "$INSTALL_ROOT/current/metadata/version.txt"
+test -f "$INSTALL_ROOT/current/metadata/layout.json"
 
 echo "[3/7] Run installed help and version outside the repository"
 cd "$OUTSIDE_DIR"

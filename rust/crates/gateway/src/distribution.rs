@@ -78,6 +78,12 @@ impl DistributionPaths {
     }
 
     pub(crate) fn from_executable(executable: &Path) -> Result<Self, PathError> {
+        let executable = fs::canonicalize(executable).map_err(|err| {
+            PathError::new(format!(
+                "failed to resolve executable path {}: {err}",
+                executable.display()
+            ))
+        })?;
         let bin_dir = executable.parent().ok_or_else(|| {
             PathError::new(format!(
                 "executable has no parent directory: {}",
@@ -359,6 +365,7 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
+        let root = fs::canonicalize(root).unwrap();
         let paths = DistributionPaths::from_executable(&root.join("bin/mlx-air")).unwrap();
         (root, paths)
     }
@@ -380,6 +387,28 @@ pub(crate) mod tests {
         assert_eq!(paths.layout_metadata, root.join("metadata/layout.json"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolver_follows_installer_launcher_symlink_to_distribution() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _) = staged_distribution("paths-symlink");
+        let launcher_root = temp_path("launcher-symlink");
+        fs::create_dir_all(&launcher_root).unwrap();
+        let launcher = launcher_root.join("mlx-air");
+        symlink(root.join("bin/mlx-air"), &launcher).unwrap();
+
+        let paths = DistributionPaths::from_executable(&launcher).unwrap();
+
+        assert_eq!(paths.root, root);
+        assert_eq!(
+            paths.gateway_executable,
+            root.join("bin/mlx_runtime_gateway")
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(launcher_root).unwrap();
     }
 
     #[test]

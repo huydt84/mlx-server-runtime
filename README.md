@@ -22,6 +22,37 @@ Full documentation is in the [`docs/`](docs/) directory:
 
 ## Quick Start
 
+Install the latest Apple Silicon release:
+
+```bash
+curl -fsSL \
+  https://github.com/huydt84/mlx-server-runtime/releases/latest/download/install.sh |
+  sh
+
+~/.local/bin/mlx-air version
+~/.local/bin/mlx-air doctor
+```
+
+Run the same command again to update. To install or roll back to a specific
+release, pass its version to the installer:
+
+```bash
+curl -fsSL \
+  https://github.com/huydt84/mlx-server-runtime/releases/latest/download/install.sh |
+  sh -s -- --version 0.1.0
+```
+
+Uninstall the distribution while preserving models, runtime state, logs, and
+benchmark results:
+
+```bash
+curl -fsSL \
+  https://github.com/huydt84/mlx-server-runtime/releases/latest/download/install.sh |
+  sh -s -- --uninstall
+```
+
+To build from source instead:
+
 ```bash
 # Build
 cargo build --workspace

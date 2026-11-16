@@ -62,13 +62,19 @@ jobs:
       - name: Stage and archive distribution
         run: scripts/package-mlx-air.sh --output-dir release --version "$VERSION"
 
-      - name: Run installed doctor outside source checkout
+      - name: Install archive and run doctor outside source checkout
         env:
           UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
         run: |
-          mkdir -p "$RUNNER_TEMP/archive" "$RUNNER_TEMP/outside" "$RUNNER_TEMP/home"
-          tar -xzf "release/mlx-air-$VERSION-darwin-arm64.tar.gz" -C "$RUNNER_TEMP/archive"
-          export MLX_AIR_CLI="$RUNNER_TEMP/archive/mlx-air-$VERSION/bin/mlx-air"
+          mkdir -p "$RUNNER_TEMP/outside" "$RUNNER_TEMP/home"
+          release/install.sh \
+            --version "$VERSION" \
+            --archive "release/mlx-air-$VERSION-darwin-arm64.tar.gz" \
+            --checksum "release/mlx-air-$VERSION-darwin-arm64.tar.gz.sha256" \
+            --install-root "$RUNNER_TEMP/install" \
+            --bin-dir "$RUNNER_TEMP/bin" \
+            --no-modify-path
+          export MLX_AIR_CLI="$RUNNER_TEMP/bin/mlx-air"
           export MLX_AIR_TEST_HOME="$RUNNER_TEMP/home"
           export MLX_AIR_TEST_CWD="$RUNNER_TEMP/outside"
           python3 - <<'PY'
@@ -154,71 +160,7 @@ jobs:
           gh release create "$TAG" \
             "release/mlx-air-$VERSION-darwin-arm64.tar.gz" \
             "release/mlx-air-$VERSION-darwin-arm64.tar.gz.sha256" \
+            "release/install.sh" \
             --verify-tag \
             --generate-notes \
             --title "MLX Air $VERSION"
-
-  update-homebrew:
-    name: Open Homebrew formula update
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs:
-      - build
-      - publish
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out source tooling
-        uses: actions/checkout@v6
-        with:
-          path: source
-          persist-credentials: false
-
-      - name: Check out Homebrew tap
-        uses: actions/checkout@v6
-        with:
-          repository: huydt84/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: tap
-
-      - name: Download published release outputs
-        uses: actions/download-artifact@v7
-        with:
-          name: mlx-air-${{ needs.build.outputs.version }}-darwin-arm64
-          path: release
-
-      - name: Update only Formula/mlx-air.rb
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          sha256="$(awk '{print $1}' "release/mlx-air-$VERSION-darwin-arm64.tar.gz.sha256")"
-          url="https://github.com/${{ github.repository }}/releases/download/$TAG/mlx-air-$VERSION-darwin-arm64.tar.gz"
-          python3 source/scripts/release_tool.py formula \
-            --tap-root tap \
-            --version "$VERSION" \
-            --url "$url" \
-            --sha256 "$sha256"
-          test "$(git -C tap diff --name-only)" = "Formula/mlx-air.rb"
-
-      - name: Create formula pull request
-        env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ needs.build.outputs.version }}
-        run: |
-          branch="mlx-air-$VERSION-${{ github.run_id }}"
-          default_branch="$(gh repo view huydt84/homebrew-tap --json defaultBranchRef --jq .defaultBranchRef.name)"
-          git -C tap config user.name "github-actions[bot]"
-          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C tap switch -c "$branch"
-          git -C tap add Formula/mlx-air.rb
-          git -C tap diff --cached --check
-          git -C tap commit -m "mlx-air $VERSION"
-          git -C tap push --set-upstream origin "$branch"
-          pr_url="$(gh pr create \
-            --repo huydt84/homebrew-tap \
-            --base "$default_branch" \
-            --head "$branch" \
-            --title "mlx-air $VERSION" \
-            --body "Update mlx-air to the immutable v$VERSION release asset and checksum.")"
-          gh pr merge "$pr_url" --repo huydt84/homebrew-tap --auto --squash

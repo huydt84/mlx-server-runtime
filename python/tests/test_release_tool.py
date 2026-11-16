@@ -1,4 +1,4 @@
-"""Tests for deterministic distribution and Homebrew release tooling."""
+"""Tests for deterministic distribution and direct-install release tooling."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_TOOL = REPO_ROOT / "scripts/release_tool.py"
+INSTALLER = REPO_ROOT / "install.sh"
 
 
 def _run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -66,13 +67,72 @@ def _fake_stage(root: Path, version: str) -> None:
     _run("metadata", "--stage-dir", str(root), "--version", version)
 
 
-def _file_snapshot(root: Path) -> dict[str, bytes]:
-    """Return file contents keyed by path relative to a test checkout."""
-    return {
-        path.relative_to(root).as_posix(): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
+def _fake_install_release(root: Path, version: str) -> tuple[Path, Path]:
+    """Create an installable archive whose fake CLI exposes its version."""
+    stage = root / f"stage-{version}"
+    output = root / f"release-{version}"
+    _fake_stage(stage, version)
+    (stage / "bin/mlx-air").write_text(
+        f"""#!/bin/sh
+case "${{1:-}}" in
+    version) printf 'mlx-air {version}\\n' ;;
+    help) exit 0 ;;
+    bench) test "${{2:-}}" = "--help" ;;
+    *) exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    (stage / "bin/mlx_runtime_gateway").write_text(
+        "#!/bin/sh\nexit 0\n", encoding="utf-8"
+    )
+    os.chmod(stage / "bin/mlx-air", 0o755)
+    os.chmod(stage / "bin/mlx_runtime_gateway", 0o755)
+    _run(
+        "archive",
+        "--stage-dir",
+        str(stage),
+        "--output-dir",
+        str(output),
+        "--version",
+        version,
+    )
+    archive = output / f"mlx-air-{version}-darwin-arm64.tar.gz"
+    return archive, Path(f"{archive}.sha256")
+
+
+def _run_installer(
+    home: Path,
+    *args: str,
+    check: bool = True,
+    modify_path: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the installer against isolated installation and command roots."""
+    install_root = home / ".local/share/mlx-air"
+    bin_dir = home / ".local/bin"
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment["SHELL"] = "/bin/sh"
+    if extra_env:
+        environment.update(extra_env)
+    command = [
+        str(INSTALLER),
+        "--install-root",
+        str(install_root),
+        "--bin-dir",
+        str(bin_dir),
+    ]
+    if not modify_path:
+        command.append("--no-modify-path")
+    command.extend(args)
+    return subprocess.run(
+        command,
+        check=check,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
 
 
 def test_version_accepts_matching_rust_python_and_tag(tmp_path: Path):
@@ -134,75 +194,298 @@ def test_archive_is_deterministic_and_contains_versioned_layout(tmp_path: Path):
     assert "mlx-air-1.2.3/metadata/layout.json" in names
 
 
-def test_formula_generator_changes_only_formula_file(tmp_path: Path):
-    """A formula update leaves every other tap file untouched."""
-    (tmp_path / "README.md").write_text("tap\n", encoding="utf-8")
-    (tmp_path / "Formula").mkdir()
-    (tmp_path / "Formula/other.rb").write_text("class Other; end\n", encoding="utf-8")
-    (tmp_path / "Formula/mlx-air.rb").write_text("old formula\n", encoding="utf-8")
-    before = _file_snapshot(tmp_path)
-    digest = "a" * 64
-    url = (
-        "https://github.com/huydt84/mlx-server-runtime/releases/download/"
-        "v1.2.3/mlx-air-1.2.3-darwin-arm64.tar.gz"
-    )
+def test_installer_supports_install_update_and_explicit_rollback(tmp_path: Path):
+    """The active symlink switches while installed versions remain available."""
+    home = tmp_path / "home"
+    first_archive, first_checksum = _fake_install_release(tmp_path, "1.2.3")
+    second_archive, second_checksum = _fake_install_release(tmp_path, "1.2.4")
 
-    _run(
-        "formula",
-        "--tap-root",
-        str(tmp_path),
+    _run_installer(
+        home,
         "--version",
         "1.2.3",
-        "--url",
-        url,
-        "--sha256",
-        digest,
+        "--archive",
+        str(first_archive),
+        "--checksum",
+        str(first_checksum),
+    )
+    launcher = home / ".local/bin/mlx-air"
+    install_root = home / ".local/share/mlx-air"
+    assert (
+        subprocess.check_output([launcher, "version"], text=True) == "mlx-air 1.2.3\n"
     )
 
-    after = _file_snapshot(tmp_path)
-    changed = {path for path in before | after if before.get(path) != after.get(path)}
-    assert changed == {"Formula/mlx-air.rb"}
-    formula = (tmp_path / "Formula/mlx-air.rb").read_text(encoding="utf-8")
-    assert f'url "{url}"' in formula
-    assert f'sha256 "{digest}"' in formula
-    assert 'depends_on "uv"' in formula
-    assert 'prefix.install "config", "licenses", "metadata", "python"' in formula
-    assert 'shell_output("#{bin}/mlx-air bench --help")' in formula
-    assert "Timeout.timeout(900)" in formula
+    _run_installer(
+        home,
+        "--version",
+        "1.2.4",
+        "--archive",
+        str(second_archive),
+        "--checksum",
+        str(second_checksum),
+    )
+    assert (
+        subprocess.check_output([launcher, "version"], text=True) == "mlx-air 1.2.4\n"
+    )
+    assert os.readlink(install_root / "current") == "versions/1.2.4"
+    assert (install_root / "versions/1.2.3").is_dir()
+    assert (install_root / "versions/1.2.4").is_dir()
 
-
-def test_formula_generator_rejects_invalid_checksum(tmp_path: Path):
-    """Formula generation fails before writing an invalid checksum."""
-    result = _run(
-        "formula",
-        "--tap-root",
-        str(tmp_path),
+    _run_installer(
+        home,
         "--version",
         "1.2.3",
-        "--url",
-        "https://example.com/mlx-air-1.2.3-darwin-arm64.tar.gz",
-        "--sha256",
-        "bad",
+        "--archive",
+        str(first_archive),
+        "--checksum",
+        str(first_checksum),
+    )
+    assert (
+        subprocess.check_output([launcher, "version"], text=True) == "mlx-air 1.2.3\n"
+    )
+    assert os.readlink(install_root / "current") == "versions/1.2.3"
+
+
+def test_installer_resolves_latest_release_and_downloads_its_assets(tmp_path: Path):
+    """An install without --version follows latest and verifies downloaded assets."""
+    home = tmp_path / "home"
+    archive, checksum = _fake_install_release(tmp_path, "1.2.3")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        """#!/bin/sh
+output=''
+url=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) output=$2; shift 2 ;;
+        -w) shift 2 ;;
+        http*) url=$1; shift ;;
+        *) shift ;;
+    esac
+done
+case "$url" in
+    */releases/latest)
+        printf '%s' 'https://github.com/huydt84/mlx-server-runtime/releases/tag/v1.2.3'
+        ;;
+    *.tar.gz.sha256) cp "$FAKE_CHECKSUM" "$output" ;;
+    *.tar.gz) cp "$FAKE_ARCHIVE" "$output" ;;
+    *) exit 1 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    os.chmod(fake_curl, 0o755)
+    original_path = os.environ["PATH"]
+
+    result = _run_installer(
+        home,
+        extra_env={
+            "PATH": f"{fake_bin}{os.pathsep}{original_path}",
+            "FAKE_ARCHIVE": str(archive),
+            "FAKE_CHECKSUM": str(checksum),
+            # A generic VERSION in the caller's shell must not pin the install.
+            "VERSION": "0.0.1",
+        },
+    )
+
+    assert "Installed mlx-air 1.2.3" in result.stdout
+    assert (
+        subprocess.check_output([home / ".local/bin/mlx-air", "version"], text=True)
+        == "mlx-air 1.2.3\n"
+    )
+
+
+def test_installer_checksum_failure_preserves_active_version(tmp_path: Path):
+    """A failed update cannot change the active version or create its directory."""
+    home = tmp_path / "home"
+    first_archive, first_checksum = _fake_install_release(tmp_path, "1.2.3")
+    second_archive, _ = _fake_install_release(tmp_path, "1.2.4")
+    bad_checksum = tmp_path / "bad.sha256"
+    bad_checksum.write_text(f"{'0' * 64}  {second_archive.name}\n", encoding="utf-8")
+    _run_installer(
+        home,
+        "--version",
+        "1.2.3",
+        "--archive",
+        str(first_archive),
+        "--checksum",
+        str(first_checksum),
+    )
+
+    result = _run_installer(
+        home,
+        "--version",
+        "1.2.4",
+        "--archive",
+        str(second_archive),
+        "--checksum",
+        str(bad_checksum),
+        check=False,
+    )
+
+    install_root = home / ".local/share/mlx-air"
+    launcher = home / ".local/bin/mlx-air"
+    assert result.returncode == 1
+    assert "checksum mismatch" in result.stderr
+    assert os.readlink(install_root / "current") == "versions/1.2.3"
+    assert not (install_root / "versions/1.2.4").exists()
+    assert (
+        subprocess.check_output([launcher, "version"], text=True) == "mlx-air 1.2.3\n"
+    )
+
+
+def test_installer_rejects_unsafe_archive_paths_and_links(tmp_path: Path):
+    """Checksummed archives still cannot escape their root or contain links."""
+    for label, member in (
+        ("traversal", tarfile.TarInfo("mlx-air-1.2.3/../../escape")),
+        ("symlink", tarfile.TarInfo("mlx-air-1.2.3/link")),
+    ):
+        if label == "symlink":
+            member.type = tarfile.SYMTYPE
+            member.linkname = "/tmp"
+        archive = tmp_path / f"{label}.tar.gz"
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.addfile(member)
+        checksum = tmp_path / f"{label}.sha256"
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+
+        result = _run_installer(
+            tmp_path / f"home-{label}",
+            "--version",
+            "1.2.3",
+            "--archive",
+            str(archive),
+            "--checksum",
+            str(checksum),
+            check=False,
+        )
+
+        assert result.returncode == 1
+        if label == "traversal":
+            assert "unsafe path" in result.stderr
+        else:
+            assert "must not contain symbolic or hard links" in result.stderr
+
+
+def test_installer_refuses_nonempty_unmanaged_install_root(tmp_path: Path):
+    """Existing user content cannot be adopted or overwritten by the installer."""
+    home = tmp_path / "home"
+    archive, checksum = _fake_install_release(tmp_path, "1.2.3")
+    unmanaged_file = home / ".local/share/mlx-air/user-file"
+    unmanaged_file.parent.mkdir(parents=True)
+    unmanaged_file.write_text("keep\n", encoding="utf-8")
+
+    result = _run_installer(
+        home,
+        "--version",
+        "1.2.3",
+        "--archive",
+        str(archive),
+        "--checksum",
+        str(checksum),
         check=False,
     )
 
     assert result.returncode == 1
-    assert "64 lowercase hexadecimal" in result.stderr
-    assert not (tmp_path / "Formula/mlx-air.rb").exists()
+    assert "non-empty unmanaged path" in result.stderr
+    assert unmanaged_file.read_text(encoding="utf-8") == "keep\n"
+    assert not (home / ".local/bin/mlx-air").exists()
 
 
-def test_release_workflow_separates_dry_run_release_and_tap_permissions():
-    """The manual path cannot publish and each publishing job has narrow permissions."""
+def test_installer_refuses_unmanaged_launcher_without_writing_install_root(
+    tmp_path: Path,
+):
+    """An existing command cannot be replaced even when the install root is free."""
+    home = tmp_path / "home"
+    archive, checksum = _fake_install_release(tmp_path, "1.2.3")
+    launcher = home / ".local/bin/mlx-air"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("user command\n", encoding="utf-8")
+
+    result = _run_installer(
+        home,
+        "--version",
+        "1.2.3",
+        "--archive",
+        str(archive),
+        "--checksum",
+        str(checksum),
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "launcher not owned" in result.stderr
+    assert launcher.read_text(encoding="utf-8") == "user command\n"
+    assert not (home / ".local/share/mlx-air").exists()
+
+
+def test_installer_adds_bin_directory_to_profile_once(tmp_path: Path):
+    """Interactive installs configure PATH idempotently when it is missing."""
+    home = tmp_path / "home"
+    archive, checksum = _fake_install_release(tmp_path, "1.2.3")
+    arguments = (
+        "--version",
+        "1.2.3",
+        "--archive",
+        str(archive),
+        "--checksum",
+        str(checksum),
+    )
+
+    _run_installer(home, *arguments, modify_path=True)
+    _run_installer(home, *arguments, modify_path=True)
+
+    profile = (home / ".profile").read_text(encoding="utf-8")
+    path_line = f'export PATH="{home}/.local/bin:$PATH"'
+    assert profile.count("# Added by MLX Air installer") == 1
+    assert profile.count(path_line) == 1
+
+
+def test_installer_uninstall_preserves_application_data(tmp_path: Path):
+    """Uninstall removes managed distributions but not runtime state or caches."""
+    home = tmp_path / "home"
+    archive, checksum = _fake_install_release(tmp_path, "1.2.3")
+    _run_installer(
+        home,
+        "--version",
+        "1.2.3",
+        "--archive",
+        str(archive),
+        "--checksum",
+        str(checksum),
+    )
+    application_data = home / "Library/Application Support/mlx-air/instances/example"
+    application_data.mkdir(parents=True)
+    (application_data / "instance.json").write_text("{}\n", encoding="utf-8")
+
+    _run_installer(home, "--uninstall")
+
+    assert not (home / ".local/share/mlx-air").exists()
+    assert not (home / ".local/bin/mlx-air").exists()
+    assert (application_data / "instance.json").is_file()
+
+
+def test_installer_has_valid_posix_shell_syntax():
+    """The release installer parses with the system POSIX shell."""
+    subprocess.run(["sh", "-n", str(INSTALLER)], check=True)
+
+
+def test_release_workflow_separates_dry_run_and_release_permissions():
+    """The manual path cannot publish and publishing permissions stay narrow."""
     workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
 
     assert 'tags:\n      - "v*.*.*"' in workflow
     assert "workflow_dispatch:" in workflow
     tag_only = "if: github.event_name == 'push' && github.ref_type == 'tag'"
-    assert workflow.count(tag_only) == 3
+    assert workflow.count(tag_only) == 2
     assert "contents: write\n    steps:" in workflow
     assert "id-token: write\n      attestations: write" in workflow
-    assert "secrets.HOMEBREW_TAP_TOKEN" in workflow
-    assert "--auto --squash" in workflow
+    assert "HOMEBREW_TAP_TOKEN" not in workflow
+    assert "update-homebrew" not in workflow
+    assert '"release/install.sh"' in workflow
 
 
 def test_release_workflow_archives_the_staging_script_layout():
@@ -213,4 +496,6 @@ def test_release_workflow_archives_the_staging_script_layout():
     )
 
     assert "scripts/package-mlx-air.sh" in workflow
+    assert "release/install.sh" in workflow
     assert '"$ROOT/scripts/stage-mlx-air.sh"' in package_script
+    assert 'cp "$ROOT/install.sh" "$OUTPUT_DIR/install.sh"' in package_script
