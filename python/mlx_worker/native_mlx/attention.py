@@ -211,6 +211,8 @@ class PagedLayerAttentionContext:
     layer_index: int
     forward_mode: ForwardMode
     attention_backend: "PagedMetalAttentionBackend"
+    step_masks: dict[int | None, mx.array | str | None] = field(default_factory=dict)
+    """Masks shared by every layer of one step, keyed by sliding-window size."""
 
     def append_and_attend(
         self,
@@ -239,20 +241,26 @@ class PagedLayerAttentionContext:
             values,
         )
         started = time.perf_counter()
-        dense_keys, dense_values = self._dense_kv_rows(key_cache, value_cache)
-        attention_mask = _dense_causal_mask(
-            mx.array(self.reservation.cache_lengths, dtype=mx.int32),
-            self.reservation.token_lengths,
-            int(queries.shape[2]),
-            int(dense_keys.shape[2]),
-            window_size=window_size,
-        )
+        if self.reservation.cache_lengths == (0,):
+            # A single row with no cached prefix attends only to its own new
+            # K/V, which are already dense: skip the page gather.
+            dense_keys, dense_values = keys, values
+        else:
+            dense_keys, dense_values = self._dense_kv_rows(key_cache, value_cache)
+        if window_size not in self.step_masks:
+            self.step_masks[window_size] = _step_attention_mask(
+                self.reservation.cache_lengths,
+                self.reservation.token_lengths,
+                int(queries.shape[2]),
+                int(dense_keys.shape[2]),
+                window_size=window_size,
+            )
         output = mx.fast.scaled_dot_product_attention(
             queries,
             dense_keys,
             dense_values,
             scale=scale,
-            mask=attention_mask.astype(queries.dtype),
+            mask=self.step_masks[window_size],
         )
         self.attention_backend.record_attention(
             self.forward_mode.value,
@@ -325,12 +333,14 @@ class PagedMetalAttentionBackend:
     ) -> tuple[LayerAttentionContext, ...]:
         self.capabilities.validate_context(reservation, forward_mode)
         assert isinstance(reservation, PagedBatchReservation)
+        step_masks: dict[int | None, mx.array | str | None] = {}
         return tuple(
             PagedLayerAttentionContext(
                 reservation=reservation,
                 layer_index=index,
                 forward_mode=forward_mode,
                 attention_backend=self,
+                step_masks=step_masks,
             )
             for index in range(reservation.backend.num_layers)
         )
@@ -390,15 +400,52 @@ class HybridPagedMetalAttentionBackend(PagedMetalAttentionBackend):
     ) -> tuple[HybridLayerAttentionContext, ...]:
         self.capabilities.validate_context(reservation, forward_mode)
         assert isinstance(reservation, HybridBatchReservation)
+        step_masks: dict[int | None, mx.array | str | None] = {}
         return tuple(
             HybridPagedLayerAttentionContext(
                 reservation=reservation,
                 layer_index=index,
                 forward_mode=forward_mode,
                 attention_backend=self,
+                step_masks=step_masks,
             )
             for index in range(reservation.backend.num_layers)
         )
+
+
+def _step_attention_mask(
+    cache_lengths: tuple[int, ...],
+    token_lengths: tuple[int, ...],
+    max_tokens: int,
+    max_total: int,
+    *,
+    window_size: int | None = None,
+) -> mx.array | str | None:
+    """Return the cheapest SDPA mask that is exact for one paged step.
+
+    A single row needs only MLX's built-in causal mask, which aligns the
+    queries with the end of the keys. Equal-length decode rows need no mask.
+    Everything else gets one boolean mask that every layer of the step shares.
+    Padding query rows attend to every key so that no row is fully masked.
+    """
+
+    if window_size is None and len(token_lengths) == 1:
+        return "causal" if max_tokens > 1 else None
+    totals = {
+        cache + tokens
+        for cache, tokens in zip(cache_lengths, token_lengths, strict=True)
+    }
+    if window_size is None and max_tokens == 1 and len(totals) == 1:
+        return None
+    offsets = mx.array(cache_lengths, dtype=mx.int32)[:, None, None]
+    query_indices = mx.arange(max_tokens, dtype=mx.int32)[None, :, None]
+    query_positions = offsets + query_indices
+    key_positions = mx.arange(max_total, dtype=mx.int32)[None, None, :]
+    valid = key_positions <= query_positions
+    if window_size is not None:
+        valid = valid & (key_positions >= query_positions - window_size + 1)
+    padding = query_indices >= mx.array(token_lengths, dtype=mx.int32)[:, None, None]
+    return (valid | padding)[:, None, :, :]
 
 
 def _dense_causal_mask(
