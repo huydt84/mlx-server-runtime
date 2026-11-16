@@ -9,7 +9,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..interfaces import ForwardBatch, LayerAttentionContext
+from ..interfaces import ForwardBatch, LayerAttentionContext, select_logits_positions
 from ..mapping import (
     WeightIndex,
     WeightMappingBug,
@@ -230,6 +230,7 @@ class Gemma3ForCausalLM(nn.Module):
             positions,
             forward_batch.layer_attention,
         )
+        hidden = select_logits_positions(hidden, forward_batch)
         return self.lm_head(hidden)
 
 

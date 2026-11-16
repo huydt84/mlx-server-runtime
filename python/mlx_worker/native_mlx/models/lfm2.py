@@ -10,7 +10,11 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..interfaces import ForwardBatch, HybridLayerAttentionContext
+from ..interfaces import (
+    ForwardBatch,
+    HybridLayerAttentionContext,
+    select_logits_positions,
+)
 from ..mapping import (
     WeightIndex,
     WeightMappingBug,
@@ -454,6 +458,7 @@ class Lfm2MoeForCausalLM(nn.Module):
             positions,
             forward_batch.layer_attention,
         )
+        hidden = select_logits_positions(hidden, forward_batch)
         return self.model.embed_tokens.as_linear(hidden)
 
 

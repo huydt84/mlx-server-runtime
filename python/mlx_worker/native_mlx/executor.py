@@ -131,6 +131,7 @@ class MlxGenerationExecutor:
                 reservation,
                 layout.forward_mode,
             ),
+            logits_positions=tuple(length - 1 for length in layout.token_lengths),
         )
         try:
             reset_graph_profile = getattr(self.model, "reset_graph_profile", None)
@@ -140,7 +141,9 @@ class MlxGenerationExecutor:
             logits = self.model(layout.input_ids, layout.positions, forward_batch)
             forward_ms = _elapsed_ms(forward_started)
             sample_started = time.perf_counter()
-            next_tokens = self._sample_last_logits(logits, layout.token_lengths)
+            next_tokens = mx.argmax(
+                _last_token_logits(logits, layout.token_lengths), axis=-1
+            )
             sample_ms = _elapsed_ms(sample_started)
         except Exception as exc:
             reservation.abort()
@@ -403,16 +406,6 @@ class MlxGenerationExecutor:
             error_message=message,
         )
 
-    @staticmethod
-    def _sample_last_logits(
-        logits: mx.array,
-        token_lengths: tuple[int, ...],
-    ) -> mx.array:
-        rows = mx.stack(
-            [logits[index, length - 1, :] for index, length in enumerate(token_lengths)]
-        )
-        return mx.argmax(rows, axis=-1)
-
 
 @dataclass
 class MlxOverlapGenerationExecutor(MlxGenerationExecutor):
@@ -468,6 +461,19 @@ def _require_result(result: StepRequestResult | None) -> StepRequestResult:
             "executor did not produce a result for every request",
         )
     return result
+
+
+def _last_token_logits(logits: mx.array, token_lengths: tuple[int, ...]) -> mx.array:
+    """Return each row's last real-token logits.
+
+    Models that honor ``ForwardBatch.logits_positions`` return one position per
+    row; a model that returns every position is indexed by row length instead.
+    """
+
+    if int(logits.shape[1]) == 1:
+        return logits[:, 0, :]
+    indices = mx.array([length - 1 for length in token_lengths], dtype=mx.int32)
+    return mx.take_along_axis(logits, indices[:, None, None], axis=1)[:, 0, :]
 
 
 def _elapsed_ms(started: float) -> int:

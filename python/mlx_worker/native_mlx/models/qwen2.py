@@ -9,7 +9,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..interfaces import ForwardBatch, LayerAttentionContext
+from ..interfaces import ForwardBatch, LayerAttentionContext, select_logits_positions
 from ..mapping import (
     WeightIndex,
     WeightMappingBug,
@@ -222,6 +222,7 @@ class Qwen2ForCausalLM(nn.Module):
             layer_attention=forward_batch.layer_attention,
             attention_mask=forward_batch.attention_mask,
         )
+        hidden = select_logits_positions(hidden, forward_batch)
         if self.config.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
         return self.lm_head(hidden)

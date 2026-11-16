@@ -10,7 +10,11 @@ from mlx_worker.native_mlx.cache import (
     HybridPagedKVCacheBackend,
     KVCacheGeometry,
 )
-from mlx_worker.native_mlx.interfaces import ForwardBatch, ForwardMode
+from mlx_worker.native_mlx.interfaces import (
+    ForwardBatch,
+    ForwardMode,
+    select_logits_positions,
+)
 from mlx_worker.native_mlx.models.gemma3 import (
     Gemma3ForCausalLM,
     parse_gemma3_config,
@@ -59,7 +63,7 @@ def test_lfm2_selects_hybrid_cache_bundle_at_startup() -> None:
     )
 
 
-def test_qwen3_and_gemma3_tiny_graphs_produce_logits() -> None:
+def _tiny_qwen3_and_gemma3() -> tuple[Qwen3ForCausalLM, Gemma3ForCausalLM]:
     qwen = Qwen3ForCausalLM(
         parse_qwen3_config(
             {
@@ -96,7 +100,69 @@ def test_qwen3_and_gemma3_tiny_graphs_produce_logits() -> None:
             }
         )
     )
-    for model in (qwen, gemma):
+    return qwen, gemma
+
+
+def _tiny_prefill(
+    model: Qwen3ForCausalLM | Gemma3ForCausalLM,
+    logits_positions: tuple[int, ...] | None,
+) -> mx.array:
+    backend = DenseKVCacheBackend(model.num_layers)
+    cache = backend.get(backend.create("tiny"), "tiny")
+    reservation = backend.reserve_batch((cache,), (3,))
+    output = model(
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        mx.array([[0, 1, 2]], dtype=mx.int32),
+        ForwardBatch(
+            forward_mode=ForwardMode.PREFILL,
+            token_lengths=(3,),
+            cache_lengths=(0,),
+            attention_mask="causal",
+            layer_attention=DenseReferenceAttentionBackend().contexts(
+                reservation, ForwardMode.PREFILL
+            ),
+            logits_positions=logits_positions,
+        ),
+    )
+    mx.eval(output)
+    reservation.commit()
+    return output
+
+
+def test_models_compute_logits_only_for_requested_positions() -> None:
+    for model in _tiny_qwen3_and_gemma3():
+        full = _tiny_prefill(model, None)
+        last = _tiny_prefill(model, (2,))
+        assert last.shape == (1, 1, 64)
+        assert mx.allclose(last[:, 0, :], full[:, 2, :], atol=1e-4).item()
+
+
+def test_select_logits_positions_picks_one_token_per_row() -> None:
+    hidden = mx.arange(2 * 3 * 2, dtype=mx.float32).reshape(2, 3, 2)
+
+    def batch(positions: tuple[int, ...] | None) -> ForwardBatch:
+        return ForwardBatch(
+            forward_mode=ForwardMode.PREFILL,
+            token_lengths=(3, 2),
+            cache_lengths=(0, 0),
+            attention_mask="causal",
+            layer_attention=(),
+            logits_positions=positions,
+        )
+
+    assert select_logits_positions(hidden, batch(None)) is hidden
+    assert select_logits_positions(hidden, batch((1, 1))).tolist() == [
+        [[2.0, 3.0]],
+        [[8.0, 9.0]],
+    ]
+    assert select_logits_positions(hidden, batch((2, 1))).tolist() == [
+        [[4.0, 5.0]],
+        [[8.0, 9.0]],
+    ]
+
+
+def test_qwen3_and_gemma3_tiny_graphs_produce_logits() -> None:
+    for model in _tiny_qwen3_and_gemma3():
         backend = DenseKVCacheBackend(model.num_layers)
         handle = backend.create("tiny")
         cache = backend.get(handle, "tiny")

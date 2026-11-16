@@ -90,6 +90,33 @@ class ForwardBatch:
     cache_lengths: tuple[int, ...]
     attention_mask: str | None
     layer_attention: tuple[LayerAttentionContext, ...]
+    logits_positions: tuple[int, ...] | None = None
+    """Per-row token index to compute logits for; ``None`` means every token."""
+
+
+def select_logits_positions(hidden: mx.array, forward_batch: ForwardBatch) -> mx.array:
+    """Keep only the hidden rows whose logits the caller asked for.
+
+    Projecting every prefill token onto the vocabulary costs as much as several
+    transformer layers, and the executor samples only one token per row.
+
+    Args:
+        hidden: Final hidden states shaped ``(batch, tokens, hidden_size)``.
+        forward_batch: Metadata naming the token index to keep for each row.
+
+    Returns:
+        ``hidden`` unchanged when no positions are requested, otherwise the
+        selected rows shaped ``(batch, 1, hidden_size)``.
+    """
+
+    positions = forward_batch.logits_positions
+    if positions is None:
+        return hidden
+    if len(set(positions)) == 1:
+        index = positions[0]
+        return hidden[:, index : index + 1, :]
+    indices = mx.array(positions, dtype=mx.int32)[:, None, None]
+    return mx.take_along_axis(hidden, indices, axis=1)
 
 
 class NativeModel(Protocol):
