@@ -106,7 +106,6 @@ Desktop.ini
 prompts/
 benchmarks/results/
 
-# Project design and agent rules — tracked separately, not in git
-AGENTS.md
+# Local planning documents — not in git
 PLAN.md
 plan/
