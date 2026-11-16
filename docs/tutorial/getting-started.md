@@ -6,7 +6,7 @@ This tutorial walks you from a fresh clone to sending your first chat completion
 
 - Apple Silicon Mac (M1/M2/M3/M4) — required for MLX
 - Rust toolchain (1.75+ recommended)
-- Python 3.10+
+- Python 3.12 or 3.13
 - `uv` package manager
 - Model weights (e.g., a `mlx-community` quantized model)
 
