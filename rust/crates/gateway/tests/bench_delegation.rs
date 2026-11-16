@@ -2,10 +2,11 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::net::{TcpListener, TcpStream};
+use std::ops::{Deref, DerefMut};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -165,6 +166,32 @@ impl Drop for StagedCli {
     }
 }
 
+/// Sends SIGTERM to a spawned process that a failing test did not reap.
+struct ReapOnDrop(Child);
+
+impl Deref for ReapOnDrop {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for ReapOnDrop {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            unsafe { libc::kill(self.0.id() as i32, libc::SIGTERM) };
+            let _ = self.0.wait();
+        }
+    }
+}
+
 #[test]
 fn rust_delegation_reaches_python_leaf_help() {
     let staged = StagedCli::new("leaf-help");
@@ -227,15 +254,17 @@ fn delegated_uv_exit_status_becomes_cli_exit_status() {
 fn delegated_process_receives_the_cli_signal() {
     let staged = StagedCli::new("signal");
     let ready = staged.base.join("uv-ready");
-    let mut child = staged
-        .command()
-        .env("FAKE_UV_RUN_MODE", "sleep")
-        .env("FAKE_UV_READY_FILE", &ready)
-        .args(["bench", "run", "--suite", "smoke"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = ReapOnDrop(
+        staged
+            .command()
+            .env("FAKE_UV_RUN_MODE", "sleep")
+            .env("FAKE_UV_READY_FILE", &ready)
+            .args(["bench", "run", "--suite", "smoke"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     wait_for_file(&ready);
 
     let result = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
@@ -880,27 +909,29 @@ fn interrupted_diagnostic_preserves_measurements_and_reaps_processes() {
     let pid_file = staged.base.join("diagnostic-interrupt-pids");
     let diagnostic_ready = staged.base.join("diagnostic-ready");
     fs::write(&config, include_str!("fixtures/statistics.toml")).unwrap();
-    let mut child = staged
-        .command()
-        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
-        .env("FAKE_GATEWAY_DIAGNOSTIC_READY_FILE", &diagnostic_ready)
-        .env("FAKE_GATEWAY_DIAGNOSTIC_DELAY_SECONDS", "60")
-        .args([
-            "bench",
-            "run",
-            "--suite",
-            "statistics",
-            "--benchmark-config",
-            config.to_str().unwrap(),
-            "--profile",
-            "representative",
-            "--output-dir",
-            output_directory.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = ReapOnDrop(
+        staged
+            .command()
+            .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+            .env("FAKE_GATEWAY_DIAGNOSTIC_READY_FILE", &diagnostic_ready)
+            .env("FAKE_GATEWAY_DIAGNOSTIC_DELAY_SECONDS", "60")
+            .args([
+                "bench",
+                "run",
+                "--suite",
+                "statistics",
+                "--benchmark-config",
+                config.to_str().unwrap(),
+                "--profile",
+                "representative",
+                "--output-dir",
+                output_directory.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     wait_for_file(&diagnostic_ready);
 
     let result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
@@ -1019,22 +1050,24 @@ fn sigint_preserves_failure_stage_and_reaps_process_group() {
     let staged = StagedCli::new("interrupt-run");
     let output_directory = staged.base.join("interrupt-artifacts");
     let pid_file = staged.base.join("interrupt-pids");
-    let mut child = staged
-        .command()
-        .env("FAKE_GATEWAY_PID_FILE", &pid_file)
-        .env("FAKE_GATEWAY_DELAY_READY", "1")
-        .args([
-            "bench",
-            "run",
-            "--suite",
-            "smoke",
-            "--output-dir",
-            output_directory.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = ReapOnDrop(
+        staged
+            .command()
+            .env("FAKE_GATEWAY_PID_FILE", &pid_file)
+            .env("FAKE_GATEWAY_DELAY_READY", "1")
+            .args([
+                "bench",
+                "run",
+                "--suite",
+                "smoke",
+                "--output-dir",
+                output_directory.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     wait_for_file(&pid_file);
 
     let result = unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
@@ -1063,13 +1096,15 @@ fn external_mode_records_server_identity_without_stopping_server() {
         ),
     )
     .unwrap();
-    let mut server = Command::new(staged.root.join("bin/mlx_runtime_gateway"))
-        .env("MLX_RUNTIME_CONFIG", &config)
-        .env("MLX_AIR_BENCHMARK_ENABLED", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut server = ReapOnDrop(
+        Command::new(staged.root.join("bin/mlx_runtime_gateway"))
+            .env("MLX_RUNTIME_CONFIG", &config)
+            .env("MLX_AIR_BENCHMARK_ENABLED", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     wait_for_port(port);
 
     let output = staged
