@@ -30,9 +30,9 @@ pub struct RuntimeState {
     /// Shared telemetry registry.
     pub metrics: Arc<MetricsRegistry>,
     benchmark_enabled: Arc<AtomicBool>,
-    /// VLM model name if configured (Phase 8).
+    /// VLM model name if configured.
     pub vlm_model_name: Arc<RwLock<Option<String>>>,
-    /// VLM model lifecycle status (Phase 8).
+    /// VLM model lifecycle status.
     pub vlm_status: Arc<RwLock<Option<ModelStatus>>>,
 }
 
@@ -501,7 +501,7 @@ fn bootstrap_worker(
         match decode_worker_message(&line) {
             Some(WorkerMessage::Status(status)) => {
                 // Only update the text model lifecycle from this STATUS.
-                // VLM loads lazily on first VLM request (Phase 8) and must NOT
+                // VLM loads lazily on first VLM request and must NOT
                 // be marked ready from the generic text bootstrap STATUS.
                 let _ = runtime.set_status(*status);
             }

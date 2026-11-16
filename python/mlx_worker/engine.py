@@ -1,4 +1,4 @@
-"""Phase 1 worker engine with direct `mlx-lm` calls and batch completions."""
+"""Worker engine with direct `mlx-lm` calls and batch completions."""
 
 from __future__ import annotations
 

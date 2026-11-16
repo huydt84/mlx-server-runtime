@@ -82,7 +82,7 @@ pub struct MetricsRegistry {
     prefill_tokens_per_second: Mutex<f64>,
     ttft_histogram: Mutex<Histogram>,
     request_latency_histogram: Mutex<Histogram>,
-    // VLM-specific counters (Phase 8)
+    // VLM-specific counters
     vlm_requests_total: AtomicU64,
     vlm_image_count_total: AtomicU64,
     vlm_image_preprocess_latency_ms: AtomicU64,
@@ -252,7 +252,7 @@ impl MetricsRegistry {
         }
     }
 
-    // ── VLM metric methods (Phase 8) ──────────────────────────────────────
+    // ── VLM metric methods ──────────────────────────────────────
 
     /// Increments the VLM request counter.
     pub fn increment_vlm_requests_total(&self) {
@@ -1055,7 +1055,7 @@ mod tests {
             "mlx_apc_mode_by_backend",
             "mlx_worker_cancellations_by_backend_total",
             "mlx_worker_errors_by_backend_total",
-            // VLM Phase 8 metrics
+            // VLM metrics
             "mlx_vlm_requests_total 0",
             "mlx_vlm_image_count_total 0",
             "mlx_vlm_image_preprocess_latency_ms 0",

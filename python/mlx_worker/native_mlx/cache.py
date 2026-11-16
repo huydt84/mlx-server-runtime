@@ -434,18 +434,12 @@ class PagedBatchReservation:
     staged_keys: list[mx.array | None]
     staged_values: list[mx.array | None]
     _finished: bool = False
-    _block_table_array: mx.array = field(init=False, repr=False)
     _slot_array: mx.array = field(init=False, repr=False)
     _page_id_arrays: tuple[mx.array, ...] = field(init=False, repr=False)
     _total_lengths: tuple[int, ...] = field(init=False, repr=False)
     _max_total_length: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        width = max((len(table) for table in self.candidate_tables), default=0)
-        rows = [
-            list(table) + [0] * (width - len(table)) for table in self.candidate_tables
-        ]
-        self._block_table_array = mx.array(rows, dtype=mx.int32)
         self._page_id_arrays = tuple(
             mx.array(table, dtype=mx.int32) for table in self.candidate_tables
         )
@@ -477,10 +471,6 @@ class PagedBatchReservation:
     @property
     def cache_lengths(self) -> tuple[int, ...]:
         return tuple(cache.size() for cache in self.request_caches)
-
-    @property
-    def block_tables(self) -> mx.array:
-        return self._block_table_array
 
     def stage_layer(
         self,

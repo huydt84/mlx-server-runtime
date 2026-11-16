@@ -80,7 +80,7 @@ pub struct ChatMessage {
     pub content: MessageContent,
 }
 
-/// The supported chat roles for Phase 1.
+/// The supported chat roles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {

@@ -203,7 +203,7 @@ def run_benchmark(
                 )
                 results["failure_stage"] = "measurement"
                 asyncio.run(
-                    _execute_phase8_state(
+                    _execute_measured_state(
                         base_url,
                         execution_configuration,
                         prompts,
@@ -983,7 +983,7 @@ def _validate_warmup_material(
         )
 
 
-async def _execute_phase8_state(
+async def _execute_measured_state(
     base_url: str,
     configuration: dict[str, Any],
     prompts: dict[str, list[Any]],

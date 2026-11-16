@@ -1,5 +1,4 @@
-"""Line-based IPC helpers for bootstrap and Phase 1 inference frames,
-including Phase 8 VLM image content support."""
+"""Line-based IPC helpers for bootstrap and inference frames, including VLM image content."""
 
 from __future__ import annotations
 
@@ -388,7 +387,7 @@ def decode_bootstrap_message(
 
 
 def encode_command(request: ChatCompletionRequest) -> bytes:
-    """Encode a Phase 1 gateway command."""
+    """Encode a gateway command."""
 
     payload = {
         "type": "chat_completion",
@@ -462,7 +461,7 @@ def _encode_content(
 def decode_command(
     raw_line: bytes,
 ) -> ChatCompletionRequest | CancelRequest | BenchmarkResetRequest | None:
-    """Decode a Phase 1 gateway command."""
+    """Decode a gateway command."""
 
     payload = json.loads(raw_line.decode("utf-8"))
     if payload.get("type") != "chat_completion":
@@ -506,7 +505,7 @@ def encode_event(
         | BenchmarkResetState
     ),
 ) -> bytes:
-    """Encode a Phase 1 worker event."""
+    """Encode a worker event."""
 
     payload: dict[str, Any]
     if isinstance(event, ChatCompletionResponse):
@@ -620,13 +619,6 @@ def encode_event(
     return (json.dumps(payload) + "\n").encode("utf-8")
 
 
-def encode_cancel_request(request_id: str) -> bytes:
-    """Encode a cancellation command."""
-
-    payload = {"type": "cancel_request", "request_id": request_id}
-    return (json.dumps(payload) + "\n").encode("utf-8")
-
-
 def decode_event(
     raw_line: bytes,
 ) -> (
@@ -637,7 +629,7 @@ def decode_event(
     | BenchmarkResetState
     | None
 ):
-    """Decode a Phase 1 worker event."""
+    """Decode a worker event."""
 
     payload = json.loads(raw_line.decode("utf-8"))
     if payload.get("type") == "chat_completion":

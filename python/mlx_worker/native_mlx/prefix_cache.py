@@ -14,7 +14,7 @@ from .interfaces import CacheAdmission
 
 @dataclass(frozen=True)
 class NoPrefixCache:
-    """Phase 9 adapter that deliberately performs no prefix reuse."""
+    """Adapter that deliberately performs no prefix reuse."""
 
     def probe(self, token_ids: tuple[int, ...]) -> PrefixProbe:
         del token_ids

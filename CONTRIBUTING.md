@@ -285,8 +285,7 @@ For performance work, first select the evidence scope from
 focus, model roles, workloads, sampling, execution order, and primary metrics
 support the intended conclusion.
 
-After `mlx-air bench` is implemented, run the selected benchmark against the
-staged or installed distribution:
+Run the selected benchmark against the staged or installed distribution:
 
 ```bash
 mlx-air bench run --suite optimization --focus scheduler

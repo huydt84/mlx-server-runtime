@@ -76,65 +76,17 @@ Request logs are structured JSON lines written by the Rust gateway and include:
 
 ## Benchmarks
 
-The native-v2 ultimate benchmark is the required performance gate for
-optimization work:
+`mlx-air bench` is the benchmark entrypoint. Each run measures one runtime:
 
 ```bash
-bash scripts/benchmark-v2.sh run
+mlx-air bench run --suite smoke
+mlx-air bench run --suite optimization --focus scheduler
 ```
 
-For hot-path optimization, this is the only accepted user-facing performance
-gate. Keep `scripts/benchmark-v2.sh` and `benchmarks/v2_benchmark.py` unchanged
-across optimization work: run the exact same benchmark files from isolated
-baseline and candidate source worktrees. If the benchmark itself must change,
-make that a separate change and rebaseline both snapshots with the new version;
-results produced by different benchmark versions are not comparable.
-
-It runs four supported model families across serial and overlap
-configurations, rotates configuration order, and covers interactive streaming,
-non-streaming latency, long prefill, sustained decode, shared-prefix reuse,
-concurrency, and mixed prefill/decode pressure. The report leads with
-user-visible TTFT, latency, and throughput. Lower TTFT/latency is explicitly
-reported as better; higher throughput is explicitly reported as better.
-
-Fair performance runs always keep profiling disabled. The same command then
-starts separate diagnostic processes for whole-pipeline/system profiling and
-model inference-graph profiling. Add `MTL_CAPTURE_ENABLED=1 --metal` for a
-bounded Metal `.gputrace`; captured timings are diagnostic and never become
-benchmark rows.
-
-After every optimization, run the benchmark in the before and after source
-snapshots, then compare their structured results:
-
-```bash
-bash scripts/benchmark-v2.sh compare \
-  --baseline /path/to/before/results.json \
-  --candidate /path/to/after/results.json
-```
-
-The comparison rejects mismatched models, prompts, token limits, sample counts,
-configuration order, or cache budgets. It checks deterministic output/token
-parity and writes absolute before/after values, 95% confidence intervals, and
-an explicit pass/fail regression verdict. Do not claim an optimization works
-from a one-model smoke run, a profiled timing, or two scripts run against the
-same changed source tree.
-
-Other benchmark entrypoints remain available for narrower work:
-
-- Text-only benchmark: `scripts/benchmark.sh`
-- VLM benchmark: `scripts/benchmark-vlm.sh`
-
-Default reports land in `benchmarks/results/`.
-
-For the full argument list, smoke commands, and full-suite commands, read:
-
-- [`docs/how-to/run-benchmarks.md`](docs/how-to/run-benchmarks.md)
-
-Fast wiring check (not sufficient for an optimization claim):
-
-```bash
-bash scripts/benchmark-v2.sh run --preset smoke
-```
+Fair performance runs keep profiling disabled; diagnostics run as separate
+processes and never become benchmark rows. Suites, focuses, profiling,
+calibration, and the two-version comparison workflow are described in
+[Run benchmarks](docs/how-to/run-benchmarks.md).
 
 ## Profiling
 

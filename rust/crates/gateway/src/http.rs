@@ -766,25 +766,6 @@ const MAX_IMAGE_URL_LENGTH: usize = 4096;
 /// Allowed hosts for loopback HTTP image URLs.
 const LOOPBACK_HTTP_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
-#[cfg(test)]
-/// Validate all image URLs in a set of messages.
-///
-/// Rejects URLs whose scheme is not supported or whose length exceeds
-/// [`MAX_IMAGE_URL_LENGTH`]. Supports local file paths, HTTPS URLs, and
-/// loopback HTTP URLs for deterministic host validation.
-fn validate_image_urls(messages: &[ChatMessage]) -> Result<(), String> {
-    for msg in messages {
-        if let MessageContent::Parts(parts) = &msg.content {
-            for part in parts {
-                if let ContentPart::ImageUrl { image_url } = part {
-                    validate_image_source(&image_url.url)?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_image_source(url: &str) -> Result<(), String> {
     if url.len() > MAX_IMAGE_URL_LENGTH {
         return Err(format!(
@@ -859,32 +840,6 @@ fn inspect_vlm_messages(messages: &[ChatMessage]) -> Result<(bool, u64), String>
     Ok((has_images, image_count))
 }
 
-#[cfg(test)]
-/// Returns true if any message contains structured content with an ImageUrl part.
-fn has_vlm_content(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|msg| match &msg.content {
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
-        MessageContent::Text(_) => false,
-    })
-}
-
-#[cfg(test)]
-/// Counts ImageUrl parts across all messages.
-fn vlm_image_count(messages: &[ChatMessage]) -> u64 {
-    messages
-        .iter()
-        .map(|msg| match &msg.content {
-            MessageContent::Parts(parts) => parts
-                .iter()
-                .filter(|p| matches!(p, ContentPart::ImageUrl { .. }))
-                .count() as u64,
-            MessageContent::Text(_) => 0,
-        })
-        .sum()
-}
-
 fn handle_chat_completion(
     body: &[u8],
     state: &AppState,
@@ -933,7 +888,7 @@ fn handle_chat_completion(
         return json_error_response("400 Bad Request", "VLM_NOT_CONFIGURED", msg);
     }
 
-    // Phase 8: enforce VLM image-count cap before queue admission.
+    // Enforce VLM image-count cap before queue admission.
     if has_images && image_count > state.limits.max_vlm_images as u64 {
         return json_error_response(
             "400 Bad Request",
@@ -1154,7 +1109,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         );
     }
 
-    // Phase 8: enforce VLM image-count cap before queue admission.
+    // Enforce VLM image-count cap before queue admission.
     if has_images && image_count > state.limits.max_vlm_images as u64 {
         let response = json_error_response(
             "400 Bad Request",
@@ -2736,53 +2691,30 @@ mod tests {
     // ── VLM routing tests ─────────────────────────────────────────────────
 
     #[test]
-    fn has_vlm_content_detects_image_url_parts() {
+    fn inspect_vlm_messages_detects_and_counts_image_parts() {
         let text_only = vec![ChatMessage {
             role: MessageRole::User,
             content: "hello".into(),
         }];
-        assert!(!has_vlm_content(&text_only));
+        assert_eq!(inspect_vlm_messages(&text_only), Ok((false, 0)));
 
-        let with_image = vec![ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "describe".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "data:image/png;base64,abc".to_string(),
-                        detail: None,
-                    },
-                },
-            ]),
-        }];
-        assert!(has_vlm_content(&with_image));
-    }
-
-    #[test]
-    fn vlm_image_count_counts_correctly() {
-        let msg = ChatMessage {
+        let image = |url: &str| ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: url.to_string(),
+                detail: None,
+            },
+        };
+        let with_images = vec![ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "compare".to_string(),
                 },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "img1.jpg".to_string(),
-                        detail: None,
-                    },
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "img2.jpg".to_string(),
-                        detail: None,
-                    },
-                },
+                image("https://example.com/a.jpg"),
+                image("https://example.com/b.jpg"),
             ]),
-        };
-        assert_eq!(vlm_image_count(&[msg]), 2);
+        }];
+        assert_eq!(inspect_vlm_messages(&with_images), Ok((true, 2)));
     }
 
     #[test]
@@ -3096,7 +3028,7 @@ mod tests {
         assert!(output.contains("data: [DONE]"));
     }
 
-    // ── Model-first routing tests (Phase 8) ────────────────────────────────
+    // ── Model-first routing tests ────────────────────────────────
 
     #[test]
     fn chat_completion_text_only_to_vlm_model_succeeds() {
@@ -3155,7 +3087,7 @@ mod tests {
         assert!(response.body.contains("\"vlm-model\""));
     }
 
-    // ── Image URL validation tests (Phase 8) ──────────────────────────────
+    // ── Image URL validation tests ──────────────────────────────
 
     /// Helper: creates a state with VLM configured and ready.
     fn vlm_ready_state(vlm_model: &str) -> AppState {
@@ -3190,7 +3122,7 @@ mod tests {
     #[test]
     fn validate_image_urls_rejects_data_uri() {
         // data: URIs are unsupported image sources.
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
@@ -3207,7 +3139,7 @@ mod tests {
 
     #[test]
     fn validate_image_urls_accepts_loopback_http_scheme() {
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
@@ -3221,7 +3153,7 @@ mod tests {
 
     #[test]
     fn validate_image_urls_accepts_ipv6_loopback_http_scheme() {
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
@@ -3235,7 +3167,7 @@ mod tests {
 
     #[test]
     fn validate_image_urls_rejects_remote_http_scheme() {
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
@@ -3257,7 +3189,7 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("phase_8_local_{unique}.ppm"));
         std::fs::write(&path, "P3\n1 1\n255\n255 0 0\n").unwrap();
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
@@ -3272,7 +3204,7 @@ mod tests {
     #[test]
     fn validate_image_urls_rejects_long_url() {
         let long_url = "https://example.com/".to_string() + &"x".repeat(4096);
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
@@ -3289,7 +3221,7 @@ mod tests {
 
     #[test]
     fn validate_image_urls_accepts_https_scheme() {
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
@@ -3303,7 +3235,7 @@ mod tests {
 
     #[test]
     fn validate_image_urls_accepts_text_only() {
-        let result = validate_image_urls(&[ChatMessage {
+        let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: "just text".into(),
         }]);
@@ -3475,7 +3407,7 @@ mod tests {
         assert!(!output.contains("text/event-stream"));
     }
 
-    // ── VLM lifecycle recovery tests (Phase 8) ────────────────────────────
+    // ── VLM lifecycle recovery tests ────────────────────────────
 
     #[test]
     fn vlm_lifecycle_recovers_from_transient_failure() {
@@ -3707,7 +3639,7 @@ mod tests {
         assert!(response.body.contains("requested model is not VLM"));
     }
 
-    // ── VLM image-count cap tests (Phase 8) ──────────────────────────────
+    // ── VLM image-count cap tests ──────────────────────────────
 
     #[test]
     fn vlm_non_streaming_rejects_too_many_images() {

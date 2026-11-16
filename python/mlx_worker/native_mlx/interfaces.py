@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
 
@@ -293,18 +293,6 @@ class NativeScheduler(Protocol):
 
 
 @dataclass(frozen=True)
-class RuntimeRequest:
-    """Normalized public request owned by the native runtime."""
-
-    request_id: str
-    model: str
-    prompt_token_ids: tuple[int, ...]
-    max_tokens: int
-    stop: tuple[str, ...]
-    sampling: SamplingParams
-
-
-@dataclass(frozen=True)
 class SchedulableRequest:
     """Model-independent token work accepted by the scheduler."""
 
@@ -359,15 +347,3 @@ class NativeRuntime(Protocol):
     def idle(self) -> bool: ...
 
     def close(self) -> None: ...
-
-
-def execution_batch_field_names() -> tuple[str, ...]:
-    """Expose field names for boundary tests."""
-
-    return tuple(field.name for field in fields(ExecutionBatch))
-
-
-def execution_request_field_names() -> tuple[str, ...]:
-    """Expose field names for boundary tests."""
-
-    return tuple(field.name for field in fields(ExecutionRequest))

@@ -1,4 +1,4 @@
-"""Phase 8 VLM worker engine powered by direct ``mlx-vlm`` primitives."""
+"""VLM worker engine powered by direct ``mlx-vlm`` primitives."""
 
 from __future__ import annotations
 

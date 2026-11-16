@@ -23,7 +23,7 @@ pub struct WorkerConfig {
     pub backend: BackendKind,
     /// Text model identifier.
     pub model: String,
-    /// Optional VLM model identifier (Phase 8).
+    /// Optional VLM model identifier.
     pub vlm_model: Option<String>,
     /// Unix socket path used for bootstrap IPC.
     pub ipc_path: String,
@@ -107,7 +107,7 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// Runtime configuration for the Phase 0 skeleton.
+/// Runtime configuration loaded from TOML.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
     /// HTTP server configuration.

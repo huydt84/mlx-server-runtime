@@ -50,7 +50,7 @@ def test_pipeline_profiler_writes_correlated_artifacts(tmp_path) -> None:
     assert {row["request_id"] for row in rows} == {"req-1"}
     assert len(json.loads(trace.read_text())["traceEvents"]) == 2
     assert "not benchmark rows" in report.read_text()
-    assert "semantic inference-graph tracing" in report.read_text()
+    assert "inference-graph tracing" in report.read_text()
 
 
 def test_pipeline_event_schema_rejects_empty_correlation_id() -> None:

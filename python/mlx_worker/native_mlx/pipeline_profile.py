@@ -228,7 +228,7 @@ def render_pipeline_report(events: Iterable[PipelineEvent]) -> str:
         "",
         "> Diagnostic timing only. These profiled measurements are not benchmark rows.",
         "",
-        "This report is whole-pipeline timing. Phase 5 semantic inference-graph tracing and Phase 15 Metal paged-attention capture remain separate, narrower diagnostics.",
+        "This report is whole-pipeline timing. Semantic inference-graph tracing and Metal paged-attention capture remain separate, narrower diagnostics.",
         "",
         "## Artifact classes",
         "",
