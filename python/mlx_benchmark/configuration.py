@@ -9,10 +9,7 @@ from typing import Any
 
 from mlx_benchmark.statistics import METRICS, STREAMING_ONLY_METRICS
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
-    import tomli as tomllib
+import tomllib
 
 
 SCHEMA_VERSION = 2
