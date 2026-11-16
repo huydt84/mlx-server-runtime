@@ -64,16 +64,18 @@ checkpoint = "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
 checkpoint = "mlx-community/gemma-3-270m-it-qat-8bit"
 
 # Native-MLX rejects a request with KV_CAPACITY_EXHAUSTED instead of queueing
-# it, so the KV budget must hold every in-flight request. 2 GiB holds ~14.5k
-# tokens on Qwen3-4B (144 KiB/token), 1.7x the largest working set
-# (shared_prefix_warm_c16, 16 x 544 tokens).
+# it, and never reclaims prefix-cache pages for new requests, so the KV pool
+# must hold every in-flight request plus the prefix cache. 2 GiB holds ~14.5k
+# tokens on Qwen3-4B (144 KiB/token). The prefix cache counts each 16-token page
+# as one entry: 256 entries (4k tokens) keep both shared_prefix_warm_c16 prefix
+# groups and their suffixes, and leave ~10k tokens for in-flight requests.
 [runtime_configurations.serial]
 backend = "native-mlx"
-environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648" }
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "256" }
 
 [runtime_configurations.overlap]
 backend = "native-mlx"
-environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648" }
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "256" }
 
 # load_mode: sequential (concurrency 1), burst (all requests at once), or
 # closed-loop (keep `concurrency` requests in flight).
@@ -162,8 +164,8 @@ cache_state = "warm-prefix"
 primary_metric = "ttft"
 
 # Four 2k requests stay in flight (~8.3k tokens) while the 16 unique prompts
-# total ~33k tokens, so the primary model's cache must evict. Models with a
-# smaller KV footprint per token may not reach eviction.
+# total ~33k tokens, more than the 256-entry (4k-token) prefix cache holds, so
+# the cache must evict.
 [workloads.cache_pressure_c4]
 prompt_group = "cache_pressure"
 output_tokens = 16
@@ -240,7 +242,7 @@ rounds = 2
 trials = 2
 runtime_configurations = ["serial", "overlap"]
 diagnostics = ["gateway", "prefill", "decode", "scheduler", "cache"]
-coverage = { primary = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c4"], dense = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c16"], moe = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"], runtime_control = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] }
+coverage = { primary = ["interactive_stream_c1", "short_nonstream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c4"], dense = ["cold_prefill_2k_c1", "decode_128_c1", "mixed_c8", "shared_prefix_warm_c16", "cache_pressure_c4"], moe = ["decode_128_c1", "steady_short_c4", "steady_short_c8", "mixed_c8"], runtime_control = ["interactive_stream_c1", "short_nonstream_c1", "steady_short_c4", "steady_short_c8"] }
 
 [suites.release]
 rounds = 2
