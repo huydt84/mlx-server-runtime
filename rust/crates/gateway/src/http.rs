@@ -347,6 +347,9 @@ fn drain_connections(connections: &mut Vec<thread::JoinHandle<()>>, timeout: Dur
 }
 
 fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), GatewayError> {
+    // On macOS an accepted socket inherits the listener's non-blocking flag, so
+    // a request whose body arrives after its headers would fail with WouldBlock.
+    stream.set_nonblocking(false)?;
     // Disable Nagle's algorithm: small SSE frames are time-sensitive and
     // should not be delayed waiting for a TCP ACK.  This is safe for all
     // connections (non-SSE responses also flush explicitly).
@@ -4110,5 +4113,36 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_millis(500));
         drop(client);
+    }
+
+    #[test]
+    fn request_body_arriving_after_headers_still_gets_a_response() {
+        let mut config = RuntimeConfig::default();
+        config.server.port = 0;
+        let server = HttpServer::bind(config, RuntimeState::new("model")).unwrap();
+        let address = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server_thread = thread::spawn(move || {
+            server
+                .serve_until(&server_shutdown, Duration::from_millis(100))
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(b"POST /missing HTTP/1.1\r\nContent-Length: 2\r\n\r\n")
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        client.write_all(b"{}").unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        shutdown.store(true, Ordering::Relaxed);
+        server_thread.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 404"), "{response:?}");
     }
 }
