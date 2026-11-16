@@ -243,6 +243,21 @@ assert not any(
     if summary["workload"] == "burst_nonstream"
 ), metrics
 PY
+python3 - "$COMMAND_LOG" <<'PY'
+import pathlib
+import sys
+
+progress = [
+    line
+    for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+    if line.startswith("[") and " round " in line
+]
+assert progress == [
+    "[1/3] round 1 primary/v1 sequential_stream trial 0: 2 ok, 0 errors",
+    "[2/3] round 1 primary/v1 burst_nonstream trial 0: 3 ok, 0 errors",
+    "[3/3] round 1 primary/v1 closed_stream trial 0: 6 ok, 0 errors",
+], progress
+PY
 test -s "$LOAD_DIR/report.md"
 test -s "$LOAD_DIR/logs/gateway.log"
 test -s "$LOAD_DIR/logs/worker.log"

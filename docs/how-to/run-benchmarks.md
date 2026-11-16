@@ -27,6 +27,15 @@ runtime order alternates between rounds and models to cancel order bias.
 Before measuring, each workload runs once with distinct warmup prompts of the
 same shape; warmup requests are recorded but never measured.
 
+While it runs, the command prints one progress line per completed trial to
+stderr, for example `[12/176] round 1 primary/serial decode_128_c1 trial 1: 4
+ok, 0 errors`. `results.json` and `report.md` are rewritten after every trial.
+
+Cold-cache workloads clear the prefix cache before each trial and fail
+validation if a request reuses cached tokens. A model whose chat template puts
+the same prefix before every prompt sets `cold_cache_allowance_tokens` to the
+number of cached tokens that prefix produces.
+
 `--focus` is optional. A focus (`gateway`, `prefill`, `decode`, `scheduler`,
 `cache`) narrows the suite to the focus's models and workloads.
 

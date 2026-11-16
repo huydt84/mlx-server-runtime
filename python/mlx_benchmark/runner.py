@@ -160,10 +160,13 @@ def run_benchmark(
         with _interrupts_raise():
             prompts = generate_prompt_bank(results["configuration"])
 
+            total_trials = _planned_trial_count(results["configuration"])
+
             def completed_trial(trial: dict[str, Any]) -> None:
                 results["trials"].append(trial)
                 _validate_completed_trial(results, trial)
                 _write_artifacts(run_directory, results)
+                _report_trial_progress(trial, len(results["trials"]), total_trials)
 
             for execution in _execution_plan(
                 results["configuration"], arguments.server_mode
@@ -920,6 +923,29 @@ def _execution_plan(
     return plan
 
 
+def _planned_trial_count(configuration: dict[str, Any]) -> int:
+    trials_per_workload = {
+        workload["name"]: int(workload["trials"])
+        for workload in configuration["workloads"]
+    }
+    return sum(
+        trials_per_workload[name]
+        for execution in configuration["executions"]
+        for name in configuration["coverage"][execution["model"]]
+    )
+
+
+def _report_trial_progress(trial: dict[str, Any], completed: int, total: int) -> None:
+    print(
+        f"[{completed}/{total}] round {trial['round']} {trial['model']}/"
+        f"{trial['runtime_configuration']} {trial['workload_name']} "
+        f"trial {trial['trial_index']}: {trial['success_count']} ok, "
+        f"{trial['error_count']} errors",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _configuration_for_execution(
     configuration: dict[str, Any], execution: dict[str, str]
 ) -> dict[str, Any]:
@@ -1410,7 +1436,12 @@ def _validate_completed_trial(results: dict[str, Any], trial: dict[str, Any]) ->
         _validate_request(results, request)
     cache_mode = trial["cache_state"]
     cached_tokens = [int(request["cached_tokens"]) for request in trial["requests"]]
-    if cache_mode == "cold" and any(cached_tokens):
+    allowance = next(
+        model["cold_cache_allowance_tokens"]
+        for model in results["configuration"]["models"]
+        if model["name"] == trial["model"]
+    )
+    if cache_mode == "cold" and any(cached > allowance for cached in cached_tokens):
         _validation_failure(
             results,
             "cold_cache_hit",

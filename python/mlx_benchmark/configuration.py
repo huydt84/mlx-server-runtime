@@ -233,6 +233,14 @@ def _validate(check: _Checker, raw: dict[str, Any]) -> None:
         for key in ("tokenizer", "revision"):
             if key in model:
                 check.string(model, key, f"{field}.{key}")
+        if "cold_cache_allowance_tokens" in model:
+            check.integer(
+                model,
+                "cold_cache_allowance_tokens",
+                f"{field}.cold_cache_allowance_tokens",
+                0,
+                1_000_000,
+            )
 
     runtimes = check.named_tables(raw, "runtime_configurations")
     for name, runtime in runtimes.items():
@@ -414,6 +422,9 @@ def _select(
                     "tokenizer", raw["models"][name]["checkpoint"]
                 ),
                 "revision": raw["models"][name].get("revision", _DEFAULT_REVISION),
+                "cold_cache_allowance_tokens": raw["models"][name].get(
+                    "cold_cache_allowance_tokens", 0
+                ),
             }
             for name in coverage
         ],

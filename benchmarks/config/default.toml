@@ -50,12 +50,16 @@ count = 16
 target_tokens = 2048
 
 # `tokenizer` defaults to `checkpoint`; `revision` defaults to the revision
-# the server reports at readiness.
+# the server reports at readiness. `cold_cache_allowance_tokens` (default 0) is
+# how many cached tokens a cold-cache request may reuse from a chat-template
+# prefix that every request shares.
 [models.primary]
 checkpoint = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 
+# Qwen2.5's default system prompt fills one 16-token KV page.
 [models.dense]
 checkpoint = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+cold_cache_allowance_tokens = 16
 
 [models.moe]
 checkpoint = "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
