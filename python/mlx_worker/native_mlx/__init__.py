@@ -1,24 +1,24 @@
 """Native MLX backend seams for native-v2."""
 
-from .interfaces import (
-    ExecutionBatch,
-    ForwardBatch,
-    NativeModel,
-    NativeMlxDiagnostics,
-    NativeMlxExecutor,
-    NativeRuntime,
-    NativeScheduler,
-    RuntimeEvent,
-    SamplingParams,
-    SchedulerEvent,
-    StepResult,
-)
 from .execution_backends import (
     DEFAULT_NATIVE_EXECUTION_BACKEND,
     NativeExecutionBackendBundle,
     available_native_execution_backends,
     build_native_execution_backend,
     validate_native_execution_backend_id,
+)
+from .interfaces import (
+    ExecutionBatch,
+    ForwardBatch,
+    NativeMlxDiagnostics,
+    NativeMlxExecutor,
+    NativeModel,
+    NativeRuntime,
+    NativeScheduler,
+    RuntimeEvent,
+    SamplingParams,
+    SchedulerEvent,
+    StepResult,
 )
 from .registry import (
     ArchitectureExecutionPlan,
@@ -28,16 +28,16 @@ from .registry import (
 )
 
 __all__ = [
-    "ArchitectureSpec",
-    "ArchitectureExecutionPlan",
-    "CompatibilityProbe",
     "DEFAULT_NATIVE_EXECUTION_BACKEND",
+    "ArchitectureExecutionPlan",
+    "ArchitectureSpec",
+    "CompatibilityProbe",
     "ExecutionBatch",
     "ForwardBatch",
-    "NativeModel",
     "NativeExecutionBackendBundle",
     "NativeMlxDiagnostics",
     "NativeMlxExecutor",
+    "NativeModel",
     "NativeRuntime",
     "NativeScheduler",
     "RuntimeEvent",
@@ -46,6 +46,6 @@ __all__ = [
     "StepResult",
     "available_native_execution_backends",
     "build_native_execution_backend",
-    "validate_native_execution_backend_id",
     "get_architecture_spec",
+    "validate_native_execution_backend_id",
 ]

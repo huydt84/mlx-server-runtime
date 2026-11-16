@@ -9,7 +9,6 @@ import sys
 import tarfile
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_TOOL = REPO_ROOT / "scripts/release_tool.py"
 INSTALLER = REPO_ROOT / "install.sh"

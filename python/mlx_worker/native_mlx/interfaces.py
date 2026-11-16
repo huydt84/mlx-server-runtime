@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import mlx.core as mx
 
@@ -23,7 +24,7 @@ class ForwardMode(str, Enum):
     MIXED = "mixed"
 
     @classmethod
-    def from_phases(cls, phases: Sequence[ExecutionPhase]) -> "ForwardMode":
+    def from_phases(cls, phases: Sequence[ExecutionPhase]) -> ForwardMode:
         """Derive one physical forward mode from request-local phases."""
 
         has_prefill = False
@@ -312,7 +313,7 @@ class NativeMlxDiagnostics(Protocol):
 class NativeScheduler(Protocol):
     """Token-level scheduler boundary for native MLX."""
 
-    def submit(self, request: "SchedulableRequest") -> None:
+    def submit(self, request: SchedulableRequest) -> None:
         """Queue typed token work."""
 
     def cancel(self, request_id: str) -> bool: ...
@@ -320,7 +321,7 @@ class NativeScheduler(Protocol):
     def finish(self, request_id: str) -> None:
         """Release scheduler-owned state and cache for a terminal request."""
 
-    def tick(self) -> tuple["SchedulerEvent", ...]: ...
+    def tick(self) -> tuple[SchedulerEvent, ...]: ...
 
     def idle(self) -> bool: ...
 

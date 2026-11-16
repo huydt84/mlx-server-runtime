@@ -11,12 +11,12 @@ import mlx.core as mx
 from .cache import (
     BatchCacheReservation,
     DenseBatchReservation,
-    DenseLayerCache,
     DenseKVCacheBackend,
-    PagedBatchReservation,
-    PagedKVCacheBackend,
+    DenseLayerCache,
     HybridBatchReservation,
     HybridPagedKVCacheBackend,
+    PagedBatchReservation,
+    PagedKVCacheBackend,
 )
 from .interfaces import ForwardMode, HybridLayerAttentionContext, LayerAttentionContext
 from .paged_decode import paged_decode_attention, simdgroups_for
@@ -211,7 +211,7 @@ class PagedLayerAttentionContext:
     reservation: PagedBatchReservation
     layer_index: int
     forward_mode: ForwardMode
-    attention_backend: "PagedMetalAttentionBackend"
+    attention_backend: PagedMetalAttentionBackend
     step_masks: dict[int | None, mx.array | str | None] = field(default_factory=dict)
     """Masks shared by every layer of one step, keyed by sliding-window size."""
 

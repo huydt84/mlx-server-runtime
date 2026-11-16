@@ -185,7 +185,7 @@ def _merge_kernel() -> Any:
 
 
 @lru_cache(maxsize=64)
-def _scalar(value: float | int, dtype: Any) -> mx.array:
+def _scalar(value: float, dtype: Any) -> mx.array:
     return mx.array([value], dtype=dtype)
 
 

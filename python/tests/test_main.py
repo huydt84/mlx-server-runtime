@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from typing import Callable
+from collections.abc import Callable
 from types import SimpleNamespace
 
 from mlx_worker.ipc import (
@@ -24,7 +24,7 @@ class FakeSocket:
         self.connected_to: str | None = None
         self.shutdown_called = False
 
-    def __enter__(self) -> "FakeSocket":
+    def __enter__(self) -> FakeSocket:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -221,7 +221,6 @@ def test_main_skips_final_event_when_cancelled(monkeypatch) -> None:
             emit_delta("hel")
             assert should_cancel is not None
             assert should_cancel()
-            return None
 
     exit_code = worker_main.main(engine_factory=FakeEngine)
 
@@ -273,7 +272,6 @@ def test_main_detects_buffered_cancel_without_socket_readable(monkeypatch) -> No
             emit_delta("hel")
             assert should_cancel is not None
             assert should_cancel()
-            return None
 
     exit_code = worker_main.main(engine_factory=FakeEngine)
 
@@ -411,8 +409,8 @@ def test_main_preserves_stream_when_buffered_frame_is_malformed(monkeypatch) -> 
 def test_main_continuous_batching_validates_text_and_vlm_backends(
     monkeypatch,
 ) -> None:
-    from mlx_worker import main as worker_main
     import mlx_worker.vlm_engine as vlm_mod
+    from mlx_worker import main as worker_main
 
     validations: list[str] = []
 
@@ -631,11 +629,11 @@ def test_main_routes_text_request_to_text_engine_when_vlm_available(
 def test_main_routes_text_and_vlm_requests_through_continuous_batch_loop(
     monkeypatch,
 ) -> None:
-    from mlx_worker import main as worker_main
     import mlx_worker.vlm_engine as vlm_mod
+    from mlx_worker import main as worker_main
 
     class FakeTextScheduler:
-        instances: list["FakeTextScheduler"] = []
+        instances: list[FakeTextScheduler] = []
 
         def __init__(self, *args, **kwargs) -> None:
             self.submitted: list[str] = []
@@ -678,7 +676,7 @@ def test_main_routes_text_and_vlm_requests_through_continuous_batch_loop(
             self.closed = True
 
     class FakeVlmScheduler:
-        instances: list["FakeVlmScheduler"] = []
+        instances: list[FakeVlmScheduler] = []
 
         def __init__(self, engine, sink, **kwargs) -> None:
             self.engine = engine
@@ -1184,10 +1182,9 @@ def test_main_vlm_engine_not_warmed_eagerly(monkeypatch) -> None:
 def test_main_default_vlm_engine_lazy_construction(monkeypatch) -> None:
     """When vlm_model is configured without injection, MlxVlmEngine is
     lazily constructed on first VLM request, not during bootstrap."""
-    from mlx_worker import main as worker_main
-
     # Must patch before main() triggers the local import.
     import mlx_worker.vlm_engine as vlm_mod
+    from mlx_worker import main as worker_main
 
     constructed_ids: list[str] = []
     constructed_engines: list[object] = []

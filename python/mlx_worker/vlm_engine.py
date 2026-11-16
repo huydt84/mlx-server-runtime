@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from collections import deque
 import copy
 import hashlib
-import math
-from contextlib import suppress
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
 import importlib
 import importlib.metadata
 import inspect
-from typing import Sequence
-from typing import Any, Callable
+import math
+import time
+from collections import deque
+from collections.abc import Callable, Sequence
+from contextlib import suppress
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from .batching import (
@@ -377,8 +377,8 @@ def _load_vlm_components() -> tuple[Callable[..., Any], Callable[..., Any]]:
     non-streaming VLM startup.
     """
     try:
-        from mlx_vlm import load as vlm_load
         from mlx_vlm import generate as vlm_generate
+        from mlx_vlm import load as vlm_load
     except ModuleNotFoundError as exc:  # pragma: no cover - host-only dependency
         raise RuntimeError("mlx-vlm is required for the VLM worker engine") from exc
 
@@ -1222,9 +1222,7 @@ class VlmContinuousBatchScheduler:
             if tokenizer is not None and job.generated_tokens:
                 decoded = tokenizer.decode(job.generated_tokens)
                 delta_text = (
-                    decoded[len(job.rendered_text) :]
-                    if decoded.startswith(job.rendered_text)
-                    else decoded
+                    decoded.removeprefix(job.rendered_text)
                 )
             else:
                 delta_text = getattr(response, "text", "") or ""
@@ -1380,9 +1378,7 @@ class VlmContinuousBatchScheduler:
         )
         image_width, image_height = _image_dimensions(model_inputs)
         prompt_signature = hashlib.sha256(
-            f"{self._engine.model_id}|{prompt}|{tuple(full_prompt_tokens)}".encode(
-                "utf-8"
-            )
+            f"{self._engine.model_id}|{prompt}|{tuple(full_prompt_tokens)}".encode()
         ).hexdigest()
         apc_cache_key = _vlm_apc_cache_key(
             model_id=self._engine.model_id,

@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import signal
 import socket
@@ -17,8 +14,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from types import FrameType
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -31,7 +32,6 @@ from mlx_benchmark.prompts import (
 )
 from mlx_benchmark.report import render_report
 from mlx_benchmark.statistics import analyze_calibration, analyze_run
-
 
 _MLX_AIR_VERSION_ENV = "MLX_AIR_VERSION"
 _INVOCATION_DIRECTORY_ENV = "MLX_AIR_INVOCATION_DIRECTORY"
@@ -779,13 +779,13 @@ def _resolve_run_directory(output_dir: str | None) -> Path:
     if output_dir is not None:
         requested = Path(output_dir).expanduser()
         return requested if requested.is_absolute() else invocation / requested
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return invocation / "artifacts" / "benchmark" / f"{timestamp}-{os.getpid()}"
 
 
 def _resolve_calibration_directory() -> Path:
     invocation = Path(os.environ.get(_INVOCATION_DIRECTORY_ENV, os.getcwd()))
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return (
         invocation
         / "artifacts"
@@ -1584,4 +1584,4 @@ def _interrupts_raise() -> Iterator[None]:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()

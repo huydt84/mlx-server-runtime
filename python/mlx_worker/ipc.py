@@ -6,7 +6,6 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-
 ModelState = Literal[
     "not_loaded",
     "downloading",
@@ -303,14 +302,14 @@ def encode_bootstrap_message(
     if isinstance(message, WorkerError):
         if message.error is None:
             sanitized = message.message.replace("\n", " ")
-            return f"ERROR\t{sanitized}\n".encode("utf-8")
+            return f"ERROR\t{sanitized}\n".encode()
         payload = {
             "message": message.message.replace("\n", " "),
             "error": asdict(message.error),
         }
-        return f"ERROR\t{json.dumps(payload)}\n".encode("utf-8")
+        return f"ERROR\t{json.dumps(payload)}\n".encode()
 
-    return f"STATUS\t{json.dumps(asdict(message))}\n".encode("utf-8")
+    return f"STATUS\t{json.dumps(asdict(message))}\n".encode()
 
 
 def _model_error_from_dict(data: dict[str, Any] | None) -> ModelError | None:

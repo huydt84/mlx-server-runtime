@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import sys
-from typing import Sequence
+from collections.abc import Sequence
+from pathlib import Path
 
 from mlx_benchmark.configuration import ConfigurationError, load_selected_configuration
 from mlx_benchmark.runner import run_benchmark, run_calibration, run_diagnostics

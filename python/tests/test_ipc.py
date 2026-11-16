@@ -6,11 +6,11 @@ import unittest
 from mlx_worker.ipc import (
     BenchmarkResetRequest,
     BenchmarkResetState,
-    ChatCompletionRequest,
+    CancelRequest,
     ChatCompletionDelta,
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
-    CancelRequest,
     ImageContent,
     ModelError,
     ModelLoadProgress,

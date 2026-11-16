@@ -5,8 +5,8 @@ from __future__ import annotations
 import inspect
 import select
 import time
+from collections.abc import Callable
 from socket import socket
-from typing import Callable
 
 from ..config import WorkerConfig
 from ..ipc import (

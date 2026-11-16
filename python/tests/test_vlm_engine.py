@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import field
 import sys
-from types import ModuleType, SimpleNamespace
 import threading
+from dataclasses import field
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from mlx_worker.batching import PromptCacheStore
 from mlx_worker.ipc import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -16,11 +17,10 @@ from mlx_worker.ipc import (
     ImageContent,
     TextContent,
 )
-from mlx_worker.batching import PromptCacheStore
 from mlx_worker.vlm_engine import (
+    _MAX_IMAGES_PER_REQUEST,
     MlxVlmEngine,
     VlmContinuousBatchScheduler,
-    _MAX_IMAGES_PER_REQUEST,
     _validate_image_source,
     validate_vlm_continuous_batching_backend,
 )  # fmt: skip
@@ -117,7 +117,7 @@ class FakeEmbeddingOutput:
 
 
 class FakeVlmBatchGenerator:
-    instances: list["FakeVlmBatchGenerator"] = []
+    instances: list[FakeVlmBatchGenerator] = []
 
     def __init__(
         self,

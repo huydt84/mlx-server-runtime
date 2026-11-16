@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
+import queue
+import select
 import signal
 import socket
-import select
-import time
-import queue
 import threading
+import time
+from collections.abc import Callable
 from contextlib import suppress
-from typing import Callable
 
 from .batching import (
     BatchEventSink,
@@ -23,9 +23,9 @@ from .config import load_config
 from .ipc import (
     BenchmarkResetRequest,
     BenchmarkResetState,
-    ChatCompletionResponse,
-    ChatCompletionDelta,
     CancelRequest,
+    ChatCompletionDelta,
+    ChatCompletionResponse,
     ModelError,
     ModelLoadProgress,
     ModelStatus,
@@ -327,11 +327,7 @@ def main(
                             # Lazy initialize VLM engine on first request.
                             if vlm_engine is None:
                                 vlm_engine = vlm_engine_factory(config.vlm_model)
-                                setattr(
-                                    vlm_engine,
-                                    "max_images_per_request",
-                                    getattr(config, "max_vlm_images", 5),
-                                )
+                                vlm_engine.max_images_per_request = getattr(config, "max_vlm_images", 5)
                             active_engine: object | None = vlm_engine
                         elif request.model == config.model:
                             active_engine = engine
@@ -518,11 +514,7 @@ def _run_continuous_batch_loop(
             )
         if vlm_engine is None:
             vlm_engine = vlm_engine_factory(vlm_model)
-            setattr(
-                vlm_engine,
-                "max_images_per_request",
-                getattr(config, "max_vlm_images", 5),
-            )
+            vlm_engine.max_images_per_request = getattr(config, "max_vlm_images", 5)
         vlm_scheduler = VlmContinuousBatchScheduler(
             vlm_engine,
             BatchEventSink(

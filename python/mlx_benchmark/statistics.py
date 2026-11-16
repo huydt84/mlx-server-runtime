@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 import math
 import statistics as stdlib_statistics
+from collections import defaultdict
 from typing import Any
-
 
 # Metric name -> (unit, better direction).
 METRICS = {

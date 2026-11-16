@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,12 +13,12 @@ from ..ipc import ModelError
 from .cache import KVCacheBackend
 from .cache_coordinator import NativeCacheCoordinator
 from .diagnostics import ModelDiagnostics
-from .executor import MlxGenerationExecutor, MlxOverlapGenerationExecutor
 from .execution_backends import (
     DEFAULT_NATIVE_EXECUTION_BACKEND,
     build_native_execution_backend,
     validate_native_execution_backend_id,
 )
+from .executor import MlxGenerationExecutor, MlxOverlapGenerationExecutor
 from .graph_profile import GraphProfiledModel
 from .interfaces import NativeBackendOptions
 from .mapping import (
@@ -27,13 +27,13 @@ from .mapping import (
     load_mapped_weights,
     load_weight_index,
 )
-from .registry import ArchitectureExecutionPlan, ArchitectureSpec, get_architecture_spec
 from .prefix_cache import (
     BlockHashPrefixCache,
     NoPrefixCache,
     PrefixCompatibilityFingerprint,
     RadixPrefixCache,
 )
+from .registry import ArchitectureExecutionPlan, ArchitectureSpec, get_architecture_spec
 
 
 @dataclass(frozen=True)

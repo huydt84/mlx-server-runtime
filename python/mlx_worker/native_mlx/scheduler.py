@@ -37,12 +37,12 @@ class SchedulerPolicy(Protocol):
 
     def order(
         self,
-        states: list["_ScheduledState"],
+        states: list[_ScheduledState],
         *,
         scheduler_round: int,
         cache_coordinator: CacheCoordinator,
         timings: dict[str, int],
-    ) -> list["_ScheduledState"]:
+    ) -> list[_ScheduledState]:
         """Return states in preferred admission order."""
 
 

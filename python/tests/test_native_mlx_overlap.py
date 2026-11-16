@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import pytest
 import mlx.core as mx
+import pytest
 
 from mlx_worker.native_mlx.overlap import probe_cross_stream_dependency
 

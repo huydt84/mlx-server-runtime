@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 
 from ..interfaces import (
     ForwardBatch,
@@ -103,7 +103,7 @@ class SwitchLinear(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         mode: str = "affine",
-    ) -> "QuantizedSwitchLinear":
+    ) -> QuantizedSwitchLinear:
         quantized = QuantizedSwitchLinear(
             self.weight.shape[-1],
             self.weight.shape[-2],

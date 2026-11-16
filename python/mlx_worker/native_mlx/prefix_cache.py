@@ -8,8 +8,7 @@ import time
 from dataclasses import dataclass, field
 
 from .cache import KVCacheBackend
-from .interfaces import CachePublication, PrefixProbe
-from .interfaces import CacheAdmission
+from .interfaces import CacheAdmission, CachePublication, PrefixProbe
 
 
 @dataclass(frozen=True)
@@ -118,8 +117,8 @@ class _RadixNode:
     bytes: int = 0
     last_used: int = 0
     pins: int = 0
-    parent: "_RadixNode | None" = None
-    children: dict[int, "_RadixNode"] = field(default_factory=dict)
+    parent: _RadixNode | None = None
+    children: dict[int, _RadixNode] = field(default_factory=dict)
 
 
 @dataclass

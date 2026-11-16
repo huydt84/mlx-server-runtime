@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 import mlx.core as mx
 
@@ -150,7 +150,7 @@ class ModelDiagnostics:
             prompt_fingerprint=prompt_fingerprint,
             cache=[
                 DenseLayerCache()
-                for _ in range(int(getattr(self.model_config, "num_hidden_layers")))
+                for _ in range(int(self.model_config.num_hidden_layers))
             ],
             decode_input_token_ids=reference.decode_input_token_ids,
             sample_size=sample_size,

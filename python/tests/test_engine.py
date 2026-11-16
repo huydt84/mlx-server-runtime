@@ -1,20 +1,20 @@
 from __future__ import annotations
 
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType, SimpleNamespace
-import sys
 
 from mlx_worker.batching import (
-    BatchEventSink,
     BatchBackendContext,
+    BatchEventSink,
     ContinuousBatchScheduler,
     MlxBatchCompletionBackend,
     PromptCacheStore,
     validate_continuous_batching_backend,
 )
 from mlx_worker.engine import MlxWorkerEngine
-from mlx_worker.ipc import ChatCompletionRequest, ChatMessage, ChatCompletionResponse
+from mlx_worker.ipc import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
 
 
 @dataclass
@@ -30,7 +30,7 @@ class FakeTokenizer:
 
 
 class FakeBatchGenerator:
-    instances: list["FakeBatchGenerator"] = []
+    instances: list[FakeBatchGenerator] = []
 
     def __init__(self, model, stop_tokens=None) -> None:
         self.model = model

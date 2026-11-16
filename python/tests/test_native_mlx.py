@@ -10,18 +10,18 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
 import pytest
+from mlx import nn
 
-from mlx_worker.native_mlx.bootstrap import (
-    NativeBootstrapFailure,
-    build_native_artifacts,
-    detect_native_architecture,
-)
 from mlx_worker.native_mlx.attention import (
     AttentionBackendCapabilities,
     DenseReferenceAttentionBackend,
     PagedMetalAttentionBackend,
+)
+from mlx_worker.native_mlx.bootstrap import (
+    NativeBootstrapFailure,
+    build_native_artifacts,
+    detect_native_architecture,
 )
 from mlx_worker.native_mlx.cache import (
     DenseBatchReservation,
@@ -33,14 +33,14 @@ from mlx_worker.native_mlx.cache import (
     PagedRequestCache,
 )
 from mlx_worker.native_mlx.cache_coordinator import NativeCacheCoordinator
-from mlx_worker.native_mlx.executor import (
-    MlxGenerationExecutor,
-    MlxOverlapGenerationExecutor,
-)
 from mlx_worker.native_mlx.execution_backends import (
     DEFAULT_NATIVE_EXECUTION_BACKEND,
     available_native_execution_backends,
     build_native_execution_backend,
+)
+from mlx_worker.native_mlx.executor import (
+    MlxGenerationExecutor,
+    MlxOverlapGenerationExecutor,
 )
 from mlx_worker.native_mlx.graph_profile import GraphProfiledModel
 from mlx_worker.native_mlx.interfaces import (
@@ -61,9 +61,9 @@ from mlx_worker.native_mlx.models.qwen2 import (
     Qwen2ModelConfig,
     Qwen2WeightAdapter,
 )
-from mlx_worker.native_mlx.prefix_cache import NoPrefixCache
 from mlx_worker.native_mlx.prefix_cache import (
     BlockHashPrefixCache,
+    NoPrefixCache,
     PrefixCompatibilityFingerprint,
     RadixPrefixCache,
 )

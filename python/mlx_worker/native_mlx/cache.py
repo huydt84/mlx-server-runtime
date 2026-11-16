@@ -439,7 +439,7 @@ class PagedBatchReservation:
     exclusively, so an aborted reservation leaves no visible change.
     """
 
-    backend: "PagedKVCacheBackend"
+    backend: PagedKVCacheBackend
     request_caches: tuple[PagedRequestCache, ...]
     append_lengths: tuple[int, ...]
     candidate_tables: tuple[tuple[int, ...], ...]
@@ -814,7 +814,7 @@ class PagedKVCacheBackend:
     def _build_reservation(
         self,
         *,
-        backend: "PagedKVCacheBackend",
+        backend: PagedKVCacheBackend,
         request_caches: tuple[PagedRequestCache, ...],
         append_lengths: tuple[int, ...],
         candidate_tables: tuple[tuple[int, ...], ...],

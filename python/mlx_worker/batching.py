@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict, deque
-from contextlib import suppress
 import copy
-from dataclasses import dataclass, field
 import importlib
 import importlib.metadata
 import inspect
 import time
-from typing import Any, Callable, Literal, Protocol, Sequence
+from collections import OrderedDict, deque
+from collections.abc import Callable, Sequence
+from contextlib import suppress
+from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol
 
 from .ipc import ChatCompletionRequest, ChatCompletionResponse
-
 
 CacheMatchKind = Literal["exact", "shorter_prefix", "trimmed_longer_prefix"]
 
@@ -45,10 +45,10 @@ class CacheBudgetManager:
 
     def __init__(self, total_budget_bytes: int) -> None:
         self._total_budget_bytes = max(0, total_budget_bytes)
-        self._stores: list["PromptCacheStore"] = []
+        self._stores: list[PromptCacheStore] = []
         self._active_batch_bytes: dict[str, int] = {}
 
-    def register(self, store: "PromptCacheStore") -> None:
+    def register(self, store: PromptCacheStore) -> None:
         if store not in self._stores:
             self._stores.append(store)
 
@@ -785,9 +785,7 @@ class ContinuousBatchScheduler:
 
         decoded = self._context.tokenizer.decode(job.generated_tokens)
         delta = (
-            decoded[len(job.rendered_text) :]
-            if decoded.startswith(job.rendered_text)
-            else decoded
+            decoded.removeprefix(job.rendered_text)
         )
         if delta:
             self._sink.emit_delta(job.request.request_id, delta)

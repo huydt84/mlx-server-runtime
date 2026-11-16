@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import mlx.core as mx
 import numpy as np
@@ -233,7 +234,7 @@ def trace_model_step(
     backend: str,
     phase: str,
     step_index: int,
-    collector: "_TraceCollector",
+    collector: _TraceCollector,
 ) -> tuple[np.ndarray, list[TraceCheckpoint]]:
     """Trace one prefill or decode semantic step."""
 

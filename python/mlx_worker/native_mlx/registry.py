@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
 import importlib
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import cache
+from typing import Any
 
 import mlx.core as mx
 
@@ -45,8 +46,8 @@ class ArchitectureSpec:
     supports_prefix_cache: bool = True
     cache_family: str = "kv"
 
-    @lru_cache(maxsize=None)
-    def resolve(self) -> "ArchitectureExecutionPlan":
+    @cache
+    def resolve(self) -> ArchitectureExecutionPlan:
         """Freeze selected family callables once during bootstrap."""
 
         module = _load_module(self.module_name)
@@ -95,7 +96,7 @@ class ArchitectureExecutionPlan:
     cache_family: str
 
 
-@lru_cache(maxsize=None)
+@cache
 def _load_module(module_name: str) -> Any:
     """Import one model module once, after architecture selection."""
 

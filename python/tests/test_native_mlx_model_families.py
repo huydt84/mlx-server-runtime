@@ -10,6 +10,7 @@ from mlx_worker.native_mlx.cache import (
     HybridPagedKVCacheBackend,
     KVCacheGeometry,
 )
+from mlx_worker.native_mlx.execution_backends import build_native_execution_backend
 from mlx_worker.native_mlx.interfaces import (
     ForwardBatch,
     ForwardMode,
@@ -28,7 +29,6 @@ from mlx_worker.native_mlx.models.qwen3 import (
     parse_qwen3_config,
 )
 from mlx_worker.native_mlx.registry import get_architecture_spec
-from mlx_worker.native_mlx.execution_backends import build_native_execution_backend
 
 
 def test_registered_model_families_match_real_checkpoint_architecture_classes() -> None:

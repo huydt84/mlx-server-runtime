@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
+import tomllib
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from mlx_benchmark.statistics import METRICS, STREAMING_ONLY_METRICS
-
-import tomllib
-
 
 SCHEMA_VERSION = 2
 _PROMPT_KINDS = {

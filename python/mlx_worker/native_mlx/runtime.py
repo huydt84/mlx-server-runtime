@@ -458,9 +458,7 @@ class NativeRuntime:
                 )
             )
             delta = (
-                text[len(state.decoded_prefix) :]
-                if text.startswith(state.decoded_prefix)
-                else text
+                text.removeprefix(state.decoded_prefix)
             )
             state.decoded_prefix = text
         emitted, stop_hit = state.stop.push(delta)
@@ -687,7 +685,7 @@ def _new_streaming_detokenizer(tokenizer: Any) -> Any | None:
     """Create one request-local streaming detokenizer when supported."""
 
     try:
-        detokenizer = getattr(tokenizer, "detokenizer")
+        detokenizer = tokenizer.detokenizer
     except (AttributeError, TypeError):
         return None
     return detokenizer if callable(getattr(detokenizer, "add_token", None)) else None

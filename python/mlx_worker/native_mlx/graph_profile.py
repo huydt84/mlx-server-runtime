@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 
 from .interfaces import ForwardBatch, NativeModel
-
 
 _LAYER_INDEX_RE = re.compile(
     r"(?:^|\.)(?:layers|blocks|h|decoder_layers)\.(\d+)(?:\.|$)"
@@ -98,7 +98,7 @@ class GraphProfiledModel:
     def __init__(self, model: NativeModel) -> None:
         self._model = model
         self._recorder = _GraphProfileRecorder()
-        self.num_layers = int(getattr(model, "num_layers"))
+        self.num_layers = int(model.num_layers)
         self._wrap_selected_modules()
 
     def __call__(

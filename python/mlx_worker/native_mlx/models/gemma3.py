@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 
 from ..interfaces import ForwardBatch, LayerAttentionContext, select_logits_positions
 from ..mapping import (
