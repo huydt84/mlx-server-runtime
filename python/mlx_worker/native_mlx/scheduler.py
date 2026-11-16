@@ -13,7 +13,6 @@ from .interfaces import (
     CacheCoordinator,
     ExecutionBatch,
     ExecutionRequest,
-    ForwardMode,
     NativeMlxExecutor,
     SchedulableRequest,
     SchedulerEvent,
@@ -245,8 +244,8 @@ class NativeContinuousScheduler:
             for name in (
                 "prepare_batch",
                 "execute_prepared",
-                "execute_prepared_serial",
                 "dispatch_batch",
+                "launch_batch",
                 "resolve_batch",
                 "discard_batch",
                 "commit_dispatched",
@@ -342,14 +341,26 @@ class NativeContinuousScheduler:
         return tuple(events)
 
     def _tick_overlap(self) -> tuple[SchedulerEvent, ...]:
-        """Resolve step N and launch step N+1, then return N's events.
+        """Build step N+1, resolve step N, then return N's events.
 
-        When N is a decode step that the next step would simply continue, N+1
-        is dispatched before N resolves, fed by N's sampled tokens while they
-        are still on the device. The GPU then never waits for the CPU to read
-        N's tokens and build N+1's graph.
+        N+1 is normally built before N resolves: a decode step reads N's
+        sampled tokens while they are still on the device, and a prefill step
+        does not depend on N at all. The GPU then never waits for the CPU to
+        read N's tokens and build N+1's graph. Every step, prefill included,
+        is evaluated asynchronously and resolved on the following tick.
+
+        A decode step that follows a decode step is enqueued at once. Any
+        other chained step is enqueued at the start of the next tick, after
+        N's events are returned: enqueueing blocks while a long step fills
+        Metal's command queue, which would otherwise hold back N's tokens.
         """
 
+        if self._in_flight is not None:
+            try:
+                self._executor.launch_batch(self._in_flight.executor_step)  # type: ignore[attr-defined]
+            except Exception:
+                # Resolving the step reports the failure for its rows.
+                pass
         events = self._pending_events
         self._pending_events = []
         late_events: list[SchedulerEvent] = []
@@ -408,17 +419,13 @@ class NativeContinuousScheduler:
                 try:
                     prepared = self._executor.prepare_batch(batch)  # type: ignore[attr-defined]
                     if prepared.has_work:
-                        if batch.forward_mode == ForwardMode.PREFILL:
-                            result = self._executor.execute_prepared_serial(prepared)  # type: ignore[attr-defined]
-                            immediate = (selected, result, timings, started)
-                        else:
-                            executor_step = self._executor.dispatch_batch(prepared)  # type: ignore[attr-defined]
-                            self._in_flight = _SchedulerInFlight(
-                                selected=selected,
-                                timings=timings,
-                                started=started,
-                                executor_step=executor_step,
-                            )
+                        executor_step = self._executor.dispatch_batch(prepared)  # type: ignore[attr-defined]
+                        self._in_flight = _SchedulerInFlight(
+                            selected=selected,
+                            timings=timings,
+                            started=started,
+                            executor_step=executor_step,
+                        )
                     else:
                         result = self._executor.execute_prepared(prepared)  # type: ignore[attr-defined]
                         immediate = (selected, result, timings, started)
@@ -458,48 +465,37 @@ class NativeContinuousScheduler:
     ) -> tuple[
         bool, tuple[list[_SelectedWork], StepResult, dict[str, int], float] | None
     ]:
-        """Dispatch the decode step that continues ``step`` before it resolves.
+        """Dispatch the step that follows ``step`` before ``step`` resolves.
 
         Returns whether this tick's next step was handled here, plus a result
         to apply when the chained step had no model work. Rows known to stop
         after ``step`` (cancelled, finished, or at ``max_tokens``) are left
-        out. A row that ``step`` ends with a terminal token still runs in the
-        chained step; that extra token is dropped when it resolves, and the
-        request's cache is released rather than published.
+        out. A row that ``step`` ends with a terminal token still runs in a
+        chained decode step; that extra token is dropped when it resolves, and
+        the request's cache is released rather than published.
         """
 
-        if not self._chain_allowed(step):
-            return False, None
-        continuing = [
-            item for item in step.selected if self._continues_after_step(item.state)
-        ]
-        if not continuing:
-            return False, None
-        request_ids = tuple(item.request.request_id for item in continuing)
         started = time.perf_counter()
-        pending = self._executor.device_next_tokens(step.executor_step, request_ids)  # type: ignore[attr-defined]
-        if pending is None:
+        timings = self._new_timings()
+        chained = self._chained_work(step, timings)
+        if chained is None:
             return False, None
+        selected, device_rows = chained
+        pending = None
+        if device_rows:
+            request_ids = tuple(
+                item.request.request_id for item in selected[:device_rows]
+            )
+            pending = self._executor.device_next_tokens(  # type: ignore[attr-defined]
+                step.executor_step, request_ids
+            )
+            if pending is None:
+                return False, None
         try:
             self._executor.commit_dispatched(step.executor_step)  # type: ignore[attr-defined]
         except Exception:
             # Resolving ``step`` reports the commit failure for its rows.
             return False, None
-        timings = self._new_timings()
-        selected = [
-            _SelectedWork(
-                state=item.state,
-                request=ExecutionRequest(
-                    request_id=item.request.request_id,
-                    phase="decode",
-                    token_ids=(0,),
-                    positions=(item.request.positions[-1] + 1,),
-                    cache_handle=item.state.cache_handle,
-                    sampling=item.state.work.sampling,
-                ),
-            )
-            for item in continuing
-        ]
         batch = ExecutionBatch(
             requests=tuple(item.request for item in selected),
             pending_token_ids=pending,
@@ -507,10 +503,14 @@ class NativeContinuousScheduler:
         try:
             prepared = self._executor.prepare_batch(batch)  # type: ignore[attr-defined]
             timings["scheduler_select_ms"] = _elapsed_ms(started)
+            self._record_selection(selected, started, timings)
             if not prepared.has_work:
                 result = self._executor.execute_prepared(prepared)  # type: ignore[attr-defined]
                 return True, (selected, result, timings, started)
-            executor_step = self._executor.dispatch_batch(prepared)  # type: ignore[attr-defined]
+            launch = all(
+                item.request.phase == "decode" for item in step.selected + selected
+            )
+            executor_step = self._executor.dispatch_batch(prepared, launch=launch)  # type: ignore[attr-defined]
         except BatchExecutionError as exc:
             self._emit_failures(selected, late_events, exc.code, str(exc))
             self._mark_finished(selected)
@@ -527,18 +527,64 @@ class NativeContinuousScheduler:
         )
         return True, None
 
-    def _chain_allowed(self, step: _SchedulerInFlight) -> bool:
-        """Return whether the next step would be a decode of ``step``'s rows."""
+    def _chained_work(
+        self, step: _SchedulerInFlight, timings: dict[str, int]
+    ) -> tuple[list[_SelectedWork], int] | None:
+        """Select the step after ``step`` while ``step`` is still running.
 
-        if any(item.request.phase != "decode" for item in step.selected):
-            return False
-        if self._prefill_candidates():
-            # Steps alternate between decode and prefill.
-            return False
+        Follows the same decode/prefill alternation as ``_select_work``. A
+        decode selection lists first the rows whose input token is ``step``'s
+        unresolved sample, and returns how many there are. Returns ``None``
+        when the next step depends on ``step``'s resolved state: another
+        prefill chunk after a prefill step.
+        """
+
         in_step = {item.request.request_id for item in step.selected}
-        return not any(
-            request_id not in in_step and self._decode_ready(state)
+        continuing = [item for item in step.selected if self._feeds_next_decode(item)]
+        resolved = [
+            state
             for request_id, state in self._running.items()
+            if request_id not in in_step and self._decode_ready(state)
+        ]
+        has_decode = bool(continuing or resolved)
+        if all(item.request.phase == "decode" for item in step.selected):
+            prefill_states = self._prefill_candidates()
+            if prefill_states:
+                selected = self._select_prefill(
+                    prefill_states, decode_waiting=has_decode, timings=timings
+                )
+                return (selected, 0) if selected else None
+        if not has_decode:
+            return None
+        self._last_step_prefilled = False
+        selected = [
+            _SelectedWork(
+                state=item.state,
+                request=ExecutionRequest(
+                    request_id=item.request.request_id,
+                    phase="decode",
+                    # Placeholder: the executor reads the device-resident token.
+                    token_ids=(0,),
+                    positions=(item.request.positions[-1] + 1,),
+                    cache_handle=item.state.cache_handle,
+                    sampling=item.state.work.sampling,
+                ),
+            )
+            for item in continuing
+        ]
+        selected.extend(self._decode_work(state) for state in resolved)
+        return selected, len(continuing)
+
+    def _feeds_next_decode(self, item: _SelectedWork) -> bool:
+        """Return whether ``item``'s sample is the input of its next decode."""
+
+        state = item.state
+        if not self._continues_after_step(state):
+            return False
+        if item.request.phase == "decode":
+            return True
+        return state.prompt_cursor + len(item.request.token_ids) == len(
+            state.work.prompt_token_ids
         )
 
     @staticmethod
@@ -638,17 +684,7 @@ class NativeContinuousScheduler:
         """
 
         decode_work = [
-            _SelectedWork(
-                state=state,
-                request=ExecutionRequest(
-                    request_id=state.work.request_id,
-                    phase="decode",
-                    token_ids=(int(state.last_token_id),),
-                    positions=(state.cache_length,),
-                    cache_handle=state.cache_handle,
-                    sampling=state.work.sampling,
-                ),
-            )
+            self._decode_work(state)
             for state in self._running.values()
             if self._decode_ready(state)
         ]
@@ -656,8 +692,37 @@ class NativeContinuousScheduler:
         if decode_work and (not prefill_states or self._last_step_prefilled):
             self._last_step_prefilled = False
             return decode_work
+        return self._select_prefill(
+            prefill_states, decode_waiting=bool(decode_work), timings=timings
+        )
+
+    @staticmethod
+    def _decode_work(state: _ScheduledState) -> _SelectedWork:
+        return _SelectedWork(
+            state=state,
+            request=ExecutionRequest(
+                request_id=state.work.request_id,
+                phase="decode",
+                token_ids=(int(state.last_token_id),),  # type: ignore[arg-type]
+                positions=(state.cache_length,),
+                cache_handle=state.cache_handle,
+                sampling=state.work.sampling,
+            ),
+        )
+
+    def _select_prefill(
+        self,
+        prefill_states: list[_ScheduledState],
+        *,
+        decode_waiting: bool,
+        timings: dict[str, int],
+    ) -> list[_SelectedWork]:
+        """Admit and select the next prefill chunks."""
+
         prefill_limit = (
-            1 if decode_work and self._prioritize_decode else self._prefill_batch_size
+            1
+            if decode_waiting and self._prioritize_decode
+            else self._prefill_batch_size
         )
         selected: list[_SelectedWork] = []
         prefill_states = self._policy.order(

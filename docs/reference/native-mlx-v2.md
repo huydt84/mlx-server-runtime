@@ -111,11 +111,10 @@ Useful native-v2 environment variables:
 Invalid native execution-backend, execution-mode, page-size, prefix-cache
 strategy, or scheduler-policy values must fail startup. They must not silently
 select dense attention, another prefix strategy, v1, `mlx-lm`, or `mlx-vlm`.
-The default `overlap` mode never silently falls back to serial. It keeps
-latency-sensitive pure prefill synchronous and pipelines decode only:
-consecutive decode steps are chained so the next step is dispatched, fed by
-the previous step's device-resident tokens, before the previous step's tokens
-are read on the CPU. Use
+The default `overlap` mode never silently falls back to serial. It
+builds every step, prefill included, before the previous step's tokens are
+read on the CPU: a decode step is fed the previous step's device-resident
+tokens, and a prefill step does not depend on the previous step. Use
 `mlx-host-validation/scripts/native_overlap.sh` to require exact serial/overlap
 output parity, a 2% performance confidence-bound gate, CPU overlap evidence,
 an MLX `.gputrace`, and matched serial/overlap Metal System Traces from the

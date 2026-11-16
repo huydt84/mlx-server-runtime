@@ -395,30 +395,29 @@ def analyze_timeline(args: argparse.Namespace) -> None:
         for line in args.events.read_text().splitlines()
         if line.strip()
     ]
-    dispatches = sorted(
-        [event for event in events if event.get("stage") == "async_dispatch"],
-        key=lambda event: int(event["monotonic_ns"]),
-    )
-    synchronizations = sorted(
-        [event for event in events if event.get("stage") == "synchronize_eval"],
-        key=lambda event: int(event["monotonic_ns"]),
-    )
+    # A step's events are recorded together when it resolves, so each
+    # synchronize_eval belongs to the preceding async_dispatch of the same
+    # request. Pairing by timestamp would be wrong: the next step is often
+    # dispatched before the previous step synchronizes.
+    steps = []
+    open_dispatches: dict[Any, dict[str, Any]] = {}
+    for event in events:
+        if event.get("stage") == "async_dispatch":
+            open_dispatches[event.get("request_id")] = event
+        elif event.get("stage") == "synchronize_eval":
+            dispatch = open_dispatches.pop(event.get("request_id"), None)
+            if dispatch is not None:
+                steps.append((dispatch, event))
+    dispatches = [dispatch for dispatch, _ in steps]
+    synchronizations = [
+        event for event in events if event.get("stage") == "synchronize_eval"
+    ]
     detokenizations = [
         event for event in events if event.get("stage") == "detokenization"
     ]
     windows = []
-    for dispatch in dispatches:
+    for dispatch, synchronization in steps:
         dispatch_ns = int(dispatch["monotonic_ns"])
-        synchronization = next(
-            (
-                event
-                for event in synchronizations
-                if int(event["monotonic_ns"]) >= dispatch_ns
-            ),
-            None,
-        )
-        if synchronization is None:
-            continue
         sync_end_ns = (
             int(synchronization["monotonic_ns"])
             + int(synchronization.get("duration_us", 0)) * 1_000

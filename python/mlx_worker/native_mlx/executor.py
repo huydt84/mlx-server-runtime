@@ -68,6 +68,8 @@ class InFlightStep:
     forward_mode: ForwardMode
     committed_lengths: tuple[int, ...] | None = None
     """Cache lengths when the reservation was committed before resolution."""
+    launched: bool = False
+    """Whether the graph was already enqueued for asynchronous evaluation."""
 
 
 @dataclass
@@ -429,7 +431,11 @@ class MlxGenerationExecutor:
         token_lengths: list[int],
         cache_lengths: list[int],
     ) -> _BatchLayout:
-        """Lay out a decode step whose input tokens are still on the device."""
+        """Lay out a decode step whose leading input tokens are on the device.
+
+        ``pending_token_ids`` holds the input tokens of the first rows; the
+        remaining rows use their own ``token_ids``.
+        """
 
         pending = batch.pending_token_ids
         assert pending is not None
@@ -438,11 +444,18 @@ class MlxGenerationExecutor:
                 "INVALID_EXECUTION_BATCH",
                 "device-resident input tokens require a decode-only batch",
             )
-        if tuple(pending.shape) != (len(batch.requests),):
+        if pending.ndim != 1 or not 0 < pending.shape[0] <= len(batch.requests):
             raise BatchExecutionError(
                 "INVALID_EXECUTION_BATCH",
-                "device-resident input tokens must match the batch size",
+                "device-resident input tokens must cover the leading batch rows",
             )
+        pending = pending.astype(mx.int32)
+        device_rows = int(pending.shape[0])
+        if device_rows < len(batch.requests):
+            host_tokens = [
+                request.token_ids[0] for request in batch.requests[device_rows:]
+            ]
+            pending = mx.concatenate([pending, mx.array(host_tokens, dtype=mx.int32)])
         if len(source_indices) != len(batch.requests):
             pending = pending[mx.array(source_indices, dtype=mx.int32)]
         return _BatchLayout(
@@ -451,7 +464,7 @@ class MlxGenerationExecutor:
             request_caches=tuple(caches),
             token_lengths=tuple(token_lengths),
             cache_lengths=tuple(cache_lengths),
-            input_ids=pending.astype(mx.int32)[:, None],
+            input_ids=pending[:, None],
             positions=mx.array(
                 [request.positions for request in requests], dtype=mx.int32
             ),
@@ -516,24 +529,36 @@ class MlxOverlapGenerationExecutor(MlxGenerationExecutor):
         # enabling additional dependency overlap for this one-model pipeline.
         self._stream = mx.default_stream(mx.gpu)
 
-    def dispatch_batch(self, prepared: PreparedStep) -> InFlightStep:
-        """Build and enqueue the graph on an owner-thread MLX stream."""
+    def dispatch_batch(
+        self, prepared: PreparedStep, *, launch: bool = True
+    ) -> InFlightStep:
+        """Build the graph on the owner-thread MLX stream, then enqueue it.
+
+        With ``launch=False`` the graph is only built; ``launch_batch``
+        enqueues it later.
+        """
 
         with mx.stream(self._stream):
             in_flight = super().dispatch_batch(prepared)
+        if launch:
+            self.launch_batch(in_flight)
+        return in_flight
+
+    def launch_batch(self, in_flight: InFlightStep) -> None:
+        """Enqueue a built step for asynchronous evaluation, at most once.
+
+        Enqueueing blocks while Metal's command queue is full, so enqueueing
+        behind a long step can take most of that step's GPU time.
+        """
+
+        if in_flight.launched:
+            return
+        with mx.stream(self._stream):
             started = time.perf_counter()
             in_flight.dispatch_started_ns = time.perf_counter_ns()
             mx.async_eval(in_flight.logits, in_flight.next_tokens)
             in_flight.dispatch_ms = _elapsed_ms(started)
-            return in_flight
-
-    def execute_prepared_serial(self, prepared: PreparedStep) -> StepResult:
-        """Run latency-sensitive pure prefill without an async handoff."""
-
-        if not prepared.has_work:
-            return self._empty_result(prepared)
-        in_flight = MlxGenerationExecutor.dispatch_batch(self, prepared)
-        return MlxGenerationExecutor.resolve_batch(self, in_flight)
+        in_flight.launched = True
 
     def resolve_batch(self, in_flight: InFlightStep) -> StepResult:
         """Synchronize only the previously dispatched owner-thread step."""

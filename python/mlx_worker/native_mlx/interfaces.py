@@ -157,9 +157,10 @@ class ExecutionBatch:
     """Scheduler-owned batch passed into one executor step.
 
     ``pending_token_ids`` lets a decode step consume the previous step's
-    sampled tokens while they are still on the device: one int32 entry per
-    request, used instead of each request's ``token_ids``, which then only
-    carry a one-token placeholder for validation.
+    sampled tokens while they are still on the device: one entry for each of
+    the leading requests, used instead of their ``token_ids``, which then only
+    carry a one-token placeholder for validation. Later requests use their own
+    ``token_ids``.
     """
 
     requests: tuple[ExecutionRequest, ...]

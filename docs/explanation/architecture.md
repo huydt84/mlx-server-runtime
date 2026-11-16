@@ -81,16 +81,23 @@ another compatible model does not require another executor or scheduler.
 
 The executor exposes an explicit prepare/dispatch/resolve seam.
 `MLX_RUNTIME_NATIVE_EXECUTION_MODE=overlap` is the default; `serial` resolves
-every step before building the next. `overlap` mode keeps pure prefill
-synchronous for TTFT, then holds at most one decode step in flight on the
-owner thread with MLX asynchronous evaluation.
-When decode step N would simply be followed by another decode of the same
-rows, step N+1 is dispatched before N resolves: N's cache append is published
-without waiting for the GPU, and N+1 reads N's sampled tokens directly on the
-device. Rows known to stop after N (cancelled, finished, or at `max_tokens`)
-leave the chain; a row that N ends with a terminal token runs one extra token
-in N+1, which is discarded. Pending prefill work ends the chain so that decode
-and prefill steps still alternate. Result-independent detokenization and
+every step before building the next. `overlap` mode runs on the owner thread with
+MLX asynchronous evaluation and dispatches step N+1 before step N resolves
+whenever N+1 does not need N's resolved state, so at most two steps are
+outstanding.
+N's cache append is published without waiting for the GPU. A decode step
+after N reads the sampled tokens of N's rows directly on the device; rows that
+were not in N use their resolved tokens. A prefill step after a decode step
+does not depend on it. A decode step after a decode step is enqueued on the
+GPU before N resolves. Any other chained step is only built before N resolves
+and is enqueued after N's events are returned, because enqueueing behind a
+long prefill blocks while Metal's command queue is full. Decode and prefill steps still alternate; a prefill step
+with no decode work to follow is resolved before the next step is selected.
+Rows known to stop after N (cancelled, finished, or at `max_tokens`) are not
+chained; a row that N ends with a terminal token runs one extra token in N+1,
+which is discarded. A request that arrives while N+1 is already queued starts
+after N+1, so overlap trades up to one step of time-to-first-token for no GPU
+idle time between steps. Result-independent detokenization and
 transport work for step N runs while step N+1 is outstanding. No background
 Python executor thread is used.
 

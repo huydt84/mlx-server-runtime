@@ -1566,15 +1566,15 @@ def test_overlap_scheduler_delays_one_result_and_preserves_cache_lifetime() -> N
     scheduler, cache_backend, model, request = _overlap_scheduler(max_tokens=2)
     scheduler.submit(request)
 
-    first = scheduler.tick()
+    # Prefill is dispatched asynchronously and resolves on the next tick.
+    assert scheduler.tick() == ()
     handle = scheduler._running["overlap"].cache_handle
     assert handle is not None
-    assert [event.token_id for event in first if event.kind == "token"] == [3]
-    assert cache_backend.length(handle) == 1
 
     second = scheduler.tick()
-    assert second == ()
+    assert [event.token_id for event in second if event.kind == "token"] == [3]
     assert cache_backend.length(handle) == 1
+    assert len(model.calls) == 2
 
     third = scheduler.tick()
     assert [event.token_id for event in third if event.kind == "token"] == [3]
@@ -1629,13 +1629,18 @@ def test_overlap_scheduler_dispatches_next_decode_before_resolving() -> None:
     scheduler, cache_backend = _chaining_scheduler(model)
     scheduler.submit(_schedulable("chain", (1,), max_tokens=6))
 
-    assert _tokens(scheduler.tick()) == [3]  # prefill
-    assert scheduler.tick() == ()  # first decode dispatched
+    assert scheduler.tick() == ()  # prefill dispatched
     handle = scheduler._running["chain"].cache_handle
 
-    # Resolving the first decode already launched the second one.
+    # Resolving the prefill already built the first decode, which is enqueued
+    # on the next tick...
+    assert _tokens(scheduler.tick()) == [3]
+    assert len(model.calls) == 2
+    assert not scheduler._in_flight.executor_step.launched
+    # ...and the decode after that decode is enqueued before it resolves.
     assert _tokens(scheduler.tick()) == [3]
     assert len(model.calls) == 3
+    assert scheduler._in_flight.executor_step.launched
     assert cache_backend.length(handle) == 2
 
     tokens = [3, 3]
@@ -1698,18 +1703,40 @@ def test_overlap_scheduler_chains_only_rows_that_continue() -> None:
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
-def test_overlap_scheduler_stops_chaining_when_a_prefill_arrives() -> None:
-    model = _RecordingModel()
-    scheduler, _ = _chaining_scheduler(model)
+def test_overlap_scheduler_chains_a_prefill_after_a_decode() -> None:
+    model = _CountingModel()
+    scheduler, _ = _chaining_scheduler(model, terminal_token_ids=())
     scheduler.submit(_schedulable("decode", (1,), max_tokens=8))
-    scheduler.tick()  # prefill
+    scheduler.tick()  # prefill dispatched
     scheduler.tick()  # first decode dispatched
 
-    scheduler.submit(_schedulable("prefill", (1, 2, 3), max_tokens=1))
-    scheduler.tick()
+    scheduler.submit(_schedulable("prefill", (1, 2, 3), max_tokens=3))
+    events = scheduler.tick()
 
-    # The pending prefill runs next instead of a chained decode.
+    # The pending prefill was built before the first decode resolved, and is
+    # enqueued only on the next tick, after the decode's token is returned.
+    assert _tokens(events) == [3]
     assert [call[1] for call in model.calls] == [(1,), (1,), (3,)]
+    assert scheduler._in_flight is not None
+    assert [item.request.phase for item in scheduler._in_flight.selected] == ["prefill"]
+    assert not scheduler._in_flight.executor_step.launched
+
+    # The decode after it mixes the prefill's device-resident token with the
+    # resolved token of the request that was already decoding.
+    events = scheduler.tick()
+    assert [
+        (event.request_id, event.token_id) for event in events if event.kind == "token"
+    ] == [("prefill", 0)]
+    assert [item.request.request_id for item in scheduler._in_flight.selected] == [
+        "prefill",
+        "decode",
+    ]
+    tokens: dict[str, list[int | None]] = {"decode": [2, 3], "prefill": [0]}
+    for _ in range(12):
+        for event in scheduler.tick():
+            if event.kind == "token":
+                tokens[event.request_id].append(event.token_id)
+    assert tokens == {"decode": [2, 3, 0, 1, 2, 3, 0, 1], "prefill": [0, 1, 2]}
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
@@ -1763,8 +1790,8 @@ def test_overlap_scheduler_defers_in_flight_cancellation_until_resolve() -> None
 def test_overlap_scheduler_discards_speculative_result_after_finish() -> None:
     scheduler, cache_backend, model, request = _overlap_scheduler(max_tokens=4)
     scheduler.submit(request)
-    first_result = scheduler.tick()
     scheduler.tick()
+    first_result = scheduler.tick()
     handle = scheduler._running["overlap"].cache_handle
     assert handle is not None
     assert any(event.kind == "token" for event in first_result)
