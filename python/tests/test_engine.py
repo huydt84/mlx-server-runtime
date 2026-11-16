@@ -4,6 +4,7 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 from mlx_worker.batching import (
     BatchBackendContext,
@@ -30,7 +31,7 @@ class FakeTokenizer:
 
 
 class FakeBatchGenerator:
-    instances: list[FakeBatchGenerator] = []
+    instances: ClassVar[list[FakeBatchGenerator]] = []
 
     def __init__(self, model, stop_tokens=None) -> None:
         self.model = model

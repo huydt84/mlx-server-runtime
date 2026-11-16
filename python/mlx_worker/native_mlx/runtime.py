@@ -457,9 +457,7 @@ class NativeRuntime:
                     skip_special_tokens=False,
                 )
             )
-            delta = (
-                text.removeprefix(state.decoded_prefix)
-            )
+            delta = text.removeprefix(state.decoded_prefix)
             state.decoded_prefix = text
         emitted, stop_hit = state.stop.push(delta)
         if self._profiler is not None:

@@ -313,7 +313,7 @@ def test_registry_composes_shared_model_and_cache_backend() -> None:
     spec = get_architecture_spec("Qwen2ForCausalLM")
     assert spec is not None
     assert spec.create_model is not None
-    execution_plan = spec.resolve()
+    execution_plan = spec.resolve
     assert execution_plan.architecture_class == "Qwen2ForCausalLM"
     assert execution_plan.cache_family == "kv"
     geometry = spec.cache_geometry(_tiny_qwen2_config())

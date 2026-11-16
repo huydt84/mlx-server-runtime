@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 from collections.abc import Callable
 from types import SimpleNamespace
+from typing import ClassVar, Self
 
 from mlx_worker.ipc import (
     ChatCompletionDelta,
@@ -24,7 +25,7 @@ class FakeSocket:
         self.connected_to: str | None = None
         self.shutdown_called = False
 
-    def __enter__(self) -> FakeSocket:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -633,7 +634,7 @@ def test_main_routes_text_and_vlm_requests_through_continuous_batch_loop(
     from mlx_worker import main as worker_main
 
     class FakeTextScheduler:
-        instances: list[FakeTextScheduler] = []
+        instances: ClassVar[list[FakeTextScheduler]] = []
 
         def __init__(self, *args, **kwargs) -> None:
             self.submitted: list[str] = []
@@ -676,7 +677,7 @@ def test_main_routes_text_and_vlm_requests_through_continuous_batch_loop(
             self.closed = True
 
     class FakeVlmScheduler:
-        instances: list[FakeVlmScheduler] = []
+        instances: ClassVar[list[FakeVlmScheduler]] = []
 
         def __init__(self, engine, sink, **kwargs) -> None:
             self.engine = engine

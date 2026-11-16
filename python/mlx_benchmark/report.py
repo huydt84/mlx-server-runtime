@@ -33,9 +33,11 @@ def _run_lines(results: dict[str, Any]) -> list[str]:
                 "",
                 "## Results",
                 "",
-                "Lower ms is better; higher tokens/s is better. Statistics are over "
-                "trial means; p95 pools individual requests. **Bold** rows are each "
-                "workload's primary metric.",
+                (
+                    "Lower ms is better; higher tokens/s is better. Statistics are over "
+                    "trial means; p95 pools individual requests. **Bold** rows are each "
+                    "workload's primary metric."
+                ),
                 "",
                 "| model | runtime | workload | metric | trials | mean | median | min–max | CV | request p95 |",
                 "| --- | --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |",
@@ -90,9 +92,11 @@ def _calibration_lines(results: dict[str, Any]) -> list[str]:
         "",
         "## Run-to-run variation",
         "",
-        "Each value is one repetition's mean for the workload's primary metric. "
-        "Host thermal, power, and memory-pressure observations are in "
-        "`results.json`.",
+        (
+            "Each value is one repetition's mean for the workload's primary metric. "
+            "Host thermal, power, and memory-pressure observations are in "
+            "`results.json`."
+        ),
         "",
         "| model | runtime | workload | metric | runs | mean | min–max | CV | stable |",
         "| --- | --- | --- | --- | ---: | ---: | --- | ---: | --- |",
@@ -129,8 +133,10 @@ def _append_diagnostics(lines: list[str], results: dict[str, Any]) -> None:
             "",
             "## Diagnostic artifacts",
             "",
-            f"Diagnostic status: `{diagnostics['status']}`. Diagnostics ran in "
-            "separate processes after measurement; the rows above are unaffected.",
+            (
+                f"Diagnostic status: `{diagnostics['status']}`. Diagnostics ran in "
+                "separate processes after measurement; the rows above are unaffected."
+            ),
             "",
         ]
     )

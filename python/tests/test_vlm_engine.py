@@ -6,6 +6,7 @@ import sys
 import threading
 from dataclasses import field
 from types import ModuleType, SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -117,7 +118,7 @@ class FakeEmbeddingOutput:
 
 
 class FakeVlmBatchGenerator:
-    instances: list[FakeVlmBatchGenerator] = []
+    instances: ClassVar[list[FakeVlmBatchGenerator]] = []
 
     def __init__(
         self,

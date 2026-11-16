@@ -310,7 +310,7 @@ class RequestTiming:
 def _duration_ms(start: float | None, end: float | None) -> int | None:
     if start is None or end is None or end < start:
         return None
-    return max(0, int(round((end - start) * 1000.0)))
+    return max(0, round((end - start) * 1000.0))
 
 
 class MlxBatchCompletionBackend:
@@ -629,7 +629,7 @@ class ContinuousBatchScheduler:
 
         self._admit_pending()
         self._last_tick_latency_ms = max(
-            0, int(round((time.perf_counter() - started) * 1000.0))
+            0, round((time.perf_counter() - started) * 1000.0)
         )
 
     def set_arbitration_delay_ms(self, value_ms: int) -> None:
@@ -784,9 +784,7 @@ class ContinuousBatchScheduler:
             return
 
         decoded = self._context.tokenizer.decode(job.generated_tokens)
-        delta = (
-            decoded.removeprefix(job.rendered_text)
-        )
+        delta = decoded.removeprefix(job.rendered_text)
         if delta:
             self._sink.emit_delta(job.request.request_id, delta)
             if job.timing.first_token_at is None:
@@ -986,7 +984,7 @@ def _prompt_cache_for_prompt_tokens(
 def validate_continuous_batching_backend() -> None:
     """Validate the installed text LLM batching API before worker readiness."""
 
-    _validate_tested_minor_version("mlx-lm", expected_minor_prefix="0.31.")
+    _validate_tested_minor_version("mlx-lm", expected_minor_prefix="0.32.")
     _load_batch_generator_cls(continuous=True)
 
 

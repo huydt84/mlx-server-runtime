@@ -323,7 +323,7 @@ def detect_native_architecture(model: str) -> NativeArchitecture:
             "unsupported_class",
             model,
         )
-    return NativeArchitecture(model, path, name, payload, spec, spec.resolve())
+    return NativeArchitecture(model, path, name, payload, spec, spec.resolve)
 
 
 def _load_tokenizer(model_path: Path) -> tuple[Any, Any, tuple[int, ...]]:

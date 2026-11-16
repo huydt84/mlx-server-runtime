@@ -1157,7 +1157,7 @@ class VlmContinuousBatchScheduler:
 
         self._admit_pending()
         self._last_tick_latency_ms = max(
-            0, int(round((time.perf_counter() - started) * 1000.0))
+            0, round((time.perf_counter() - started) * 1000.0)
         )
 
     def set_arbitration_delay_ms(self, value_ms: int) -> None:
@@ -1221,9 +1221,7 @@ class VlmContinuousBatchScheduler:
             tokenizer = getattr(self._engine.processor, "tokenizer", None)
             if tokenizer is not None and job.generated_tokens:
                 decoded = tokenizer.decode(job.generated_tokens)
-                delta_text = (
-                    decoded.removeprefix(job.rendered_text)
-                )
+                delta_text = decoded.removeprefix(job.rendered_text)
             else:
                 delta_text = getattr(response, "text", "") or ""
             if delta_text:
@@ -1672,7 +1670,7 @@ class VlmContinuousBatchScheduler:
 def validate_vlm_continuous_batching_backend() -> None:
     """Validate the installed VLM batching API before worker readiness."""
 
-    _validate_tested_minor_version("mlx-vlm", expected_minor_prefix="0.6.")
+    _validate_tested_minor_version("mlx-vlm", expected_minor_prefix="0.7.")
     _load_batch_generator_cls(continuous=True)
     if _make_apc_manager() is None:
         raise RuntimeError(

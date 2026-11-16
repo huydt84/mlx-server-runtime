@@ -73,16 +73,16 @@ def test_pipeline_event_schema_rejects_empty_correlation_id() -> None:
 
 
 def test_report_orders_dominant_stage_first() -> None:
-    base = dict(
-        schema_version=1,
-        run_id="run",
-        request_id="request",
-        backend="native-mlx",
-        model="model",
-        workload="workload",
-        monotonic_ns=1,
-        offset_us=0,
-    )
+    base = {
+        "schema_version": 1,
+        "run_id": "run",
+        "request_id": "request",
+        "backend": "native-mlx",
+        "model": "model",
+        "workload": "workload",
+        "monotonic_ns": 1,
+        "offset_us": 0,
+    }
     report = render_pipeline_report(
         (
             PipelineEvent(**base, component="runtime", stage="small", duration_us=1),

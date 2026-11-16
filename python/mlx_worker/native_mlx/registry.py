@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, cached_property
 from typing import Any
 
 import mlx.core as mx
@@ -46,7 +46,7 @@ class ArchitectureSpec:
     supports_prefix_cache: bool = True
     cache_family: str = "kv"
 
-    @cache
+    @cached_property
     def resolve(self) -> ArchitectureExecutionPlan:
         """Freeze selected family callables once during bootstrap."""
 
@@ -65,22 +65,22 @@ class ArchitectureSpec:
     def parse_config(self) -> Callable[[dict[str, Any]], Any]:
         """Load the selected family's config parser during startup only."""
 
-        return self.resolve().parse_config
+        return self.resolve.parse_config
 
     def create_weight_adapter(self) -> WeightMappingAdapter:
         """Construct the selected family's weight adapter during startup."""
 
-        return self.resolve().create_weight_adapter()
+        return self.resolve.create_weight_adapter()
 
     def create_model(self, config: Any, weights: list[tuple[str, Any]]) -> NativeModel:
         """Construct the selected family's model during startup."""
 
-        return self.resolve().create_model(config, weights)
+        return self.resolve.create_model(config, weights)
 
     def cache_geometry(self, config: Any) -> KVCacheGeometry:
         """Return the startup-frozen cache geometry for this family."""
 
-        return self.resolve().cache_geometry(config)
+        return self.resolve.cache_geometry(config)
 
 
 @dataclass(frozen=True)

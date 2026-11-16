@@ -38,18 +38,16 @@ class _GraphProfileRecorder:
             )
 
     def summary(self) -> dict[str, int]:
-        metrics = {
-            name: max(0, int(round(value))) for name, value in self.metrics.items()
-        }
+        metrics = {name: max(0, round(value)) for name, value in self.metrics.items()}
         total = sum(self.layer_totals.values())
         if total:
             worst_layer_index, worst_layer_ms = max(
                 self.layer_totals.items(), key=lambda item: item[1]
             )
-            metrics["model_graph_layer_total_ms"] = max(0, int(round(total)))
+            metrics["model_graph_layer_total_ms"] = max(0, round(total))
             metrics["model_graph_worst_layer_ms"] = max(
                 0,
-                int(round(worst_layer_ms)),
+                round(worst_layer_ms),
             )
             metrics["model_graph_worst_layer_index"] = worst_layer_index
         return metrics

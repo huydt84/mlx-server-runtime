@@ -191,7 +191,7 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
     for row, (length, table) in enumerate(zip(lengths, tables, strict=True)):
         start = max(0, length - window_size) if window_size else 0
 
-        def dense(pool):
+        def dense(pool, table=table, length=length, start=start):
             rows = pool[mx.array(table)].reshape(-1, kv_heads, head_dim)[:length]
             return rows[start:].transpose(1, 0, 2)[None]
 

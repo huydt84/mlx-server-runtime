@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
@@ -356,11 +357,9 @@ class NativeContinuousScheduler:
         """
 
         if self._in_flight is not None:
-            try:
+            # Resolving the step reports a launch failure for its rows.
+            with suppress(Exception):
                 self._executor.launch_batch(self._in_flight.executor_step)  # type: ignore[attr-defined]
-            except Exception:
-                # Resolving the step reports the failure for its rows.
-                pass
         events = self._pending_events
         self._pending_events = []
         late_events: list[SchedulerEvent] = []

@@ -327,7 +327,9 @@ def main(
                             # Lazy initialize VLM engine on first request.
                             if vlm_engine is None:
                                 vlm_engine = vlm_engine_factory(config.vlm_model)
-                                vlm_engine.max_images_per_request = getattr(config, "max_vlm_images", 5)
+                                vlm_engine.max_images_per_request = getattr(
+                                    config, "max_vlm_images", 5
+                                )
                             active_engine: object | None = vlm_engine
                         elif request.model == config.model:
                             active_engine = engine
@@ -357,20 +359,9 @@ def main(
                         # never blocks on cold-start model loading.
 
                         if request.stream:
-
-                            def emit_delta(delta: str) -> None:
-                                client.sendall(
-                                    encode_event(
-                                        ChatCompletionDelta(
-                                            request_id=request.request_id,
-                                            delta=delta,
-                                        )
-                                    )
-                                )
-
                             event = active_engine.stream_chat(  # type: ignore[attr-defined]
                                 request,
-                                emit_delta,
+                                _delta_emitter(client, request.request_id),
                                 should_cancel,
                             )
                         else:
@@ -401,6 +392,17 @@ def main(
             client.shutdown(socket.SHUT_RDWR)
 
     return 0
+
+
+def _delta_emitter(client: socket.socket, request_id: str) -> Callable[[str], None]:
+    """Return a callback that streams text deltas for one request over ``client``."""
+
+    def emit_delta(delta: str) -> None:
+        client.sendall(
+            encode_event(ChatCompletionDelta(request_id=request_id, delta=delta))
+        )
+
+    return emit_delta
 
 
 def _run_continuous_batch_loop(

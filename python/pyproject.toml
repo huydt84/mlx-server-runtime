@@ -21,6 +21,11 @@ dev = [
     "ruff>=0.17.5",
 ]
 
+[tool.ruff.lint]
+# Intentional failure boundaries (worker, scheduler, benchmark runner) that
+# report errors to callers, and ValueError as the validation error contract.
+ignore = ["BLE001", "TRY004"]
+
 [tool.setuptools]
 package-dir = {"" = "."}
 
