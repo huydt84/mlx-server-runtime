@@ -43,6 +43,7 @@ from .scheduler import NativeContinuousScheduler
 __all__ = [
     "NativeParityResult",
     "NativePrefillDecodeParityResult",
+    "apply_mlx_cache_limit",
     "build_prompt_fingerprint",
     "compare_native_prefill_decode_to_mlx_lm",
     "compare_native_to_mlx_lm",
@@ -187,6 +188,22 @@ def run_native_worker(
                         flush_profile()
 
 
+def apply_mlx_cache_limit(limit_bytes: int) -> None:
+    """Bound the MLX buffer cache that keeps freed device buffers for reuse.
+
+    Batch and sequence shapes change every step, so the default cache, sized to
+    the whole device memory limit, fills with buffers that are never reused
+    and pushes the rest of the host into swap.
+
+    Args:
+        limit_bytes: Maximum bytes of freed buffers MLX may retain.
+    """
+
+    import mlx.core as mx
+
+    mx.set_cache_limit(limit_bytes)
+
+
 def create_native_worker(
     config: WorkerConfig,
     *,
@@ -195,6 +212,7 @@ def create_native_worker(
 ) -> NativeRuntime:
     """Compose bootstrap, shared executor, scheduler, and request runtime."""
 
+    apply_mlx_cache_limit(config.native_mlx_cache_limit_bytes)
     artifacts = build_native_artifacts(
         config.model,
         stage_callback,

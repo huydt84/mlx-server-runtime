@@ -41,6 +41,7 @@ class WorkerConfig:
     text_cache_budget_bytes: int = 8 * 1024 * 1024
     text_cache_max_entries: int = 32
     native_kv_page_size: int = 16
+    native_mlx_cache_limit_bytes: int = 1024 * 1024 * 1024
     native_execution_backend: str = DEFAULT_NATIVE_EXECUTION_BACKEND
     native_execution_mode: str = "serial"
     native_prefix_cache_strategy: str = "radix"
@@ -113,6 +114,13 @@ def load_config() -> WorkerConfig:
     native_kv_page_size = int(os.environ.get("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "16"))
     if native_kv_page_size not in (8, 16, 32):
         raise ValueError("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE must be one of 8, 16, or 32")
+    native_mlx_cache_limit_bytes = int(
+        os.environ.get("MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES", str(1024**3))
+    )
+    if native_mlx_cache_limit_bytes < 0:
+        raise ValueError(
+            "MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES must be non-negative"
+        )
     native_execution_backend = os.environ.get(
         "MLX_RUNTIME_NATIVE_EXECUTION_BACKEND",
         DEFAULT_NATIVE_EXECUTION_BACKEND,
@@ -194,6 +202,7 @@ def load_config() -> WorkerConfig:
         text_cache_budget_bytes=text_cache_budget_bytes,
         text_cache_max_entries=text_cache_max_entries,
         native_kv_page_size=native_kv_page_size,
+        native_mlx_cache_limit_bytes=native_mlx_cache_limit_bytes,
         native_execution_backend=native_execution_backend,
         native_execution_mode=native_execution_mode,
         native_prefix_cache_strategy=native_prefix_cache_strategy,

@@ -2044,3 +2044,38 @@ def test_runtime_cancellation_terminal_response_carries_stage_and_latency() -> N
     assert response.cancellation_stage == "python_waiting"
     assert response.cancellation_latency_ms == 2
 
+
+def test_apply_mlx_cache_limit_sets_the_mlx_buffer_cache_limit() -> None:
+    from mlx_worker.native_mlx.worker import apply_mlx_cache_limit
+
+    previous = mx.set_cache_limit(0)
+    try:
+        apply_mlx_cache_limit(3 * 1024 * 1024)
+
+        assert mx.set_cache_limit(previous) == 3 * 1024 * 1024
+    finally:
+        mx.set_cache_limit(previous)
+
+
+def test_create_native_worker_limits_mlx_cache_before_loading(monkeypatch) -> None:
+    from mlx_worker.config import WorkerConfig
+    from mlx_worker.native_mlx import worker
+
+    calls: list[object] = []
+
+    def stop_loading(*_args: object, **_kwargs: object) -> None:
+        calls.append("load")
+        raise RuntimeError("stop before loading the model")
+
+    monkeypatch.setattr(worker, "apply_mlx_cache_limit", calls.append)
+    monkeypatch.setattr(worker, "build_native_artifacts", stop_loading)
+    config = WorkerConfig(
+        socket_path="/tmp/unused.sock",
+        model="model",
+        native_mlx_cache_limit_bytes=5,
+    )
+
+    with pytest.raises(RuntimeError, match="stop before loading"):
+        worker.create_native_worker(config)
+
+    assert calls == [5, "load"]

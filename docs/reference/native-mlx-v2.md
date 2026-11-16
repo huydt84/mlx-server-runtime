@@ -98,8 +98,9 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_NATIVE_METAL_CAPTURE` | `0`, `1` | Requests optional heavy Metal capture preflight; requires process-start `MTL_CAPTURE_ENABLED=1` |
 | `MLX_RUNTIME_TEXT_PROMPT_CONCURRENCY` | positive integer | Text prompt/prefill admission width |
 | `MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE` | positive integer | Chunked-prefill token budget |
-| `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Text KV/prefix-cache byte budget |
-| `MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES` | positive integer | Prefix-cache entry bound |
+| `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Text KV page-pool size, allocated at startup and shared by in-flight requests and the prefix cache; a request that does not fit fails with `KV_CAPACITY_EXHAUSTED` |
+| `MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES` | positive integer | Prefix-cache entry bound; each cached KV page (`MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` tokens) is one entry |
+| `MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES` | non-negative integer | Freed MLX device buffers kept for reuse; defaults to 1 GiB so changing batch shapes cannot fill device memory and push the host into swap |
 
 Invalid native execution-backend, execution-mode, page-size, prefix-cache
 strategy, or scheduler-policy values must fail startup. They must not silently

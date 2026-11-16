@@ -115,6 +115,29 @@ def test_load_config_rejects_invalid_native_execution_mode(monkeypatch) -> None:
         load_config()
 
 
+def test_load_config_defaults_native_mlx_cache_limit_to_one_gib(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES", raising=False)
+
+    config = load_config()
+
+    assert config.native_mlx_cache_limit_bytes == 1024**3
+
+
+def test_load_config_parses_native_mlx_cache_limit(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES", "0")
+
+    config = load_config()
+
+    assert config.native_mlx_cache_limit_bytes == 0
+
+
+def test_load_config_rejects_negative_native_mlx_cache_limit(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES", "-1")
+
+    with pytest.raises(ValueError, match="MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES"):
+        load_config()
+
+
 def test_load_config_parses_native_prefix_cache_strategy(monkeypatch) -> None:
     monkeypatch.setenv("MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY", "radix")
 
