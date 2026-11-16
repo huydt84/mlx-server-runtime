@@ -2229,7 +2229,7 @@ mod tests {
         assert!(
             after_headers.starts_with("data: "),
             "expected headers immediately followed by first data event, got: {:?}",
-            &after_headers.chars().take(30).collect::<String>()
+            after_headers.chars().take(30).collect::<String>()
         );
 
         // All SSE data events must use the same model field.

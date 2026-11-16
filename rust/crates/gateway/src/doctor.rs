@@ -7,7 +7,10 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const REQUIRED_IMPORTS: &str =
     "import mlx.core; import mlx_lm; import mlx_vlm; import mlx_worker; print('imports_ok')";
@@ -181,7 +184,11 @@ fn check_writable(name: &'static str, path: &Path) -> DoctorCheck {
     if let Err(err) = fs::create_dir_all(path) {
         return fail(name, format!("{}: {err}", path.display()));
     }
-    let probe = path.join(format!(".mlx-air-write-probe-{}", std::process::id()));
+    let probe = path.join(format!(
+        ".mlx-air-write-probe-{}-{}",
+        std::process::id(),
+        PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     let result = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -287,6 +294,26 @@ mod tests {
             stdout: format!("{output}\n"),
             stderr: String::new(),
         }
+    }
+
+    #[test]
+    fn concurrent_writable_checks_of_one_directory_do_not_collide() {
+        let directory = temp_path("doctor-writable-race");
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..50)
+                            .map(|_| check_writable("shared directory", &directory))
+                            .all(|check| check.passed)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert!(handle.join().unwrap());
+            }
+        });
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
