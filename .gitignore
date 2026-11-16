@@ -104,7 +104,6 @@ Desktop.ini
 .codex/
 .opencode/
 prompts/
-benchmarks/results/
 
 # Local planning documents — not in git
 PLAN.md

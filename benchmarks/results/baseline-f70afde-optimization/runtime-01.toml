@@ -1,0 +1,27 @@
+[server]
+host = "127.0.0.1"
+port = 51628
+
+[worker]
+python = "/Users/huydinhtrong/Library/Application Support/mlx-air/environments/benchmark/0.1.0/5c972da92a9d2c3a7423661be3f4da3724632dbe69062b647de044e086176214/bin/python3"
+module = "mlx_worker.main"
+backend = "native-mlx"
+model = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+ipc_path = "/tmp/mlx-air-501/benchmark-30017-6148b50c258c.sock"
+
+[generation]
+temperature = 0.0
+top_p = 1.0
+max_tokens = 128
+
+[limits]
+max_pending_requests = 32
+max_active_requests = 16
+max_prompt_tokens = 4352
+max_completion_tokens = 128
+max_total_tokens_per_request = 4480
+request_timeout_seconds = 300
+
+[telemetry]
+enable_prometheus = true
+metrics_path = "/metrics"
