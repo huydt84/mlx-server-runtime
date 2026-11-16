@@ -83,9 +83,15 @@ The executor exposes an explicit prepare/dispatch/resolve seam.
 `MLX_RUNTIME_NATIVE_EXECUTION_MODE=serial` remains the default. The explicit
 `overlap` mode keeps pure prefill synchronous for TTFT, then holds at most one
 decode step in flight on the owner thread with MLX asynchronous evaluation.
-It resolves outstanding work before cache commit, cancellation, release, or
-shutdown. Result-independent detokenization and transport work for step N runs
-while step N+1 is outstanding. No background Python executor thread is used.
+When decode step N would simply be followed by another decode of the same
+rows, step N+1 is dispatched before N resolves: N's cache append is published
+without waiting for the GPU, and N+1 reads N's sampled tokens directly on the
+device. Rows known to stop after N (cancelled, finished, or at `max_tokens`)
+leave the chain; a row that N ends with a terminal token runs one extra token
+in N+1, which is discarded. Pending prefill work ends the chain so that decode
+and prefill steps still alternate. Result-independent detokenization and
+transport work for step N runs while step N+1 is outstanding. No background
+Python executor thread is used.
 
 For VLMs, the runtime still exposes continuous batching, upstream APC reuse,
 and repeated-image feature caching through the worker. This is not

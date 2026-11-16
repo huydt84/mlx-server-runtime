@@ -37,7 +37,13 @@ class BatchCacheReservation(Protocol):
     request_caches: tuple[RequestCache, ...]
     append_lengths: tuple[int, ...]
 
-    def commit(self) -> tuple[int, ...]: ...
+    def commit(self, *, synchronize: bool = True) -> tuple[int, ...]:
+        """Publish the staged append.
+
+        ``synchronize=False`` publishes lengths and page ownership while the
+        staged MLX writes may still be running; later steps that read the
+        cache depend on those writes through the MLX graph.
+        """
 
     def abort(self) -> None: ...
 
@@ -249,7 +255,8 @@ class DenseBatchReservation:
     layer_views: tuple[DenseBatchLayerCache, ...]
     _finished: bool = False
 
-    def commit(self) -> tuple[int, ...]:
+    def commit(self, *, synchronize: bool = True) -> tuple[int, ...]:
+        del synchronize
         if self._finished:
             raise ValueError("cache reservation already finished")
         for layer in self.layer_views:
@@ -542,7 +549,7 @@ class PagedBatchReservation:
         self.staged_values[layer_index] = value_cache
         return key_cache, value_cache
 
-    def commit(self) -> tuple[int, ...]:
+    def commit(self, *, synchronize: bool = True) -> tuple[int, ...]:
         if self._finished:
             raise ValueError("cache reservation already finished")
         for keys, values in zip(self.staged_keys, self.staged_values, strict=True):
@@ -556,10 +563,11 @@ class PagedBatchReservation:
             _require_array(value) if value is not None else None
             for value in self.staged_values
         )
-        mx.eval(
-            *(value for value in staged_keys if value is not None),
-            *(value for value in staged_values if value is not None),
-        )
+        if synchronize:
+            mx.eval(
+                *(value for value in staged_keys if value is not None),
+                *(value for value in staged_values if value is not None),
+            )
         lengths = self.backend._commit_reservation(self, staged_keys, staged_values)
         self._finished = True
         return lengths
@@ -636,7 +644,7 @@ class HybridBatchReservation(PagedBatchReservation):
         )
         self.staged_states[layer_index] = mx.stack(states, axis=0)
 
-    def commit(self) -> tuple[int, ...]:
+    def commit(self, *, synchronize: bool = True) -> tuple[int, ...]:
         if self._finished:
             raise ValueError("cache reservation already finished")
         for keys, values, state in zip(
@@ -658,11 +666,12 @@ class HybridBatchReservation(PagedBatchReservation):
             _require_array(value) if value is not None else None
             for value in self.staged_states
         )
-        mx.eval(
-            *(value for value in staged_keys if value is not None),
-            *(value for value in staged_values if value is not None),
-            *(value for value in staged_states if value is not None),
-        )
+        if synchronize:
+            mx.eval(
+                *(value for value in staged_keys if value is not None),
+                *(value for value in staged_values if value is not None),
+                *(value for value in staged_states if value is not None),
+            )
         lengths = self.backend._commit_hybrid_reservation(
             self, staged_keys, staged_values, staged_states
         )

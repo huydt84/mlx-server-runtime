@@ -1585,6 +1585,162 @@ def test_overlap_scheduler_delays_one_result_and_preserves_cache_lifetime() -> N
     assert scheduler.idle()
 
 
+@dataclass
+class _CountingModel(_RecordingModel):
+    """Predicts ``(input + 1) % 4`` so a prompt ending in 1 reaches token 0."""
+
+    def __call__(
+        self,
+        input_ids: mx.array,
+        positions: mx.array,
+        forward_batch: ForwardBatch,
+    ) -> mx.array:
+        super().__call__(input_ids, positions, forward_batch)
+        next_ids = (input_ids.astype(mx.int32) + 1) % 4
+        return (next_ids[..., None] == mx.arange(4)).astype(mx.float32)
+
+
+def _chaining_scheduler(
+    model: _RecordingModel,
+    terminal_token_ids: tuple[int, ...] = (0,),
+) -> tuple[NativeContinuousScheduler, DenseKVCacheBackend]:
+    cache_backend = DenseKVCacheBackend(num_layers=model.num_layers)
+    scheduler = NativeContinuousScheduler(
+        MlxOverlapGenerationExecutor(
+            architecture_class="FakeForCausalLM",
+            model=model,
+            cache_backend=cache_backend,
+            attention_backend=DenseReferenceAttentionBackend(),
+        ),
+        NativeCacheCoordinator(cache_backend, NoPrefixCache()),
+        execution_mode="overlap",
+        terminal_token_ids=terminal_token_ids,
+    )
+    return scheduler, cache_backend
+
+
+def _tokens(events: tuple[SchedulerEvent, ...]) -> list[int | None]:
+    return [event.token_id for event in events if event.kind == "token"]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_dispatches_next_decode_before_resolving() -> None:
+    model = _RecordingModel()
+    scheduler, cache_backend = _chaining_scheduler(model)
+    scheduler.submit(_schedulable("chain", (1,), max_tokens=6))
+
+    assert _tokens(scheduler.tick()) == [3]  # prefill
+    assert scheduler.tick() == ()  # first decode dispatched
+    handle = scheduler._running["chain"].cache_handle
+
+    # Resolving the first decode already launched the second one.
+    assert _tokens(scheduler.tick()) == [3]
+    assert len(model.calls) == 3
+    assert cache_backend.length(handle) == 2
+
+    tokens = [3, 3]
+    while scheduler._in_flight is not None:
+        tokens.extend(_tokens(scheduler.tick()))
+
+    # max_tokens is known ahead, so no step runs past the last token.
+    assert tokens == [3] * 6
+    assert len(model.calls) == 6
+    scheduler.finish("chain")
+    assert scheduler.idle()
+    assert cache_backend.length(handle) == 0
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_drops_the_chained_token_after_a_terminal_token() -> None:
+    model = _CountingModel()
+    scheduler, cache_backend = _chaining_scheduler(model)
+    scheduler.submit(_schedulable("eos", (1,), max_tokens=8))
+
+    tokens: list[int | None] = []
+    for _ in range(6):
+        tokens.extend(_tokens(scheduler.tick()))
+    handle = scheduler._running["eos"].cache_handle
+
+    # 1 -> 2 -> 3 -> 0 (terminal). The step after 0 was already running when
+    # 0 resolved; its token is discarded and nothing further is scheduled.
+    assert tokens == [2, 3, 0]
+    assert len(model.calls) == 4
+    assert scheduler._in_flight is None
+    scheduler.finish("eos")
+    assert scheduler.idle()
+    assert cache_backend.length(handle) == 0
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_chains_only_rows_that_continue() -> None:
+    model = _CountingModel()
+    scheduler, _ = _chaining_scheduler(model, terminal_token_ids=())
+    scheduler.submit(_schedulable("short", (1,), max_tokens=3))
+    scheduler.submit(_schedulable("long", (2,), max_tokens=6))
+
+    tokens: dict[str, list[int | None]] = {"short": [], "long": []}
+    for _ in range(12):
+        for event in scheduler.tick():
+            if event.kind == "token":
+                tokens[event.request_id].append(event.token_id)
+
+    # "short" leaves the chain at max_tokens, so later chained steps feed
+    # "long" only its own device-resident token.
+    assert tokens == {"short": [2, 3, 0], "long": [3, 0, 1, 2, 3, 0]}
+    assert [call[1] for call in model.calls] == [
+        (1, 1),
+        (1, 1),
+        (1, 1),
+        (1,),
+        (1,),
+        (1,),
+    ]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_overlap_scheduler_stops_chaining_when_a_prefill_arrives() -> None:
+    model = _RecordingModel()
+    scheduler, _ = _chaining_scheduler(model)
+    scheduler.submit(_schedulable("decode", (1,), max_tokens=8))
+    scheduler.tick()  # prefill
+    scheduler.tick()  # first decode dispatched
+
+    scheduler.submit(_schedulable("prefill", (1, 2, 3), max_tokens=1))
+    scheduler.tick()
+
+    # The pending prefill runs next instead of a chained decode.
+    assert [call[1] for call in model.calls] == [(1,), (1,), (3,)]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
+def test_executor_rejects_device_tokens_for_a_prefill_batch() -> None:
+    model = _RecordingModel()
+    cache_backend = DenseKVCacheBackend(num_layers=model.num_layers)
+    executor = MlxOverlapGenerationExecutor(
+        architecture_class="FakeForCausalLM",
+        model=model,
+        cache_backend=cache_backend,
+        attention_backend=DenseReferenceAttentionBackend(),
+    )
+    handle = cache_backend.create("request")
+    batch = ExecutionBatch(
+        requests=(
+            ExecutionRequest(
+                request_id="request",
+                phase="prefill",
+                token_ids=(1,),
+                positions=(0,),
+                cache_handle=handle,
+            ),
+        ),
+        pending_token_ids=mx.array([1], dtype=mx.int32),
+    )
+
+    with pytest.raises(BatchExecutionError) as error:
+        executor.prepare_batch(batch)
+    assert error.value.code == "INVALID_EXECUTION_BATCH"
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires MLX Metal")
 def test_overlap_scheduler_defers_in_flight_cancellation_until_resolve() -> None:
     scheduler, cache_backend, _, request = _overlap_scheduler(max_tokens=4)

@@ -66,6 +66,8 @@ class InFlightStep:
     dispatch_ms: int
     dispatch_started_ns: int
     forward_mode: ForwardMode
+    committed_lengths: tuple[int, ...] | None = None
+    """Cache lengths when the reservation was committed before resolution."""
 
 
 @dataclass
@@ -178,13 +180,17 @@ class MlxGenerationExecutor:
             raise BatchExecutionError("MODEL_EXECUTION_FAILED", str(exc)) from exc
         eval_ms = _elapsed_ms(eval_started)
         eval_completed_ns = time.perf_counter_ns()
-        try:
-            commit_started = time.perf_counter()
-            committed_lengths = in_flight.reservation.commit()
-            commit_ms = _elapsed_ms(commit_started)
-        except Exception as exc:
-            in_flight.reservation.abort()
-            raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
+        if in_flight.committed_lengths is not None:
+            committed_lengths = in_flight.committed_lengths
+            commit_ms = 0
+        else:
+            try:
+                commit_started = time.perf_counter()
+                committed_lengths = in_flight.reservation.commit()
+                commit_ms = _elapsed_ms(commit_started)
+            except Exception as exc:
+                in_flight.reservation.abort()
+                raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
         graph_profile_metrics = _graph_profile_metrics(self.model)
         for source_index, request, cache_length, token_id in zip(
             layout.source_indices,
@@ -221,6 +227,43 @@ class MlxGenerationExecutor:
                 **graph_profile_metrics,
             ),
         )
+
+    def device_next_tokens(
+        self, in_flight: InFlightStep, request_ids: tuple[str, ...]
+    ) -> mx.array | None:
+        """Return a dispatched step's sampled tokens for ``request_ids``.
+
+        The tokens stay on the device. Returns ``None`` when any request did
+        not run in that step.
+        """
+
+        layout = in_flight.prepared.layout
+        if layout is None:
+            return None
+        rows = {request.request_id: row for row, request in enumerate(layout.requests)}
+        if any(request_id not in rows for request_id in request_ids):
+            return None
+        indices = [rows[request_id] for request_id in request_ids]
+        if indices == list(range(len(layout.requests))):
+            return in_flight.next_tokens
+        return in_flight.next_tokens[mx.array(indices, dtype=mx.int32)]
+
+    def commit_dispatched(self, in_flight: InFlightStep) -> None:
+        """Publish a dispatched step's cache append before its tokens resolve.
+
+        The next decode step can then reserve on top of this one and read the
+        new K/V through the MLX graph while this step is still running.
+        """
+
+        if in_flight.committed_lengths is not None:
+            return
+        try:
+            in_flight.committed_lengths = in_flight.reservation.commit(
+                synchronize=False
+            )
+        except Exception as exc:
+            in_flight.reservation.abort()
+            raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
 
     def discard_batch(self, in_flight: InFlightStep) -> None:
         """Synchronize outstanding work, then release its uncommitted reservation."""
@@ -335,6 +378,19 @@ class MlxGenerationExecutor:
         if not valid_requests:
             return None, ordered_results
 
+        if batch.pending_token_ids is not None:
+            return (
+                self._pending_layout(
+                    batch,
+                    valid_requests,
+                    source_indices,
+                    caches,
+                    token_lengths,
+                    cache_lengths,
+                ),
+                ordered_results,
+            )
+
         max_tokens = max(token_lengths)
         token_rows: list[list[int]] = []
         position_rows: list[list[int]] = []
@@ -362,6 +418,44 @@ class MlxGenerationExecutor:
                 ),
             ),
             ordered_results,
+        )
+
+    @staticmethod
+    def _pending_layout(
+        batch: ExecutionBatch,
+        requests: list[ExecutionRequest],
+        source_indices: list[int],
+        caches: list[RequestCache],
+        token_lengths: list[int],
+        cache_lengths: list[int],
+    ) -> _BatchLayout:
+        """Lay out a decode step whose input tokens are still on the device."""
+
+        pending = batch.pending_token_ids
+        assert pending is not None
+        if any(request.phase != "decode" for request in batch.requests):
+            raise BatchExecutionError(
+                "INVALID_EXECUTION_BATCH",
+                "device-resident input tokens require a decode-only batch",
+            )
+        if tuple(pending.shape) != (len(batch.requests),):
+            raise BatchExecutionError(
+                "INVALID_EXECUTION_BATCH",
+                "device-resident input tokens must match the batch size",
+            )
+        if len(source_indices) != len(batch.requests):
+            pending = pending[mx.array(source_indices, dtype=mx.int32)]
+        return _BatchLayout(
+            requests=tuple(requests),
+            source_indices=tuple(source_indices),
+            request_caches=tuple(caches),
+            token_lengths=tuple(token_lengths),
+            cache_lengths=tuple(cache_lengths),
+            input_ids=pending.astype(mx.int32)[:, None],
+            positions=mx.array(
+                [request.positions for request in requests], dtype=mx.int32
+            ),
+            forward_mode=ForwardMode.DECODE,
         )
 
     def _preflight_cache(
@@ -446,6 +540,12 @@ class MlxOverlapGenerationExecutor(MlxGenerationExecutor):
 
         with mx.stream(self._stream):
             return super().resolve_batch(in_flight)
+
+    def commit_dispatched(self, in_flight: InFlightStep) -> None:
+        """Publish the outstanding step's cache append on the owner stream."""
+
+        with mx.stream(self._stream):
+            super().commit_dispatched(in_flight)
 
     def discard_batch(self, in_flight: InFlightStep) -> None:
         """Synchronize before releasing an outstanding cache reservation."""
