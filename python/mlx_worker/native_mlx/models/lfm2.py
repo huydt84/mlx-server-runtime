@@ -41,6 +41,7 @@ class Lfm2ModelConfig:
     num_key_value_heads: int
     max_position_embeddings: int
     use_expert_bias: bool
+    routed_scaling_factor: float
     num_dense_layers: int
     norm_eps: float
     conv_bias: bool
@@ -350,7 +351,13 @@ class Lfm2Mlp(nn.Module):
 
 
 class Lfm2MoE(nn.Module):
-    """Top-k routed SwiGLU expert block."""
+    """Top-k routed SwiGLU expert block with sigmoid gating.
+
+    Routing follows the Hugging Face Transformers ``Lfm2MoeTopKRouter``: expert
+    scores are ``sigmoid(gate(x))``, ``expert_bias`` only influences which experts
+    are selected, and the selected unbiased scores are optionally renormalized and
+    then multiplied by ``routed_scaling_factor``.
+    """
 
     def __init__(self, config: Lfm2ModelConfig):
         super().__init__()
@@ -358,6 +365,7 @@ class Lfm2MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.use_expert_bias = config.use_expert_bias
+        self.routed_scaling_factor = config.routed_scaling_factor
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.switch_mlp = SwitchGLU(
             config.hidden_size,
@@ -368,15 +376,32 @@ class Lfm2MoE(nn.Module):
             self.expert_bias = mx.zeros((config.num_experts,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        gates = mx.softmax(self.gate(x).astype(mx.float32), axis=-1)
-        if self.use_expert_bias:
-            gates = gates + self.expert_bias
-        indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
-        scores = mx.take_along_axis(gates, indices, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        scores = scores.astype(x.dtype)
+        indices, scores = self.route(x)
         return (self.switch_mlp(x, indices) * scores[..., None]).sum(axis=-2)
+
+    def route(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        """Select experts and compute their routing weights.
+
+        Args:
+            x: Normalized hidden states with shape ``[..., hidden_size]``.
+
+        Returns:
+            The selected expert indices and routing weights, each with shape
+            ``[..., top_k]``; weights are cast to ``x.dtype``.
+        """
+
+        routing_weights = mx.sigmoid(self.gate(x))
+        selection = routing_weights
+        if self.use_expert_bias:
+            selection = routing_weights.astype(mx.float32) + self.expert_bias
+        indices = mx.argpartition(selection, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]
+        scores = mx.take_along_axis(routing_weights, indices, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-6)
+        scores = scores * self.routed_scaling_factor
+        return indices, scores.astype(x.dtype)
 
 
 class Lfm2DecoderLayer(nn.Module):
@@ -520,6 +545,7 @@ def parse_lfm2_config(payload: dict[str, Any]) -> Lfm2ModelConfig:
         num_key_value_heads=kv_heads,
         max_position_embeddings=int(payload["max_position_embeddings"]),
         use_expert_bias=bool(payload.get("use_expert_bias", False)),
+        routed_scaling_factor=float(payload.get("routed_scaling_factor", 1.0)),
         num_dense_layers=int(payload["num_dense_layers"]),
         norm_eps=float(payload["norm_eps"]),
         conv_bias=bool(payload.get("conv_bias", False)),

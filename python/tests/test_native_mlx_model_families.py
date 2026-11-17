@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import mlx.core as mx
 
 from mlx_worker.native_mlx.attention import DenseReferenceAttentionBackend
@@ -21,6 +23,7 @@ from mlx_worker.native_mlx.models.gemma3 import (
     parse_gemma3_config,
 )
 from mlx_worker.native_mlx.models.lfm2 import (
+    Lfm2MoE,
     Lfm2MoeForCausalLM,
     parse_lfm2_config,
 )
@@ -230,3 +233,76 @@ def test_lfm2_tiny_graph_commits_hybrid_conv_state_and_length() -> None:
     assert backend.length(handle) == 3
     assert cache.layers[0].conv_state is not None
     assert cache.layers[2].conv_state is not None
+
+
+def _tiny_lfm2_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "architectures": ["Lfm2MoeForCausalLM"],
+        "model_type": "lfm2_moe",
+        "vocab_size": 64,
+        "hidden_size": 2,
+        "intermediate_size": 4,
+        "moe_intermediate_size": 4,
+        "num_hidden_layers": 1,
+        "num_experts": 3,
+        "num_experts_per_tok": 2,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "max_position_embeddings": 128,
+        "num_dense_layers": 0,
+        "norm_eps": 1e-5,
+        "conv_L_cache": 3,
+        "layer_types": ["conv"],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_lfm2_config_reads_routed_scaling_factor_with_default() -> None:
+    assert parse_lfm2_config(_tiny_lfm2_payload()).routed_scaling_factor == 1.0
+    config = parse_lfm2_config(_tiny_lfm2_payload(routed_scaling_factor=2.5))
+    assert config.routed_scaling_factor == 2.5
+
+
+def test_lfm2_moe_routes_with_sigmoid_and_selection_only_expert_bias() -> None:
+    moe = Lfm2MoE(
+        parse_lfm2_config(
+            _tiny_lfm2_payload(use_expert_bias=True, routed_scaling_factor=2.0)
+        )
+    )
+    moe.gate.weight = mx.array([[2.0, 0.0], [0.0, 0.0], [-1.0, 0.0]])
+    # Sigmoid scores are ~[0.881, 0.5, 0.269]; the bias makes expert 2 win the
+    # selection over expert 1 without changing the gathered weights.
+    moe.expert_bias = mx.array([0.0, -1.0, 1.0])
+
+    indices, scores = moe.route(mx.array([[[1.0, 0.0]]]))
+    mx.eval(indices, scores)
+
+    picked = dict(
+        zip(indices.reshape(-1).tolist(), scores.reshape(-1).tolist(), strict=True)
+    )
+    assert sorted(picked) == [0, 2]
+    sigmoid_0 = 1.0 / (1.0 + math.exp(-2.0))
+    sigmoid_2 = 1.0 / (1.0 + math.exp(1.0))
+    total = sigmoid_0 + sigmoid_2 + 1e-6
+    assert math.isclose(picked[0], 2.0 * sigmoid_0 / total, rel_tol=1e-5)
+    assert math.isclose(picked[2], 2.0 * sigmoid_2 / total, rel_tol=1e-5)
+
+
+def test_lfm2_moe_without_normalization_keeps_raw_sigmoid_scores() -> None:
+    moe = Lfm2MoE(
+        parse_lfm2_config(
+            _tiny_lfm2_payload(use_expert_bias=False, norm_topk_prob=False)
+        )
+    )
+    moe.gate.weight = mx.array([[2.0, 0.0], [0.0, 0.0], [-1.0, 0.0]])
+
+    indices, scores = moe.route(mx.array([[[1.0, 0.0]]]))
+    mx.eval(indices, scores)
+
+    picked = dict(
+        zip(indices.reshape(-1).tolist(), scores.reshape(-1).tolist(), strict=True)
+    )
+    assert sorted(picked) == [0, 1]
+    assert math.isclose(picked[0], 1.0 / (1.0 + math.exp(-2.0)), rel_tol=1e-5)
+    assert math.isclose(picked[1], 0.5, rel_tol=1e-5)
