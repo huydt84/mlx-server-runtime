@@ -19,7 +19,8 @@ pub struct WorkerConfig {
     pub python: String,
     /// Python module entrypoint.
     pub module: String,
-    /// Explicit worker backend. `v1` remains default.
+    /// Worker backend. `native-mlx` is the default; `v1` serves through
+    /// `mlx-lm` for checkpoints and VLMs native-mlx does not implement.
     pub backend: BackendKind,
     /// Text model identifier.
     pub model: String,
@@ -34,7 +35,7 @@ pub struct WorkerConfig {
 pub enum BackendKind {
     /// Existing `mlx_lm` runtime path.
     V1,
-    /// Experimental native MLX runtime path.
+    /// Native MLX runtime path, the default.
     NativeMlx,
 }
 
@@ -89,6 +90,77 @@ pub struct RequestLimits {
     pub max_vlm_images: usize,
 }
 
+/// Default share of the Metal recommended working set the worker may use.
+pub const DEFAULT_MEMORY_UTILIZATION: f32 = 0.5;
+
+/// Worker memory sizing.
+///
+/// The native-mlx worker sizes its KV page pool from these values after the
+/// weights load: `utilization x recommended working set - weights - activation
+/// reserve`, unless `kv_cache_bytes` pins an absolute pool size.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryConfig {
+    /// Fraction in (0, 1] of the Metal recommended working set for weights,
+    /// activations, and the KV pool together.
+    pub utilization: f32,
+    /// Absolute KV pool size in bytes; overrides `utilization` when set.
+    pub kv_cache_bytes: Option<u64>,
+    /// Whether `limits.max_total_tokens_per_request` was set explicitly. When
+    /// false, the worker lowers it to the KV pool capacity; when true and the
+    /// pool cannot hold one such request, the worker refuses to start.
+    pub max_total_tokens_explicit: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            utilization: DEFAULT_MEMORY_UTILIZATION,
+            kv_cache_bytes: None,
+            max_total_tokens_explicit: false,
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// Validates a memory utilization fraction.
+    pub fn validate_utilization(value: f64) -> Result<f32, String> {
+        if value.is_finite() && value > 0.0 && value <= 1.0 {
+            Ok(value as f32)
+        } else {
+            Err(format!(
+                "memory utilization must be greater than 0 and at most 1, got {value}"
+            ))
+        }
+    }
+}
+
+/// Parses a byte size such as `4GiB`, `512MiB`, `2GB`, or `1073741824`.
+pub fn parse_byte_size(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    let split = trimmed
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split);
+    let multiplier: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1e3,
+        "m" | "mb" => 1e6,
+        "g" | "gb" => 1e9,
+        "kib" => 1024.0,
+        "mib" => 1024.0 * 1024.0,
+        "gib" => 1024.0 * 1024.0 * 1024.0,
+        other => return Err(format!("unsupported byte-size unit {other:?} in {raw:?}")),
+    };
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("invalid byte size {raw:?}"))?;
+    let bytes = (value * multiplier).round();
+    if !bytes.is_finite() || bytes < 1.0 || bytes > u64::MAX as f64 {
+        return Err(format!("byte size must be positive, got {raw:?}"));
+    }
+    Ok(bytes as u64)
+}
+
 /// Telemetry settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryConfig {
@@ -118,6 +190,8 @@ pub struct RuntimeConfig {
     pub generation: GenerationConfig,
     /// Request backpressure limits.
     pub limits: RequestLimits,
+    /// Worker memory sizing.
+    pub memory: MemoryConfig,
     /// Telemetry settings.
     pub telemetry: TelemetryConfig,
 }
@@ -132,7 +206,7 @@ impl Default for RuntimeConfig {
             worker: WorkerConfig {
                 python: "python/.venv/bin/python".to_string(),
                 module: "mlx_worker.main".to_string(),
-                backend: BackendKind::V1,
+                backend: BackendKind::NativeMlx,
                 model: "mlx-community/Qwen2.5-7B-Instruct-4bit".to_string(),
                 vlm_model: None,
                 ipc_path: "/tmp/mlx-runtime.sock".to_string(),
@@ -151,6 +225,7 @@ impl Default for RuntimeConfig {
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
             },
+            memory: MemoryConfig::default(),
             telemetry: TelemetryConfig {
                 enable_prometheus: true,
                 metrics_path: "/metrics".to_string(),
@@ -182,6 +257,12 @@ impl RuntimeConfig {
     pub fn overlay(path: impl AsRef<Path>, base: Self) -> io::Result<Self> {
         let contents = fs::read_to_string(path)?;
         Self::apply_contents(base, &contents)
+    }
+
+    /// Parses config text over the defaults; test helper for renderers.
+    #[cfg(test)]
+    pub(crate) fn overlay_contents_for_test(contents: &str) -> Self {
+        Self::apply_contents(Self::default(), contents).expect("rendered config parses")
     }
 
     fn apply_contents(mut config: Self, contents: &str) -> io::Result<Self> {
@@ -275,7 +356,34 @@ impl RuntimeConfig {
                                 io::ErrorKind::InvalidData,
                                 "limits.max_total_tokens_per_request out of range",
                             )
-                        })?
+                        })?;
+                    config.memory.max_total_tokens_explicit = true;
+                }
+                ("memory", "utilization", Value::Float(value)) => {
+                    config.memory.utilization = MemoryConfig::validate_utilization(value.into())
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                }
+                ("memory", "utilization", Value::Integer(value)) => {
+                    config.memory.utilization = MemoryConfig::validate_utilization(value as f64)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+                }
+                ("memory", "kv_cache_bytes", Value::Integer(value)) => {
+                    let bytes = u64::try_from(value)
+                        .ok()
+                        .filter(|bytes| *bytes > 0)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "memory.kv_cache_bytes must be positive",
+                            )
+                        })?;
+                    config.memory.kv_cache_bytes = Some(bytes);
+                }
+                ("memory", "kv_cache_bytes", Value::String(value)) => {
+                    config.memory.kv_cache_bytes = Some(
+                        parse_byte_size(&value)
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
+                    );
                 }
                 ("limits", "request_timeout_seconds", Value::Integer(value)) => {
                     config.limits.request_timeout_seconds = u64::try_from(value).map_err(|_| {
@@ -340,6 +448,15 @@ impl RuntimeConfig {
             self.limits.max_total_tokens_per_request,
             self.limits.request_timeout_seconds,
             self.limits.max_vlm_images
+        );
+        let _ = writeln!(
+            rendered,
+            "memory utilization={} kv_cache_bytes={} max_total_tokens_explicit={}",
+            self.memory.utilization,
+            self.memory
+                .kv_cache_bytes
+                .map_or_else(|| "<derived>".to_string(), |bytes| bytes.to_string()),
+            self.memory.max_total_tokens_explicit
         );
         let _ = write!(
             rendered,
@@ -436,6 +553,61 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn load_text(contents: &str) -> io::Result<RuntimeConfig> {
+        RuntimeConfig::apply_contents(RuntimeConfig::default(), contents)
+    }
+
+    #[test]
+    fn memory_defaults_derive_the_pool_and_request_limit() {
+        let config = RuntimeConfig::default();
+        assert_eq!(config.memory.utilization, DEFAULT_MEMORY_UTILIZATION);
+        assert_eq!(config.memory.kv_cache_bytes, None);
+        assert!(!config.memory.max_total_tokens_explicit);
+    }
+
+    #[test]
+    fn memory_section_sets_utilization_and_absolute_pool() {
+        let config = load_text("[memory]\nutilization = 0.7\nkv_cache_bytes = \"4GiB\"\n").unwrap();
+        assert!((config.memory.utilization - 0.7).abs() < 1e-6);
+        assert_eq!(config.memory.kv_cache_bytes, Some(4 * 1024 * 1024 * 1024));
+
+        let config = load_text("[memory]\nutilization = 1\nkv_cache_bytes = 1048576\n").unwrap();
+        assert_eq!(config.memory.utilization, 1.0);
+        assert_eq!(config.memory.kv_cache_bytes, Some(1_048_576));
+    }
+
+    #[test]
+    fn memory_section_rejects_out_of_range_values() {
+        for contents in [
+            "[memory]\nutilization = 0\n",
+            "[memory]\nutilization = 1.5\n",
+            "[memory]\nkv_cache_bytes = 0\n",
+            "[memory]\nkv_cache_bytes = \"4 TiB\"\n",
+        ] {
+            let error = load_text(contents).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{contents}");
+        }
+    }
+
+    #[test]
+    fn explicit_max_total_tokens_is_tracked() {
+        let config = load_text("[limits]\nmax_total_tokens_per_request = 8192\n").unwrap();
+        assert_eq!(config.limits.max_total_tokens_per_request, 8192);
+        assert!(config.memory.max_total_tokens_explicit);
+    }
+
+    #[test]
+    fn byte_sizes_accept_binary_and_decimal_units() {
+        assert_eq!(parse_byte_size("1073741824").unwrap(), 1 << 30);
+        assert_eq!(parse_byte_size("512MiB").unwrap(), 512 << 20);
+        assert_eq!(parse_byte_size("1.5GiB").unwrap(), 3 << 29);
+        assert_eq!(parse_byte_size("2GB").unwrap(), 2_000_000_000);
+        assert_eq!(parse_byte_size(" 8 gib ").unwrap(), 8 << 30);
+        assert!(parse_byte_size("0").is_err());
+        assert!(parse_byte_size("GiB").is_err());
+        assert!(parse_byte_size("3 parsecs").is_err());
+    }
 
     #[test]
     fn load_returns_defaults_when_file_is_missing() {

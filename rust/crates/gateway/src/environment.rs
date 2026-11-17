@@ -14,12 +14,17 @@ pub(crate) struct RuntimeEnvironment {
     pub(crate) python: PathBuf,
     pub(crate) setup_record: PathBuf,
     pub(crate) lockfile_sha256: String,
+    pub(crate) worker_package_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SetupRecord {
     distribution_version: String,
     lockfile_sha256: String,
+    /// Records written before the worker hash existed read as empty, which
+    /// never matches, so those environments reinstall the worker once.
+    #[serde(default)]
+    worker_package_sha256: String,
     python_executable: PathBuf,
     python_version: String,
     project_install_mode: String,
@@ -50,12 +55,16 @@ pub(crate) fn select_runtime_environment(
     let lockfile_sha256 = distribution
         .lockfile_sha256()
         .map_err(|err| EnvironmentError::new(err.to_string()))?;
+    let worker_package_sha256 = distribution
+        .worker_package_sha256()
+        .map_err(|err| EnvironmentError::new(err.to_string()))?;
     let root = application.runtime_environment(DISTRIBUTION_VERSION, &lockfile_sha256);
     Ok(RuntimeEnvironment {
         python: root.join("bin/python"),
         setup_record: root.join("setup.json"),
         root,
         lockfile_sha256,
+        worker_package_sha256,
     })
 }
 
@@ -88,6 +97,10 @@ pub(crate) fn ensure_runtime_environment(
             "--frozen".into(),
             "--no-dev".into(),
             "--no-editable".into(),
+            // The worker is a local, non-editable package: rebuild it from
+            // this distribution instead of reusing an older build.
+            "--reinstall-package".into(),
+            "mlx-worker".into(),
         ])
         .env(
             "UV_PROJECT_ENVIRONMENT",
@@ -127,6 +140,7 @@ pub(crate) fn ensure_runtime_environment(
     let record = SetupRecord {
         distribution_version: DISTRIBUTION_VERSION.to_string(),
         lockfile_sha256: environment.lockfile_sha256.clone(),
+        worker_package_sha256: environment.worker_package_sha256.clone(),
         python_executable: environment.python.clone(),
         python_version: output_detail(&version.stdout, &version.stderr),
         project_install_mode: "non-editable".to_string(),
@@ -149,6 +163,7 @@ fn setup_is_current(environment: &RuntimeEnvironment) -> bool {
     };
     record.distribution_version == DISTRIBUTION_VERSION
         && record.lockfile_sha256 == environment.lockfile_sha256
+        && record.worker_package_sha256 == environment.worker_package_sha256
         && record.python_executable == environment.python
         && record.project_install_mode == "non-editable"
         && record.installed_dependency_groups.is_empty()
@@ -249,6 +264,8 @@ mod tests {
                 "--frozen".into(),
                 "--no-dev".into(),
                 "--no-editable".into(),
+                "--reinstall-package".into(),
+                "mlx-worker".into(),
             ]
         );
         assert_eq!(
@@ -277,6 +294,7 @@ mod tests {
             &SetupRecord {
                 distribution_version: DISTRIBUTION_VERSION.to_string(),
                 lockfile_sha256: selected.lockfile_sha256.clone(),
+                worker_package_sha256: selected.worker_package_sha256.clone(),
                 python_executable: selected.python.clone(),
                 python_version: "Python 3.12.1".to_string(),
                 project_install_mode: "non-editable".to_string(),
@@ -294,5 +312,51 @@ mod tests {
         assert!(runner.calls.borrow().is_empty());
         fs::remove_dir_all(distribution_root).unwrap();
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn changed_worker_package_reinstalls_into_the_same_environment() {
+        let (distribution_root, distribution) = staged_distribution("environment-worker-change");
+        let home = temp_path("environment-worker-change-home");
+        let application = ApplicationPaths::from_home(&home);
+        let before = select_runtime_environment(&distribution, &application).unwrap();
+        fs::create_dir_all(before.python.parent().unwrap()).unwrap();
+        fs::write(&before.python, "python").unwrap();
+        ensure_runtime_environment(&distribution, &application, &FakeRunner::successful()).unwrap();
+
+        fs::write(
+            distribution.python_package.join("native.py"),
+            "SAMPLING = True\n",
+        )
+        .unwrap();
+        let after = select_runtime_environment(&distribution, &application).unwrap();
+        let runner = FakeRunner::successful();
+        ensure_runtime_environment(&distribution, &application, &runner).unwrap();
+
+        assert_eq!(after.root, before.root);
+        assert_ne!(after.worker_package_sha256, before.worker_package_sha256);
+        assert_eq!(runner.calls.borrow().len(), 2);
+        let record: SetupRecord =
+            serde_json::from_slice(&fs::read(&after.setup_record).unwrap()).unwrap();
+        assert_eq!(record.worker_package_sha256, after.worker_package_sha256);
+        fs::remove_dir_all(distribution_root).unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn worker_hash_ignores_bytecode_caches() {
+        let (distribution_root, distribution) = staged_distribution("environment-pycache");
+        let before = distribution.worker_package_sha256().unwrap();
+        fs::create_dir_all(distribution.python_package.join("__pycache__")).unwrap();
+        fs::write(
+            distribution
+                .python_package
+                .join("__pycache__/main.cpython-313.pyc"),
+            "bytecode",
+        )
+        .unwrap();
+
+        assert_eq!(distribution.worker_package_sha256().unwrap(), before);
+        fs::remove_dir_all(distribution_root).unwrap();
     }
 }

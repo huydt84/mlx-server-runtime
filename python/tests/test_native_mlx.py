@@ -1404,6 +1404,79 @@ def _schedulable(
     )
 
 
+@dataclass
+class _PagedFakeCacheCoordinator(_FakeCacheCoordinator):
+    total_pages: int = 0
+    page_size: int = 4
+
+    def kv_admission_capacity(self) -> tuple[int, int]:
+        used = sum(-(-length // self.page_size) for length in self.lengths.values())
+        return self.total_pages - used, self.page_size
+
+
+def _paged_scheduler(
+    executor: _FakeExecutor, *, total_pages: int
+) -> tuple[NativeContinuousScheduler, _PagedFakeCacheCoordinator]:
+    coordinator = _PagedFakeCacheCoordinator(executor.lengths, total_pages=total_pages)
+    scheduler = NativeContinuousScheduler(
+        executor,
+        coordinator,  # type: ignore[arg-type]
+        prefill_batch_size=4,
+        prefill_step_size=256,
+    )
+    return scheduler, coordinator
+
+
+def test_scheduler_holds_new_requests_until_kv_pages_free_up() -> None:
+    executor = _FakeExecutor()
+    # Each request needs ceil((4 + 8) / 4) + 1 = 4 pages through its last token.
+    scheduler, _ = _paged_scheduler(executor, total_pages=6)
+    scheduler.submit(_schedulable("first", (1, 2, 3, 4), max_tokens=8))
+    scheduler.submit(_schedulable("second", (5, 6, 7, 8), max_tokens=8))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[0].requests] == ["first"]
+    assert "second" in scheduler._waiting
+    assert scheduler._kv_admission_waits >= 1
+
+    scheduler.tick()
+    assert [request.phase for request in executor.batches[-1].requests] == ["decode"]
+    assert "second" in scheduler._waiting
+
+    scheduler.finish("first")
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[-1].requests] == [
+        "second"
+    ]
+    assert "second" in scheduler._running
+
+
+def test_scheduler_admits_a_lone_request_even_when_pages_look_short() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _paged_scheduler(executor, total_pages=1)
+    scheduler.submit(_schedulable("only", (1, 2, 3, 4), max_tokens=8))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[0].requests] == ["only"]
+
+
+def test_scheduler_admits_requests_that_fit_together() -> None:
+    executor = _FakeExecutor()
+    scheduler, _ = _paged_scheduler(executor, total_pages=8)
+    scheduler.submit(_schedulable("first", (1, 2, 3, 4), max_tokens=8))
+    scheduler.submit(_schedulable("second", (5, 6, 7, 8), max_tokens=8))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[0].requests] == [
+        "first",
+        "second",
+    ]
+
+
 def test_scheduler_owns_chunking_and_emits_typed_token_events() -> None:
     executor = _FakeExecutor()
     scheduler, _ = _scheduler(executor, prefill_step_size=2)
@@ -2176,6 +2249,51 @@ def test_runtime_uses_request_local_streaming_detokenizer() -> None:
     assert response.text == "ab"
 
 
+def test_runtime_accepts_sampling_and_rejects_out_of_range_values() -> None:
+    scheduler = _FakeScheduler()
+    tokenizer = _FakeTokenizer()
+    runtime = NativeRuntime(
+        scheduler,  # type: ignore[arg-type]
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+    )
+
+    runtime.submit(_chat_request(top_p=0.9))
+    runtime.submit(_chat_request(request_id="sampled", temperature=0.6, top_p=0.95))
+    assert [request.sampling.temperature for request in scheduler.submitted] == [
+        0.0,
+        0.6,
+    ]
+    assert scheduler.submitted[1].sampling.top_p == 0.95
+
+    with pytest.raises(ValueError, match="temperature"):
+        runtime.submit(_chat_request(request_id="negative", temperature=-0.1))
+    with pytest.raises(ValueError, match="top_p"):
+        runtime.submit(_chat_request(request_id="zero-top-p", top_p=0.0))
+
+
+def test_runtime_rejects_requests_above_the_kv_derived_limit() -> None:
+    scheduler = _FakeScheduler()
+    tokenizer = _FakeTokenizer()
+    runtime = NativeRuntime(
+        scheduler,  # type: ignore[arg-type]
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+        max_total_tokens=3,
+    )
+
+    with pytest.raises(ValueError, match="derived from the KV cache pool"):
+        runtime.submit(_chat_request(max_tokens=2))
+    assert scheduler.submitted == []
+
+    runtime.submit(_chat_request(max_tokens=1))
+    assert len(scheduler.submitted) == 1
+
+
 def test_runtime_passes_scheduler_policy_metadata() -> None:
     scheduler = _FakeScheduler()
     tokenizer = _FakeTokenizer()
@@ -2292,3 +2410,36 @@ def test_create_native_worker_limits_mlx_cache_before_loading(monkeypatch) -> No
         worker.create_native_worker(config)
 
     assert calls == [5, "load"]
+
+
+class _BootstrapCapture:
+    def __init__(self) -> None:
+        self.sent = bytearray()
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.extend(data)
+
+
+def test_native_worker_refuses_a_vlm_model_before_loading_anything() -> None:
+    from mlx_worker.config import WorkerConfig
+    from mlx_worker.native_mlx.worker import run_native_worker
+
+    def factory(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("the text model must not load")
+
+    client = _BootstrapCapture()
+    status = run_native_worker(
+        client,  # type: ignore[arg-type]
+        WorkerConfig(
+            socket_path="unused",
+            model="mlx-community/Qwen3-8B-4bit",
+            backend="native-mlx",
+            vlm_model="mlx-community/Qwen3-VL-2B-Instruct-4bit",
+        ),
+        native_worker_factory=factory,  # type: ignore[arg-type]
+    )
+
+    assert status == 1
+    sent = client.sent.decode()
+    assert "VLM_UNSUPPORTED" in sent
+    assert "--backend v1" in sent

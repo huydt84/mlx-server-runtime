@@ -2,11 +2,13 @@ use crate::{BackendKind, RuntimeConfig};
 use std::fmt;
 use std::path::Path;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct CliConfigOverrides {
     pub(crate) model: Option<String>,
     pub(crate) backend: Option<BackendKind>,
     pub(crate) port: Option<u16>,
+    pub(crate) memory_utilization: Option<f32>,
+    pub(crate) kv_cache_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -49,6 +51,12 @@ pub(crate) fn resolve_runtime_config(
     }
     if let Some(port) = overrides.port {
         config.server.port = port;
+    }
+    if let Some(utilization) = overrides.memory_utilization {
+        config.memory.utilization = utilization;
+    }
+    if let Some(bytes) = overrides.kv_cache_bytes {
+        config.memory.kv_cache_bytes = Some(bytes);
     }
     if config.worker.model.trim().is_empty() {
         return Err(ConfigError::new(
@@ -116,6 +124,8 @@ mod tests {
             model: Some("cli-model".to_string()),
             backend: Some(BackendKind::NativeMlx),
             port: Some(8003),
+            memory_utilization: Some(0.75),
+            kv_cache_bytes: Some(1 << 30),
         };
 
         let config = resolve_runtime_config(

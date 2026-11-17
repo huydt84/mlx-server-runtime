@@ -163,10 +163,12 @@ def run_benchmark(
             total_trials = _planned_trial_count(results["configuration"])
 
             def completed_trial(trial: dict[str, Any]) -> None:
+                failures_before = len(results["validation_failures"])
                 results["trials"].append(trial)
                 _validate_completed_trial(results, trial)
                 _write_artifacts(run_directory, results)
                 _report_trial_progress(trial, len(results["trials"]), total_trials)
+                _stop_on_failed_trial(results, trial, failures_before)
 
             for execution in _execution_plan(
                 results["configuration"], arguments.server_mode
@@ -220,8 +222,11 @@ def run_benchmark(
                     server.stop()
                     server = None
             _validate_final_results(results)
-            if any(trial["error_count"] for trial in results["trials"]):
-                raise _RunFailure("measurement", "one or more requests failed")
+            if results["validation_failures"]:
+                failure = results["validation_failures"][0]
+                raise _RunFailure(
+                    "validation", f"{failure['code']}: {failure['message']}"
+                )
             results["analysis"] = analyze_run(results)
             results["status"] = "succeeded"
             results["failure_stage"] = None
@@ -1005,7 +1010,7 @@ async def _execute_measured_state(
             False,
         )
         priming: list[dict[str, Any]] = []
-        if cache_state == "warm-prefix":
+        if cache_state in {"warm-prefix", "primed"}:
             prime_prompts = shared_prefix_prime_prompts(
                 group,
                 trial_index=trial_index,
@@ -1263,6 +1268,12 @@ def _wait_for_readiness(
             if status == 200 and payload.get("ready") is True:
                 return payload
             last_error = f"readiness returned HTTP {status}: {payload}"
+            # A failed worker startup does not recover; stop waiting now.
+            _, startup = _get_json(f"{base_url}/startup", timeout=2)
+            if startup.get("status") == "failed":
+                raise _RunFailure(
+                    "readiness", f"gateway startup failed: {startup.get('error')}"
+                )
         except (OSError, ValueError, json.JSONDecodeError) as error:
             last_error = str(error)
         time.sleep(0.2)
@@ -1395,6 +1406,39 @@ def _runtime_metric_delta(
     }
 
 
+def _stop_on_failed_trial(
+    results: dict[str, Any], trial: dict[str, Any], failures_before: int
+) -> None:
+    """Abort the run at the first trial with failed requests or broken contract.
+
+    Later workloads would measure a server already known to be failing, and a
+    run with any failed trial cannot support a conclusion, so measuring them
+    only delays the failure.
+    """
+
+    label = f"{trial['workload_name']} trial {trial['trial_index']}"
+    if trial["error_count"]:
+        first_error = next(
+            (
+                request.get("error")
+                for request in trial["requests"]
+                if request.get("status") == "failed"
+            ),
+            None,
+        )
+        raise _RunFailure(
+            "measurement",
+            f"{label}: {trial['error_count']} of {len(trial['requests'])} "
+            f"requests failed; first error: {first_error}",
+        )
+    new_failures = results["validation_failures"][failures_before:]
+    if new_failures:
+        failure = new_failures[0]
+        raise _RunFailure(
+            "validation", f"{label}: {failure['code']}: {failure['message']}"
+        )
+
+
 def _validate_completed_trial(results: dict[str, Any], trial: dict[str, Any]) -> None:
     workload = next(
         workload
@@ -1446,6 +1490,15 @@ def _validate_completed_trial(results: dict[str, Any], trial: dict[str, Any]) ->
             results,
             "cold_cache_hit",
             f"{trial['workload_name']} cold trial recorded cached tokens {cached_tokens}",
+        )
+    if cache_mode == "primed" and any(
+        cached >= int(request["prompt_tokens"])
+        for cached, request in zip(cached_tokens, trial["requests"], strict=True)
+    ):
+        _validation_failure(
+            results,
+            "primed_prefix_state",
+            f"{trial['workload_name']} reused a whole measured prompt",
         )
     if cache_mode == "warm-prefix" and any(
         cached <= 0 or cached >= int(request["prompt_tokens"])

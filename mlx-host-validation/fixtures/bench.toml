@@ -46,6 +46,11 @@ environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUT
 backend = "native-mlx"
 environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY = "block-hash", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "268435456", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "2" }
 
+# A KV pool below one page fails native startup.
+[runtime_configurations.broken_startup]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_KV_CACHE_BYTES = "1" }
+
 [workloads.sequential_stream]
 prompt_group = "short"
 output_tokens = 4
@@ -173,3 +178,17 @@ trials = 2
 runtime_configurations = ["native"]
 diagnostics = []
 coverage = { control = ["delayed_ttft"] }
+
+[suites.fail_startup]
+rounds = 1
+trials = 1
+runtime_configurations = ["broken_startup"]
+diagnostics = []
+coverage = { primary = ["cold"] }
+
+[suites.fail_trial]
+rounds = 1
+trials = 1
+runtime_configurations = ["v1"]
+diagnostics = []
+coverage = { control = ["cold", "burst_nonstream"] }

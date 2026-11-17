@@ -13,6 +13,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Validate serial versus overlap execution: token parity, latency regression, MLX overlap probe, and optional Metal captures."
 cli_option CHECKPOINT --checkpoint MLX_OVERLAP_CHECKPOINT string \
     "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served in both execution modes."
@@ -127,18 +129,10 @@ start_gateway() {
         MTL_CAPTURE_ENABLED="${MTL_CAPTURE_ENABLED:-0}" \
         cargo run -p mlx_runtime_gateway --bin mlx_runtime_gateway >"$log" 2>&1 &
     GATEWAY_PID=$!
-    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
-        if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-            return
-        fi
-        if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-            tail -100 "$log" >&2
-            exit 1
-        fi
-        sleep 1
-    done
-    echo "overlap_gateway_error=readiness timeout for $mode" >&2
-    exit 1
+    if ! gateway_wait_ready "$PORT" "$HEALTH_TIMEOUT" "$GATEWAY_PID" "$log"; then
+        echo "overlap_gateway_error=gateway not ready for $mode" >&2
+        exit 1
+    fi
 }
 
 capture_metal_timeline() {

@@ -688,7 +688,22 @@ fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
             "MLX_RUNTIME_MAX_VLM_IMAGES",
             config.limits.max_vlm_images.to_string(),
         ),
+        (
+            "MLX_RUNTIME_MEMORY_UTILIZATION",
+            config.memory.utilization.to_string(),
+        ),
+        (
+            "MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST",
+            config.limits.max_total_tokens_per_request.to_string(),
+        ),
+        (
+            "MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT",
+            u8::from(config.memory.max_total_tokens_explicit).to_string(),
+        ),
     ];
+    if let Some(bytes) = config.memory.kv_cache_bytes {
+        values.push(("MLX_RUNTIME_KV_CACHE_BYTES", bytes.to_string()));
+    }
     for key in [
         "MLX_RUNTIME_NATIVE_EXECUTION_MODE",
         "MLX_RUNTIME_NATIVE_PIPELINE_PROFILE",
@@ -781,8 +796,20 @@ mod tests {
     }
 
     #[test]
-    fn worker_env_defaults_to_v1_backend() {
+    fn worker_env_defaults_to_native_backend() {
         let config = RuntimeConfig::default();
+        let env = worker_env(&config);
+
+        assert!(env.iter().any(|(key, value)| {
+            *key == "MLX_RUNTIME_BACKEND" && value == BackendKind::NativeMlx.as_str()
+        }));
+    }
+
+    #[test]
+    fn worker_env_uses_explicit_v1_backend() {
+        let mut config = RuntimeConfig::default();
+        config.worker.backend = BackendKind::V1;
+
         let env = worker_env(&config);
 
         assert!(
@@ -793,15 +820,37 @@ mod tests {
     }
 
     #[test]
-    fn worker_env_uses_explicit_native_backend() {
+    fn worker_env_forwards_memory_sizing() {
+        let env = worker_env(&RuntimeConfig::default());
+        let get = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            get("MLX_RUNTIME_MEMORY_UTILIZATION").as_deref(),
+            Some("0.5")
+        );
+        assert_eq!(
+            get("MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST").as_deref(),
+            Some("65536")
+        );
+        assert_eq!(
+            get("MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT").as_deref(),
+            Some("0")
+        );
+        assert_eq!(get("MLX_RUNTIME_KV_CACHE_BYTES"), None);
+
         let mut config = RuntimeConfig::default();
-        config.worker.backend = BackendKind::NativeMlx;
-
+        config.memory.kv_cache_bytes = Some(1 << 30);
+        config.memory.max_total_tokens_explicit = true;
         let env = worker_env(&config);
-
-        assert!(env.iter().any(|(key, value)| {
-            *key == "MLX_RUNTIME_BACKEND" && value == BackendKind::NativeMlx.as_str()
-        }));
+        assert!(env
+            .iter()
+            .any(|(key, value)| *key == "MLX_RUNTIME_KV_CACHE_BYTES" && value == "1073741824"));
+        assert!(env
+            .iter()
+            .any(|(key, value)| *key == "MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT" && value == "1"));
     }
 
     #[test]

@@ -18,8 +18,8 @@ mod supervisor;
 mod telemetry;
 
 pub use config::{
-    BackendKind, GenerationConfig, RequestLimits, RuntimeConfig, ServerConfig, TelemetryConfig,
-    WorkerConfig,
+    parse_byte_size, BackendKind, GenerationConfig, MemoryConfig, RequestLimits, RuntimeConfig,
+    ServerConfig, TelemetryConfig, WorkerConfig, DEFAULT_MEMORY_UTILIZATION,
 };
 pub use errors::GatewayError;
 

@@ -34,6 +34,8 @@ class PrefixCache(Protocol):
 
     def release(self, cache_handle: str | None) -> None: ...
 
+    def reclaim(self, pages: int) -> int: ...
+
     def metrics(self) -> dict[str, Any]: ...
 
     def reset(self, *, clear_cache: bool, reset_counters: bool) -> None: ...
@@ -77,6 +79,28 @@ class NativeCacheCoordinator:
 
     def length(self, cache_handle: str | None) -> int:
         return self.backend.length(cache_handle)
+
+    def kv_admission_capacity(self) -> tuple[int, int] | None:
+        """Return ``(free_pages, page_size)`` for admission control.
+
+        Returns ``None`` when the backend has no fixed page pool.
+        """
+
+        free_page_count = getattr(self.backend, "free_page_count", None)
+        page_size = getattr(self.backend, "page_size", None)
+        if not callable(free_page_count) or not page_size:
+            return None
+        return int(free_page_count()), int(page_size)
+
+    def reclaim_pages(self, pages: int) -> int:
+        """Evict unpinned prefix-cache entries until ``pages`` pages are free.
+
+        Returns:
+            Pages returned to the backend's free list, possibly fewer than
+            requested.
+        """
+
+        return self.prefix_cache.reclaim(pages)
 
     def release(self, cache_handle: str | None) -> None:
         self.prefix_cache.release(cache_handle)

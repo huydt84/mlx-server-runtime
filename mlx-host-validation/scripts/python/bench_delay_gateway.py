@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Host-validation proxy that adds a declared gateway response delay."""
+"""Host-validation proxy that adds a declared gateway response delay.
+
+With ``MLX_AIR_BENCH_FAIL_AFTER_RESET=1`` it instead answers every chat
+completion with HTTP 503 once the benchmark has reset state for its first
+trial, so warmups succeed and the first measured trial fails.
+"""
 
 from __future__ import annotations
 
@@ -45,6 +50,8 @@ environment = os.environ.copy()
 environment["MLX_RUNTIME_CONFIG"] = str(proxy_config)
 upstream = subprocess.Popen([str(REAL_GATEWAY)], env=environment)
 delay_seconds = int(os.environ.get("MLX_AIR_BENCH_DELAY_MS", "120")) / 1000
+fail_after_reset = os.environ.get("MLX_AIR_BENCH_FAIL_AFTER_RESET") == "1"
+reset_seen = False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -59,8 +66,15 @@ class Handler(BaseHTTPRequestHandler):
         self._forward()
 
     def _forward(self) -> None:
+        global reset_seen
         content_length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(content_length) if content_length else None
+        if self.path == "/internal/benchmark/reset":
+            reset_seen = True
+        if fail_after_reset and reset_seen and self.path == "/v1/chat/completions":
+            self.send_error(503, "injected failure after benchmark reset")
+            self.close_connection = True
+            return
         connection = HTTPConnection("127.0.0.1", upstream_port, timeout=300)
         headers = {
             name: value

@@ -12,20 +12,20 @@ def test_load_config_parses_max_vlm_images(monkeypatch) -> None:
     assert config.max_vlm_images == 7
 
 
-def test_load_config_defaults_backend_to_v1(monkeypatch) -> None:
+def test_load_config_defaults_backend_to_native(monkeypatch) -> None:
     monkeypatch.delenv("MLX_RUNTIME_BACKEND", raising=False)
 
     config = load_config()
 
-    assert config.backend == "v1"
+    assert config.backend == "native-mlx"
 
 
-def test_load_config_parses_native_backend(monkeypatch) -> None:
-    monkeypatch.setenv("MLX_RUNTIME_BACKEND", "native-mlx")
+def test_load_config_parses_v1_backend(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_BACKEND", "v1")
 
     config = load_config()
 
-    assert config.backend == "native-mlx"
+    assert config.backend == "v1"
 
 
 def test_load_config_parses_continuous_batching_controls(monkeypatch) -> None:
@@ -215,4 +215,75 @@ def test_load_config_requires_pipeline_profile_directory(monkeypatch) -> None:
     monkeypatch.delenv("MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR", raising=False)
 
     with pytest.raises(ValueError, match="PIPELINE_PROFILE_DIR"):
+        load_config()
+
+
+_MEMORY_ENV = (
+    "MLX_RUNTIME_MEMORY_UTILIZATION",
+    "MLX_RUNTIME_KV_CACHE_BYTES",
+    "MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES",
+    "MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST",
+    "MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT",
+)
+
+
+def test_load_config_defaults_memory_sizing(monkeypatch) -> None:
+    for name in _MEMORY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    config = load_config()
+
+    assert config.memory_utilization == 0.5
+    assert config.kv_cache_bytes is None
+    assert config.max_total_tokens_per_request == 65_536
+    assert config.max_total_tokens_explicit is False
+
+
+def test_load_config_parses_memory_sizing(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_MEMORY_UTILIZATION", "0.8")
+    monkeypatch.setenv("MLX_RUNTIME_KV_CACHE_BYTES", "1073741824")
+    monkeypatch.setenv("MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES", "4096")
+    monkeypatch.setenv("MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST", "8192")
+    monkeypatch.setenv("MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT", "1")
+
+    config = load_config()
+
+    assert config.memory_utilization == 0.8
+    assert config.kv_cache_bytes == 1 << 30
+    assert config.max_total_tokens_per_request == 8192
+    assert config.max_total_tokens_explicit is True
+
+
+def test_load_config_accepts_legacy_kv_budget_variable(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_KV_CACHE_BYTES", raising=False)
+    monkeypatch.setenv("MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES", "268435456")
+
+    assert load_config().kv_cache_bytes == 268_435_456
+
+
+def test_legacy_zero_budget_disables_v1_cache_without_pinning_native_pool(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_KV_CACHE_BYTES", raising=False)
+    monkeypatch.setenv("MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES", "0")
+
+    config = load_config()
+
+    assert config.text_cache_budget_bytes == 0
+    assert config.kv_cache_bytes is None
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("MLX_RUNTIME_MEMORY_UTILIZATION", "0"),
+        ("MLX_RUNTIME_MEMORY_UTILIZATION", "1.2"),
+        ("MLX_RUNTIME_KV_CACHE_BYTES", "-1"),
+        ("MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST", "0"),
+    ],
+)
+def test_load_config_rejects_invalid_memory_sizing(monkeypatch, name, value) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
         load_config()

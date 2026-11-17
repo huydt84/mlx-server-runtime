@@ -17,15 +17,26 @@ class WorkerConfig:
 
     Attributes:
         socket_path: Unix domain socket path for IPC with the Rust gateway.
-        backend: Backend selected by Rust startup. ``v1`` remains default.
+        backend: Backend selected by Rust startup. ``native-mlx`` is the
+            default; ``v1`` serves through ``mlx-lm``.
         model: Text-only model identifier (e.g. an ``mlx-community`` hub path).
         vlm_model: Optional VLM model identifier. When ``None`` or empty,
             no VLM engine is constructed and the worker runs text-only.
+        memory_utilization: Fraction in (0, 1] of the Metal recommended
+            working set for weights, activations, and the native KV pool.
+        kv_cache_bytes: Absolute native KV pool size; overrides
+            ``memory_utilization`` when set.
+        max_total_tokens_per_request: Configured per-request token limit.
+        max_total_tokens_explicit: Whether the operator set that limit. When
+            false, native-mlx lowers it to the KV pool capacity.
+        text_cache_max_entries_explicit: Whether the operator set
+            ``text_cache_max_entries``. When false, the native prefix cache
+            may hold every page of the KV pool and gives pages back on demand.
     """
 
     socket_path: str
     model: str
-    backend: str = "v1"
+    backend: str = "native-mlx"
     vlm_model: str | None = None
     max_vlm_images: int = 5
     continuous_batching: bool = False
@@ -40,6 +51,11 @@ class WorkerConfig:
     vlm_prefill_chunk_size: int = 256
     text_cache_budget_bytes: int = 8 * 1024 * 1024
     text_cache_max_entries: int = 32
+    text_cache_max_entries_explicit: bool = False
+    memory_utilization: float = 0.5
+    kv_cache_bytes: int | None = None
+    max_total_tokens_per_request: int = 65_536
+    max_total_tokens_explicit: bool = False
     native_kv_page_size: int = 16
     native_mlx_cache_limit_bytes: int = 1024 * 1024 * 1024
     native_execution_backend: str = DEFAULT_NATIVE_EXECUTION_BACKEND
@@ -65,7 +81,9 @@ def load_config() -> WorkerConfig:
 
     raw_vlm = os.environ.get("MLX_RUNTIME_VLM_MODEL", "")
     vlm_model: str | None = raw_vlm if raw_vlm.strip() else None
-    backend = os.environ.get("MLX_RUNTIME_BACKEND", "v1").strip() or "v1"
+    backend = (
+        os.environ.get("MLX_RUNTIME_BACKEND", "native-mlx").strip() or "native-mlx"
+    )
     max_vlm_images = int(os.environ.get("MLX_RUNTIME_MAX_VLM_IMAGES", "5"))
     continuous_batching = _load_bool("MLX_RUNTIME_CONTINUOUS_BATCHING", "0")
     prompt_concurrency = int(os.environ.get("MLX_RUNTIME_PROMPT_CONCURRENCY", "4"))
@@ -111,6 +129,29 @@ def load_config() -> WorkerConfig:
         None,
         32,
     )
+    memory_utilization = float(os.environ.get("MLX_RUNTIME_MEMORY_UTILIZATION", "0.5"))
+    if not 0.0 < memory_utilization <= 1.0:
+        raise ValueError(
+            "MLX_RUNTIME_MEMORY_UTILIZATION must be greater than 0 and at most 1"
+        )
+    kv_cache_bytes: int | None = None
+    if os.environ.get("MLX_RUNTIME_KV_CACHE_BYTES", "").strip():
+        kv_cache_bytes = int(os.environ["MLX_RUNTIME_KV_CACHE_BYTES"])
+        if kv_cache_bytes <= 0:
+            raise ValueError("MLX_RUNTIME_KV_CACHE_BYTES must be positive")
+    elif (
+        text_cache_budget_bytes > 0
+        and os.environ.get("MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES", "").strip()
+    ):
+        # Legacy pin for the native pool. Zero only disables the v1 prompt
+        # cache, so native-mlx then derives its pool from the utilization.
+        kv_cache_bytes = text_cache_budget_bytes
+    max_total_tokens_per_request = int(
+        os.environ.get("MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST", "65536")
+    )
+    if max_total_tokens_per_request <= 0:
+        raise ValueError("MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST must be positive")
+    max_total_tokens_explicit = _load_bool("MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT", "0")
     native_kv_page_size = int(os.environ.get("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE", "16"))
     if native_kv_page_size not in (8, 16, 32):
         raise ValueError("MLX_RUNTIME_NATIVE_KV_PAGE_SIZE must be one of 8, 16, or 32")
@@ -201,6 +242,13 @@ def load_config() -> WorkerConfig:
         vlm_prefill_chunk_size=vlm_prefill_chunk_size,
         text_cache_budget_bytes=text_cache_budget_bytes,
         text_cache_max_entries=text_cache_max_entries,
+        text_cache_max_entries_explicit=bool(
+            os.environ.get("MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES", "").strip()
+        ),
+        memory_utilization=memory_utilization,
+        kv_cache_bytes=kv_cache_bytes,
+        max_total_tokens_per_request=max_total_tokens_per_request,
+        max_total_tokens_explicit=max_total_tokens_explicit,
         native_kv_page_size=native_kv_page_size,
         native_mlx_cache_limit_bytes=native_mlx_cache_limit_bytes,
         native_execution_backend=native_execution_backend,

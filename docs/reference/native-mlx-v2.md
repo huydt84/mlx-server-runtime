@@ -9,7 +9,8 @@ entrypoints, evidence artifacts, metrics, known limitations, and v1 fallback.
 
 ## Support Boundary
 
-`native-mlx` is an explicit backend selector. The default backend remains `v1`.
+`native-mlx` is the default backend. It serves only the architecture classes
+below; select `v1` for any other `mlx-lm` checkpoint and for `vlm_model`.
 
 The registered architecture classes and their known-good checkpoints are:
 
@@ -106,8 +107,10 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_NATIVE_METAL_CAPTURE` | `0`, `1` | Requests optional heavy Metal capture preflight; requires process-start `MTL_CAPTURE_ENABLED=1` |
 | `MLX_RUNTIME_TEXT_PROMPT_CONCURRENCY` | positive integer | Text prompt/prefill admission width |
 | `MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE` | positive integer | Chunked-prefill token budget |
-| `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Text KV page-pool size, allocated at startup and shared by in-flight requests and the prefix cache; a request that does not fit fails with `KV_CAPACITY_EXHAUSTED` |
-| `MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES` | positive integer | Prefix-cache entry bound; each cached KV page (`MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` tokens) is one entry |
+| `MLX_RUNTIME_MEMORY_UTILIZATION` | float in (0, 1] | Share of the Metal recommended working set for weights, activations, and the KV pool; the pool gets the remainder after the weights load. Set from `[memory] utilization` / `--memory-utilization` |
+| `MLX_RUNTIME_KV_CACHE_BYTES` | positive integer | Absolute KV page-pool size; overrides the utilization. Set from `[memory] kv_cache_bytes` / `--kv-cache-memory` |
+| `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Legacy name for `MLX_RUNTIME_KV_CACHE_BYTES`, used when that is unset. The pool is allocated at startup and shared by in-flight requests and the prefix cache; new requests wait until their prompt plus `max_tokens` fits |
+| `MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES` | positive integer | Prefix-cache entry bound; each cached KV page (`MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` tokens) is one entry. Unset, the prefix cache may hold every page of the KV pool: when admitting a request needs pages, the scheduler first evicts least recently used prefix entries that no running request uses |
 | `MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES` | non-negative integer | Freed MLX device buffers kept for reuse; defaults to 1 GiB so changing batch shapes cannot fill device memory and push the host into swap |
 
 Invalid native execution-backend, execution-mode, page-size, prefix-cache
@@ -255,20 +258,19 @@ request totals.
 
 ## Known Limitations
 
-- `native-mlx` is experimental and explicit opt-in.
 - The only registered production execution backend is currently `native-metal-paged-sdpa`.
 - Only explicitly implemented architecture classes are supported.
 - Hybrid models (LFM2-MoE, Qwen3.5) run without a prefix cache.
 - Qwen3.5 mixture-of-experts checkpoints and the Qwen3.5 vision tower are not
   implemented.
-- Greedy decoding is the validated native path.
-- VLM requests remain outside `native-mlx`.
+- Native decoding supports `temperature` and `top_p`. `temperature: 0` is greedy and bit-identical to `argmax`; a positive temperature scales the logits, keeps the smallest set of tokens whose probability reaches `top_p`, and draws on the device with the Gumbel-max trick. Each request gets a random seed, and every draw is keyed by that seed and the token position, so the random draw does not depend on serial or overlap execution, batch composition, or prompt chunking. The logits themselves can differ in the last bits with batch composition and with how much of the prompt came from the prefix cache, so two runs of the same prompt are not guaranteed to produce identical text. A per-request `seed` field is not exposed yet. `top_k`, penalties, and logprobs are not supported.
+- VLM requests remain outside `native-mlx`; a `vlm_model` with the native backend fails at startup with `VLM_UNSUPPORTED`.
 - `overlap` is the default execution mode; set
   `MLX_RUNTIME_NATIVE_EXECUTION_MODE=serial` for the synchronous coordinator.
 
-## v1 Fallback
+## v1 Backend
 
-Use v1 by leaving the default backend unchanged:
+Select v1 for checkpoints native-mlx does not implement and for VLMs:
 
 ```toml
 [worker]
@@ -281,5 +283,6 @@ or by setting:
 MLX_RUNTIME_BACKEND=v1
 ```
 
-`native-mlx` startup failures should tell the operator that v1 remains
-available. Native startup must never silently fall back to v1.
+or with `mlx-air serve --backend v1`. `native-mlx` startup failures tell the
+operator to start with `--backend v1`. Native startup never silently falls
+back to v1.

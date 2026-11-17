@@ -13,7 +13,7 @@
 # Probe checkpoints:
 #   - overlapping native-v2 public gateway streaming requests against `mlx-community/Qwen2.5-7B-Instruct-4bit`
 #   - one native-v2 cancelled public stream while other requests continue
-#   - default v1 gateway non-regression request against same checkpoint
+#   - v1 gateway non-regression request against same checkpoint
 #
 # Host requirements:
 #   - Apple Silicon (`arm64`)
@@ -45,6 +45,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Validate native-mlx continuous batching (overlapping streams, cancellation, metrics) through the public gateway, then a v1 non-regression request."
 cli_option CHECKPOINT --checkpoint MLX_CONTINUOUS_BATCHING_CHECKPOINT string \
     "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
@@ -64,7 +66,6 @@ cli_require_free_port "$V1_PORT" --v1-port
 
 NATIVE_LOG="$ARTIFACTS_DIR/native.log"
 V1_LOG="$ARTIFACTS_DIR/v1.log"
-HEALTH_CAPTURE="$ARTIFACTS_DIR/health.txt"
 V1_CAPTURE="$ARTIFACTS_DIR/v1.json"
 REQUEST_DIR="$ARTIFACTS_DIR/requests"
 NATIVE_CONFIG="$ARTIFACTS_DIR/native.toml"
@@ -87,21 +88,7 @@ trap cleanup EXIT
 wait_healthy() {
     local log_path="$1"
     local port="$2"
-    rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
-        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
-            echo "gateway exited unexpectedly; inspect $log_path" >&2
-            return 1
-        fi
-        if curl -fsS "http://127.0.0.1:${port}/health" >"$HEALTH_CAPTURE"; then
-            if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
-                return 0
-            fi
-        fi
-        sleep 1
-    done
-    echo "gateway did not become healthy; inspect $log_path" >&2
-    return 1
+    gateway_wait_ready "$port" "$HEALTH_TIMEOUT" "$GATEWAY_PID" "$log_path"
 }
 
 start_gateway() {
@@ -206,7 +193,7 @@ native_target.write_text(
     )
 )
 v1_target.write_text(
-    source.replace('port = 8000', f'port = {v1_port}').replace(
+    source.replace('backend = "native-mlx"', 'backend = "v1"').replace('port = 8000', f'port = {v1_port}').replace(
         'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
         f'model = "{checkpoint}"',
     ).replace(
@@ -432,7 +419,7 @@ if not payload["cancel"].get("client_closed"):
     raise SystemExit("cancel probe did not close client")
 PY
 
-echo "[5/6] Start default v1 gateway and run non-regression request"
+echo "[5/6] Start v1 gateway and run non-regression request"
 start_gateway "$V1_LOG" "$V1_PORT" MLX_RUNTIME_CONFIG="$V1_CONFIG"
 V1_STATUS=$(curl -sS -o "$V1_CAPTURE" -w '%{http_code}' \
     -X POST "http://127.0.0.1:${V1_PORT}/v1/chat/completions" \

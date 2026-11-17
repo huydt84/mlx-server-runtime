@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
-from mlx_benchmark.prompts import Prompt
+from mlx_benchmark.prompts import Prompt, prompt_messages
 
 
 class LoadGenerationError(RuntimeError):
@@ -237,7 +237,7 @@ async def execute_setup_prompts(
             sampling = configuration["sampling"]
             payload = {
                 "model": model["checkpoint"],
-                "messages": [{"role": "user", "content": prompt.text}],
+                "messages": prompt_messages(prompt),
                 "max_tokens": output_tokens,
                 "temperature": sampling["temperature"],
                 "top_p": sampling["top_p"],
@@ -440,7 +440,7 @@ async def _execute_request(
     }
     payload = {
         "model": model["checkpoint"],
-        "messages": [{"role": "user", "content": prompt.text}],
+        "messages": prompt_messages(prompt),
         "max_tokens": workload["output_tokens"],
         "temperature": sampling["temperature"],
         "top_p": sampling["top_p"],

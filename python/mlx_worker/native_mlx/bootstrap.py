@@ -28,6 +28,16 @@ from .mapping import (
     load_mapped_weights,
     load_weight_index,
 )
+from .memory import (
+    KVMemoryError,
+    KVMemoryPlan,
+    KVMemorySettings,
+    activation_reserve_bytes,
+    plan_kv_pool,
+    recommended_working_set_bytes,
+    resolve_max_total_tokens,
+    weights_nbytes,
+)
 from .prefix_cache import (
     BlockHashPrefixCache,
     NoPrefixCache,
@@ -67,6 +77,8 @@ class BootstrapArtifacts:
     tokenizer: Any
     decode_target: Any
     eos_token_ids: tuple[int, ...]
+    kv_memory: KVMemoryPlan | None = None
+    max_total_tokens: int | None = None
 
 
 class NativeBootstrapFailure(RuntimeError):
@@ -82,14 +94,34 @@ def build_native_artifacts(
     stage_callback: Any | None = None,
     *,
     cache_budget_bytes: int = 8 * 1024 * 1024,
-    cache_max_entries: int = 32,
+    cache_max_entries: int | None = 32,
     kv_page_size: int = 16,
     execution_backend_id: str = DEFAULT_NATIVE_EXECUTION_BACKEND,
     execution_mode: str = "serial",
     prefix_cache_strategy: str = "radix",
     graph_profile: bool = False,
+    memory: KVMemorySettings | None = None,
 ) -> BootstrapArtifacts:
-    """Validate and construct the registered architecture and shared executor."""
+    """Validate and construct the registered architecture and shared executor.
+
+    Args:
+        model: Model identifier or local path.
+        stage_callback: Receives ``(stage, state)`` startup transitions.
+        cache_budget_bytes: Fixed KV pool size used when ``memory`` is None.
+        cache_max_entries: Prefix-cache entry limit, one entry per KV page.
+            ``None`` lets the prefix cache hold every page of the KV pool; the
+            scheduler evicts entries when admission needs their pages.
+        kv_page_size: Tokens per KV page.
+        execution_backend_id: Registered execution backend.
+        execution_mode: ``serial`` or ``overlap``.
+        prefix_cache_strategy: ``radix`` or ``block-hash``.
+        graph_profile: Wrap the model for graph profiling.
+        memory: Size the KV pool from memory settings after the weights load
+            and derive the per-request token limit from it.
+
+    Returns:
+        The constructed serving dependencies.
+    """
 
     if execution_mode not in {"serial", "overlap"}:
         raise _failure(
@@ -155,6 +187,30 @@ def build_native_artifacts(
         ) from exc
     if stage_callback:
         stage_callback("weight_mapping", "loading_weights")
+    kv_memory: KVMemoryPlan | None = None
+    if memory is not None:
+        try:
+            kv_memory = plan_kv_pool(
+                kv_cache_bytes=memory.kv_cache_bytes,
+                utilization=memory.utilization,
+                working_set_bytes=recommended_working_set_bytes(),
+                weights_bytes=weights_nbytes(weights),
+                reserve_bytes=activation_reserve_bytes(
+                    architecture.raw_config,
+                    prefill_tokens=memory.prefill_tokens,
+                    prefill_rows=memory.prefill_rows,
+                    buffer_cache_limit_bytes=memory.buffer_cache_limit_bytes,
+                ),
+            )
+        except KVMemoryError as exc:
+            raise _failure(
+                "KV_MEMORY_INSUFFICIENT",
+                str(exc),
+                "kv_memory_planning",
+                "invalid_configuration",
+                model,
+            ) from exc
+        cache_budget_bytes = kv_memory.pool_bytes
     try:
         native_model = plan.create_model(config, weights)
         # A model may refine its config from the loaded weights, for example
@@ -172,6 +228,8 @@ def build_native_artifacts(
         )
         cache_backend = execution_backend.cache_backend
         attention_backend = execution_backend.attention_backend
+        if cache_max_entries is None:
+            cache_max_entries = max(1, int(getattr(cache_backend, "num_pages", 32)))
         prefix_cache = _build_prefix_cache(
             strategy=prefix_cache_strategy,
             supports_prefix_cache=plan.supports_prefix_cache,
@@ -207,6 +265,9 @@ def build_native_artifacts(
             "supported_class_bug",
             model,
         ) from exc
+    max_total_tokens: int | None = None
+    if memory is not None:
+        max_total_tokens = _resolve_request_limit(cache_backend, memory, model)
     if stage_callback:
         stage_callback("native_executor_construction", "initializing_runtime")
     if stage_callback:
@@ -230,7 +291,38 @@ def build_native_artifacts(
         tokenizer=tokenizer,
         decode_target=decode_target,
         eos_token_ids=eos,
+        kv_memory=kv_memory,
+        max_total_tokens=max_total_tokens,
     )
+
+
+def _resolve_request_limit(
+    cache_backend: KVCacheBackend,
+    memory: KVMemorySettings,
+    model: str,
+) -> int:
+    """Fit the per-request token limit to the paged pool's capacity."""
+
+    num_pages = getattr(cache_backend, "num_pages", None)
+    page_size = getattr(cache_backend, "page_size", None)
+    bytes_per_page = getattr(cache_backend, "bytes_per_page", None)
+    if not num_pages or not page_size or not bytes_per_page:
+        return memory.max_total_tokens_per_request
+    try:
+        return resolve_max_total_tokens(
+            capacity_tokens=int(num_pages) * int(page_size),
+            configured=memory.max_total_tokens_per_request,
+            explicit=memory.max_total_tokens_explicit,
+            bytes_per_token=int(bytes_per_page) // int(page_size),
+        )
+    except KVMemoryError as exc:
+        raise _failure(
+            "KV_MEMORY_INSUFFICIENT",
+            str(exc),
+            "kv_memory_planning",
+            "invalid_configuration",
+            model,
+        ) from exc
 
 
 def _build_prefix_cache(
@@ -427,7 +519,7 @@ def _failure(
     return NativeBootstrapFailure(
         ModelError(
             code=code,
-            message=f"{message}. Default v1 backend remains available.",
+            message=f"{message}. Start with --backend v1 to serve through mlx-lm.",
             at=int(time.time()),
             backend="native-mlx",
             stage=stage,

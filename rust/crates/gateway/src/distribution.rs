@@ -205,6 +205,38 @@ impl DistributionPaths {
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
+    /// Hash the bundled worker package: `pyproject.toml` and every file under
+    /// `mlx_worker`, except bytecode caches, in sorted path order.
+    ///
+    /// The runtime environment installs the worker as a non-editable copy, so
+    /// a distribution whose worker changed without a lockfile change must
+    /// reinstall it; this hash detects that.
+    pub(crate) fn worker_package_sha256(&self) -> Result<String, PathError> {
+        let mut files = Vec::new();
+        collect_package_files(&self.python_package, &mut files)?;
+        files.sort();
+        let mut hasher = Sha256::new();
+        let mut hash_file = |path: &Path, label: &Path| -> Result<(), PathError> {
+            let bytes = fs::read(path).map_err(|err| {
+                PathError::new(format!(
+                    "failed to read bundled worker file {}: {err}",
+                    path.display()
+                ))
+            })?;
+            hasher.update(label.as_os_str().as_encoded_bytes());
+            hasher.update([0]);
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+            Ok(())
+        };
+        hash_file(&self.pyproject, Path::new("pyproject.toml"))?;
+        for path in &files {
+            let label = path.strip_prefix(&self.python_project).unwrap_or(path);
+            hash_file(path, label)?;
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
     pub(crate) fn validate_benchmark_resources(&self) -> Result<(), PathError> {
         require_directory(&self.benchmark_package, "bundled mlx_benchmark package")?;
         require_file(
@@ -298,6 +330,34 @@ pub(crate) fn effective_user_id() -> u32 {
 #[cfg(not(unix))]
 pub(crate) fn effective_user_id() -> u32 {
     0
+}
+
+fn collect_package_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), PathError> {
+    let entries = fs::read_dir(directory).map_err(|err| {
+        PathError::new(format!(
+            "failed to list bundled worker directory {}: {err}",
+            directory.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            PathError::new(format!(
+                "failed to list bundled worker directory {}: {err}",
+                directory.display()
+            ))
+        })?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == "__pycache__" || path.extension().is_some_and(|ext| ext == "pyc") {
+            continue;
+        }
+        if path.is_dir() {
+            collect_package_files(&path, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

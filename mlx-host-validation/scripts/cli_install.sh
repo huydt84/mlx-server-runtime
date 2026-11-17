@@ -11,6 +11,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Validate the release installer (install.sh) and the installed CLI: doctor, foreground serve, and shutdown."
 cli_option MODEL --model MLX_AIR_INSTALL_MODEL string "mlx-community/gemma-3-270m-it-qat-8bit" "Model served by the installed CLI."
 cli_option PORT --port MLX_AIR_INSTALL_PORT port 18111 "Installed server port."
@@ -136,18 +138,8 @@ echo "[6/7] Start the installed foreground server and wait for readiness"
 HOME="$TEST_HOME" HF_HOME="$HOST_HF_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$CLI" serve --model "$MODEL" --port "$PORT" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 $((READY_TIMEOUT * 10))); do
-    if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-        echo "installed server exited before readiness" >&2
-        exit 1
-    fi
-    WORKER_PID="$(pgrep -P "$SERVER_PID" | head -n 1 || true)"
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:$PORT/ready" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 0.1
-done
-curl --silent --fail --max-time 2 "http://127.0.0.1:$PORT/ready" >/dev/null
+gateway_wait_ready "$PORT" "$READY_TIMEOUT" "$SERVER_PID" "$SERVER_LOG"
+WORKER_PID="$(pgrep -P "$SERVER_PID" | head -n 1 || true)"
 test -n "${WORKER_PID:-}"
 echo "installed_server_ready=1"
 

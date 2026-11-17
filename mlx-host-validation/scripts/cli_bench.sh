@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Host-only validation of `mlx-air bench`: load modes, interrupt cleanup, cache
+# Host-only validation of `mlx-air bench`: load modes, interrupt cleanup,
+# fail-fast on a failed startup or trial, cache
 # states and reset authorization, diagnostics, and calibration statistics.
 # Run on Apple Silicon with Metal, uv, and the fixture models available.
 #
@@ -12,7 +13,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
-cli_describe "Validate mlx-air bench: load modes, interrupt cleanup, cache states and reset authorization, diagnostics, and calibration."
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
+cli_describe "Validate mlx-air bench: load modes, interrupt cleanup, fail-fast, cache states and reset authorization, diagnostics, and calibration."
 cli_option FIXTURE --benchmark-config MLX_AIR_BENCH_CONFIG path "$ROOT/mlx-host-validation/fixtures/bench.toml" \
     "Benchmark configuration fixture passed to every bench command."
 cli_option COMMAND_TIMEOUT --command-timeout MLX_AIR_BENCH_COMMAND_TIMEOUT int 3600 \
@@ -126,24 +129,7 @@ PY
 }
 
 wait_ready() {
-    python3 - "$1" "$READY_TIMEOUT" <<'PY'
-import json
-import sys
-import time
-import urllib.request
-
-url = f"http://127.0.0.1:{sys.argv[1]}/ready"
-deadline = time.monotonic() + int(sys.argv[2])
-while time.monotonic() < deadline:
-    try:
-        with urllib.request.urlopen(url, timeout=2) as response:
-            if response.status == 200 and json.load(response).get("ready") is True:
-                raise SystemExit(0)
-    except Exception:
-        pass
-    time.sleep(0.2)
-raise SystemExit(f"manual gateway did not become ready within {sys.argv[2]} seconds")
-PY
+    gateway_wait_ready "$1" "$READY_TIMEOUT" "${GATEWAY_PID:-}" "$MANUAL_LOG"
 }
 
 # Start a regular gateway from the cache-state run's runtime config.
@@ -185,12 +171,12 @@ stop_manual_gateway() {
     unset GATEWAY_PID
 }
 
-echo "[1/7] Stage the benchmark-capable distribution"
+echo "[1/9] Stage the benchmark-capable distribution"
 "$ROOT/scripts/stage-mlx-air.sh" --output-dir "$STAGE_DIR"
 mkdir -p "$OUTSIDE_DIR" "$TEST_HOME"
 cd "$OUTSIDE_DIR"
 
-echo "[2/7] Load modes: one server start and exactly 11 measured requests"
+echo "[2/9] Load modes: one server start and exactly 11 measured requests"
 LOAD_DIR="$WORK_DIR/load-modes"
 bench run --suite load_modes --benchmark-config "$FIXTURE" --output-dir "$LOAD_DIR"
 LOAD_GATEWAY_PID="$(wait_for_gateway)"
@@ -286,7 +272,7 @@ assert_reaped "$LOAD_WORKER_PID" "load-mode worker"
 assert_no_staged_gateway
 echo "load_modes_ok=1"
 
-echo "[3/7] Interrupt a run during startup and verify cleanup"
+echo "[3/9] Interrupt a run during startup and verify cleanup"
 INTERRUPT_DIR="$WORK_DIR/interrupted"
 bench run --suite load_modes --benchmark-config "$FIXTURE" --output-dir "$INTERRUPT_DIR"
 INTERRUPT_GATEWAY_PID="$(wait_for_gateway)"
@@ -314,7 +300,36 @@ assert_reaped "$INTERRUPT_WORKER_PID" "interrupted worker"
 assert_no_staged_gateway
 echo "interrupt_cleanup_ok=1"
 
-echo "[4/7] Cache states: cold, warm prefix, and cache pressure with runtime deltas"
+echo "[4/9] Fail fast: a reported startup failure ends the run at readiness"
+FAIL_STARTUP_DIR="$WORK_DIR/fail-startup"
+FAIL_STARTED=$SECONDS
+bench run --suite fail_startup --benchmark-config "$FIXTURE" --output-dir "$FAIL_STARTUP_DIR"
+if wait_command "failed-startup benchmark"; then
+    echo "failed-startup benchmark unexpectedly exited successfully" >&2
+    exit 1
+fi
+FAIL_STARTUP_SECONDS=$((SECONDS - FAIL_STARTED))
+python3 - "$FAIL_STARTUP_DIR/results.json" "$FAIL_STARTUP_SECONDS" <<'PY'
+import json
+import pathlib
+import sys
+
+startup = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert startup["status"] == "failed", startup
+assert startup["failure_stage"] == "readiness", startup
+# The foreground gateway exits when its worker fails to start; a gateway that
+# stays up reports the failure through /startup instead.
+message = startup["error"]["message"]
+assert "exited before readiness" in message or "startup failed" in message, startup
+assert startup["trials"] == [], startup
+# The readiness timeout is 1800 s; failing fast means well under it.
+assert int(sys.argv[2]) < 300, sys.argv[2]
+PY
+assert_no_staged_gateway
+echo "fail_fast_startup_seconds=$FAIL_STARTUP_SECONDS"
+echo "fail_fast_startup_ok=1"
+
+echo "[5/9] Cache states: cold, warm prefix, and cache pressure with runtime deltas"
 CACHE_DIR="$WORK_DIR/cache-states"
 bench run --suite cache_states --benchmark-config "$FIXTURE" --output-dir "$CACHE_DIR"
 wait_command "cache-state benchmark"
@@ -365,7 +380,7 @@ PY
 assert_no_staged_gateway
 echo "cache_states_ok=1"
 
-echo "[5/7] Benchmark reset: absent without authorization, 409 while busy, preserves the model when idle"
+echo "[6/9] Benchmark reset: absent without authorization, 409 while busy, preserves the model when idle"
 start_manual_gateway unauthorized
 python3 - "$PORT" <<'PY'
 import sys
@@ -478,7 +493,7 @@ stop_manual_gateway
 assert_no_staged_gateway
 echo "reset_idle_enforcement_ok=1"
 
-echo "[6/7] Diagnostics: representative profile after measurement, then one explicit family"
+echo "[7/9] Diagnostics: representative profile after measurement, then one explicit family"
 DIAGNOSTICS_DIR="$WORK_DIR/diagnostics"
 bench run --suite diagnostics --benchmark-config "$FIXTURE" --profile representative \
     --output-dir "$DIAGNOSTICS_DIR"
@@ -556,9 +571,10 @@ PY
 assert_no_staged_gateway
 echo "explicit_diagnostic_family_ok=1"
 
-# Calibration runs last because it replaces the staged gateway with a proxy
-# that adds a known response delay.
-echo "[7/7] Calibration: repeated runs see a controlled 120 ms delay"
+# Calibration and the failed-trial check run last because they replace the
+# staged gateway with a proxy that adds a known response delay or injects
+# request failures.
+echo "[8/9] Calibration: repeated runs see a controlled 120 ms delay"
 mv "$STAGE_DIR/bin/mlx_runtime_gateway" "$STAGE_DIR/bin/mlx_runtime_gateway.real"
 cp "$DELAY_PROXY" "$STAGE_DIR/bin/mlx_runtime_gateway"
 chmod +x "$STAGE_DIR/bin/mlx_runtime_gateway"
@@ -607,4 +623,30 @@ PY
 test -s "$(dirname "$CALIBRATION_FILE")/report.md"
 assert_no_staged_gateway
 echo "calibration_ok=1"
+
+echo "[9/9] Fail fast: the first trial with failed requests ends the run"
+FAIL_TRIAL_DIR="$WORK_DIR/fail-trial"
+export MLX_AIR_BENCH_DELAY_MS=0
+export MLX_AIR_BENCH_FAIL_AFTER_RESET=1
+bench run --suite fail_trial --benchmark-config "$FIXTURE" --output-dir "$FAIL_TRIAL_DIR"
+if wait_command "failed-trial benchmark"; then
+    echo "failed-trial benchmark unexpectedly exited successfully" >&2
+    exit 1
+fi
+unset MLX_AIR_BENCH_FAIL_AFTER_RESET
+python3 - "$FAIL_TRIAL_DIR/results.json" <<'PY'
+import json
+import pathlib
+import sys
+
+data = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert data["status"] == "failed", data
+assert data["failure_stage"] == "measurement", data
+# Two workloads are configured; the run stops after the first one's trial.
+assert [trial["workload_name"] for trial in data["trials"]] == ["cold"], data["trials"]
+assert data["trials"][0]["error_count"] == 2, data["trials"][0]
+assert "first error" in data["error"]["message"], data["error"]
+PY
+assert_no_staged_gateway
+echo "fail_fast_trial_ok=1"
 echo "cli_bench_ok=1"

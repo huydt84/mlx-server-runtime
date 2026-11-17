@@ -45,10 +45,18 @@ class ForwardMode(str, Enum):
 
 @dataclass(frozen=True)
 class SamplingParams:
-    """Executor-visible sampling parameters."""
+    """Executor-visible sampling parameters.
+
+    Attributes:
+        temperature: ``0`` selects the most likely token; higher values
+            sample from the temperature-scaled distribution.
+        top_p: Nucleus mass kept when sampling; ignored when greedy.
+        seed: Per-request seed; with the token position it fixes every draw.
+    """
 
     temperature: float = 0.0
     top_p: float = 1.0
+    seed: int = 0
 
 
 class LayerAttentionContext(Protocol):

@@ -11,6 +11,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Validate the mlx-air serve foreground lifecycle: readiness, non-streaming and streaming requests, and SIGTERM shutdown."
 cli_option MODEL --model MLX_AIR_SERVE_MODEL string "mlx-community/Qwen2.5-7B-Instruct-4bit" "Model to serve."
 cli_option PORT --port MLX_AIR_SERVE_PORT port 18003 "Server port."
@@ -66,22 +68,8 @@ echo "[2/6] Start one real model through mlx-air serve"
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
-for _ in $(seq 1 $((READY_TIMEOUT * 10))); do
-    if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-        echo "server exited before readiness" >&2
-        sed -n '1,240p' "$SERVER_LOG" >&2
-        exit 1
-    fi
-    WORKER_PID="$(pgrep -P "$SERVER_PID" | head -n 1 || true)"
-    if curl --silent --fail --max-time 1 \
-        "http://127.0.0.1:$PORT/ready" >/dev/null 2>&1; then
-        break
-    fi
-    sleep 0.1
-done
-
-curl --silent --fail --max-time 2 \
-    "http://127.0.0.1:$PORT/ready" >/dev/null
+gateway_wait_ready "$PORT" "$READY_TIMEOUT" "$SERVER_PID" "$SERVER_LOG"
+WORKER_PID="$(pgrep -P "$SERVER_PID" | head -n 1 || true)"
 test -n "${WORKER_PID:-}"
 echo "server_ready=1"
 

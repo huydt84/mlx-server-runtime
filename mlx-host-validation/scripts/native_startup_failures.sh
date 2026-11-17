@@ -14,8 +14,11 @@
 #      placeholder startup.
 #   3. Explicit `native-mlx` selection rejects unsupported architecture with
 #      structured `unsupported_class` startup failure.
-#   4. Default v1 backend still reaches healthy gateway startup.
-#   5. One real v1 public API request succeeds after shared startup.
+#   4. Native KV memory planning refuses to start with `KV_MEMORY_INSUFFICIENT`
+#      when the memory utilization cannot hold the real checkpoint's weights,
+#      and when an explicit per-request token limit exceeds the KV pool.
+#   5. The v1 backend still reaches healthy gateway startup.
+#   6. One real v1 public API request succeeds after shared startup.
 #
 # Expected verification signal:
 #   - Script exits with status code 0.
@@ -33,6 +36,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Validate structured native-mlx startup failures, then a healthy v1 gateway and one real request."
 cli_option MODEL_NAME --checkpoint MLX_STARTUP_FAILURES_CHECKPOINT string \
     "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by the v1 gateway."
@@ -92,7 +97,7 @@ print(f"mlx_compute_ok={values}")
 PY
 
 echo "[3/5] Probe native-mlx structured startup failures"
-uv run python - <<'PY'
+MLX_STARTUP_FAILURES_REAL_MODEL="$MODEL_NAME" uv run python - <<'PY'
 from __future__ import annotations
 
 import json
@@ -112,14 +117,18 @@ def run_probe(
     expected_category: str,
     expected_stage: str,
     expected_code: str,
+    *,
+    model: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"{label}-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="probe-") as temp_dir:
         root = Path(temp_dir)
         model_dir = root / "model"
         model_dir.mkdir()
         (model_dir / "config.json").write_text(
             json.dumps({"architectures": [architecture_class]})
         )
+        model_ref = model or str(model_dir)
         socket_path = root / "worker.sock"
         log_path = root / "worker.log"
 
@@ -130,8 +139,11 @@ def run_probe(
         env = os.environ.copy()
         env["MLX_RUNTIME_SOCKET"] = str(socket_path)
         env["MLX_RUNTIME_BACKEND"] = "native-mlx"
-        env["MLX_RUNTIME_MODEL"] = str(model_dir)
+        env["MLX_RUNTIME_MODEL"] = model_ref
         env["MLX_RUNTIME_VLM_MODEL"] = ""
+        for name in ("MLX_RUNTIME_KV_CACHE_BYTES", "MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES"):
+            env.pop(name, None)
+        env.update(extra_env or {})
 
         with log_path.open("w", encoding="utf-8") as log_file:
             proc = subprocess.Popen(
@@ -160,7 +172,7 @@ def run_probe(
                         if line:
                             decoded.append(decode_bootstrap_message(line + b"\n"))
 
-            rc = proc.wait(timeout=30)
+            rc = proc.wait(timeout=300)
             if rc != 1:
                 raise SystemExit(
                     f"{label}: expected worker exit 1, saw {rc}; inspect {log_path}"
@@ -209,9 +221,32 @@ run_probe(
     expected_stage="architecture_detection",
     expected_code="UNSUPPORTED_ARCHITECTURE_CLASS",
 )
+real_model = os.environ["MLX_STARTUP_FAILURES_REAL_MODEL"]
+run_probe(
+    label="kv-memory-utilization-below-weights",
+    architecture_class="unused",
+    expected_category="invalid_configuration",
+    expected_stage="kv_memory_planning",
+    expected_code="KV_MEMORY_INSUFFICIENT",
+    model=real_model,
+    extra_env={"MLX_RUNTIME_MEMORY_UTILIZATION": "0.01"},
+)
+run_probe(
+    label="kv-memory-explicit-limit-exceeds-pool",
+    architecture_class="unused",
+    expected_category="invalid_configuration",
+    expected_stage="kv_memory_planning",
+    expected_code="KV_MEMORY_INSUFFICIENT",
+    model=real_model,
+    extra_env={
+        "MLX_RUNTIME_KV_CACHE_BYTES": str(64 * 1024 * 1024),
+        "MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST": "65536",
+        "MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT": "1",
+    },
+)
 PY
 
-echo "[4/5] Start gateway with default v1 backend"
+echo "[4/5] Start gateway with the v1 backend"
 cd "$ROOT"
 rm -f "$GATEWAY_LOG" "$HEALTH_CAPTURE" "$CHAT_CAPTURE" "$REQUEST_CAPTURE"
 if ! grep -qx 'port = 8000' "$ROOT/config/runtime.toml"; then
@@ -219,6 +254,7 @@ if ! grep -qx 'port = 8000' "$ROOT/config/runtime.toml"; then
     exit 1
 fi
 sed -e "s/^port = 8000$/port = $PORT/" \
+    -e 's/^backend = "native-mlx"$/backend = "v1"/' \
     -e "s#^model = \"mlx-community/Qwen2.5-7B-Instruct-4bit\"#model = \"$MODEL_NAME\"#" \
     "$ROOT/config/runtime.toml" >"$GATEWAY_CONFIG"
 
@@ -246,23 +282,10 @@ PY
 MLX_RUNTIME_CONFIG="$GATEWAY_CONFIG" "$GATEWAY_BIN" >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
 
-for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
-    if curl -fsS "http://127.0.0.1:$PORT/health" >"$HEALTH_CAPTURE"; then
-        if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
-            echo "health_response=healthy"
-            break
-        fi
-    fi
-
-    if ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
-        echo "gateway exited unexpectedly; inspect $GATEWAY_LOG" >&2
-        exit 1
-    fi
-
-    sleep 1
-done
-
+gateway_wait_ready "$PORT" "$HEALTH_TIMEOUT" "$GATEWAY_PID" "$GATEWAY_LOG"
+curl -fsS "http://127.0.0.1:$PORT/health" >"$HEALTH_CAPTURE"
 grep -qx 'healthy' "$HEALTH_CAPTURE"
+echo "health_response=healthy"
 
 echo "[5/5] Run one non-streaming v1 chat completion"
 HTTP_STATUS=$(curl -sS -o "$CHAT_CAPTURE" -w '%{http_code}' \

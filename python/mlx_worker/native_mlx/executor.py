@@ -21,6 +21,7 @@ from .interfaces import (
     StepRequestResult,
     StepResult,
 )
+from .sampling import sample_next_tokens
 
 
 @dataclass(frozen=True)
@@ -145,8 +146,15 @@ class MlxGenerationExecutor:
             logits = self.model(layout.input_ids, layout.positions, forward_batch)
             forward_ms = _elapsed_ms(forward_started)
             sample_started = time.perf_counter()
-            next_tokens = mx.argmax(
-                _last_token_logits(logits, layout.token_lengths), axis=-1
+            next_tokens = sample_next_tokens(
+                _last_token_logits(logits, layout.token_lengths),
+                [request.sampling for request in layout.requests],
+                [
+                    cache_length + token_length
+                    for cache_length, token_length in zip(
+                        layout.cache_lengths, layout.token_lengths, strict=True
+                    )
+                ],
             )
             sample_ms = _elapsed_ms(sample_started)
         except Exception as exc:

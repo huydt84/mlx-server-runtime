@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import select
+import sys
 import time
 from collections.abc import Callable
 from socket import socket
@@ -36,6 +37,7 @@ from .diagnostics import (
     trace_native_debug_to_mlx_lm,
 )
 from .interfaces import NativeRuntime
+from .memory import KVMemorySettings
 from .pipeline_profile import PipelineProfiler
 from .runtime import NativeRuntime as NativeRequestRuntime
 from .scheduler import NativeContinuousScheduler
@@ -63,6 +65,23 @@ def run_native_worker(
     """Run native bootstrap and transport commands to the request runtime."""
 
     started = _now()
+    if getattr(config, "vlm_model", None):
+        _emit_failure(
+            client,
+            config.model,
+            started,
+            NativeBootstrapFailure(
+                _model_error(
+                    "VLM_UNSUPPORTED",
+                    f"native-mlx does not serve vision-language models, so "
+                    f"vlm_model {config.vlm_model!r} cannot be loaded",
+                    "backend_selection",
+                    "invalid_configuration",
+                    str(config.vlm_model),
+                )
+            ),
+        )
+        return 1
     stage_callback = _stage_emitter(client, config.model, started)
     try:
         stage_callback("architecture_detection", "verifying")
@@ -213,11 +232,32 @@ def create_native_worker(
     """Compose bootstrap, shared executor, scheduler, and request runtime."""
 
     apply_mlx_cache_limit(config.native_mlx_cache_limit_bytes)
+    prefill_rows = getattr(
+        config, "text_prompt_concurrency", getattr(config, "prompt_concurrency", 4)
+    )
+    prefill_chunk = getattr(
+        config, "text_prefill_chunk_size", getattr(config, "prefill_chunk_size", 256)
+    )
+    memory = KVMemorySettings(
+        utilization=getattr(config, "memory_utilization", 0.5),
+        kv_cache_bytes=getattr(config, "kv_cache_bytes", None),
+        max_total_tokens_per_request=getattr(
+            config, "max_total_tokens_per_request", 65_536
+        ),
+        max_total_tokens_explicit=getattr(config, "max_total_tokens_explicit", False),
+        prefill_tokens=prefill_rows * prefill_chunk,
+        prefill_rows=prefill_rows,
+        buffer_cache_limit_bytes=config.native_mlx_cache_limit_bytes,
+    )
     artifacts = build_native_artifacts(
         config.model,
         stage_callback,
-        cache_budget_bytes=config.text_cache_budget_bytes,
-        cache_max_entries=config.text_cache_max_entries,
+        memory=memory,
+        cache_max_entries=(
+            config.text_cache_max_entries
+            if getattr(config, "text_cache_max_entries_explicit", False)
+            else None
+        ),
         kv_page_size=config.native_kv_page_size,
         execution_backend_id=config.native_execution_backend,
         execution_mode=getattr(config, "native_execution_mode", "overlap"),
@@ -225,6 +265,13 @@ def create_native_worker(
         graph_profile=config.native_graph_profile,
     )
     artifacts.executor.load(artifacts.options)
+    if artifacts.kv_memory is not None:
+        print(
+            f"native-mlx memory {artifacts.kv_memory.describe()} "
+            f"max_total_tokens_per_request={artifacts.max_total_tokens}",
+            file=sys.stderr,
+            flush=True,
+        )
     profiler = PipelineProfiler.from_environment(config.model)
     scheduler = NativeContinuousScheduler(
         artifacts.executor,
@@ -251,6 +298,7 @@ def create_native_worker(
         decode_target=artifacts.decode_target,
         eos_token_ids=artifacts.eos_token_ids,
         profiler=profiler,
+        max_total_tokens=artifacts.max_total_tokens,
     )
 
 
@@ -345,7 +393,7 @@ def _model_error(
 
     return ModelError(
         code=code,
-        message=f"{message}. Default v1 backend remains available.",
+        message=f"{message}. Start with --backend v1 to serve through mlx-lm.",
         at=_now(),
         backend="native-mlx",
         stage=stage,

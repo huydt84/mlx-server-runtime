@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .cache import KVCacheBackend
@@ -39,6 +41,12 @@ class NoPrefixCache:
 
     def release(self, cache_handle: str | None) -> None:
         del cache_handle
+
+    def reclaim(self, pages: int) -> int:
+        """Return 0: the no-cache adapter holds no pages."""
+
+        del pages
+        return 0
 
     def metrics(self) -> dict[str, int | str]:
         return {
@@ -326,19 +334,48 @@ class BlockHashPrefixCache:
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def reclaim(self, pages: int) -> int:
+        """Evict least recently used unpinned entries to free KV pages.
+
+        Args:
+            pages: Free pages the caller still needs.
+
+        Returns:
+            Pages actually returned to the backend's free list.
+        """
+
+        free_page_count = getattr(self.backend, "free_page_count", None)
+        if pages <= 0 or not callable(free_page_count):
+            return 0
+        start = int(free_page_count())
+        self._evict_lru(lambda: int(free_page_count()) - start < pages)
+        return int(free_page_count()) - start
+
     def _evict_until_within_limits(self, protected: str | None = None) -> None:
-        while (
-            len(self._entries) > self.max_entries
-            or self._stored_bytes() > self.max_bytes
-        ):
-            candidates = [
+        self._evict_lru(
+            lambda: (
+                len(self._entries) > self.max_entries
+                or self._stored_bytes() > self.max_bytes
+            ),
+            protected=protected,
+        )
+
+    def _evict_lru(
+        self, should_evict: Callable[[], bool], protected: str | None = None
+    ) -> None:
+        if not should_evict():
+            return
+        candidates = sorted(
+            (
                 entry
                 for entry in self._entries.values()
                 if entry.pins == 0 and entry.block_hash != protected
-            ]
-            if not candidates:
+            ),
+            key=lambda entry: (entry.last_used, -entry.pages),
+        )
+        for victim in candidates:
+            if not should_evict():
                 return
-            victim = min(candidates, key=lambda entry: (entry.last_used, -entry.pages))
             self._entries.pop(victim.block_hash, None)
             self.backend.release(victim.cache_handle)
             self._evictions += 1
@@ -352,7 +389,8 @@ class BlockHashPrefixCache:
         return max(1, min(self.max_entries, self.max_bytes // bytes_per_page))
 
     def _stored_bytes(self) -> int:
-        return sum(entry.bytes for entry in self._entries.values())
+        # Every entry holds exactly one page of its own.
+        return len(self._entries) * self._bytes_for_pages(1)
 
     def _tick(self) -> int:
         self._clock = max(self._clock + 1, time.monotonic_ns())
@@ -383,6 +421,8 @@ class RadixPrefixCache:
     _published_lengths_by_handle: dict[str, int] = field(
         default_factory=dict, init=False
     )
+    _entry_total: int = field(default=0, init=False)
+    _bytes_total: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if self.page_size <= 0:
@@ -470,6 +510,8 @@ class RadixPrefixCache:
                 node.cached_length = length
                 node.pages = length // self.page_size
                 node.bytes = self._bytes_for_pages(1)
+                self._entry_total += 1
+                self._bytes_total += node.bytes
             node.last_used = self._tick()
             published = length
         self._evict_until_within_limits()
@@ -537,6 +579,8 @@ class RadixPrefixCache:
                     self.backend.release(node.cache_handle)
             self._root = _RadixNode()
             self._published_lengths_by_handle.clear()
+            self._entry_total = 0
+            self._bytes_total = 0
         if reset_counters:
             self._queries = 0
             self._hits = 0
@@ -613,31 +657,69 @@ class RadixPrefixCache:
             return new
         return node
 
+    def reclaim(self, pages: int) -> int:
+        """Evict least recently used unpinned leaves to free KV pages.
+
+        A leaf shares its leading pages with its ancestors, so evicting it
+        frees only the pages no other entry or request still references; the
+        walk continues up the tree until enough pages are free or nothing
+        unpinned is left.
+
+        Args:
+            pages: Free pages the caller still needs.
+
+        Returns:
+            Pages actually returned to the backend's free list.
+        """
+
+        free_page_count = getattr(self.backend, "free_page_count", None)
+        if pages <= 0 or not callable(free_page_count):
+            return 0
+        start = int(free_page_count())
+        self._evict_lru(lambda: int(free_page_count()) - start < pages)
+        return int(free_page_count()) - start
+
     def _evict_until_within_limits(self) -> None:
-        while (
-            self._entry_count() > self.max_entries
-            or self._stored_bytes() > self.max_bytes
-        ):
-            candidates = [
-                node
-                for node in self._walk_nodes()
-                if node.cache_handle is not None
-                and node.pins == 0
-                and not node.children
-            ]
-            if not candidates:
-                return
-            victim = min(candidates, key=lambda node: (node.last_used, -node.pages))
+        self._evict_lru(
+            lambda: (
+                self._entry_total > self.max_entries
+                or self._bytes_total > self.max_bytes
+            )
+        )
+
+    def _evict_lru(self, should_evict: Callable[[], bool]) -> None:
+        if not should_evict():
+            return
+        heap: list[tuple[int, int, int, _RadixNode]] = []
+        for node in self._walk_nodes():
+            if self._evictable(node):
+                heapq.heappush(heap, (node.last_used, -node.pages, id(node), node))
+        while heap and should_evict():
+            *_, victim = heapq.heappop(heap)
+            if not self._evictable(victim):
+                continue
             self.backend.release(victim.cache_handle)
+            self._entry_total -= 1
+            self._bytes_total -= victim.bytes
             victim.cache_handle = None
             victim.cached_length = 0
             victim.pages = 0
             victim.bytes = 0
             self._evictions += 1
             self._metrics_dirty = True
-            self._prune_empty_ancestors(victim)
+            parent = self._prune_empty_ancestors(victim)
+            if parent is not None and self._evictable(parent):
+                heapq.heappush(
+                    heap, (parent.last_used, -parent.pages, id(parent), parent)
+                )
 
-    def _prune_empty_ancestors(self, node: _RadixNode) -> None:
+    @staticmethod
+    def _evictable(node: _RadixNode) -> bool:
+        return node.cache_handle is not None and node.pins == 0 and not node.children
+
+    def _prune_empty_ancestors(self, node: _RadixNode) -> _RadixNode | None:
+        """Drop empty nodes above ``node`` and return the first one kept."""
+
         while (
             node.parent is not None
             and node.cache_handle is None
@@ -647,6 +729,7 @@ class RadixPrefixCache:
             parent = node.parent
             parent.children.pop(node.edge_tokens[0], None)
             node = parent
+        return node if node.parent is not None else None
 
     def _walk_nodes(self) -> list[_RadixNode]:
         pending = list(self._root.children.values())
@@ -675,12 +758,6 @@ class RadixPrefixCache:
     def _publishable_chain_pages(self) -> int:
         bytes_per_page = max(1, self._bytes_for_pages(1))
         return max(1, min(self.max_entries, self.max_bytes // bytes_per_page))
-
-    def _entry_count(self) -> int:
-        return sum(node.cache_handle is not None for node in self._walk_nodes())
-
-    def _stored_bytes(self) -> int:
-        return sum(node.bytes for node in self._walk_nodes())
 
     def _tick(self) -> int:
         self._clock = max(self._clock + 1, time.monotonic_ns())
