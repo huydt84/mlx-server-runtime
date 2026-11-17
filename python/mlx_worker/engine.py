@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .batching import (
@@ -28,7 +29,29 @@ def _load_mlx_components() -> tuple[
     except ModuleNotFoundError as exc:  # pragma: no cover - host-only dependency
         raise RuntimeError("mlx_lm is required for the default worker engine") from exc
 
-    return load, stream_generate, make_sampler
+    def load_model(model_id: str) -> tuple[Any, Any]:
+        from .prism_hadamard import is_prism_hadamard_checkpoint, load_mlx_lm
+
+        path = _local_model_path(model_id)
+        if path is not None and is_prism_hadamard_checkpoint(path):
+            return load_mlx_lm(path)
+        return load(model_id)
+
+    return load_model, stream_generate, make_sampler
+
+
+def _local_model_path(model_id: str) -> Path | None:
+    """Resolve a local directory or downloaded Hugging Face snapshot, if any."""
+
+    path = Path(model_id)
+    if path.is_dir():
+        return path
+    try:
+        from huggingface_hub import snapshot_download
+
+        return Path(snapshot_download(model_id, local_files_only=True))
+    except Exception:
+        return None
 
 
 def _noop_sampler(_temp: float, _top_p: float) -> Callable[[Any], Any]:

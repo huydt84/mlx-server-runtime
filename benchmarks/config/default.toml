@@ -67,6 +67,14 @@ checkpoint = "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
 [models.runtime_control]
 checkpoint = "mlx-community/gemma-3-270m-it-qat-8bit"
 
+# Qwen3.5 hybrid (Gated DeltaNet + full attention) 27B checkpoints at
+# sub-2-bit weights: a 1-bit affine pack and a Hadamard-rotated ternary pack.
+[models.hybrid_binary]
+checkpoint = "prism-ml/Bonsai-27B-mlx-1bit"
+
+[models.hybrid_ternary]
+checkpoint = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+
 # Native-MLX rejects a request with KV_CAPACITY_EXHAUSTED instead of queueing
 # it, and never reclaims prefix-cache pages for new requests, so the KV pool
 # must hold every in-flight request plus the prefix cache. 2 GiB holds ~14.5k
@@ -80,6 +88,14 @@ environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUT
 [runtime_configurations.overlap]
 backend = "native-mlx"
 environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "256" }
+
+# The v1 backend serves through mlx-lm's BatchGenerator behind the same
+# gateway, so it is the mlx-lm baseline for native-mlx comparisons. Its prompt
+# cache is off: native-mlx keeps no prefix cache for hybrid models, and v1 does
+# not clear its cache between cold-cache trials.
+[runtime_configurations.mlx_lm]
+backend = "v1"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "0", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "0" }
 
 # load_mode: sequential (concurrency 1), burst (all requests at once), or
 # closed-loop (keep `concurrency` requests in flight).
@@ -261,3 +277,13 @@ trials = 4
 runtime_configurations = ["serial", "overlap"]
 diagnostics = ["gateway", "prefill", "decode", "scheduler", "cache"]
 coverage = { primary = "all", dense = "all", moe = "all", runtime_control = "all" }
+
+# native-mlx (overlap) against mlx-lm on the hybrid checkpoints. Hybrid models
+# have no native prefix cache, so warm-prefix and cache-pressure workloads are
+# not covered.
+[suites.mlx_lm_comparison]
+rounds = 2
+trials = 2
+runtime_configurations = ["overlap", "mlx_lm"]
+diagnostics = []
+coverage = { hybrid_binary = ["interactive_stream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "mixed_c8"], hybrid_ternary = ["interactive_stream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "mixed_c8"] }

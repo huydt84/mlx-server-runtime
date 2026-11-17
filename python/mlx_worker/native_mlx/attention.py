@@ -119,6 +119,15 @@ class DenseLayerAttentionContext:
     def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
         self.reservation.stage_conv_state(self.layer_index, combined, cache_size)
 
+    def recurrent_state(self, shape: tuple[int, ...], dtype: Any) -> mx.array:
+        return self.reservation.recurrent_state(self.layer_index, shape, dtype)
+
+    def stage_recurrent_state(self, state: mx.array) -> None:
+        self.reservation.stage_recurrent_state(self.layer_index, state)
+
+    def token_mask(self, seq_len: int) -> mx.array | None:
+        return self.reservation.token_mask(seq_len)
+
 
 @dataclass
 class DenseTraceAttentionContext:
@@ -164,6 +173,17 @@ class DenseTraceAttentionContext:
 
     def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
         self.cache.conv_state = combined[0, -cache_size + 1 :]
+
+    def recurrent_state(self, shape: tuple[int, ...], dtype: Any) -> mx.array:
+        state = self.cache.recurrent_state
+        return (mx.zeros(shape, dtype) if state is None else state)[None, ...]
+
+    def stage_recurrent_state(self, state: mx.array) -> None:
+        self.cache.recurrent_state = state[0]
+
+    def token_mask(self, seq_len: int) -> mx.array | None:
+        del seq_len
+        return None
 
 
 @dataclass(frozen=True)
@@ -405,6 +425,15 @@ class HybridPagedLayerAttentionContext(PagedLayerAttentionContext):
 
     def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
         self.reservation.stage_conv_state(self.layer_index, combined, cache_size)
+
+    def recurrent_state(self, shape: tuple[int, ...], dtype: Any) -> mx.array:
+        return self.reservation.recurrent_state(self.layer_index, shape, dtype)
+
+    def stage_recurrent_state(self, state: mx.array) -> None:
+        self.reservation.stage_recurrent_state(self.layer_index, state)
+
+    def token_mask(self, seq_len: int) -> mx.array | None:
+        return self.reservation.token_mask(seq_len)
 
 
 @dataclass

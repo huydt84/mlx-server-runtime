@@ -12,6 +12,10 @@
 #   - `mlx-community/LFM2.5-8B-A1B-MLX-4bit`
 #   - `mlx-community/Qwen3-4B-Instruct-2507-4bit`
 #   - `mlx-community/gemma-3-270m-it-qat-8bit`
+#   - `prism-ml/Bonsai-27B-mlx-1bit` (Qwen3.5 hybrid, 1-bit affine)
+#   - `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` (Qwen3.5 hybrid, Hadamard-rotated
+#     ternary pack; the reference is mlx-lm's qwen3_5 graph with the pack's
+#     packed modules, because mlx-lm cannot load the pack alone)
 #
 # Probe checkpoints:
 #   - `local-probe/LlamaForCausalLM` unsupported-class reference from model-validation
@@ -46,7 +50,7 @@ PYTHON_DIR="$ROOT/python"
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
 cli_describe "Validate native forward-pass and greedy-token parity against mlx_lm for each registered model family."
 cli_option CHECKPOINT_LIST --checkpoints MLX_MODEL_FAMILIES_CHECKPOINTS list \
-    "mlx-community/Qwen2.5-7B-Instruct-4bit,mlx-community/LFM2.5-8B-A1B-MLX-4bit,mlx-community/Qwen3-4B-Instruct-2507-4bit,mlx-community/gemma-3-270m-it-qat-8bit" \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit,mlx-community/LFM2.5-8B-A1B-MLX-4bit,mlx-community/Qwen3-4B-Instruct-2507-4bit,mlx-community/gemma-3-270m-it-qat-8bit,prism-ml/Bonsai-27B-mlx-1bit,prism-ml/Ternary-Bonsai-2-27B-mlx-2bit" \
     "Comma-separated checkpoints to check, in order."
 cli_option DECODE_STEPS --decode-steps MLX_MODEL_FAMILIES_DECODE_STEPS int 2 \
     "Greedy decode steps compared after prefill."

@@ -69,6 +69,7 @@ def _build_native_metal_paged_sdpa(
         page_size=page_size,
         budget_bytes=cache_budget_bytes,
         dtype=geometry.dtype,
+        kv_layer_indices=geometry.kv_layer_indices,
     )
     bundle = NativeExecutionBackendBundle(
         backend_id=DEFAULT_NATIVE_EXECUTION_BACKEND,

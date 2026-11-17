@@ -337,10 +337,25 @@ def trace_native_debug_to_mlx_lm(
     )
 
 
-def _load_reference_logits(checkpoint: str, token_ids: Sequence[int]) -> mx.array:
+def load_reference_model(checkpoint: str):
+    """Load the ``mlx-lm`` reference model for a checkpoint.
+
+    Hadamard-rotated packs cannot be loaded by ``mlx-lm`` alone; they use the
+    ``mlx-lm`` graph with the pack's packed modules installed.
+    """
+
     from mlx_lm.utils import load_model
 
-    reference_model, _ = load_model(_reference_model_path(checkpoint))
+    from ..prism_hadamard import is_prism_hadamard_checkpoint, load_mlx_lm_model
+
+    path = _reference_model_path(checkpoint)
+    if is_prism_hadamard_checkpoint(path):
+        return load_mlx_lm_model(path)[0]
+    return load_model(path)[0]
+
+
+def _load_reference_logits(checkpoint: str, token_ids: Sequence[int]) -> mx.array:
+    reference_model = load_reference_model(checkpoint)
     inputs = mx.array([list(token_ids)], dtype=mx.int32)
     logits = reference_model(inputs)
     mx.eval(logits)
@@ -353,9 +368,8 @@ def _reference_prefill_then_decode(
     decode_steps: int,
 ) -> tuple[list[int], float]:
     from mlx_lm.models.cache import make_prompt_cache
-    from mlx_lm.utils import load_model
 
-    reference_model, _ = load_model(_reference_model_path(checkpoint))
+    reference_model = load_reference_model(checkpoint)
     cache = make_prompt_cache(reference_model)
     inputs = mx.array([list(token_ids)], dtype=mx.int32)
     logits = reference_model(inputs, cache=cache)

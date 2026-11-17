@@ -81,6 +81,18 @@ class HybridLayerAttentionContext(LayerAttentionContext, Protocol):
     def stage_conv_state(self, combined: mx.array, cache_size: int) -> None:
         """Stage request-local state for transactional commit."""
 
+    def recurrent_state(self, shape: tuple[int, ...], dtype: Any) -> mx.array:
+        """Return request-local recurrent state stacked on a batch axis.
+
+        Requests without committed state get zeros of ``shape`` and ``dtype``.
+        """
+
+    def stage_recurrent_state(self, state: mx.array) -> None:
+        """Stage batch-stacked recurrent state for transactional commit."""
+
+    def token_mask(self, seq_len: int) -> mx.array | None:
+        """Return a ``(batch, seq_len)`` real-token mask, ``None`` if unpadded."""
+
 
 @dataclass(frozen=True)
 class ForwardBatch:

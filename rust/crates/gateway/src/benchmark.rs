@@ -12,7 +12,6 @@ use crate::command_runner::{display_command, path_arg, CommandRunner, CommandSpe
 use crate::distribution::{ApplicationPaths, DistributionPaths};
 use crate::environment::output_detail;
 
-const BENCHMARK_EXTRA: &str = "bench";
 const DISTRIBUTION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const GATEWAY_EXECUTABLE_ENV: &str = "MLX_AIR_GATEWAY_EXECUTABLE";
 pub(crate) const DEFAULT_BENCHMARK_CONFIG_ENV: &str = "MLX_AIR_DEFAULT_BENCHMARK_CONFIG";
@@ -33,7 +32,6 @@ struct SetupRecord {
     lockfile_sha256: String,
     python_executable: PathBuf,
     python_version: String,
-    installed_extras: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -100,8 +98,6 @@ pub(crate) fn ensure_benchmark_environment(
             "sync".into(),
             "--frozen".into(),
             "--no-dev".into(),
-            "--extra".into(),
-            BENCHMARK_EXTRA.into(),
         ])
         .env(
             "UV_PROJECT_ENVIRONMENT",
@@ -146,7 +142,6 @@ pub(crate) fn ensure_benchmark_environment(
             lockfile_sha256: environment.lockfile_sha256.clone(),
             python_executable: environment.python.clone(),
             python_version: output_detail(&version.stdout, &version.stderr),
-            installed_extras: vec![BENCHMARK_EXTRA.to_string()],
         },
     )?;
     eprintln!("MLX Air benchmark environment is ready");
@@ -166,8 +161,6 @@ pub(crate) fn benchmark_command(
                 OsString::from("--directory"),
                 path_arg(&distribution.python_project),
                 OsString::from("run"),
-                OsString::from("--extra"),
-                OsString::from(BENCHMARK_EXTRA),
                 OsString::from("python"),
                 OsString::from("-m"),
                 OsString::from("mlx_benchmark"),
@@ -210,7 +203,6 @@ fn setup_is_current(environment: &BenchmarkEnvironment) -> bool {
     record.distribution_version == DISTRIBUTION_VERSION
         && record.lockfile_sha256 == environment.lockfile_sha256
         && record.python_executable == environment.python
-        && record.installed_extras == [BENCHMARK_EXTRA]
 }
 
 fn write_setup_record(path: &Path, record: &SetupRecord) -> Result<(), BenchmarkError> {
@@ -299,8 +291,6 @@ mod tests {
                 "sync".into(),
                 "--frozen".into(),
                 "--no-dev".into(),
-                "--extra".into(),
-                "bench".into(),
             ]
         );
         assert_eq!(
@@ -332,8 +322,6 @@ mod tests {
                 "--directory".into(),
                 distribution.python_project.as_os_str().to_owned(),
                 "run".into(),
-                "--extra".into(),
-                "bench".into(),
                 "python".into(),
                 "-m".into(),
                 "mlx_benchmark".into(),
@@ -379,7 +367,6 @@ mod tests {
                 lockfile_sha256: selected.lockfile_sha256.clone(),
                 python_executable: selected.python.clone(),
                 python_version: "Python 3.12.1".to_string(),
-                installed_extras: vec![BENCHMARK_EXTRA.to_string()],
             },
         )
         .unwrap();

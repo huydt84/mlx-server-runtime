@@ -14,6 +14,68 @@ import mlx.core as mx
 
 
 @dataclass(frozen=True)
+class RecurrentStateRow:
+    """One request's row of a batch-stacked recurrent state tensor.
+
+    Committing a step keeps a reference to the whole batched state instead of
+    slicing it per request. When the next step runs the same requests in the
+    same order, the batched tensor is reused as-is, so a large recurrent state
+    (Gated DeltaNet keeps ~3 MiB per layer per request) is not copied by a
+    re-stack on every decode step.
+    """
+
+    batch: mx.array
+    row: int
+
+    def value(self) -> mx.array:
+        """Return this request's state without the batch axis."""
+
+        return self.batch[self.row]
+
+
+def gather_recurrent_rows(
+    rows: list[RecurrentStateRow | None],
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> mx.array:
+    """Batch per-request recurrent states, reusing an unchanged batch tensor.
+
+    Args:
+        rows: Committed state row per request, ``None`` for a fresh request.
+        shape: Per-request state shape without the batch axis.
+        dtype: State dtype used for fresh requests.
+
+    Returns:
+        The states stacked on a new leading batch axis.
+    """
+
+    first = rows[0] if rows else None
+    if (
+        first is not None
+        and int(first.batch.shape[0]) == len(rows)
+        and all(
+            row is not None and row.batch is first.batch and row.row == index
+            for index, row in enumerate(rows)
+        )
+    ):
+        return first.batch
+    return mx.stack(
+        [row.value() if row is not None else mx.zeros(shape, dtype) for row in rows],
+        axis=0,
+    )
+
+
+def valid_token_mask(append_lengths: tuple[int, ...], seq_len: int) -> mx.array | None:
+    """Return a ``(batch, seq_len)`` mask of real tokens, or ``None`` if unpadded."""
+
+    if all(length == seq_len for length in append_lengths):
+        return None
+    return (
+        mx.arange(seq_len)[None, :] < mx.array(append_lengths, dtype=mx.int32)[:, None]
+    )
+
+
+@dataclass(frozen=True)
 class KVCacheGeometry:
     """Architecture-declared dimensions required by a shared KV backend."""
 
@@ -21,6 +83,12 @@ class KVCacheGeometry:
     num_kv_heads: int
     head_dim: int
     dtype: Any
+    kv_layer_indices: tuple[int, ...] | None = None
+    """Layers that store paged KV; ``None`` means every layer.
+
+    Hybrid models whose other layers keep only request-local state list their
+    attention layers here so the KV budget is not spent on unused pages.
+    """
 
 
 class RequestCache(Protocol):
@@ -95,6 +163,7 @@ class DenseLayerCache:
     values: mx.array | None = None
     offset: int = 0
     conv_state: mx.array | None = None
+    recurrent_state: mx.array | None = None
 
     @property
     def offsets(self) -> mx.array:
@@ -136,6 +205,7 @@ class DenseBatchLayerCache:
     _committed_keys: tuple[mx.array, ...] = field(init=False, default=())
     _committed_values: tuple[mx.array, ...] = field(init=False, default=())
     _committed_conv_states: tuple[mx.array, ...] = field(init=False, default=())
+    _committed_recurrent_states: tuple[mx.array, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
         self.offsets = mx.array(
@@ -217,6 +287,12 @@ class DenseBatchLayerCache:
                 strict=True,
             ):
                 layer.conv_state = state
+            for layer, state in zip(
+                self.request_layers,
+                self._committed_recurrent_states,
+                strict=False,
+            ):
+                layer.recurrent_state = state
             return
         for layer, keys, values in zip(
             self.request_layers,
@@ -232,6 +308,11 @@ class DenseBatchLayerCache:
         if self._committed_keys or self._committed_values:
             raise ValueError("dense layer cannot stage both KV and convolution state")
         self._committed_conv_states = states
+
+    def stage_recurrent_states(self, states: tuple[mx.array, ...]) -> None:
+        if self._committed_keys or self._committed_values:
+            raise ValueError("dense layer cannot stage both KV and recurrent state")
+        self._committed_recurrent_states = states
 
 
 @dataclass
@@ -309,6 +390,32 @@ class DenseBatchReservation:
                 combined[index, append_length : append_length + cache_size - 1]
             )
         self.layer_views[layer_index].stage_conv_states(tuple(states))
+
+    def recurrent_state(
+        self,
+        layer_index: int,
+        shape: tuple[int, ...],
+        dtype: Any,
+    ) -> mx.array:
+        """Return each request's recurrent state stacked on the batch axis."""
+
+        states = []
+        for cache in self.request_caches:
+            state = cache.layers[layer_index].recurrent_state
+            states.append(mx.zeros(shape, dtype) if state is None else state)
+        return mx.stack(states, axis=0)
+
+    def stage_recurrent_state(self, layer_index: int, state: mx.array) -> None:
+        """Stage per-request recurrent state for a transactional commit."""
+
+        self.layer_views[layer_index].stage_recurrent_states(
+            tuple(state[index] for index in range(len(self.request_caches)))
+        )
+
+    def token_mask(self, seq_len: int) -> mx.array | None:
+        """Return the real-token mask for this step's padded rows."""
+
+        return valid_token_mask(self.append_lengths, seq_len)
 
     def abort(self) -> None:
         self._finished = True
@@ -397,6 +504,7 @@ class DenseKVCacheBackend:
                 target_layer.values = source_layer.values[:, :, :fork_length, :]
             target_layer.offset = fork_length
             target_layer.conv_state = source_layer.conv_state
+            target_layer.recurrent_state = source_layer.recurrent_state
         return new_handle
 
     def metrics(self) -> dict[str, Any]:
@@ -613,9 +721,15 @@ class PagedBatchReservation:
 
 @dataclass
 class HybridRequestCache(PagedRequestCache):
-    """Paged request cache with LFM2-only convolution state."""
+    """Paged request cache with request-local state for hybrid models.
+
+    ``conv_states`` holds short-convolution history (LFM2 and Gated DeltaNet
+    layers); ``recurrent_states`` holds linear-attention state (Gated DeltaNet
+    layers only).
+    """
 
     conv_states: dict[int, mx.array] = field(default_factory=dict)
+    recurrent_states: dict[int, RecurrentStateRow] = field(default_factory=dict)
 
 
 @dataclass
@@ -623,6 +737,7 @@ class HybridBatchReservation(PagedBatchReservation):
     """Transactional paged KV plus convolution-state reservation."""
 
     staged_states: list[mx.array | None] = field(default_factory=list)
+    staged_recurrent_states: list[mx.array | None] = field(default_factory=list)
 
     def stage_layer(
         self,
@@ -677,16 +792,55 @@ class HybridBatchReservation(PagedBatchReservation):
         )
         self.staged_states[layer_index] = mx.stack(states, axis=0)
 
+    def recurrent_state(
+        self,
+        layer_index: int,
+        shape: tuple[int, ...],
+        dtype: Any,
+    ) -> mx.array:
+        """Return each request's recurrent state stacked on the batch axis."""
+
+        return gather_recurrent_rows(
+            [
+                _require_hybrid_cache(cache).recurrent_states.get(layer_index)
+                for cache in self.request_caches
+            ],
+            shape,
+            dtype,
+        )
+
+    def stage_recurrent_state(self, layer_index: int, state: mx.array) -> None:
+        """Stage one layer's batch-stacked recurrent state for commit."""
+
+        if self._finished:
+            raise ValueError("cache reservation already finished")
+        if self.staged_keys[layer_index] is not None:
+            raise ValueError(f"layer {layer_index} staged both state and KV")
+        if int(state.shape[0]) != len(self.request_caches):
+            raise ValueError("recurrent state batch does not match the reservation")
+        self.staged_recurrent_states[layer_index] = state
+
+    def token_mask(self, seq_len: int) -> mx.array | None:
+        """Return the real-token mask for this step's padded rows."""
+
+        return valid_token_mask(self.append_lengths, seq_len)
+
     def commit(self, *, synchronize: bool = True) -> tuple[int, ...]:
         if self._finished:
             raise ValueError("cache reservation already finished")
-        for keys, values, state in zip(
-            self.staged_keys, self.staged_values, self.staged_states, strict=True
+        for keys, values, state, recurrent in zip(
+            self.staged_keys,
+            self.staged_values,
+            self.staged_states,
+            self.staged_recurrent_states,
+            strict=True,
         ):
             kv_complete = keys is not None and values is not None
             state_complete = state is not None
             if kv_complete == state_complete:
                 raise ValueError("hybrid cache commit requires one operation per layer")
+            if recurrent is not None and not state_complete:
+                raise ValueError("recurrent state requires a convolution state")
         staged_keys = tuple(
             _require_array(value) if value is not None else None
             for value in self.staged_keys
@@ -699,14 +853,16 @@ class HybridBatchReservation(PagedBatchReservation):
             _require_array(value) if value is not None else None
             for value in self.staged_states
         )
+        staged_recurrent = tuple(self.staged_recurrent_states)
         if synchronize:
             mx.eval(
                 *(value for value in staged_keys if value is not None),
                 *(value for value in staged_values if value is not None),
                 *(value for value in staged_states if value is not None),
+                *(value for value in staged_recurrent if value is not None),
             )
         lengths = self.backend._commit_hybrid_reservation(
-            self, staged_keys, staged_values, staged_states
+            self, staged_keys, staged_values, staged_states, staged_recurrent
         )
         self._finished = True
         return lengths
@@ -722,6 +878,7 @@ class PagedKVCacheBackend:
     page_size: int
     budget_bytes: int
     dtype: Any = mx.float16
+    kv_layer_indices: tuple[int, ...] | None = None
     _caches: dict[str, PagedRequestCache] = field(default_factory=dict, init=False)
     _reserved_pages: set[int] = field(default_factory=set, init=False)
     _allocation_failures: int = field(default=0, init=False)
@@ -731,12 +888,19 @@ class PagedKVCacheBackend:
             raise ValueError("native KV page size must be one of 8, 16, or 32")
         if min(self.num_layers, self.num_kv_heads, self.head_dim) <= 0:
             raise ValueError("native KV geometry must be positive")
-        if self.dtype not in (mx.float16, mx.bfloat16):
-            raise ValueError("native paged KV supports float16 or bfloat16")
+        if self.dtype not in (mx.float16, mx.bfloat16, mx.float32):
+            raise ValueError("native paged KV supports float16, bfloat16, or float32")
+        kv_layers = (
+            frozenset(range(self.num_layers))
+            if self.kv_layer_indices is None
+            else frozenset(self.kv_layer_indices)
+        )
+        if not kv_layers or not kv_layers <= frozenset(range(self.num_layers)):
+            raise ValueError("native KV layer indices must name existing layers")
         dtype_bytes = int(mx.array(0, dtype=self.dtype).itemsize)
         self.bytes_per_page = (
             2
-            * self.num_layers
+            * len(kv_layers)
             * self.page_size
             * self.num_kv_heads
             * self.head_dim
@@ -753,11 +917,16 @@ class PagedKVCacheBackend:
             self.num_kv_heads,
             self.head_dim,
         )
+        # State-only layers keep an empty placeholder so per-layer indexing
+        # stays uniform; staging KV into one fails on its zero-page shape.
+        empty = (0, *shape[1:])
         self.key_pages = [
-            mx.zeros(shape, dtype=self.dtype) for _ in range(self.num_layers)
+            mx.zeros(shape if index in kv_layers else empty, dtype=self.dtype)
+            for index in range(self.num_layers)
         ]
         self.value_pages = [
-            mx.zeros(shape, dtype=self.dtype) for _ in range(self.num_layers)
+            mx.zeros(shape if index in kv_layers else empty, dtype=self.dtype)
+            for index in range(self.num_layers)
         ]
         self._free_pages = list(range(self.num_pages))
         self._ref_counts = [0] * self.num_pages
@@ -1103,6 +1272,7 @@ class HybridPagedKVCacheBackend(PagedKVCacheBackend):
             staged_keys=staged_keys,
             staged_values=staged_values,
             staged_states=[None] * self.num_layers,
+            staged_recurrent_states=[None] * self.num_layers,
         )
 
     def fork(
@@ -1116,6 +1286,7 @@ class HybridPagedKVCacheBackend(PagedKVCacheBackend):
         new_handle = super().fork(handle, request_id, length=length)
         target = _require_hybrid_cache(self.get(new_handle, request_id))
         target.conv_states = dict(source.conv_states)
+        target.recurrent_states = dict(source.recurrent_states)
         return new_handle
 
     def _commit_hybrid_reservation(
@@ -1124,12 +1295,19 @@ class HybridPagedKVCacheBackend(PagedKVCacheBackend):
         staged_keys: tuple[mx.array | None, ...],
         staged_values: tuple[mx.array | None, ...],
         staged_states: tuple[mx.array | None, ...],
+        staged_recurrent: tuple[mx.array | None, ...] = (),
     ) -> tuple[int, ...]:
         lengths = super()._commit_reservation(reservation, staged_keys, staged_values)
         for index, state in enumerate(staged_states):
             if state is not None:
                 for cache, row in zip(reservation.request_caches, state, strict=True):
                     _require_hybrid_cache(cache).conv_states[index] = row
+        for index, state in enumerate(staged_recurrent):
+            if state is not None:
+                for row, cache in enumerate(reservation.request_caches):
+                    _require_hybrid_cache(cache).recurrent_states[index] = (
+                        RecurrentStateRow(state, row)
+                    )
         return lengths
 
     def metrics(self) -> dict[str, Any]:

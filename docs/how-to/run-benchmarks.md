@@ -20,8 +20,15 @@ Suites, focuses, workloads, and models are defined in
 | `optimization` | 2 × 2 | Each model role on the workloads it is meant to exercise. |
 | `release` | 2 × 3 | Release-gate coverage. |
 | `exhaustive` | 2 × 4 | Every workload on every model role. |
+| `mlx_lm_comparison` | 2 × 2 | native-mlx `overlap` against the `mlx_lm` baseline on the Qwen3.5 hybrid checkpoints (`hybrid_binary`, `hybrid_ternary`). |
 
-Every suite runs both the `serial` and `overlap` runtime configurations. Each
+The `smoke`, `optimization`, `release`, and `exhaustive` suites run the native
+`serial` and `overlap` runtime configurations. The `mlx_lm` runtime
+configuration runs the v1 backend, which serves through `mlx-lm`'s
+`BatchGenerator` behind the same gateway, so it measures `mlx-lm` under the
+same load generator, prompts, and HTTP path as native-mlx. Its prompt cache
+is off, because native-mlx keeps no prefix cache for hybrid models and the v1
+backend does not clear its cache before cold-cache trials. Each
 round starts one server per (model, runtime configuration) pair, and the
 runtime order alternates between rounds and models to cancel order bias.
 Before measuring, each workload runs once with distinct warmup prompts of the

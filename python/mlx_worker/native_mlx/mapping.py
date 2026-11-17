@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -94,6 +95,9 @@ def load_weight_index(model_path: Path) -> WeightIndex:
 
     index_path = model_path / "model.safetensors.index.json"
     if not index_path.exists():
+        single = model_path / "model.safetensors"
+        if single.exists():
+            return _single_file_index(model_path, single)
         raise WeightArtifactValidationError(
             f"missing native weight index: {index_path.name}"
         )
@@ -139,4 +143,35 @@ def load_weight_index(model_path: Path) -> WeightIndex:
         model_path=model_path,
         weight_map={str(key): str(value) for key, value in weight_map.items()},
         source_files=tuple(source_files),
+    )
+
+
+def _single_file_index(model_path: Path, weights_file: Path) -> WeightIndex:
+    """Index an unsharded checkpoint from its safetensors header.
+
+    Single-file checkpoints may omit ``model.safetensors.index.json``. Only
+    the JSON header is read, so no tensor data is loaded.
+    """
+
+    try:
+        with weights_file.open("rb") as handle:
+            (header_size,) = struct.unpack("<Q", handle.read(8))
+            if header_size <= 0 or header_size > weights_file.stat().st_size:
+                raise ValueError("invalid header size")
+            header = json.loads(handle.read(header_size))
+    except (OSError, ValueError, struct.error) as exc:
+        raise WeightArtifactValidationError(
+            f"could not read {weights_file.name} header: {exc}"
+        ) from exc
+    if not isinstance(header, dict):
+        raise WeightArtifactValidationError(
+            f"{weights_file.name} header is not a JSON object"
+        )
+    names = [str(name) for name in header if name != "__metadata__"]
+    if not names:
+        raise WeightArtifactValidationError(f"{weights_file.name} has no tensors")
+    return WeightIndex(
+        model_path=model_path,
+        weight_map=dict.fromkeys(names, weights_file.name),
+        source_files=(weights_file.name,),
     )

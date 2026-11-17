@@ -96,6 +96,9 @@ class ArchitectureExecutionPlan:
     cache_family: str
 
 
+_KV_DTYPES = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
+
+
 @cache
 def _load_module(module_name: str) -> Any:
     """Import one model module once, after architecture selection."""
@@ -179,6 +182,30 @@ _REGISTRY: dict[str, ArchitectureSpec] = {
         supports_prefix_cache=False,
         cache_family="hybrid",
     ),
+    "Qwen3_5ForConditionalGeneration": ArchitectureSpec(
+        architecture_class="Qwen3_5ForConditionalGeneration",
+        known_good_checkpoint="prism-ml/Bonsai-27B-mlx-1bit",
+        compatibility_probes=(),
+        module_name=".models.qwen3_5",
+        parse_config_name="parse_qwen3_5_config",
+        weight_adapter_name="Qwen3_5WeightAdapter",
+        model_factory_name="build_qwen3_5_model",
+        cache_geometry_factory=lambda config: KVCacheGeometry(
+            num_layers=int(config.num_hidden_layers),
+            num_kv_heads=int(config.num_key_value_heads),
+            head_dim=int(config.head_dim),
+            dtype=_KV_DTYPES[config.kv_cache_dtype],
+            kv_layer_indices=tuple(config.full_attention_layers),
+        ),
+        supports_prefix_cache=False,
+        cache_family="hybrid",
+    ),
+}
+
+# Checkpoints that declare no ``architectures`` but a model type whose weight
+# format a registered architecture implements.
+_MODEL_TYPE_ARCHITECTURES: dict[str, str] = {
+    "prism_hadamard_qwen35": "Qwen3_5ForConditionalGeneration",
 }
 
 
@@ -186,6 +213,16 @@ def get_architecture_spec(architecture_class: str) -> ArchitectureSpec | None:
     """Return the registered architecture specification."""
 
     return _REGISTRY.get(architecture_class)
+
+
+def architecture_for_model_type(model_type: object) -> str | None:
+    """Return the architecture class implementing an architecture-less model type."""
+
+    return (
+        _MODEL_TYPE_ARCHITECTURES.get(model_type)
+        if isinstance(model_type, str)
+        else None
+    )
 
 
 def qwen2_spec() -> ArchitectureSpec:
@@ -197,6 +234,7 @@ def qwen2_spec() -> ArchitectureSpec:
 __all__ = [
     "ArchitectureSpec",
     "CompatibilityProbe",
+    "architecture_for_model_type",
     "get_architecture_spec",
     "qwen2_spec",
 ]

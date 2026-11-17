@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..ipc import ModelError
+from ..prism_hadamard import generation_eos_token_ids, is_prism_hadamard_checkpoint
 from .cache import KVCacheBackend
 from .cache_coordinator import NativeCacheCoordinator
 from .diagnostics import ModelDiagnostics
@@ -33,7 +34,12 @@ from .prefix_cache import (
     PrefixCompatibilityFingerprint,
     RadixPrefixCache,
 )
-from .registry import ArchitectureExecutionPlan, ArchitectureSpec, get_architecture_spec
+from .registry import (
+    ArchitectureExecutionPlan,
+    ArchitectureSpec,
+    architecture_for_model_type,
+    get_architecture_spec,
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,9 @@ def build_native_artifacts(
         stage_callback("weight_mapping", "loading_weights")
     try:
         native_model = plan.create_model(config, weights)
+        # A model may refine its config from the loaded weights, for example
+        # the K/V activation dtype that sizes the KV pool.
+        config = getattr(native_model, "resolved_config", config)
         if graph_profile:
             native_model = GraphProfiledModel(native_model)
         geometry = plan.cache_geometry(config)
@@ -306,6 +315,8 @@ def detect_native_architecture(model: str) -> NativeArchitecture:
     name = (
         architectures[0] if isinstance(architectures, list) and architectures else None
     )
+    if name is None:
+        name = architecture_for_model_type(payload.get("model_type"))
     if not isinstance(name, str) or not name:
         raise _failure(
             "MISSING_ARCHITECTURES",
@@ -359,7 +370,14 @@ def _load_tokenizer(model_path: Path) -> tuple[Any, Any, tuple[int, ...]]:
         eos = [] if value is None else [value]
     elif isinstance(eos, int):
         eos = [eos]
-    return wrapper, decode_target, tuple(int(value) for value in eos)
+    eos = [int(value) for value in eos]
+    if is_prism_hadamard_checkpoint(model_path):
+        # Hadamard packs list every end-of-generation id in
+        # generation_config.json; the tokenizer alone knows only one.
+        eos += [
+            value for value in generation_eos_token_ids(model_path) if value not in eos
+        ]
+    return wrapper, decode_target, tuple(eos)
 
 
 def resolve_model_path(model: str) -> Path:

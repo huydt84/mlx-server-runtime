@@ -1183,9 +1183,6 @@ case "${FAKE_UV_RUN_MODE:-python}" in
         ;;
 esac
 
-if [ "$1" = "--extra" ]; then
-    shift 2
-fi
 if [ "$1" = "python" ]; then
     shift
 fi

@@ -128,7 +128,7 @@ import sys
 runtime = json.loads(pathlib.Path(sys.argv[1]).read_text())
 benchmark = json.loads(pathlib.Path(sys.argv[2]).read_text())
 assert runtime["installed_dependency_groups"] == [], runtime
-assert benchmark["installed_extras"] == ["bench"], benchmark
+assert "installed_extras" not in benchmark, benchmark
 PY
 echo "separate_environments_ok=1"
 

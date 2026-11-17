@@ -11,17 +11,19 @@ entrypoints, evidence artifacts, metrics, known limitations, and v1 fallback.
 
 `native-mlx` is an explicit backend selector. The default backend remains `v1`.
 
-The first supported architecture class is:
+The registered architecture classes and their known-good checkpoints are:
 
-```text
-Qwen2ForCausalLM
-```
+| Architecture class | Known-good checkpoints |
+| --- | --- |
+| `Qwen2ForCausalLM` | `mlx-community/Qwen2.5-7B-Instruct-4bit` |
+| `Qwen3ForCausalLM` | `mlx-community/Qwen3-4B-Instruct-2507-4bit` |
+| `Gemma3ForCausalLM` | `mlx-community/gemma-3-270m-it-qat-8bit` |
+| `Lfm2MoeForCausalLM` | `mlx-community/LFM2.5-8B-A1B-MLX-4bit` |
+| `Qwen3_5ForConditionalGeneration` (dense, text only) | `prism-ml/Bonsai-27B-mlx-1bit`, `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` |
 
-The known-good checkpoint used by the native-v2 plan and host scripts is:
-
-```text
-mlx-community/Qwen2.5-7B-Instruct-4bit
-```
+A checkpoint without `architectures` is matched by model type only where a
+registered class implements its weight format: `prism_hadamard_qwen35` maps to
+`Qwen3_5ForConditionalGeneration`.
 
 Support is architecture-class based, not model-family-name based. A checkpoint
 declaring an unsupported architecture must fail before serving. A supported
@@ -121,6 +123,39 @@ an MLX `.gputrace`, and matched serial/overlap Metal System Traces from the
 Python worker. The Metal gate uses the same sustained four-request concurrent
 decode workload in both modes and rejects a p95 GPU interval-gap regression
 beyond 2% or 50 microseconds, whichever allowance is larger.
+
+## Hybrid Models
+
+`Lfm2MoeForCausalLM` and `Qwen3_5ForConditionalGeneration` use the hybrid
+cache: attention layers store paged KV, and the other layers keep
+request-local state committed with each step.
+
+- LFM2 short-convolution layers keep the last `conv_L_cache - 1` inputs.
+- Qwen3.5 Gated DeltaNet layers keep the last `linear_conv_kernel_dim - 1`
+  convolution inputs and a float32 recurrent state of
+  `linear_num_value_heads x linear_value_head_dim x linear_key_head_dim` per
+  layer. On a 27B Qwen3.5 checkpoint that is about 150 MiB per in-flight
+  request, outside `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES`.
+- Qwen3.5 allocates KV pages only for its full-attention layers, so the
+  budget is not spent on Gated DeltaNet layers. The KV dtype is the dtype the
+  loaded weights produce, which can be float32.
+- Recurrent state cannot be truncated to a prefix, so hybrid models run
+  without a prefix cache; requests never reuse cached tokens.
+- Padded prefill rows mask padding out of both the convolution state and the
+  recurrence, so batching does not change a request's output.
+
+The Gated DeltaNet recurrence uses the `mlx-lm` Metal kernel
+(`mlx_lm.models.gated_delta`), so native and `mlx-lm` runs execute the same
+recurrence code.
+
+### Hadamard-Rotated Packs
+
+`prism_hadamard_qwen35` packs store projection weights folded with a
+blockwise sign-and-Hadamard rotation. The native model, and the v1 backend
+when it loads such a pack, apply the activation rotation before each packed
+matmul and rotate looked-up embedding rows back. Plain `mlx_lm.load` cannot
+load these packs. Their norms and other unquantized tensors are float32, so
+the residual stream and the KV cache are float32.
 
 ## Attention Backend Contract
 
@@ -223,6 +258,9 @@ request totals.
 - `native-mlx` is experimental and explicit opt-in.
 - The only registered production execution backend is currently `native-metal-paged-sdpa`.
 - Only explicitly implemented architecture classes are supported.
+- Hybrid models (LFM2-MoE, Qwen3.5) run without a prefix cache.
+- Qwen3.5 mixture-of-experts checkpoints and the Qwen3.5 vision tower are not
+  implemented.
 - Greedy decoding is the validated native path.
 - VLM requests remain outside `native-mlx`.
 - `overlap` is the default execution mode; set

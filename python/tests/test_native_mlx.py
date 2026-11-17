@@ -280,6 +280,7 @@ def test_models_directory_has_registered_architecture_modules() -> None:
         "lfm2.py",
         "qwen2.py",
         "qwen3.py",
+        "qwen3_5.py",
     ]
     assert not (models / "Qwen2ForCausalLM").exists()
 
