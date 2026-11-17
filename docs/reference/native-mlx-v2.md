@@ -144,12 +144,16 @@ uses two attention paths:
 - **Decode steps** (every row adds one token) run a Metal kernel that follows
   each row's block table while it attends, so rows of different lengths need
   neither a dense copy nor padding. One threadgroup serves one row and KV head
-  together with all query heads that share it. When a step has few rows, long
-  rows are split into key ranges on separate threadgroups and merged by a
-  second kernel. Head dimensions that are not a multiple of 32 fall back to
+  together with all query heads that share it. When a step has few rows, each
+  row's keys are split into ranges of at least 32 keys on separate
+  threadgroups and merged by a second kernel. Head dimensions that are not a multiple of 32 fall back to
   the gather path below.
 - **Prefill and mixed steps** gather each row's pages into padded dense K/V
   and call `mx.fast.scaled_dot_product_attention`.
+
+Each layer writes the step's new K/V into the pool before attending: one
+slice copy when the step's cache slots are consecutive (a single row, for
+one), otherwise one indexed scatter.
 
 Its capability metadata therefore reports that it consumes page tables
 directly.

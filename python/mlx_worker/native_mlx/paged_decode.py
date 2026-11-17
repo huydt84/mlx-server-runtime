@@ -12,9 +12,10 @@ Each simdgroup accumulates an online softmax over a strided subset of the
 row's keys; the simdgroups are then merged through threadgroup memory.
 
 Layers run one after another, so a step with few rows would otherwise occupy
-only a handful of GPU cores. Long rows are therefore split into key ranges
+only a handful of GPU cores. Each row's keys are therefore split into ranges
 handled by separate threadgroups, and a second small kernel merges the
-partial softmax results.
+partial softmax results. Even at short contexts the extra parallelism costs
+less than the merge launch.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ _MAX_SIMDGROUPS = 8
 # Split a row's keys until a step launches about this many threadgroups...
 _TARGET_THREADGROUPS = 32
 # ...but give every split at least this many keys.
-_MIN_KEYS_PER_SPLIT = 256
+_MIN_KEYS_PER_SPLIT = 32
 _MAX_SPLITS = 32
 
 _SOURCE = """

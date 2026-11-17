@@ -7,6 +7,7 @@ import math
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import Any, Protocol
 
 import mlx.core as mx
@@ -450,6 +451,8 @@ class PagedBatchReservation:
     staged_values: list[mx.array | None]
     _finished: bool = False
     _slot_array: mx.array = field(init=False, repr=False)
+    _slot_start: int | None = field(init=False, default=None, repr=False)
+    """First slot when the step's slots are consecutive, else ``None``."""
     _page_id_arrays: tuple[mx.array, ...] = field(init=False, repr=False)
     _total_lengths: tuple[int, ...] = field(init=False, repr=False)
     _max_total_length: int = field(init=False, repr=False)
@@ -481,6 +484,8 @@ class PagedBatchReservation:
                     page * self.backend.page_size + position % self.backend.page_size
                 )
         self._slot_array = mx.array(slots, dtype=mx.int32)
+        if slots and all(b == a + 1 for a, b in pairwise(slots)):
+            self._slot_start = slots[0]
 
     @property
     def token_lengths(self) -> tuple[int, ...]:
@@ -524,12 +529,33 @@ class PagedBatchReservation:
         for old_page, new_page in self.copy_pages:
             key_cache[new_page] = key_cache[old_page]
             value_cache[new_page] = value_cache[old_page]
-        packed_keys: list[mx.array] = []
-        packed_values: list[mx.array] = []
-        for index, append_length in enumerate(self.append_lengths):
-            packed_keys.append(keys[index, :, :append_length, :].transpose(1, 0, 2))
-            packed_values.append(values[index, :, :append_length, :].transpose(1, 0, 2))
         slot_array = self._slot_array
+        sequence = int(keys.shape[2])
+        if all(length == sequence for length in self.append_lengths):
+            # No row is padded (every decode step, for one): the slot order is
+            # the row-major (row, position) order, so a single reshape packs
+            # the step without per-row slices and a concatenation.
+            packed_key_rows = keys.swapaxes(1, 2).reshape(
+                -1, self.backend.num_kv_heads, self.backend.head_dim
+            )
+            packed_value_rows = values.swapaxes(1, 2).reshape(
+                -1, self.backend.num_kv_heads, self.backend.head_dim
+            )
+        else:
+            packed_key_rows = mx.concatenate(
+                [
+                    keys[index, :, :length, :].transpose(1, 0, 2)
+                    for index, length in enumerate(self.append_lengths)
+                ],
+                axis=0,
+            )
+            packed_value_rows = mx.concatenate(
+                [
+                    values[index, :, :length, :].transpose(1, 0, 2)
+                    for index, length in enumerate(self.append_lengths)
+                ],
+                axis=0,
+            )
         flat_shape = (
             self.backend.num_pages * self.backend.page_size,
             self.backend.num_kv_heads,
@@ -537,8 +563,15 @@ class PagedBatchReservation:
         )
         flat_keys = key_cache.reshape(flat_shape)
         flat_values = value_cache.reshape(flat_shape)
-        flat_keys[slot_array] = mx.concatenate(packed_keys, axis=0)
-        flat_values[slot_array] = mx.concatenate(packed_values, axis=0)
+        if self._slot_start is not None:
+            # Consecutive slots (one decode row, for one) take a plain slice
+            # copy, which is cheaper on the GPU than an indexed scatter.
+            end = self._slot_start + int(packed_key_rows.shape[0])
+            flat_keys[self._slot_start : end] = packed_key_rows
+            flat_values[self._slot_start : end] = packed_value_rows
+        else:
+            flat_keys[slot_array] = packed_key_rows
+            flat_values[slot_array] = packed_value_rows
         key_cache = flat_keys.reshape(key_cache.shape)
         value_cache = flat_values.reshape(value_cache.shape)
         # Drop the pool's reference to the previous buffer so the scatter above

@@ -155,7 +155,7 @@ def test_paged_attention_builds_one_mask_per_step() -> None:
     ("query_heads", "kv_heads", "head_dim"), [(4, 2, 64), (7, 1, 128), (4, 1, 256)]
 )
 @pytest.mark.parametrize("window_size", [None, 5, 300])
-@pytest.mark.parametrize("lengths", [[1, 4, 13, 40], [700]])
+@pytest.mark.parametrize("lengths", [[1, 4, 13, 40], [70], [700]])
 def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
     dtype,
     query_heads: int,
@@ -215,9 +215,27 @@ def test_paged_decode_kernel_rejects_unsupported_geometry() -> None:
     assert simdgroups_for(4, 1, 256) == 4
 
 
-def test_paged_decode_splits_long_rows_only_when_few_threadgroups_run() -> None:
-    assert splits_for(rows=1, kv_heads=8, max_keys=192) == 1
-    assert splits_for(rows=1, kv_heads=8, max_keys=700) == 2
+def test_paged_decode_splits_rows_only_when_few_threadgroups_run() -> None:
+    # Every split keeps at least 32 keys.
+    assert splits_for(rows=1, kv_heads=8, max_keys=40) == 1
+    assert splits_for(rows=1, kv_heads=8, max_keys=64) == 2
     assert splits_for(rows=1, kv_heads=8, max_keys=4096) == 4
+    assert splits_for(rows=2, kv_heads=8, max_keys=4096) == 2
     assert splits_for(rows=4, kv_heads=8, max_keys=4096) == 1
     assert splits_for(rows=1, kv_heads=1, max_keys=100_000) == 32
+
+
+def test_paged_reservation_copies_consecutive_slots_as_one_slice() -> None:
+    backend = PagedKVCacheBackend(1, _KV_HEADS, 32, 8, 1 << 20)
+    first = backend.get(backend.create("first"), "first")
+    second = backend.get(backend.create("second"), "second")
+
+    # One row's slots are consecutive, even across a page boundary.
+    reservation = backend.reserve_batch((first,), (12,))
+    assert reservation._slot_start == 0
+    reservation.abort()
+
+    # Two rows land on different pages, so their slots need a scatter.
+    reservation = backend.reserve_batch((first, second), (1, 1))
+    assert reservation._slot_start is None
+    reservation.abort()
