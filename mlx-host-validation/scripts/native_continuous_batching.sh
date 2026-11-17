@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_continuous_batching.sh
+#   bash mlx-host-validation/scripts/native_continuous_batching.sh [options]
+#   bash mlx-host-validation/scripts/native_continuous_batching.sh --help
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -42,18 +43,34 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-CHECKPOINT="mlx-community/Qwen2.5-7B-Instruct-4bit"
-NATIVE_PORT=18180
-V1_PORT=18181
-NATIVE_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-native.log"
-V1_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-v1.log"
-HEALTH_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-health.txt"
-V1_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-v1.json"
-REQUEST_DIR="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-requests"
-NATIVE_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-native.toml"
-V1_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-v1.toml"
-OVERLAP_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-overlap.json"
-METRICS_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching-metrics.txt"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native-mlx continuous batching (overlapping streams, cancellation, metrics) through the public gateway, then a v1 non-regression request."
+cli_option CHECKPOINT --checkpoint MLX_CONTINUOUS_BATCHING_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
+cli_option NATIVE_PORT --native-port MLX_CONTINUOUS_BATCHING_NATIVE_PORT port 18180 "native-mlx gateway port."
+cli_option V1_PORT --v1-port MLX_CONTINUOUS_BATCHING_V1_PORT port 18181 "v1 gateway port."
+cli_option TEXT_CACHE_BUDGET_BYTES --text-cache-budget-bytes MLX_CONTINUOUS_BATCHING_TEXT_CACHE_BUDGET_BYTES int \
+    33554432 "Native paged KV budget in bytes."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_CONTINUOUS_BATCHING_HEALTH_TIMEOUT int 300 \
+    "Seconds to wait for each gateway to report healthy."
+cli_option ARTIFACTS_DIR --artifacts-dir MLX_CONTINUOUS_BATCHING_ARTIFACTS_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-continuous-batching" "Directory for logs, configs, requests, and captures."
+cli_option SKIP_BUILD --skip-build MLX_CONTINUOUS_BATCHING_SKIP_BUILD bool 0 \
+    "Skip uv sync and cargo build; reuse the existing environment and gateway binary."
+cli_parse "$@"
+cli_require_free_port "$NATIVE_PORT" --native-port
+cli_require_free_port "$V1_PORT" --v1-port
+
+NATIVE_LOG="$ARTIFACTS_DIR/native.log"
+V1_LOG="$ARTIFACTS_DIR/v1.log"
+HEALTH_CAPTURE="$ARTIFACTS_DIR/health.txt"
+V1_CAPTURE="$ARTIFACTS_DIR/v1.json"
+REQUEST_DIR="$ARTIFACTS_DIR/requests"
+NATIVE_CONFIG="$ARTIFACTS_DIR/native.toml"
+V1_CONFIG="$ARTIFACTS_DIR/v1.toml"
+OVERLAP_CAPTURE="$ARTIFACTS_DIR/overlap.json"
+METRICS_CAPTURE="$ARTIFACTS_DIR/metrics.txt"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 mkdir -p "$REQUEST_DIR"
 
@@ -71,7 +88,7 @@ wait_healthy() {
     local log_path="$1"
     local port="$2"
     rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
         if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
             echo "gateway exited unexpectedly; inspect $log_path" >&2
             return 1
@@ -138,8 +155,12 @@ PY
 
 echo "[1/6] Sync Python dev environment"
 cd "$PYTHON_DIR"
-uv sync --group dev
-cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "build_skipped=1"
+else
+    uv sync --group dev
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
+fi
 
 echo "[2/6] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'
@@ -202,7 +223,7 @@ write_request "$REQUEST_DIR/v1.json" "Say hello in one short sentence." 16 false
 
 start_gateway "$NATIVE_LOG" "$NATIVE_PORT" \
     MLX_RUNTIME_CONFIG="$NATIVE_CONFIG" \
-    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES=33554432
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
 
 uv --directory "$PYTHON_DIR" run python - <<'PY' "$REQUEST_DIR/stream_a.json" "$REQUEST_DIR/stream_b.json" "$REQUEST_DIR/cancel.json" "$OVERLAP_CAPTURE" "$METRICS_CAPTURE" "$NATIVE_PORT"
 from __future__ import annotations

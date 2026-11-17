@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_chunked_prefill.sh
+#   bash mlx-host-validation/scripts/native_chunked_prefill.sh [options]
+#   bash mlx-host-validation/scripts/native_chunked_prefill.sh --help
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -20,7 +21,6 @@
 #   - `uv` environment for `python/`
 #   - known-good checkpoint already available to local Hugging Face cache
 #   - `cargo` toolchain for `mlx_runtime_gateway`
-#   - optional `MLX_CHUNKED_TEXT_CACHE_BUDGET_BYTES` override for native KV budget
 #
 # Expected success signals:
 #   - `mlx_import_ok=1`
@@ -53,11 +53,36 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-CHECKPOINT="mlx-community/Qwen2.5-7B-Instruct-4bit"
-TEXT_CACHE_BUDGET_BYTES="${MLX_CHUNKED_TEXT_CACHE_BUDGET_BYTES:-268435456}"
-NATIVE_PORT_BASE=18082
-V1_PORT=18083
-TMP_ROOT="${TMPDIR:-/tmp}/mlx-runtime-v2-chunked-prefill"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native-mlx chunked prefill interleaving for each chunk size through the public gateway, physical batching proofs, then a v1 non-regression request."
+cli_option CHECKPOINT --checkpoint MLX_CHUNKED_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
+cli_option CHUNK_SIZES --chunk-sizes MLX_CHUNKED_CHUNK_SIZES list "32,96" \
+    "Prefill chunk sizes to probe, one native gateway run each."
+cli_option NATIVE_PORT --native-port MLX_CHUNKED_NATIVE_PORT port 18082 \
+    "native-mlx gateway port, reused by each chunk-size run in turn."
+cli_option V1_PORT --v1-port MLX_CHUNKED_V1_PORT port 18083 "v1 gateway port."
+cli_option TEXT_CACHE_BUDGET_BYTES --text-cache-budget-bytes MLX_CHUNKED_TEXT_CACHE_BUDGET_BYTES int \
+    268435456 "Native paged KV budget in bytes."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_CHUNKED_HEALTH_TIMEOUT int 300 \
+    "Seconds to wait for each gateway to report healthy."
+cli_option TMP_ROOT --artifacts-dir MLX_CHUNKED_ARTIFACTS_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-chunked-prefill" "Directory for logs, configs, requests, and captures."
+cli_option SKIP_BUILD --skip-build MLX_CHUNKED_SKIP_BUILD bool 0 \
+    "Skip uv sync and cargo build; reuse the existing environment and gateway binary."
+cli_example "bash mlx-host-validation/scripts/native_chunked_prefill.sh --chunk-sizes 16,64,256"
+cli_parse "$@"
+cli_split_list CHUNK_SIZE_LIST "$CHUNK_SIZES"
+for chunk_size in "${CHUNK_SIZE_LIST[@]}"; do
+    [[ "$chunk_size" =~ ^[1-9][0-9]*$ ]] || {
+        echo "error: --chunk-sizes entries must be positive integers, got '$chunk_size'" >&2
+        exit 2
+    }
+done
+cli_require_free_port "$NATIVE_PORT" --native-port
+cli_require_free_port "$V1_PORT" --v1-port
+
 REQUEST_DIR="$TMP_ROOT/requests"
 NATIVE_CONFIG="$TMP_ROOT/runtime-native.toml"
 V1_CONFIG="$TMP_ROOT/runtime-v1.toml"
@@ -83,7 +108,7 @@ wait_healthy() {
     local log_path="$1"
     local port="$2"
     rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
         if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
             echo "gateway exited unexpectedly; inspect $log_path" >&2
             return 1
@@ -146,10 +171,12 @@ stop_gateway() {
 }
 
 echo "[1/7] Sync Python dev environment and build gateway"
-cd "$PYTHON_DIR"
-uv sync --group dev
-cd "$ROOT"
-cargo build -p mlx_runtime_gateway
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "build_skipped=1"
+else
+    (cd "$PYTHON_DIR" && uv sync --group dev)
+    (cd "$ROOT" && cargo build -p mlx_runtime_gateway)
+fi
 
 echo "[2/7] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv --directory "$PYTHON_DIR" run python - <<'PY'
@@ -171,7 +198,7 @@ print(f"mlx_compute_ok={values}")
 PY
 
 echo "[3/7] Build runtime configs and request fixtures"
-uv --directory "$PYTHON_DIR" run python - <<'PY' "$ROOT/config/runtime.toml" "$NATIVE_CONFIG" "$V1_CONFIG" "$CHECKPOINT" "$NATIVE_PORT_BASE" "$V1_PORT" "$REQUEST_DIR"
+uv --directory "$PYTHON_DIR" run python - <<'PY' "$ROOT/config/runtime.toml" "$NATIVE_CONFIG" "$V1_CONFIG" "$CHECKPOINT" "$NATIVE_PORT" "$V1_PORT" "$REQUEST_DIR"
 from __future__ import annotations
 
 import json
@@ -278,7 +305,7 @@ import sys
 source = pathlib.Path(sys.argv[1]).read_text()
 target = pathlib.Path(sys.argv[2])
 target.write_text(
-    source.replace('port = 18082', f'port = {sys.argv[3]}').replace(
+    source.replace(
         'ipc_path = "/tmp/mlx-runtime.sock"',
         f'ipc_path = "/tmp/mlx-runtime-chunked-{sys.argv[4]}.sock"',
     )
@@ -854,8 +881,9 @@ finally:
     cache_coordinator.release(isolation_valid_handle)
 PY
 
-probe_chunk_size 32 18082
-probe_chunk_size 96 18084
+for chunk_size in "${CHUNK_SIZE_LIST[@]}"; do
+    probe_chunk_size "$chunk_size" "$NATIVE_PORT"
+done
 
 echo "[6/7] Run default v1 non-regression request"
 start_v1_gateway "$V1_LOG" "$V1_PORT"

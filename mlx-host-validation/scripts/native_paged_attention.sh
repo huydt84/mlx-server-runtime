@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_paged_attention.sh
+#   bash mlx-host-validation/scripts/native_paged_attention.sh [options]
+#   bash mlx-host-validation/scripts/native_paged_attention.sh --help
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -47,10 +48,27 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-CHECKPOINT="${MLX_PAGED_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
-NATIVE_PORT="${MLX_PAGED_NATIVE_PORT:-18092}"
-V1_PORT="${MLX_PAGED_V1_PORT:-18093}"
-TMP_ROOT="${TMPDIR:-/tmp}/mlx-runtime-v2-paged-attention"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native-mlx paged attention: kernel parity, page lifecycle, capacity, cancellation, a public-gateway workload, then a v1 non-regression request."
+cli_option CHECKPOINT --checkpoint MLX_PAGED_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways and the direct probes."
+cli_option NATIVE_PORT --native-port MLX_PAGED_NATIVE_PORT port 18092 "native-mlx gateway port."
+cli_option V1_PORT --v1-port MLX_PAGED_V1_PORT port 18093 "v1 gateway port."
+cli_option TEXT_CACHE_BUDGET_BYTES --text-cache-budget-bytes MLX_PAGED_TEXT_CACHE_BUDGET_BYTES int \
+    268435456 "Native paged KV budget in bytes."
+cli_option PREFILL_CHUNK_SIZE --prefill-chunk-size MLX_PAGED_PREFILL_CHUNK_SIZE int 16 \
+    "Native prefill chunk size for the public-gateway workload."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_PAGED_HEALTH_TIMEOUT int 360 \
+    "Seconds to wait for each gateway to report healthy."
+cli_option TMP_ROOT --artifacts-dir MLX_PAGED_ARTIFACTS_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-paged-attention" "Directory for logs, configs, requests, and captures."
+cli_option SKIP_BUILD --skip-build MLX_PAGED_SKIP_BUILD bool 0 \
+    "Skip uv sync and cargo build; reuse the existing environment and gateway binary."
+cli_parse "$@"
+cli_require_free_port "$NATIVE_PORT" --native-port
+cli_require_free_port "$V1_PORT" --v1-port
+
 REQUEST_DIR="$TMP_ROOT/requests"
 NATIVE_CONFIG="$TMP_ROOT/runtime-native.toml"
 V1_CONFIG="$TMP_ROOT/runtime-v1.toml"
@@ -78,7 +96,7 @@ wait_healthy() {
     local log_path="$1"
     local port="$2"
     rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 360); do
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
         if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
             echo "gateway exited unexpectedly; inspect $log_path" >&2
             return 1
@@ -107,8 +125,8 @@ start_gateway() {
         cd "$ROOT"
         exec env \
             MLX_RUNTIME_CONFIG="$config_path" \
-            MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_PAGED_TEXT_CACHE_BUDGET_BYTES:-268435456}" \
-            MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_PAGED_PREFILL_CHUNK_SIZE:-16}" \
+            MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES" \
+            MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
             "$GATEWAY_BIN"
     ) >"$log_path" 2>&1 &
     GATEWAY_PID=$!
@@ -124,8 +142,12 @@ stop_gateway() {
 }
 
 echo "[1/7] Sync Python environment and build gateway"
-uv --directory "$PYTHON_DIR" sync --group dev
-cargo build -p mlx_runtime_gateway
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "build_skipped=1"
+else
+    uv --directory "$PYTHON_DIR" sync --group dev
+    (cd "$ROOT" && cargo build -p mlx_runtime_gateway)
+fi
 
 echo "[2/7] Verify Apple Silicon and MLX Metal"
 uv --directory "$PYTHON_DIR" run python - <<'PY'

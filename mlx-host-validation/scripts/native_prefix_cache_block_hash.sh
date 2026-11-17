@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_prefix_cache_block_hash.sh
+#   bash mlx-host-validation/scripts/native_prefix_cache_block_hash.sh [options]
+#   bash mlx-host-validation/scripts/native_prefix_cache_block_hash.sh --help
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -65,10 +66,31 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 export PYTHONPATH="$PYTHON_DIR${PYTHONPATH:+:$PYTHONPATH}"
-CHECKPOINT="${MLX_BLOCK_HASH_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
-NATIVE_PORT="${MLX_BLOCK_HASH_NATIVE_PORT:-18102}"
-V1_PORT="${MLX_BLOCK_HASH_V1_PORT:-18103}"
-TMP_ROOT="${TMPDIR:-/tmp}/mlx-runtime-v2-block-hash prefix-cache"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate the native-mlx block-hash prefix cache: hits, eviction, incompatible-key misses, benchmark and graph profile against v1."
+cli_option CHECKPOINT --checkpoint MLX_BLOCK_HASH_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
+cli_option NATIVE_PORT --native-port MLX_BLOCK_HASH_NATIVE_PORT port 18102 "native-mlx gateway port."
+cli_option V1_PORT --v1-port MLX_BLOCK_HASH_V1_PORT port 18103 "v1 gateway port."
+cli_option PREFILL_CHUNK_SIZE --prefill-chunk-size MLX_BLOCK_HASH_PREFILL_CHUNK_SIZE int 16 \
+    "Native prefill chunk size."
+cli_option TEXT_CACHE_MAX_ENTRIES --text-cache-max-entries MLX_BLOCK_HASH_TEXT_CACHE_MAX_ENTRIES int "" \
+    "Native prefix-cache entry limit; default 64, and 4 for the incompatible-key probe."
+cli_option TEXT_CACHE_BUDGET_BYTES --text-cache-budget-bytes MLX_BLOCK_HASH_TEXT_CACHE_BUDGET_BYTES int \
+    268435456 "Native paged KV budget in bytes."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_BLOCK_HASH_HEALTH_TIMEOUT int 360 \
+    "Seconds to wait for each gateway to report healthy."
+cli_option BENCHMARK_REPORT --report MLX_BLOCK_HASH_BENCHMARK_REPORT path \
+    "$ROOT/benchmarks/results/native_prefix_cache_block_hash_benchmark.md" "Markdown report written at the end."
+cli_option TMP_ROOT --artifacts-dir MLX_BLOCK_HASH_ARTIFACTS_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-block-hash prefix-cache" "Directory for logs, configs, requests, and captures."
+cli_option SKIP_BUILD --skip-build MLX_BLOCK_HASH_SKIP_BUILD bool 0 \
+    "Skip uv sync and cargo build; reuse the existing environment and gateway binary."
+cli_parse "$@"
+cli_require_free_port "$NATIVE_PORT" --native-port
+cli_require_free_port "$V1_PORT" --v1-port
+
 REQUEST_DIR="$TMP_ROOT/requests"
 NATIVE_CONFIG="$TMP_ROOT/runtime-native.toml"
 V1_CONFIG="$TMP_ROOT/runtime-v1.toml"
@@ -81,7 +103,6 @@ NATIVE_BENCHMARK="$TMP_ROOT/benchmark-native.json"
 V1_BENCHMARK="$TMP_ROOT/benchmark-v1.json"
 GRAPH_PROFILE_JSON="$TMP_ROOT/graph-profile-native.json"
 GRAPH_PROFILE_METRICS="$TMP_ROOT/graph-profile-metrics.txt"
-BENCHMARK_REPORT="${MLX_BLOCK_HASH_BENCHMARK_REPORT:-$ROOT/benchmarks/results/native_prefix_cache_block_hash_benchmark.md}"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 BLOCK_HASH_HELPER="$ROOT/mlx-host-validation/scripts/python/prefix_cache_benchmark.py"
 
@@ -101,7 +122,7 @@ wait_healthy() {
     local log_path="$1"
     local port="$2"
     rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 360); do
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
         if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
             echo "gateway exited unexpectedly; inspect $log_path" >&2
             return 1
@@ -147,8 +168,12 @@ stop_gateway() {
 }
 
 echo "[1/7] Sync Python environment and build gateway"
-uv --directory "$PYTHON_DIR" sync --group dev
-cargo build -p mlx_runtime_gateway
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "build_skipped=1"
+else
+    uv --directory "$PYTHON_DIR" sync --group dev
+    (cd "$ROOT" && cargo build -p mlx_runtime_gateway)
+fi
 
 echo "[2/7] Verify Apple Silicon and MLX Metal"
 uv --directory "$PYTHON_DIR" run python - <<'PY'
@@ -184,9 +209,9 @@ start_gateway \
     "$NATIVE_PORT" \
     "$NATIVE_CONFIG" \
     MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY=block-hash \
-    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_BLOCK_HASH_PREFILL_CHUNK_SIZE:-16}" \
-    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${MLX_BLOCK_HASH_TEXT_CACHE_MAX_ENTRIES:-64}" \
-    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_BLOCK_HASH_TEXT_CACHE_BUDGET_BYTES:-268435456}"
+    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
+    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${TEXT_CACHE_MAX_ENTRIES:-64}" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
 
 uv --directory "$PYTHON_DIR" run python "$BLOCK_HASH_HELPER" native-probes \
     --request-dir "$REQUEST_DIR" \
@@ -203,9 +228,9 @@ start_gateway \
     "$NATIVE_CONFIG" \
     MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY=block-hash \
     MLX_RUNTIME_NATIVE_KV_PAGE_SIZE=32 \
-    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_BLOCK_HASH_PREFILL_CHUNK_SIZE:-16}" \
-    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${MLX_BLOCK_HASH_TEXT_CACHE_MAX_ENTRIES:-4}" \
-    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_BLOCK_HASH_TEXT_CACHE_BUDGET_BYTES:-268435456}"
+    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
+    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${TEXT_CACHE_MAX_ENTRIES:-4}" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
 uv --directory "$PYTHON_DIR" run python "$BLOCK_HASH_HELPER" incompatible-miss \
     --request-dir "$REQUEST_DIR" \
     --port "$NATIVE_PORT"
@@ -230,9 +255,9 @@ start_gateway \
     "$NATIVE_PORT" \
     "$NATIVE_CONFIG" \
     MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY=block-hash \
-    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_BLOCK_HASH_PREFILL_CHUNK_SIZE:-16}" \
-    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${MLX_BLOCK_HASH_TEXT_CACHE_MAX_ENTRIES:-64}" \
-    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_BLOCK_HASH_TEXT_CACHE_BUDGET_BYTES:-268435456}"
+    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
+    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${TEXT_CACHE_MAX_ENTRIES:-64}" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
 uv --directory "$PYTHON_DIR" run python "$BLOCK_HASH_HELPER" benchmark \
     --request-dir "$REQUEST_DIR" \
     --port "$NATIVE_PORT" \
@@ -255,9 +280,9 @@ start_gateway \
     "$NATIVE_CONFIG" \
     MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY=block-hash \
     MLX_RUNTIME_NATIVE_GRAPH_PROFILE=1 \
-    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_BLOCK_HASH_PREFILL_CHUNK_SIZE:-16}" \
-    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${MLX_BLOCK_HASH_TEXT_CACHE_MAX_ENTRIES:-64}" \
-    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_BLOCK_HASH_TEXT_CACHE_BUDGET_BYTES:-268435456}"
+    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
+    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${TEXT_CACHE_MAX_ENTRIES:-64}" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
 uv --directory "$PYTHON_DIR" run python "$BLOCK_HASH_HELPER" graph-profile \
     --request-dir "$REQUEST_DIR" \
     --port "$NATIVE_PORT" \

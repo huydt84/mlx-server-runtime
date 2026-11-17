@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
 # Host-only foreground lifecycle validation for MLX Air.
 # Run on Apple Silicon with Metal, uv, curl, and the configured model available.
+#
+# Usage:
+#   bash mlx-host-validation/scripts/cli_serve_foreground.sh [options]
+#   bash mlx-host-validation/scripts/cli_serve_foreground.sh --help
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate the mlx-air serve foreground lifecycle: readiness, non-streaming and streaming requests, and SIGTERM shutdown."
+cli_option MODEL --model MLX_AIR_SERVE_MODEL string "mlx-community/Qwen2.5-7B-Instruct-4bit" "Model to serve."
+cli_option PORT --port MLX_AIR_SERVE_PORT port 18003 "Server port."
+cli_option READY_TIMEOUT --ready-timeout MLX_AIR_SERVE_READY_TIMEOUT int 300 \
+    "Seconds to wait for the server to report ready."
+cli_option REQUEST_TIMEOUT --request-timeout MLX_AIR_SERVE_REQUEST_TIMEOUT int 180 "Seconds allowed per chat request."
+cli_option KEEP_WORK_DIR --keep-work-dir MLX_AIR_SERVE_KEEP_WORK_DIR bool 0 \
+    "Keep the temporary work directory (staged distribution, logs, captures) after exit."
+cli_parse "$@"
+cli_require_free_port "$PORT" --port
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlx-air-cli-foreground-serve.XXXXXX")"
 STAGE_DIR="$WORK_DIR/distribution"
 OUTSIDE_DIR="$WORK_DIR/outside-repository"
 SERVER_LOG="$WORK_DIR/server.log"
 NON_STREAM_RESPONSE="$WORK_DIR/non-stream.json"
 STREAM_RESPONSE="$WORK_DIR/stream.txt"
-MODEL="${MLX_AIR_SERVE_MODEL:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
-PORT="${MLX_AIR_SERVE_PORT:-18003}"
 SOCKET_DIR="/tmp/mlx-air-$(id -u)"
 
 cleanup() {
@@ -30,7 +44,11 @@ cleanup() {
         echo "server log after validation failure:" >&2
         sed -n '1,300p' "$SERVER_LOG" >&2
     fi
-    rm -rf "$WORK_DIR"
+    if [[ "$KEEP_WORK_DIR" == "1" ]]; then
+        echo "work_dir=$WORK_DIR" >&2
+    else
+        rm -rf "$WORK_DIR"
+    fi
     exit "$status"
 }
 
@@ -48,7 +66,7 @@ echo "[2/6] Start one real model through mlx-air serve"
     >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
-for _ in $(seq 1 3000); do
+for _ in $(seq 1 $((READY_TIMEOUT * 10))); do
     if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
         echo "server exited before readiness" >&2
         sed -n '1,240p' "$SERVER_LOG" >&2
@@ -68,7 +86,7 @@ test -n "${WORKER_PID:-}"
 echo "server_ready=1"
 
 echo "[3/6] Send one non-streaming request"
-curl --silent --show-error --fail --max-time 180 \
+curl --silent --show-error --fail --max-time "$REQUEST_TIMEOUT" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: ready\"}],\"max_tokens\":16,\"temperature\":0.0,\"stream\":false}" \
     "http://127.0.0.1:$PORT/v1/chat/completions" \
@@ -77,7 +95,7 @@ python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["cho
 echo "non_stream_request_ok=1"
 
 echo "[4/6] Send one streaming request"
-curl --silent --show-error --fail --max-time 180 --no-buffer \
+curl --silent --show-error --fail --max-time "$REQUEST_TIMEOUT" --no-buffer \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: stream\"}],\"max_tokens\":16,\"temperature\":0.0,\"stream\":true}" \
     "http://127.0.0.1:$PORT/v1/chat/completions" \

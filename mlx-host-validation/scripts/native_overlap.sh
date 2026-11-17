@@ -3,26 +3,42 @@
 # Native-v2 same-thread MLX overlap validation.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_overlap.sh
-#   MTL_CAPTURE_ENABLED=1 MLX_OVERLAP_METAL_CAPTURE=1 \
-#       bash mlx-host-validation/scripts/native_overlap.sh
+#   bash mlx-host-validation/scripts/native_overlap.sh [options]
+#   bash mlx-host-validation/scripts/native_overlap.sh --help
+#   MTL_CAPTURE_ENABLED=1 bash mlx-host-validation/scripts/native_overlap.sh --metal-capture
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-TRACE_DIR="${MLX_OVERLAP_TRACE_DIR:-${TMPDIR:-/tmp}/mlx-runtime-v2-overlap}"
-CHECKPOINT="${MLX_OVERLAP_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
-PORT="${MLX_OVERLAP_PORT:-18017}"
-WARMUPS="${MLX_OVERLAP_WARMUPS:-5}"
-SAMPLES="${MLX_OVERLAP_SAMPLES:-10}"
-MAX_TOKENS="${MLX_OVERLAP_MAX_TOKENS:-8}"
-MAX_REGRESSION="${MLX_OVERLAP_MAX_REGRESSION:-0.02}"
-METAL_CAPTURE="${MLX_OVERLAP_METAL_CAPTURE:-0}"
-XCTRACE_CAPTURE="${MLX_OVERLAP_XCTRACE:-$METAL_CAPTURE}"
-XCTRACE_SECONDS="${MLX_OVERLAP_XCTRACE_SECONDS:-15}"
-XCTRACE_REQUESTS="${MLX_OVERLAP_XCTRACE_REQUESTS:-4}"
-XCTRACE_MAX_TOKENS="${MLX_OVERLAP_XCTRACE_MAX_TOKENS:-128}"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate serial versus overlap execution: token parity, latency regression, MLX overlap probe, and optional Metal captures."
+cli_option CHECKPOINT --checkpoint MLX_OVERLAP_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served in both execution modes."
+cli_option PORT --port MLX_OVERLAP_PORT port 18017 "Gateway port, reused by the serial and overlap runs in turn."
+cli_option WARMUPS --warmups MLX_OVERLAP_WARMUPS int 5 "Warmup requests per mode before timing."
+cli_option SAMPLES --samples MLX_OVERLAP_SAMPLES int 10 "Timed requests per mode; an even number >= 2."
+cli_option MAX_TOKENS --max-tokens MLX_OVERLAP_MAX_TOKENS int 8 "Completion tokens per timed request."
+cli_option MAX_REGRESSION --max-regression MLX_OVERLAP_MAX_REGRESSION number 0.02 \
+    "Largest allowed overlap latency regression, as a fraction of serial."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_OVERLAP_HEALTH_TIMEOUT int 300 \
+    "Seconds to wait for each gateway to report healthy."
+cli_option METAL_CAPTURE --metal-capture MLX_OVERLAP_METAL_CAPTURE bool 0 \
+    "Record an MLX .gputrace capture; requires MTL_CAPTURE_ENABLED=1."
+cli_option XCTRACE_CAPTURE --xctrace MLX_OVERLAP_XCTRACE bool "" \
+    "Record Metal System Traces with xctrace; defaults to the --metal-capture value."
+cli_option XCTRACE_SECONDS --xctrace-seconds MLX_OVERLAP_XCTRACE_SECONDS int 15 "xctrace recording length in seconds."
+cli_option XCTRACE_REQUESTS --xctrace-requests MLX_OVERLAP_XCTRACE_REQUESTS int 4 "Requests sent during each xctrace recording."
+cli_option XCTRACE_MAX_TOKENS --xctrace-max-tokens MLX_OVERLAP_XCTRACE_MAX_TOKENS int 128 \
+    "Completion tokens per xctrace request."
+cli_option TRACE_DIR --artifacts-dir MLX_OVERLAP_TRACE_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-overlap" "Directory for configs, logs, reports, and traces."
+cli_example "bash mlx-host-validation/scripts/native_overlap.sh --samples 20 --max-tokens 32"
+cli_example "MTL_CAPTURE_ENABLED=1 bash mlx-host-validation/scripts/native_overlap.sh --metal-capture"
+cli_parse "$@"
+XCTRACE_CAPTURE="${XCTRACE_CAPTURE:-$METAL_CAPTURE}"
+cli_require_free_port "$PORT" --port
 PROBE_HELPER="$ROOT/mlx-host-validation/scripts/python/overlap_mlx_probe.py"
 BENCH_HELPER="$ROOT/mlx-host-validation/scripts/python/overlap_benchmark.py"
 PIPELINE_HELPER="$ROOT/mlx-host-validation/scripts/python/pipeline_profile_check.py"
@@ -46,7 +62,7 @@ if [[ "$(uname -m)" != "arm64" ]]; then
     exit 1
 fi
 if (( SAMPLES < 2 || SAMPLES % 2 != 0 )); then
-    echo "overlap_samples_error=MLX_OVERLAP_SAMPLES must be an even integer >= 2" >&2
+    echo "overlap_samples_error=--samples must be an even integer >= 2" >&2
     exit 1
 fi
 if [[ "$METAL_CAPTURE" == "1" && "${MTL_CAPTURE_ENABLED:-0}" != "1" ]]; then
@@ -111,7 +127,7 @@ start_gateway() {
         MTL_CAPTURE_ENABLED="${MTL_CAPTURE_ENABLED:-0}" \
         cargo run -p mlx_runtime_gateway --bin mlx_runtime_gateway >"$log" 2>&1 &
     GATEWAY_PID=$!
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
         if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
             return
         fi

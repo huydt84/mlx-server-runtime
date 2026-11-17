@@ -122,6 +122,10 @@ When validation is host-only:
   for the native runtime, `cli_<command>.sh` for the `mlx-air` CLI), never
   after a plan phase. The same applies to its Python helpers, fixtures,
   environment variables (`MLX_<CAPABILITY>_*`), output keys, and report paths.
+- Declare every script setting with `mlx-host-validation/scripts/lib/cli.sh`
+  (`cli_option` with a flag and an `MLX_<CAPABILITY>_*` variable, then
+  `cli_parse "$@"` before any side effect). Never hardcode a gateway port;
+  give each script its own default port and call `cli_require_free_port`.
 - Each script is a separate integration test. It must exercise only its own
   capability and must not invoke another host-validation script.
 - When work for a capability lands, extend that capability's script instead of

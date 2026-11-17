@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_startup_failures.sh
+#   bash mlx-host-validation/scripts/native_startup_failures.sh [options]
+#   bash mlx-host-validation/scripts/native_startup_failures.sh --help
 #
 # What this verifies:
 #   1. Python environment can import `mlx` and `mlx_lm` on Apple Silicon.
@@ -30,12 +31,28 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-MODEL_NAME="mlx-community/Qwen2.5-7B-Instruct-4bit"
-GATEWAY_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-startup-failure-gateway.log"
-HEALTH_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-startup-failure-health.txt"
-CHAT_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-startup-failure-chat.json"
-REQUEST_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-startup-failure-request.json"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate structured native-mlx startup failures, then a healthy v1 gateway and one real request."
+cli_option MODEL_NAME --checkpoint MLX_STARTUP_FAILURES_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by the v1 gateway."
+cli_option PORT --port MLX_STARTUP_FAILURES_PORT port 18191 "v1 gateway port."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_STARTUP_FAILURES_HEALTH_TIMEOUT int 300 \
+    "Seconds to wait for the v1 gateway to report healthy."
+cli_option ARTIFACTS_DIR --artifacts-dir MLX_STARTUP_FAILURES_ARTIFACTS_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-startup-failures" "Directory for the gateway log, config, and captures."
+cli_option SKIP_BUILD --skip-build MLX_STARTUP_FAILURES_SKIP_BUILD bool 0 \
+    "Skip uv sync and cargo build; reuse the existing environment and gateway binary."
+cli_parse "$@"
+cli_require_free_port "$PORT" --port
+
+GATEWAY_LOG="$ARTIFACTS_DIR/gateway.log"
+GATEWAY_CONFIG="$ARTIFACTS_DIR/v1.toml"
+HEALTH_CAPTURE="$ARTIFACTS_DIR/health.txt"
+CHAT_CAPTURE="$ARTIFACTS_DIR/chat.json"
+REQUEST_CAPTURE="$ARTIFACTS_DIR/request.json"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
+mkdir -p "$ARTIFACTS_DIR"
 
 cleanup() {
     if [[ -n "${GATEWAY_PID:-}" ]]; then
@@ -48,8 +65,12 @@ trap cleanup EXIT
 
 echo "[1/5] Sync Python dev environment"
 cd "$PYTHON_DIR"
-uv sync --group dev
-cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "build_skipped=1"
+else
+    uv sync --group dev
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
+fi
 
 echo "[2/5] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'
@@ -193,6 +214,13 @@ PY
 echo "[4/5] Start gateway with default v1 backend"
 cd "$ROOT"
 rm -f "$GATEWAY_LOG" "$HEALTH_CAPTURE" "$CHAT_CAPTURE" "$REQUEST_CAPTURE"
+if ! grep -qx 'port = 8000' "$ROOT/config/runtime.toml"; then
+    echo "config/runtime.toml no longer contains 'port = 8000'" >&2
+    exit 1
+fi
+sed -e "s/^port = 8000$/port = $PORT/" \
+    -e "s#^model = \"mlx-community/Qwen2.5-7B-Instruct-4bit\"#model = \"$MODEL_NAME\"#" \
+    "$ROOT/config/runtime.toml" >"$GATEWAY_CONFIG"
 
 uv --directory "$PYTHON_DIR" run python - <<'PY' "$REQUEST_CAPTURE" "$MODEL_NAME"
 import json
@@ -215,11 +243,11 @@ path.write_text(
 )
 PY
 
-"$GATEWAY_BIN" >"$GATEWAY_LOG" 2>&1 &
+MLX_RUNTIME_CONFIG="$GATEWAY_CONFIG" "$GATEWAY_BIN" >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
 
-for _ in $(seq 1 300); do
-    if curl -fsS http://127.0.0.1:8000/health >"$HEALTH_CAPTURE"; then
+for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
+    if curl -fsS "http://127.0.0.1:$PORT/health" >"$HEALTH_CAPTURE"; then
         if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
             echo "health_response=healthy"
             break
@@ -238,7 +266,7 @@ grep -qx 'healthy' "$HEALTH_CAPTURE"
 
 echo "[5/5] Run one non-streaming v1 chat completion"
 HTTP_STATUS=$(curl -sS -o "$CHAT_CAPTURE" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     --data-binary "@$REQUEST_CAPTURE")
 

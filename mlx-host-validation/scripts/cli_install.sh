@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
 # Host-only validation of the release installer (install.sh) and the installed CLI.
 # Run on Apple Silicon with macOS 14+, Metal, uv, curl, and the test model available.
+#
+# Usage:
+#   bash mlx-host-validation/scripts/cli_install.sh [options]
+#   bash mlx-host-validation/scripts/cli_install.sh --help
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate the release installer (install.sh) and the installed CLI: doctor, foreground serve, and shutdown."
+cli_option MODEL --model MLX_AIR_INSTALL_MODEL string "mlx-community/gemma-3-270m-it-qat-8bit" "Model served by the installed CLI."
+cli_option PORT --port MLX_AIR_INSTALL_PORT port 18111 "Installed server port."
+cli_option READY_TIMEOUT --ready-timeout MLX_AIR_INSTALL_READY_TIMEOUT int 1800 \
+    "Seconds allowed for the installed doctor and for server readiness."
+cli_option UV_CACHE --uv-cache-dir MLX_AIR_HOST_UV_CACHE_DIR path "$HOME/Library/Caches/uv" \
+    "uv cache shared with the isolated test home."
+cli_option KEEP_WORK_DIR --keep-work-dir MLX_AIR_INSTALL_KEEP_WORK_DIR bool 0 \
+    "Keep the temporary work directory (staged distribution, logs, captures) after exit."
+cli_parse "$@"
+cli_require_free_port "$PORT" --port
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlx-air-cli-install.XXXXXX")"
 RELEASE_DIR="$WORK_DIR/release"
 INSTALL_ROOT="$WORK_DIR/install"
@@ -17,9 +34,6 @@ VERSION="$(python3 "$ROOT/scripts/release_tool.py" version --repo-root "$ROOT")"
 ARCHIVE="$RELEASE_DIR/mlx-air-$VERSION-darwin-arm64.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
 CLI="$BIN_DIR/mlx-air"
-MODEL="${MLX_AIR_INSTALL_MODEL:-mlx-community/gemma-3-270m-it-qat-8bit}"
-PORT="${MLX_AIR_INSTALL_PORT:-18111}"
-UV_CACHE="${MLX_AIR_HOST_UV_CACHE_DIR:-$HOME/Library/Caches/uv}"
 HOST_HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 SOCKET_DIR="/tmp/mlx-air-$(id -u)"
 
@@ -39,7 +53,11 @@ cleanup() {
         echo "server output after validation failure:" >&2
         sed -n '1,300p' "$SERVER_LOG" >&2
     fi
-    rm -rf "$WORK_DIR"
+    if [[ "$KEEP_WORK_DIR" == "1" ]]; then
+        echo "work_dir=$WORK_DIR" >&2
+    else
+        rm -rf "$WORK_DIR"
+    fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -89,7 +107,7 @@ echo "[4/7] Run installed doctor with a fixed 30-minute bound"
 HOME="$TEST_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$CLI" doctor >"$DOCTOR_LOG" 2>&1 &
 DOCTOR_PID=$!
-wait_bounded "$DOCTOR_PID" "installed doctor" 18000
+wait_bounded "$DOCTOR_PID" "installed doctor" $((READY_TIMEOUT * 10))
 unset DOCTOR_PID
 grep -F "[PASS] Apple Silicon:" "$DOCTOR_LOG" >/dev/null
 grep -F "[PASS] runtime environment:" "$DOCTOR_LOG" >/dev/null
@@ -118,7 +136,7 @@ echo "[6/7] Start the installed foreground server and wait for readiness"
 HOME="$TEST_HOME" HF_HOME="$HOST_HF_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$CLI" serve --model "$MODEL" --port "$PORT" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 18000); do
+for _ in $(seq 1 $((READY_TIMEOUT * 10))); do
     if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
         echo "installed server exited before readiness" >&2
         exit 1

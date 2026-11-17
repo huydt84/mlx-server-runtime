@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_scheduling_policies.sh
+#   bash mlx-host-validation/scripts/native_scheduling_policies.sh [options]
+#   bash mlx-host-validation/scripts/native_scheduling_policies.sh --help
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -52,10 +53,31 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 export PYTHONPATH="$ROOT/mlx-host-validation/scripts/python:$PYTHON_DIR${PYTHONPATH:+:$PYTHONPATH}"
-CHECKPOINT="${MLX_POLICY_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
-NATIVE_PORT="${MLX_POLICY_NATIVE_PORT:-18122}"
-V1_PORT="${MLX_POLICY_V1_PORT:-18123}"
-TMP_ROOT="${TMPDIR:-/tmp}/mlx-runtime-v2-scheduling-policy"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native-mlx scheduling policies through the public gateway and write a policy comparison report."
+cli_option CHECKPOINT --checkpoint MLX_POLICY_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
+cli_option NATIVE_PORT --native-port MLX_POLICY_NATIVE_PORT port 18122 "native-mlx gateway port."
+cli_option V1_PORT --v1-port MLX_POLICY_V1_PORT port 18123 "v1 gateway port."
+cli_option PREFILL_CHUNK_SIZE --prefill-chunk-size MLX_POLICY_PREFILL_CHUNK_SIZE int 16 \
+    "Native prefill chunk size."
+cli_option TEXT_CACHE_MAX_ENTRIES --text-cache-max-entries MLX_POLICY_TEXT_CACHE_MAX_ENTRIES int 64 \
+    "Native prefix-cache entry limit."
+cli_option TEXT_CACHE_BUDGET_BYTES --text-cache-budget-bytes MLX_POLICY_TEXT_CACHE_BUDGET_BYTES int \
+    268435456 "Native paged KV budget in bytes."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_POLICY_HEALTH_TIMEOUT int 360 \
+    "Seconds to wait for each gateway to report healthy."
+cli_option REPORT --report MLX_POLICY_REPORT path \
+    "$ROOT/benchmarks/results/native_scheduling_policies_policies.md" "Markdown report written at the end."
+cli_option TMP_ROOT --artifacts-dir MLX_POLICY_ARTIFACTS_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-scheduling-policy" "Directory for logs, configs, requests, and captures."
+cli_option SKIP_BUILD --skip-build MLX_POLICY_SKIP_BUILD bool 0 \
+    "Skip uv sync and cargo build; reuse the existing environment and gateway binary."
+cli_parse "$@"
+cli_require_free_port "$NATIVE_PORT" --native-port
+cli_require_free_port "$V1_PORT" --v1-port
+
 REQUEST_DIR="$TMP_ROOT/requests"
 NATIVE_CONFIG="$TMP_ROOT/runtime-native.toml"
 V1_CONFIG="$TMP_ROOT/runtime-v1.toml"
@@ -63,7 +85,6 @@ HEALTH_CAPTURE="$TMP_ROOT/health.txt"
 NATIVE_LOG="$TMP_ROOT/native.log"
 V1_LOG="$TMP_ROOT/v1.log"
 METRICS_CAPTURE="$TMP_ROOT/metrics.txt"
-REPORT="${MLX_POLICY_REPORT:-$ROOT/benchmarks/results/native_scheduling_policies_policies.md}"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 HELPER="$ROOT/mlx-host-validation/scripts/python/scheduling_policies.py"
 
@@ -84,7 +105,7 @@ wait_healthy() {
     local log_path="$1"
     local port="$2"
     rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 360); do
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
         if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
             echo "gateway exited unexpectedly; inspect $log_path" >&2
             return 1
@@ -130,8 +151,12 @@ stop_gateway() {
 }
 
 echo "[1/8] Sync Python environment and build gateway"
-uv --directory "$PYTHON_DIR" sync --group dev
-cargo build -p mlx_runtime_gateway
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "build_skipped=1"
+else
+    uv --directory "$PYTHON_DIR" sync --group dev
+    (cd "$ROOT" && cargo build -p mlx_runtime_gateway)
+fi
 
 echo "[2/8] Verify Apple Silicon and MLX Metal"
 uv --directory "$PYTHON_DIR" run python - <<'PY'
@@ -170,9 +195,9 @@ for policy in fcfs lpm lof priority; do
         "$NATIVE_PORT" \
         "$NATIVE_CONFIG" \
         MLX_RUNTIME_NATIVE_SCHEDULING_POLICY="$policy" \
-        MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_POLICY_PREFILL_CHUNK_SIZE:-16}" \
-        MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${MLX_POLICY_TEXT_CACHE_MAX_ENTRIES:-64}" \
-        MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_POLICY_TEXT_CACHE_BUDGET_BYTES:-268435456}"
+        MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
+        MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="$TEXT_CACHE_MAX_ENTRIES" \
+        MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
     uv --directory "$PYTHON_DIR" run python "$HELPER" policy-probe \
         --request-dir "$REQUEST_DIR" \
         --port "$NATIVE_PORT" \
@@ -189,9 +214,9 @@ start_gateway \
     "$NATIVE_PORT" \
     "$NATIVE_CONFIG" \
     MLX_RUNTIME_NATIVE_SCHEDULING_POLICY=priority \
-    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="${MLX_POLICY_PREFILL_CHUNK_SIZE:-16}" \
-    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="${MLX_POLICY_TEXT_CACHE_MAX_ENTRIES:-64}" \
-    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="${MLX_POLICY_TEXT_CACHE_BUDGET_BYTES:-268435456}"
+    MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE="$PREFILL_CHUNK_SIZE" \
+    MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES="$TEXT_CACHE_MAX_ENTRIES" \
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
 uv --directory "$PYTHON_DIR" run python "$HELPER" cancel-probe \
     --request-dir "$REQUEST_DIR" \
     --port "$NATIVE_PORT" \

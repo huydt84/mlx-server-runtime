@@ -72,7 +72,7 @@ enum Command {
         name: String,
     },
     /// Check platform and runtime dependencies.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Print the MLX Air version.
     Version,
     /// Print root or command help.
@@ -108,6 +108,16 @@ struct ServeArgs {
     /// Managed instance name; valid only with `--detach`.
     #[arg(long, requires = "detach")]
     name: Option<String>,
+}
+
+#[derive(Debug, Default, Args)]
+struct DoctorArgs {
+    /// Runtime configuration file whose listen port is checked.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// HTTP port to check instead of the configured one.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -259,7 +269,7 @@ fn dispatch(cli: Cli, runtime: &dyn RuntimeOperations) -> CliOutput {
                 CliOutput::stderr(failure.code, format!("error: {}\n", failure.message))
             }
         },
-        Some(Command::Doctor) => match runtime.doctor() {
+        Some(Command::Doctor(args)) => match runtime.doctor(&args) {
             Ok(report) => doctor_output(&report),
             Err(message) => CliOutput::stderr(
                 ExitCode::EnvironmentSetupFailure,
@@ -308,7 +318,7 @@ trait RuntimeOperations {
     fn ps(&self) -> Result<String, RuntimeFailure>;
     fn attach(&self, name: &str) -> Result<(), RuntimeFailure>;
     fn stop(&self, name: &str) -> Result<String, RuntimeFailure>;
-    fn doctor(&self) -> Result<DoctorReport, String>;
+    fn doctor(&self, args: &DoctorArgs) -> Result<DoctorReport, String>;
     fn benchmark(&self, action: BenchmarkAction, args: &[OsString]) -> Result<(), RuntimeFailure>;
 }
 
@@ -431,18 +441,22 @@ impl RuntimeOperations for ProductionRuntime {
             .map_err(RuntimeFailure::instance)
     }
 
-    fn doctor(&self) -> Result<DoctorReport, String> {
+    fn doctor(&self, args: &DoctorArgs) -> Result<DoctorReport, String> {
         let distribution =
             DistributionPaths::from_current_executable().map_err(|err| err.to_string())?;
         let application = ApplicationPaths::from_environment().map_err(|err| err.to_string())?;
         let selected = select_runtime_environment(&distribution, &application)
             .map_err(|err| err.to_string())?;
         let environment_config = std::env::var_os("MLX_RUNTIME_CONFIG").map(PathBuf::from);
+        let overrides = CliConfigOverrides {
+            port: args.port,
+            ..CliConfigOverrides::default()
+        };
         let config = resolve_runtime_config(
             &distribution.default_config,
             environment_config.as_deref(),
-            None,
-            &CliConfigOverrides::default(),
+            args.config.as_deref(),
+            &overrides,
             &selected.python,
         )
         .map_err(|err| err.to_string())?;
@@ -558,12 +572,14 @@ mod tests {
 
     struct FakeRuntime {
         calls: Cell<usize>,
+        doctor_port: Cell<Option<u16>>,
     }
 
     impl FakeRuntime {
         fn new() -> Self {
             Self {
                 calls: Cell::new(0),
+                doctor_port: Cell::new(None),
             }
         }
     }
@@ -598,8 +614,9 @@ mod tests {
             Ok(format!("Stopped {name}\n"))
         }
 
-        fn doctor(&self) -> Result<DoctorReport, String> {
+        fn doctor(&self, args: &DoctorArgs) -> Result<DoctorReport, String> {
             self.calls.set(self.calls.get() + 1);
+            self.doctor_port.set(args.port);
             Ok(DoctorReport {
                 checks: vec![DoctorCheck {
                     name: "fake",
@@ -861,6 +878,27 @@ mod tests {
 
         assert_eq!(result.code, ExitCode::NormalTermination);
         assert_eq!(result.stdout, "[PASS] fake: ok\n");
+    }
+
+    #[test]
+    fn doctor_passes_the_requested_port_to_the_runtime() {
+        let runtime = FakeRuntime::new();
+        let default = execute(["mlx-air", "doctor"], &runtime);
+        assert_eq!(default.code, ExitCode::NormalTermination);
+        assert_eq!(runtime.doctor_port.get(), None);
+
+        let custom = execute(["mlx-air", "doctor", "--port", "18500"], &runtime);
+        assert_eq!(custom.code, ExitCode::NormalTermination);
+        assert_eq!(runtime.doctor_port.get(), Some(18500));
+    }
+
+    #[test]
+    fn doctor_rejects_an_invalid_port() {
+        let runtime = FakeRuntime::new();
+        let result = execute(["mlx-air", "doctor", "--port", "70000"], &runtime);
+
+        assert_ne!(result.code, ExitCode::NormalTermination);
+        assert_eq!(runtime.calls.get(), 0);
     }
 
     #[test]

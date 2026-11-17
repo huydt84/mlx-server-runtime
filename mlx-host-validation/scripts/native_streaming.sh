@@ -4,9 +4,10 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_streaming.sh
-#   MLX_STREAMING_CHECKPOINT=mlx-community/Qwen3-4B-Instruct-2507-4bit \
-#     bash mlx-host-validation/scripts/native_streaming.sh
+#   bash mlx-host-validation/scripts/native_streaming.sh [options]
+#   bash mlx-host-validation/scripts/native_streaming.sh --help
+#   bash mlx-host-validation/scripts/native_streaming.sh \
+#     --checkpoint mlx-community/Qwen3-4B-Instruct-2507-4bit --port 18290
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -45,21 +46,41 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-CHECKPOINT="${MLX_STREAMING_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
-NATIVE_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-native.log"
-V1_LOG="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-v1.log"
-HEALTH_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-health.txt"
-NON_STREAM_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-non-stream.json"
-STREAM_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-stream.txt"
-STOP_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-stop.json"
-LENGTH_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-length.json"
-CANCEL_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-cancel.txt"
-FOLLOW_UP_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-follow-up.json"
-METRICS_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-metrics.txt"
-V1_CAPTURE="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-v1.json"
-REQUEST_DIR="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-requests"
-NATIVE_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-native.toml"
-V1_CONFIG="${TMPDIR:-/tmp}/mlx-runtime-v2-streaming-v1.toml"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native-mlx streaming, stop, length, and cancellation through the public gateway, then a v1 non-regression request."
+cli_option CHECKPOINT --checkpoint MLX_STREAMING_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
+cli_option PORT --port MLX_STREAMING_PORT port 18190 \
+    "Gateway port; the native and v1 gateways run one after the other on it."
+cli_option TEXT_CACHE_BUDGET_BYTES --text-cache-budget-bytes MLX_STREAMING_TEXT_CACHE_BUDGET_BYTES int \
+    $((32 * 1024 * 1024)) "Native paged KV budget in bytes."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_STREAMING_HEALTH_TIMEOUT int 300 \
+    "Seconds to wait for each gateway to report healthy."
+cli_option ARTIFACTS_DIR --artifacts-dir MLX_STREAMING_ARTIFACTS_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-streaming" "Directory for logs, configs, requests, and captures."
+cli_option SKIP_BUILD --skip-build MLX_STREAMING_SKIP_BUILD bool 0 \
+    "Skip uv sync and cargo build; reuse the existing environment and gateway binary."
+cli_example "bash mlx-host-validation/scripts/native_streaming.sh --port 18290"
+cli_example "bash mlx-host-validation/scripts/native_streaming.sh --checkpoint mlx-community/Qwen3-4B-Instruct-2507-4bit"
+cli_parse "$@"
+cli_require_free_port "$PORT" --port
+
+BASE_URL="http://127.0.0.1:$PORT"
+NATIVE_LOG="$ARTIFACTS_DIR/native.log"
+V1_LOG="$ARTIFACTS_DIR/v1.log"
+HEALTH_CAPTURE="$ARTIFACTS_DIR/health.txt"
+NON_STREAM_CAPTURE="$ARTIFACTS_DIR/non-stream.json"
+STREAM_CAPTURE="$ARTIFACTS_DIR/stream.txt"
+STOP_CAPTURE="$ARTIFACTS_DIR/stop.json"
+LENGTH_CAPTURE="$ARTIFACTS_DIR/length.json"
+CANCEL_CAPTURE="$ARTIFACTS_DIR/cancel.txt"
+FOLLOW_UP_CAPTURE="$ARTIFACTS_DIR/follow-up.json"
+METRICS_CAPTURE="$ARTIFACTS_DIR/metrics.txt"
+V1_CAPTURE="$ARTIFACTS_DIR/v1.json"
+REQUEST_DIR="$ARTIFACTS_DIR/requests"
+NATIVE_CONFIG="$ARTIFACTS_DIR/native.toml"
+V1_CONFIG="$ARTIFACTS_DIR/v1.toml"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
 mkdir -p "$REQUEST_DIR"
 
@@ -81,12 +102,12 @@ trap cleanup EXIT
 wait_healthy() {
     local log_path="$1"
     rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 300); do
+    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
         if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
             echo "gateway exited unexpectedly; inspect $log_path" >&2
             return 1
         fi
-        if curl -fsS http://127.0.0.1:8000/health >"$HEALTH_CAPTURE"; then
+        if curl -fsS "$BASE_URL/health" >"$HEALTH_CAPTURE"; then
             if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
                 return 0
             fi
@@ -100,8 +121,8 @@ wait_healthy() {
 start_gateway() {
     local log_path="$1"
     shift
-    if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
-        echo "gateway port 8000 is already in use" >&2
+    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "gateway port $PORT is already in use; choose another with --port" >&2
         return 1
     fi
     rm -f "$log_path"
@@ -149,8 +170,12 @@ PY
 
 echo "[1/6] Sync Python dev environment"
 cd "$PYTHON_DIR"
-uv sync --group dev
-cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
+if [[ "$SKIP_BUILD" == "1" ]]; then
+    echo "build_skipped=1"
+else
+    uv sync --group dev
+    cargo build --manifest-path "$ROOT/Cargo.toml" -p mlx_runtime_gateway
+fi
 
 echo "[2/6] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'
@@ -172,7 +197,7 @@ print(f"mlx_compute_ok={values}")
 PY
 
 echo "[3/6] Start native-mlx gateway and run real public requests"
-uv --directory "$PYTHON_DIR" run python - <<'PY' "$ROOT/config/runtime.toml" "$NATIVE_CONFIG" "$V1_CONFIG" "$CHECKPOINT"
+uv --directory "$PYTHON_DIR" run python - <<'PY' "$ROOT/config/runtime.toml" "$NATIVE_CONFIG" "$V1_CONFIG" "$CHECKPOINT" "$PORT"
 from __future__ import annotations
 
 import pathlib
@@ -182,6 +207,9 @@ source = pathlib.Path(sys.argv[1]).read_text()
 native_target = pathlib.Path(sys.argv[2])
 v1_target = pathlib.Path(sys.argv[3])
 checkpoint = sys.argv[4]
+if "port = 8000" not in source:
+    raise SystemExit("config/runtime.toml no longer contains 'port = 8000'")
+source = source.replace("port = 8000", f"port = {sys.argv[5]}", 1)
 native_target.write_text(
     source.replace('backend = "v1"', 'backend = "native-mlx"').replace(
         'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
@@ -207,10 +235,10 @@ write_request "$REQUEST_DIR/cancel.json" "Write a long alphabetic sequence with 
 # before the cancellation request on a 4B model with a 64-token budget.
 start_gateway "$NATIVE_LOG" \
     MLX_RUNTIME_CONFIG="$NATIVE_CONFIG" \
-    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES=$((32 * 1024 * 1024))
+    MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"
 
 NON_STREAM_STATUS=$(curl -sS -o "$NON_STREAM_CAPTURE" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -X POST "$BASE_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     --data-binary "@$REQUEST_DIR/non_stream.json")
 if [[ "$NON_STREAM_STATUS" != "200" ]]; then
@@ -219,7 +247,7 @@ if [[ "$NON_STREAM_STATUS" != "200" ]]; then
 fi
 
 STREAM_STATUS=$(curl -sS -N -o "$STREAM_CAPTURE" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -X POST "$BASE_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -H 'Accept: text/event-stream' \
     --data-binary "@$REQUEST_DIR/stream.json")
@@ -229,7 +257,7 @@ if [[ "$STREAM_STATUS" != "200" ]]; then
 fi
 
 STOP_STATUS=$(curl -sS -o "$STOP_CAPTURE" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -X POST "$BASE_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     --data-binary "@$REQUEST_DIR/stop.json")
 if [[ "$STOP_STATUS" != "200" ]]; then
@@ -238,7 +266,7 @@ if [[ "$STOP_STATUS" != "200" ]]; then
 fi
 
 LENGTH_STATUS=$(curl -sS -o "$LENGTH_CAPTURE" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -X POST "$BASE_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     --data-binary "@$REQUEST_DIR/length.json")
 if [[ "$LENGTH_STATUS" != "200" ]]; then
@@ -246,7 +274,7 @@ if [[ "$LENGTH_STATUS" != "200" ]]; then
     exit 1
 fi
 
-uv --directory "$PYTHON_DIR" run python - <<'PY' "$REQUEST_DIR/cancel.json" "$CANCEL_CAPTURE"
+uv --directory "$PYTHON_DIR" run python - <<'PY' "$REQUEST_DIR/cancel.json" "$CANCEL_CAPTURE" "$PORT"
 from __future__ import annotations
 
 import http.client
@@ -257,7 +285,7 @@ request_path = pathlib.Path(sys.argv[1])
 capture_path = pathlib.Path(sys.argv[2])
 body = request_path.read_text()
 
-conn = http.client.HTTPConnection("127.0.0.1", 8000, timeout=30)
+conn = http.client.HTTPConnection("127.0.0.1", int(sys.argv[3]), timeout=30)
 conn.putrequest("POST", "/v1/chat/completions")
 conn.putheader("Content-Type", "application/json")
 conn.putheader("Accept", "text/event-stream")
@@ -285,7 +313,7 @@ PY
 sleep 1
 
 FOLLOW_UP_STATUS=$(curl -sS -o "$FOLLOW_UP_CAPTURE" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -X POST "$BASE_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     --data-binary "@$REQUEST_DIR/non_stream.json")
 if [[ "$FOLLOW_UP_STATUS" != "200" ]]; then
@@ -293,7 +321,7 @@ if [[ "$FOLLOW_UP_STATUS" != "200" ]]; then
     exit 1
 fi
 
-curl -fsS http://127.0.0.1:8000/metrics >"$METRICS_CAPTURE"
+curl -fsS "$BASE_URL/metrics" >"$METRICS_CAPTURE"
 
 uv --directory "$PYTHON_DIR" run python - <<'PY' \
     "$NON_STREAM_CAPTURE" "$STREAM_CAPTURE" "$STOP_CAPTURE" "$LENGTH_CAPTURE" \
@@ -363,7 +391,7 @@ write_request "$REQUEST_DIR/v1.json" "Say hello in one short sentence." 16 false
 start_gateway "$V1_LOG" MLX_RUNTIME_CONFIG="$V1_CONFIG"
 
 V1_STATUS=$(curl -sS -o "$V1_CAPTURE" -w '%{http_code}' \
-    -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -X POST "$BASE_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     --data-binary "@$REQUEST_DIR/v1.json")
 if [[ "$V1_STATUS" != "200" ]]; then

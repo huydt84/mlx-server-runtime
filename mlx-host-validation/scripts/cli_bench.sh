@@ -2,10 +2,28 @@
 # Host-only validation of `mlx-air bench`: load modes, interrupt cleanup, cache
 # states and reset authorization, diagnostics, and calibration statistics.
 # Run on Apple Silicon with Metal, uv, and the fixture models available.
+#
+# Usage:
+#   bash mlx-host-validation/scripts/cli_bench.sh [options]
+#   bash mlx-host-validation/scripts/cli_bench.sh --help
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate mlx-air bench: load modes, interrupt cleanup, cache states and reset authorization, diagnostics, and calibration."
+cli_option FIXTURE --benchmark-config MLX_AIR_BENCH_CONFIG path "$ROOT/mlx-host-validation/fixtures/bench.toml" \
+    "Benchmark configuration fixture passed to every bench command."
+cli_option COMMAND_TIMEOUT --command-timeout MLX_AIR_BENCH_COMMAND_TIMEOUT int 3600 \
+    "Seconds allowed for each bench command."
+cli_option READY_TIMEOUT --ready-timeout MLX_AIR_BENCH_READY_TIMEOUT int 1800 \
+    "Seconds to wait for each manually started gateway to report ready."
+cli_option UV_CACHE --uv-cache-dir MLX_AIR_HOST_UV_CACHE_DIR path "$HOME/Library/Caches/uv" \
+    "uv cache shared with the isolated test home."
+cli_option KEEP_WORK_DIR --keep-work-dir MLX_AIR_BENCH_KEEP_WORK_DIR bool 0 \
+    "Keep the temporary work directory (staged distribution, logs, captures) after exit."
+cli_parse "$@"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORK_DIR="$(mktemp -d "${TMP_ROOT%/}/mlx-air-cli-bench.XXXXXX")"
 STAGE_DIR="$WORK_DIR/distribution"
@@ -13,9 +31,7 @@ OUTSIDE_DIR="$WORK_DIR/outside-repository"
 TEST_HOME="$WORK_DIR/home"
 COMMAND_LOG="$WORK_DIR/command.log"
 MANUAL_LOG="$WORK_DIR/manual-gateway.log"
-FIXTURE="$ROOT/mlx-host-validation/fixtures/bench.toml"
 DELAY_PROXY="$ROOT/mlx-host-validation/scripts/python/bench_delay_gateway.py"
-UV_CACHE="${MLX_AIR_HOST_UV_CACHE_DIR:-$HOME/Library/Caches/uv}"
 HOST_HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 cleanup() {
@@ -36,7 +52,11 @@ cleanup() {
         sed -n '1,300p' "$MANUAL_LOG" >&2
         find "$WORK_DIR" -path '*/logs/*.log' -type f -print -exec sed -n '1,200p' {} \; >&2
     fi
-    rm -rf "$WORK_DIR"
+    if [[ "$KEEP_WORK_DIR" == "1" ]]; then
+        echo "work_dir=$WORK_DIR" >&2
+    else
+        rm -rf "$WORK_DIR"
+    fi
     exit "$status"
 }
 
@@ -68,14 +88,14 @@ wait_command() {
     local label="$1"
     local pid="$COMMAND_PID"
     unset COMMAND_PID
-    for _ in $(seq 1 36000); do
+    for _ in $(seq 1 $((COMMAND_TIMEOUT * 10))); do
         if ! kill -0 "$pid" >/dev/null 2>&1; then
             wait "$pid"
             return $?
         fi
         sleep 0.1
     done
-    echo "$label exceeded the 3600 second bound" >&2
+    echo "$label exceeded the $COMMAND_TIMEOUT second bound" >&2
     kill -TERM "$pid" >/dev/null 2>&1 || true
     return 1
 }
@@ -106,14 +126,14 @@ PY
 }
 
 wait_ready() {
-    python3 - "$1" <<'PY'
+    python3 - "$1" "$READY_TIMEOUT" <<'PY'
 import json
 import sys
 import time
 import urllib.request
 
 url = f"http://127.0.0.1:{sys.argv[1]}/ready"
-deadline = time.monotonic() + 1800
+deadline = time.monotonic() + int(sys.argv[2])
 while time.monotonic() < deadline:
     try:
         with urllib.request.urlopen(url, timeout=2) as response:
@@ -122,7 +142,7 @@ while time.monotonic() < deadline:
     except Exception:
         pass
     time.sleep(0.2)
-raise SystemExit("manual gateway did not become ready within 1800 seconds")
+raise SystemExit(f"manual gateway did not become ready within {sys.argv[2]} seconds")
 PY
 }
 

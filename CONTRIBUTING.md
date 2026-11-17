@@ -325,6 +325,24 @@ capability they cover: `native_*.sh` for the native runtime and `cli_*.sh` for
 the `mlx-air` CLI. Report any Apple Silicon, Metal, or checkpoint validation
 that remains to be run. Do not replace a required host check with mocks or a direct import test.
 
+Every host script takes command-line options. Run one with `--help` to list
+them and `--print-config` to see the resolved values without running anything:
+
+```bash
+bash mlx-host-validation/scripts/native_streaming.sh --help
+bash mlx-host-validation/scripts/native_streaming.sh --port 18290 --skip-build
+```
+
+Each flag also has an `MLX_<CAPABILITY>_*` environment variable. A flag wins
+over its variable, and the variable wins over the default. Gateway scripts use
+their own default ports and stop before building anything when a port is
+already taken, naming the flag that changes it.
+
+New and changed scripts declare their settings with
+`mlx-host-validation/scripts/lib/cli.sh` (`cli_option`, then `cli_parse "$@"`
+before any side effect) instead of reading environment variables directly or
+hardcoding ports, checkpoints, or timeouts.
+
 ## Keep Changes Reviewable
 
 - Keep architecture changes inside the model and registry seams.

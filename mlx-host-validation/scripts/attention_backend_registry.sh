@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with MLX Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/attention_backend_registry.sh
+#   bash mlx-host-validation/scripts/attention_backend_registry.sh [options]
+#   bash mlx-host-validation/scripts/attention_backend_registry.sh --help
 #
 # Expected success signals:
 #   - `attention_backend_config_tests_ok=1`
@@ -26,6 +27,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate the native attention-backend registry: contract tests, Metal capability and parity probes, and hot-path identity."
+cli_option PYTEST_FILTER --pytest-filter MLX_ATTENTION_REGISTRY_PYTEST_FILTER string \
+    "execution_backend or attention_capabilities or paged_metal_attention" \
+    "pytest -k expression for the contract tests."
+cli_option SKIP_CONTRACT_TESTS --skip-contract-tests MLX_ATTENTION_REGISTRY_SKIP_CONTRACT_TESTS bool 0 \
+    "Skip the pytest contract tests and run only the Metal probes."
+cli_parse "$@"
 
 if [[ "$(uname -m)" != "arm64" ]]; then
     echo "attention_backend_host_error=Apple Silicon arm64 is required" >&2
@@ -33,12 +43,15 @@ if [[ "$(uname -m)" != "arm64" ]]; then
 fi
 
 echo "[1/2] Run focused configuration and backend contract tests"
-(
-    cd "$PYTHON_DIR"
-    uv run pytest tests/test_config.py tests/test_native_mlx.py \
-        -k 'execution_backend or attention_capabilities or paged_metal_attention' -q
-)
-echo "attention_backend_config_tests_ok=1"
+if [[ "$SKIP_CONTRACT_TESTS" == "1" ]]; then
+    echo "attention_backend_config_tests_skipped=1"
+else
+    (
+        cd "$PYTHON_DIR"
+        uv run pytest tests/test_config.py tests/test_native_mlx.py -k "$PYTEST_FILTER" -q
+    )
+    echo "attention_backend_config_tests_ok=1"
+fi
 
 echo "[2/2] Run direct Metal capability and parity probes"
 (

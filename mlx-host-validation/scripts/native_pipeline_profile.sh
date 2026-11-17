@@ -3,16 +3,17 @@
 # Native-v2 whole inference-pipeline profiling validation.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_pipeline_profile.sh
-#   MLX_PROFILE_METAL=1 MTL_CAPTURE_ENABLED=1 bash mlx-host-validation/scripts/native_pipeline_profile.sh
+#   bash mlx-host-validation/scripts/native_pipeline_profile.sh [options]
+#   bash mlx-host-validation/scripts/native_pipeline_profile.sh --help
+#   MTL_CAPTURE_ENABLED=1 bash mlx-host-validation/scripts/native_pipeline_profile.sh --metal
 #
 # Known-good checkpoint: mlx-community/Qwen2.5-7B-Instruct-4bit
-# Probe checkpoint override: MLX_PROFILE_CHECKPOINT=/path/or/hub-id
+# Probe checkpoint override: --checkpoint /path/or/hub-id
 #
 # Host requirements:
 #   - Apple Silicon arm64 with Metal-capable MLX; full Xcode for `.gputrace`
 #   - `uv`, `cargo`, the checkpoint in the local Hugging Face cache
-#   - at least 2 GiB free in MLX_PROFILE_DIR (default under /tmp)
+#   - at least 2 GiB free in the --artifacts-dir directory (default under /tmp)
 #   - MTL_CAPTURE_ENABLED=1 must be present before startup when heavy capture is requested
 #
 # Low-overhead validation always runs a bounded public HTTP request and writes
@@ -29,10 +30,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-TRACE_DIR="${MLX_PROFILE_DIR:-${TMPDIR:-/tmp}/mlx-runtime-v2-pipeline-profile}"
-CHECKPOINT="${MLX_PROFILE_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}"
-RUN_ID="profile-$(date +%s)"
-PORT="${MLX_PROFILE_PORT:-18016}"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Profile the whole native-mlx inference pipeline for one bounded public-gateway request."
+cli_option CHECKPOINT --checkpoint MLX_PROFILE_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint or local path to serve."
+cli_option PORT --port MLX_PROFILE_PORT port 18016 "Gateway port used during capture."
+cli_option METAL --metal MLX_PROFILE_METAL bool 0 \
+    "Capture a bounded Metal .gputrace; requires MTL_CAPTURE_ENABLED=1."
+cli_option RUN_ID --run-id MLX_PROFILE_RUN_ID string "" "Profile run id; defaults to profile-<unix time>."
+cli_option HEALTH_TIMEOUT --health-timeout MLX_PROFILE_HEALTH_TIMEOUT int 300 \
+    "Seconds to wait for the gateway to report healthy."
+cli_option TRACE_DIR --artifacts-dir MLX_PROFILE_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-pipeline-profile" "Directory for the config, gateway log, and profile artifacts."
+cli_parse "$@"
+RUN_ID="${RUN_ID:-profile-$(date +%s)}"
+cli_require_free_port "$PORT" --port
 CONFIG="$TRACE_DIR/runtime.toml"
 HELPER="$ROOT/mlx-host-validation/scripts/python/pipeline_profile_check.py"
 GATEWAY_LOG="$TRACE_DIR/gateway.log"
@@ -41,7 +54,7 @@ if [[ "$(uname -m)" != "arm64" ]]; then
     echo "profile_host_error=Apple Silicon arm64 is required" >&2
     exit 1
 fi
-if [[ "${MLX_PROFILE_METAL:-0}" == "1" && "${MTL_CAPTURE_ENABLED:-0}" != "1" ]]; then
+if [[ "$METAL" == "1" && "${MTL_CAPTURE_ENABLED:-0}" != "1" ]]; then
     echo "profile_capture_error=MTL_CAPTURE_ENABLED=1 must be set before process startup" >&2
     exit 1
 fi
@@ -57,7 +70,7 @@ export MLX_RUNTIME_NATIVE_PIPELINE_PROFILE=1
 export MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR="$TRACE_DIR"
 export MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_RUN_ID="$RUN_ID"
 export MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_WORKLOAD=profile-public-gateway
-export MLX_RUNTIME_NATIVE_METAL_CAPTURE="${MLX_PROFILE_METAL:-0}"
+export MLX_RUNTIME_NATIVE_METAL_CAPTURE="$METAL"
 
 cleanup() {
     if [[ -n "${GATEWAY_PID:-}" ]]; then
@@ -70,7 +83,7 @@ trap cleanup EXIT
 echo "[1/3] Start native-mlx gateway with bounded pipeline profiling"
 cargo run -p mlx_runtime_gateway --bin mlx_runtime_gateway >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
-for _ in $(seq 1 300); do
+for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
     if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
         break
     fi
@@ -93,8 +106,8 @@ echo "[3/3] Verify durable artifacts"
 test -s "$TRACE_DIR/pipeline-events.jsonl"
 test -s "$TRACE_DIR/pipeline-trace.json"
 test -s "$TRACE_DIR/pipeline-report.md"
-echo "profile_metal_capture=${MLX_PROFILE_METAL:-0}"
-if [[ "${MLX_PROFILE_METAL:-0}" == "1" ]]; then
+echo "profile_metal_capture=$METAL"
+if [[ "$METAL" == "1" ]]; then
     test -s "$TRACE_DIR/pipeline.gputrace"
     echo "profile_gputrace=$TRACE_DIR/pipeline.gputrace"
 fi

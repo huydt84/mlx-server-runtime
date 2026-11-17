@@ -20,8 +20,11 @@ The default validation checkpoint is
 `mlx-community/Qwen2.5-7B-Instruct-4bit`. Override it when necessary:
 
 ```bash
-export MLX_PROFILE_CHECKPOINT=/path/to/checkpoint
+bash scripts/profile.sh --checkpoint /path/to/checkpoint
 ```
+
+Run `bash scripts/profile.sh --help` to list every option. Each flag also has
+an `MLX_PROFILE_*` environment variable; a flag wins over its variable.
 
 ## Capture a Pipeline Profile
 
@@ -31,12 +34,12 @@ Run the bounded public-gateway workload from the repository root:
 bash scripts/profile.sh
 ```
 
-By default, artifacts are written below the system temporary directory. Choose
-a durable location with:
+By default, artifacts are written below the system temporary directory and
+the gateway listens on port 18016. Choose a durable location, or another port
+when 18016 is taken, with:
 
 ```bash
-export MLX_PROFILE_DIR="$PWD/profiles/native-mlx"
-bash scripts/profile.sh
+bash scripts/profile.sh --artifacts-dir "$PWD/profiles/native-mlx" --port 18516
 ```
 
 The command starts the gateway with profiling enabled, waits for readiness,
@@ -68,9 +71,7 @@ detokenization, and transport events.
 Metal capture is heavier and must be enabled before the worker starts:
 
 ```bash
-MTL_CAPTURE_ENABLED=1 \
-MLX_PROFILE_METAL=1 \
-bash scripts/profile.sh
+MTL_CAPTURE_ENABLED=1 bash scripts/profile.sh --metal
 ```
 
 The profiler brackets only the bounded public request and writes

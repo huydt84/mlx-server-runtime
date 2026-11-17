@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_kv_prefill_decode.sh
+#   bash mlx-host-validation/scripts/native_kv_prefill_decode.sh [options]
+#   bash mlx-host-validation/scripts/native_kv_prefill_decode.sh --help
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -47,11 +48,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-CHECKPOINT="mlx-community/Qwen2.5-7B-Instruct-4bit"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native prefill/decode parity against mlx_lm, physical batching, and KV cache lifecycle."
+cli_option CHECKPOINT --checkpoint MLX_KV_PREFILL_DECODE_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint to load."
+cli_option SKIP_SYNC --skip-sync MLX_KV_PREFILL_DECODE_SKIP_SYNC bool 0 \
+    "Skip uv sync; reuse the existing Python environment."
+cli_parse "$@"
 
 echo "[1/3] Sync Python dev environment"
 cd "$PYTHON_DIR"
-uv sync --group dev
+if [[ "$SKIP_SYNC" == "1" ]]; then
+    echo "sync_skipped=1"
+else
+    uv sync --group dev
+fi
 
 echo "[2/3] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'

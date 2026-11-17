@@ -28,6 +28,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!mlx-host-validation/scripts/lib/
 lib64/
 parts/
 sdist/

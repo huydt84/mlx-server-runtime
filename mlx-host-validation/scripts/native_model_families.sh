@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_model_families.sh
+#   bash mlx-host-validation/scripts/native_model_families.sh [options]
+#   bash mlx-host-validation/scripts/native_model_families.sh --help
 #
 # Known-good checkpoints:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -41,16 +42,31 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
-CHECKPOINTS=(
-    "mlx-community/Qwen2.5-7B-Instruct-4bit"
-    "mlx-community/LFM2.5-8B-A1B-MLX-4bit"
-    "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-    "mlx-community/gemma-3-270m-it-qat-8bit"
-)
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native forward-pass and greedy-token parity against mlx_lm for each registered model family."
+cli_option CHECKPOINT_LIST --checkpoints MLX_MODEL_FAMILIES_CHECKPOINTS list \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit,mlx-community/LFM2.5-8B-A1B-MLX-4bit,mlx-community/Qwen3-4B-Instruct-2507-4bit,mlx-community/gemma-3-270m-it-qat-8bit" \
+    "Comma-separated checkpoints to check, in order."
+cli_option DECODE_STEPS --decode-steps MLX_MODEL_FAMILIES_DECODE_STEPS int 2 \
+    "Greedy decode steps compared after prefill."
+cli_option SKIP_SYNC --skip-sync MLX_MODEL_FAMILIES_SKIP_SYNC bool 0 \
+    "Skip uv sync; reuse the existing Python environment."
+cli_example "bash mlx-host-validation/scripts/native_model_families.sh --checkpoints mlx-community/Qwen3-4B-Instruct-2507-4bit"
+cli_parse "$@"
+cli_split_list CHECKPOINTS "$CHECKPOINT_LIST"
+if [[ ${#CHECKPOINTS[@]} -eq 0 ]]; then
+    echo "error: --checkpoints needs at least one checkpoint" >&2
+    exit 2
+fi
 
 echo "[1/3] Sync Python dev environment"
 cd "$PYTHON_DIR"
-uv sync --group dev
+if [[ "$SKIP_SYNC" == "1" ]]; then
+    echo "sync_skipped=1"
+else
+    uv sync --group dev
+fi
 
 echo "[2/3] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'
@@ -72,7 +88,7 @@ print(f"mlx_compute_ok={values}")
 PY
 
 echo "[3/3] Run real native forward pass and greedy-token parity"
-uv run python - <<'PY' "${CHECKPOINTS[@]}"
+uv run python - <<'PY' "$DECODE_STEPS" "${CHECKPOINTS[@]}"
 from __future__ import annotations
 
 import sys
@@ -86,7 +102,8 @@ from mlx_worker.native_mlx.diagnostics import (
     compare_native_prefill_decode_to_mlx_lm,
 )
 
-for checkpoint in sys.argv[1:]:
+decode_steps = int(sys.argv[1])
+for checkpoint in sys.argv[2:]:
     artifacts = build_native_artifacts(checkpoint)
     model_path = artifacts.architecture.model_path
     token_ids = build_finalized_token_ids(
@@ -115,7 +132,7 @@ for checkpoint in sys.argv[1:]:
         checkpoint,
         artifacts.diagnostics,
         token_ids,
-        decode_steps=2,
+        decode_steps=decode_steps,
     )
     print(
         "prefill_decode_ok="

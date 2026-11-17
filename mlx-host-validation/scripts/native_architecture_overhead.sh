@@ -5,11 +5,29 @@
 # This is the aggregate near-zero-overhead gate.  It combines the
 # hardware-independent architecture-count proof with the real public-gateway,
 # MLX capture, and Metal System Trace gate in native_overlap.sh.
+#
+# Usage:
+#   bash mlx-host-validation/scripts/native_architecture_overhead.sh [options]
+#   bash mlx-host-validation/scripts/native_architecture_overhead.sh --help
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TRACE_DIR="${MLX_OVERHEAD_TRACE_DIR:-${TMPDIR:-/tmp}/mlx-runtime-v2-architecture-overhead}"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Gate native-v2 architecture isolation and CPU overhead: lazy manifest counts plus the serial/overlap parity, latency, MLX, and Metal gates."
+cli_option CHECKPOINT --checkpoint MLX_OVERHEAD_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by the overlap gate."
+cli_option PORT --port MLX_OVERHEAD_PORT port 18017 "Gateway port for the overlap gate."
+cli_option WARMUPS --warmups MLX_OVERHEAD_WARMUPS int 5 "Warmup requests per mode before timing."
+cli_option SAMPLES --samples MLX_OVERHEAD_SAMPLES int 10 "Timed requests per mode; an even number >= 2."
+cli_option MAX_TOKENS --max-tokens MLX_OVERHEAD_MAX_TOKENS int 8 "Completion tokens per timed request."
+cli_option MAX_REGRESSION --max-regression MLX_OVERHEAD_MAX_REGRESSION number 0.02 \
+    "Largest allowed overlap latency regression, as a fraction of serial."
+cli_option TRACE_DIR --artifacts-dir MLX_OVERHEAD_TRACE_DIR path \
+    "${TMPDIR:-/tmp}/mlx-runtime-v2-architecture-overhead" "Directory for manifest results and overlap artifacts."
+cli_parse "$@"
+cli_require_free_port "$PORT" --port
 ARCH_HELPER="$ROOT/mlx-host-validation/scripts/python/architecture_overhead.py"
 OVERLAP_SCRIPT="$ROOT/mlx-host-validation/scripts/native_overlap.sh"
 OVERLAP_DIR="$TRACE_DIR/overlap"
@@ -26,16 +44,16 @@ PYTHONPATH="$ROOT/python" uv --directory "$ROOT/python" run python "$ARCH_HELPER
     --output-markdown "$TRACE_DIR/architecture-overhead.md"
 
 echo "[2/3] Run public-gateway parity, performance, MLX, and Metal gates"
-MTL_CAPTURE_ENABLED=1 \
-MLX_OVERLAP_TRACE_DIR="$OVERLAP_DIR" \
-MLX_OVERLAP_CHECKPOINT="${MLX_OVERHEAD_CHECKPOINT:-mlx-community/Qwen2.5-7B-Instruct-4bit}" \
-MLX_OVERLAP_WARMUPS="${MLX_OVERHEAD_WARMUPS:-5}" \
-MLX_OVERLAP_SAMPLES="${MLX_OVERHEAD_SAMPLES:-10}" \
-MLX_OVERLAP_MAX_TOKENS="${MLX_OVERHEAD_MAX_TOKENS:-8}" \
-MLX_OVERLAP_MAX_REGRESSION="${MLX_OVERHEAD_MAX_REGRESSION:-0.02}" \
-MLX_OVERLAP_METAL_CAPTURE=1 \
-MLX_OVERLAP_XCTRACE=1 \
-bash "$OVERLAP_SCRIPT"
+MTL_CAPTURE_ENABLED=1 bash "$OVERLAP_SCRIPT" \
+    --artifacts-dir "$OVERLAP_DIR" \
+    --checkpoint "$CHECKPOINT" \
+    --port "$PORT" \
+    --warmups "$WARMUPS" \
+    --samples "$SAMPLES" \
+    --max-tokens "$MAX_TOKENS" \
+    --max-regression "$MAX_REGRESSION" \
+    --metal-capture \
+    --xctrace
 
 echo "[3/3] Verify durable artifacts"
 test -s "$TRACE_DIR/architecture-overhead.json"

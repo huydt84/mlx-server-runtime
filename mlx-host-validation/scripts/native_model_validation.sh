@@ -4,7 +4,8 @@
 # Run this on an Apple Silicon Mac with Metal available.
 #
 # Usage:
-#   bash mlx-host-validation/scripts/native_model_validation.sh
+#   bash mlx-host-validation/scripts/native_model_validation.sh [options]
+#   bash mlx-host-validation/scripts/native_model_validation.sh --help
 #
 # Known-good checkpoint:
 #   - `mlx-community/Qwen2.5-7B-Instruct-4bit`
@@ -36,10 +37,24 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate native startup for a known-good checkpoint and structured failures for unsupported and malformed local probes."
+cli_option CHECKPOINT --checkpoint MLX_MODEL_VALIDATION_CHECKPOINT string \
+    "mlx-community/Qwen2.5-7B-Instruct-4bit" "Known-good checkpoint expected to reach READY."
+cli_option PROBE_TIMEOUT --probe-timeout MLX_MODEL_VALIDATION_PROBE_TIMEOUT int 60 \
+    "Seconds to wait for each worker probe to exit."
+cli_option SKIP_SYNC --skip-sync MLX_MODEL_VALIDATION_SKIP_SYNC bool 0 \
+    "Skip uv sync; reuse the existing Python environment."
+cli_parse "$@"
 
 echo "[1/3] Sync Python dev environment"
 cd "$PYTHON_DIR"
-uv sync --group dev
+if [[ "$SKIP_SYNC" == "1" ]]; then
+    echo "sync_skipped=1"
+else
+    uv sync --group dev
+fi
 
 echo "[2/3] Verify Apple Silicon, mlx, and mlx_lm imports"
 uv run python - <<'PY'
@@ -61,7 +76,7 @@ print(f"mlx_compute_ok={values}")
 PY
 
 echo "[3/3] Probe native worker startup stages"
-uv run python - <<'PY'
+uv run python - <<'PY' "$CHECKPOINT" "$PROBE_TIMEOUT"
 from __future__ import annotations
 
 import json
@@ -174,7 +189,7 @@ def run_probe(
                     if any(isinstance(item, WorkerReady) for item in decoded):
                         break
 
-            rc = proc.wait(timeout=60)
+            rc = proc.wait(timeout=int(sys.argv[2]))
             expected_rc = 0 if expected_ready else 1
             if rc != expected_rc:
                 raise SystemExit(
@@ -236,7 +251,7 @@ with tempfile.TemporaryDirectory(prefix="model_validation-local-probes-") as pro
 
     run_probe(
         label="known_good",
-        model_ref="mlx-community/Qwen2.5-7B-Instruct-4bit",
+        model_ref=sys.argv[1],
         expected_category=None,
         expected_stage=None,
         expected_statuses=[

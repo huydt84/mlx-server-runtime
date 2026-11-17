@@ -1,17 +1,34 @@
 #!/usr/bin/env bash
 # Host-only validation for the MLX Air distribution, environment, and doctor.
 # Run on Apple Silicon with macOS 14+, Metal, and uv available.
+#
+# Usage:
+#   bash mlx-host-validation/scripts/cli_doctor.sh [options]
+#   bash mlx-host-validation/scripts/cli_doctor.sh --help
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/cli.sh
+source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+cli_describe "Validate the staged mlx-air distribution and every host-only doctor diagnostic from outside the repository."
+cli_option PORT --port MLX_AIR_DOCTOR_PORT port 18005 \
+    "Port passed to mlx-air doctor --port for the port-availability check."
+cli_option KEEP_WORK_DIR --keep-work-dir MLX_AIR_DOCTOR_KEEP_WORK_DIR bool 0 \
+    "Keep the temporary work directory (staged distribution, logs, captures) after exit."
+cli_parse "$@"
+cli_require_free_port "$PORT" --port
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/mlx-air-cli-doctor.XXXXXX")"
 STAGE_DIR="$WORK_DIR/distribution"
 UNRELATED_DIR="$WORK_DIR/outside-repository"
 DOCTOR_OUTPUT="$WORK_DIR/doctor.txt"
 
 cleanup() {
-    rm -rf "$WORK_DIR"
+    if [[ "$KEEP_WORK_DIR" == "1" ]]; then
+        echo "work_dir=$WORK_DIR" >&2
+    else
+        rm -rf "$WORK_DIR"
+    fi
 }
 
 trap cleanup EXIT
@@ -32,7 +49,7 @@ mkdir -p "$UNRELATED_DIR" "$WORK_DIR/home"
 cd "$UNRELATED_DIR"
 HOME="$WORK_DIR/home" \
 UV_CACHE_DIR="$WORK_DIR/uv-cache" \
-    "$STAGE_DIR/bin/mlx-air" doctor | tee "$DOCTOR_OUTPUT"
+    "$STAGE_DIR/bin/mlx-air" doctor --port "$PORT" | tee "$DOCTOR_OUTPUT"
 
 echo "[3/4] Verify every host-only diagnostic"
 grep -F "[PASS] Apple Silicon:" "$DOCTOR_OUTPUT"
@@ -45,7 +62,7 @@ grep -F "[PASS] socket directory:" "$DOCTOR_OUTPUT"
 grep -F "[PASS] runtime environment:" "$DOCTOR_OUTPUT"
 grep -F "[PASS] Python imports: imports_ok" "$DOCTOR_OUTPUT"
 grep -F "[PASS] Metal execution: metal_ok" "$DOCTOR_OUTPUT"
-grep -F "[PASS] port availability:" "$DOCTOR_OUTPUT"
+grep -F "[PASS] port availability: 127.0.0.1:$PORT" "$DOCTOR_OUTPUT"
 
 echo "[4/4] Verify the managed environment record"
 SETUP_RECORD="$(find "$WORK_DIR/home/Library/Application Support/mlx-air/environments/runtime" -name setup.json -print -quit)"

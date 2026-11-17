@@ -33,6 +33,10 @@ curl -fsSL \
 ~/.local/bin/mlx-air doctor
 ```
 
+`mlx-air doctor` checks that the configured port (8000 by default) is free.
+Pass `--port` to check the port you will serve on, for example
+`mlx-air doctor --port 8080`, or `--config` to read it from a runtime config.
+
 Run the same command again to update. To install or roll back to a specific
 release, pass its version to the installer:
 
