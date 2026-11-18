@@ -10,11 +10,11 @@ pub use events::{
     encode_worker_event, encode_worker_message, GatewayCommand, WorkerEvent, WorkerMessage,
 };
 pub use request::{
-    ChatCompletionRequest, ChatMessage, ContentPart, HealthCheck, ImageUrl, MessageContent,
-    MessageRole,
+    AudioTask, ChatCompletionRequest, ChatMessage, ContentPart, HealthCheck, ImageUrl,
+    MessageContent, MessageRole, TranscriptionRequest,
 };
 pub use response::{
     BenchmarkResetState, ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent,
-    WorkerError, WorkerReady,
+    TranscriptionResponse, TranscriptionSegment, TranscriptionWord, WorkerError, WorkerReady,
 };
 pub use status::{ModelError, ModelLoadProgress, ModelState, ModelStatus, ModelSummary};

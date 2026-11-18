@@ -67,6 +67,7 @@ The Python worker now has two serving paths with different ownership splits:
 |---------|---------------------|---------------------|
 | Text LLM (`native-mlx`) | Repo-owned native runtime, scheduler, executor, and registered MLX architecture plans | Iteration-level continuous batching with chunked prefill, alternating decode and prefill steps |
 | VLM | `mlx_vlm.generate.BatchGenerator` plus repo-owned worker lifecycle/cache policy | Continuous batching with APC reuse and vision-feature caching |
+| Speech-to-text (optional, either backend) | `mlx_audio` Whisper (`model.generate`) | One request at a time, run to completion between text/VLM scheduler steps |
 
 For native text serving, Rust still owns HTTP/SSE, outer admission, worker
 supervision, and telemetry projection. Python owns prompt construction,
@@ -106,6 +107,13 @@ and repeated-image feature caching through the worker. This is not
 PagedAttention and not literal vLLM parity; it is the closest Apple Silicon
 implementation of the same serving shape. Mixed text+VLM serving uses the same
 worker process under bounded arbitration.
+
+The optional transcription model runs inside the same worker process. Rust
+parses the OpenAI multipart upload, enforces the size limit, and sends the file
+base64-encoded over IPC; Python decodes the audio and runs Whisper. Because a
+transcription runs synchronously on the worker's model thread, chat scheduling
+pauses for its inference time. The gateway loads the model with a one-second
+silent warmup request right after the worker reports ready.
 
 Worker scheduling and cache behavior are controlled with backend-specific
 environment variables:

@@ -294,6 +294,7 @@ mod tests {
             max_total_tokens_per_request: 65_536,
             request_timeout_seconds: 300,
             max_vlm_images: 5,
+            max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
         }
     }
 

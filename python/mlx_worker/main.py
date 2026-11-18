@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from typing import TYPE_CHECKING
 
 from .batching import (
     BatchEventSink,
@@ -29,6 +30,8 @@ from .ipc import (
     ModelError,
     ModelLoadProgress,
     ModelStatus,
+    TranscriptionRequest,
+    TranscriptionResponse,
     WorkerCommandError,
     WorkerError,
     WorkerReady,
@@ -37,6 +40,9 @@ from .ipc import (
     encode_event,
     request_has_images,
 )
+
+if TYPE_CHECKING:
+    from .transcription import TranscriptionService
 
 
 def _pop_buffered_line(read_buffer: bytearray) -> bytes | None:
@@ -70,7 +76,7 @@ def _read_command_line(
         if not block and not select.select([client], [], [], 0)[0]:
             return None
 
-        chunk = client.recv(4096)
+        chunk = client.recv(1 << 20)
         if not chunk:
             return b""
 
@@ -264,12 +270,18 @@ def main(
 
         client.sendall(encode_bootstrap_message(WorkerReady()))
 
+        from .transcription import TranscriptionService
+
+        transcription = TranscriptionService(
+            getattr(config, "transcription_model", None)
+        )
         if getattr(config, "continuous_batching", False):
             _run_continuous_batch_loop(
                 client,
                 config,
                 engine,
                 vlm_engine_factory,
+                transcription,
             )
             return 0
 
@@ -291,6 +303,7 @@ def main(
                     ChatCompletionResponse
                     | WorkerCommandError
                     | BenchmarkResetState
+                    | TranscriptionResponse
                     | None
                 ) = WorkerCommandError(
                     code="INVALID_REQUEST",
@@ -306,6 +319,8 @@ def main(
                     )
                 elif isinstance(request, CancelRequest):
                     continue
+                elif isinstance(request, TranscriptionRequest):
+                    event = transcription.handle(request)
                 elif isinstance(request, BenchmarkResetRequest):
                     cache_state = engine.benchmark_reset(
                         clear_cache=request.clear_cache,
@@ -410,8 +425,12 @@ def _run_continuous_batch_loop(
     config: object,
     engine: object,
     vlm_engine_factory: Callable[[str], object] | None,
+    transcription: TranscriptionService | None = None,
 ) -> None:
-    """Run the shared text and VLM continuous batching loop."""
+    """Run the shared text and VLM continuous batching loop.
+
+    Transcription requests run to completion between scheduler ticks.
+    """
 
     from .vlm_engine import VlmContinuousBatchScheduler
 
@@ -603,6 +622,15 @@ def _run_continuous_batch_loop(
                         emit_error(
                             "unknown", "INVALID_REQUEST", "unsupported worker command"
                         )
+                    elif isinstance(command, TranscriptionRequest):
+                        if transcription is None:
+                            emit_error(
+                                command.request_id,
+                                "INVALID_REQUEST",
+                                "no transcription model is configured",
+                            )
+                        else:
+                            client.sendall(encode_event(transcription.handle(command)))
                     elif isinstance(command, CancelRequest):
                         handled = text_scheduler.cancel(command.request_id)
                         if not handled and vlm_scheduler is not None:

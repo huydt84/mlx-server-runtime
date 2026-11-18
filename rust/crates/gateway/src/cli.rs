@@ -93,6 +93,10 @@ struct ServeArgs {
     /// Model identifier or local model path.
     #[arg(long)]
     model: Option<String>,
+    /// Whisper speech-to-text model identifier or local path served by
+    /// `/v1/audio/transcriptions` and `/v1/audio/translations`.
+    #[arg(long, value_name = "MODEL")]
+    transcription_model: Option<String>,
     /// Runtime configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -521,6 +525,7 @@ fn resolve_serve_context(
     let environment_config = std::env::var_os("MLX_RUNTIME_CONFIG").map(PathBuf::from);
     let overrides = CliConfigOverrides {
         model: args.model.clone(),
+        transcription_model: args.transcription_model.clone(),
         backend: args.backend.map(Into::into),
         port: args.port,
         memory_utilization: args.memory_utilization,
@@ -724,6 +729,8 @@ mod tests {
             "native-mlx",
             "--port",
             "9000",
+            "--transcription-model",
+            "mlx-community/whisper-large-v3-turbo-asr-fp16",
         ]);
 
         assert!(result.is_ok(), "unexpected parse error: {result:?}");

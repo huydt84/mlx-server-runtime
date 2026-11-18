@@ -1,5 +1,6 @@
 //! Reusable gateway and public `mlx-air` command-line interfaces.
 
+mod audio;
 mod benchmark;
 pub mod cli;
 mod command_runner;

@@ -52,6 +52,18 @@ The default backend is `native-mlx`, which serves the architectures listed in
 cache. Add `--backend v1` to serve any other `mlx-lm` checkpoint or a VLM; a
 checkpoint native-mlx does not implement fails at startup and names that flag.
 
+Add `--transcription-model` to serve Whisper speech-to-text next to the chat
+model on `/v1/audio/transcriptions` and `/v1/audio/translations`. WAV, MP3,
+and FLAC work out of the box; m4a, mp4, ogg, and webm uploads need `ffmpeg`
+(`brew install ffmpeg`):
+
+```bash
+~/.local/bin/mlx-air serve --model mlx-community/Qwen3-8B-4bit \
+  --transcription-model mlx-community/whisper-large-v3-turbo-asr-fp16
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F model=mlx-community/whisper-large-v3-turbo-asr-fp16 -F file=@speech.wav
+```
+
 With `--detach --name NAME --port PORT` the command returns once the instance
 is ready. If the worker cannot start (for example the memory settings cannot
 hold the model), it stops the launchd service and reports the error right
@@ -103,6 +115,10 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 - `GET /models/{model}/status` returns detailed model lifecycle state.
 - `GET /models/{model}/ready` returns model-specific readiness.
 - `GET /metrics` exposes Prometheus metrics.
+- `POST /v1/chat/completions` serves OpenAI-compatible chat completions.
+- `POST /v1/audio/transcriptions` and `POST /v1/audio/translations` serve
+  OpenAI-compatible Whisper speech-to-text when a transcription model is
+  configured (see below).
 
 ## Telemetry
 
