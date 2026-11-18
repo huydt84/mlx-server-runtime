@@ -13,7 +13,7 @@
 # Probe checkpoints:
 #   - native-v2 public gateway mixed workload with chunk sizes `32` and `96`
 #   - one long prompt plus two active short decode requests against `mlx-community/Qwen2.5-7B-Instruct-4bit`
-#   - default v1 public request against same checkpoint
+#   - v1 public request against same checkpoint
 #
 # Host requirements:
 #   - Apple Silicon (`arm64`)
@@ -55,6 +55,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Validate native-mlx chunked prefill interleaving for each chunk size through the public gateway, physical batching proofs, then a v1 non-regression request."
 cli_option CHECKPOINT --checkpoint MLX_CHUNKED_CHECKPOINT string \
     "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
@@ -86,7 +88,6 @@ cli_require_free_port "$V1_PORT" --v1-port
 REQUEST_DIR="$TMP_ROOT/requests"
 NATIVE_CONFIG="$TMP_ROOT/runtime-native.toml"
 V1_CONFIG="$TMP_ROOT/runtime-v1.toml"
-HEALTH_CAPTURE="$TMP_ROOT/health.txt"
 V1_CAPTURE="$TMP_ROOT/v1.json"
 NATIVE_LOG="$TMP_ROOT/native.log"
 V1_LOG="$TMP_ROOT/v1.log"
@@ -107,21 +108,7 @@ trap cleanup EXIT
 wait_healthy() {
     local log_path="$1"
     local port="$2"
-    rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
-        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
-            echo "gateway exited unexpectedly; inspect $log_path" >&2
-            return 1
-        fi
-        if curl -fsS "http://127.0.0.1:${port}/health" >"$HEALTH_CAPTURE"; then
-            if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
-                return 0
-            fi
-        fi
-        sleep 1
-    done
-    echo "gateway did not become healthy; inspect $log_path" >&2
-    return 1
+    gateway_wait_ready "$port" "$HEALTH_TIMEOUT" "$GATEWAY_PID" "$log_path"
 }
 
 start_gateway() {
@@ -229,7 +216,7 @@ native_target.write_text(
     )
 )
 v1_target.write_text(
-    source.replace('port = 8000', f'port = {v1_port}').replace(
+    source.replace('backend = "native-mlx"', 'backend = "v1"').replace('port = 8000', f'port = {v1_port}').replace(
         'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
         f'model = "{checkpoint}"',
     )
@@ -885,7 +872,7 @@ for chunk_size in "${CHUNK_SIZE_LIST[@]}"; do
     probe_chunk_size "$chunk_size" "$NATIVE_PORT"
 done
 
-echo "[6/7] Run default v1 non-regression request"
+echo "[6/7] Run v1 non-regression request"
 start_v1_gateway "$V1_LOG" "$V1_PORT"
 V1_STATUS=$(curl -sS -o "$V1_CAPTURE" -w '%{http_code}' \
     -X POST "http://127.0.0.1:${V1_PORT}/v1/chat/completions" \

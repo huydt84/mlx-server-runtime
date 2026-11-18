@@ -83,7 +83,8 @@ def write_fixtures(args: argparse.Namespace) -> None:
         .replace("max_pending_requests = 64", "max_pending_requests = 8")
         .replace("request_timeout_seconds = 300", "request_timeout_seconds = 30")
     )
-    v1 = template.replace("port = 8000", f"port = {args.v1_port}", 1).replace(
+    v1 = template.replace('backend = "native-mlx"', 'backend = "v1"', 1)
+    v1 = v1.replace("port = 8000", f"port = {args.v1_port}", 1).replace(
         'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
         f'model = "{args.checkpoint}"',
         1,

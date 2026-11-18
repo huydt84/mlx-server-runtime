@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -91,8 +93,10 @@ class NativeRuntime:
         decode_target: Any,
         eos_token_ids: tuple[int, ...],
         profiler: Any | None = None,
+        max_total_tokens: int | None = None,
     ) -> None:
         self._scheduler = scheduler
+        self._max_total_tokens = max_total_tokens
         self._model_ref = model_ref
         self._prompt_tokenizer = prompt_tokenizer
         self._decode_target = decode_target
@@ -157,6 +161,7 @@ class NativeRuntime:
                 sampling=SamplingParams(
                     temperature=request.temperature,
                     top_p=request.top_p,
+                    seed=secrets.randbits(63),
                 ),
                 enqueued_at=state.enqueued_at,
                 max_tokens=request.max_tokens,
@@ -657,8 +662,10 @@ class NativeRuntime:
     ) -> None:
         if request.model != self._model_ref:
             raise ValueError("requested model does not match loaded model")
-        if request.temperature != 0.0 or request.top_p != 1.0:
-            raise ValueError("native-mlx currently supports greedy decoding only")
+        if not math.isfinite(request.temperature) or request.temperature < 0.0:
+            raise ValueError("temperature must be a non-negative number")
+        if not math.isfinite(request.top_p) or not 0.0 < request.top_p <= 1.0:
+            raise ValueError("top_p must be greater than 0 and at most 1")
         if any(not value for value in request.stop):
             raise ValueError("stop sequences must not be empty")
         if len(prompt) > request.max_prompt_tokens:
@@ -667,6 +674,15 @@ class NativeRuntime:
             raise ValueError("completion exceeds max_completion_tokens")
         if len(prompt) + request.max_tokens > request.max_total_tokens_per_request:
             raise ValueError("request exceeds max_total_tokens_per_request")
+        if (
+            self._max_total_tokens is not None
+            and len(prompt) + request.max_tokens > self._max_total_tokens
+        ):
+            raise ValueError(
+                "request exceeds max_total_tokens_per_request "
+                f"{self._max_total_tokens} derived from the KV cache pool; raise "
+                "--memory-utilization or --kv-cache-memory"
+            )
 
 
 def _optional_int(metrics: dict[str, object], name: str) -> int | None:

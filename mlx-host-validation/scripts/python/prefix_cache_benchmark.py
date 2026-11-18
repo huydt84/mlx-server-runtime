@@ -121,6 +121,7 @@ def write_fixtures(args: argparse.Namespace) -> None:
     )
     v1_target.write_text(
         source.replace("port = 8000", f"port = {args.v1_port}")
+        .replace('backend = "native-mlx"', 'backend = "v1"')
         .replace(
             'model = "mlx-community/Qwen2.5-7B-Instruct-4bit"',
             f'model = "{checkpoint}"',

@@ -86,6 +86,11 @@ impl StartResult {
 
 pub(crate) trait ReadinessProbe {
     fn is_ready(&self, port: u16) -> bool;
+
+    /// Returns the gateway's startup error once it reports a failed startup.
+    fn startup_failure(&self, _port: u16) -> Option<String> {
+        None
+    }
 }
 
 pub(crate) struct HttpReadinessProbe;
@@ -94,6 +99,41 @@ impl ReadinessProbe for HttpReadinessProbe {
     fn is_ready(&self, port: u16) -> bool {
         http_ready(port)
     }
+
+    fn startup_failure(&self, port: u16) -> Option<String> {
+        let (_, body) = http_get(port, "/startup")?;
+        startup_failure_message(&body)
+    }
+}
+
+/// Returns the last error line a gateway wrote to its log, if any.
+fn last_error_line(log: &Path) -> Option<String> {
+    let contents = fs::read_to_string(log).ok()?;
+    contents
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("Error:") || line.contains("failed"))
+        .map(|line| line.trim().to_string())
+}
+
+/// Extracts the error from a `/startup` body whose status is `failed`.
+fn startup_failure_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value.get("status")?.as_str()? != "failed" {
+        return None;
+    }
+    let error = value.get("error").filter(|error| !error.is_null());
+    Some(match error {
+        Some(error) => {
+            let code = error.get("code").and_then(|code| code.as_str());
+            let message = error.get("message").and_then(|message| message.as_str());
+            match (code, message) {
+                (Some(code), Some(message)) => format!("{code}: {message}"),
+                _ => error.to_string(),
+            }
+        }
+        None => "startup failed without an error report".to_string(),
+    })
 }
 
 pub(crate) struct InstanceManager<'a> {
@@ -358,15 +398,46 @@ impl<'a> InstanceManager<'a> {
 
     fn wait_until_ready(&self, metadata: &InstanceMetadata) -> Result<u32, InstanceError> {
         let deadline = Instant::now() + self.startup_timeout;
+        let mut first_pid: Option<u32> = None;
         loop {
             let status = self.query_service(&metadata.label)?;
             if let Some(pid) = status.pid {
-                if status.loaded
-                    && status.state == "running"
-                    && self.process_is_alive(pid)?
-                    && self.readiness.is_ready(metadata.port)
-                {
-                    return Ok(pid);
+                // launchd restarts a gateway that exits; a new pid before
+                // readiness means startup failed and will keep failing.
+                match first_pid {
+                    None => first_pid = Some(pid),
+                    Some(first) if first != pid => {
+                        return Err(InstanceError::new(
+                            InstanceErrorKind::Serving,
+                            format!(
+                                "managed instance '{}' exited during startup and was restarted \
+                                 by launchd{}; see {}",
+                                metadata.name,
+                                last_error_line(&metadata.stderr_log)
+                                    .map(|line| format!(": {line}"))
+                                    .unwrap_or_default(),
+                                metadata.stderr_log.display()
+                            ),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                if status.loaded && status.state == "running" && self.process_is_alive(pid)? {
+                    if self.readiness.is_ready(metadata.port) {
+                        return Ok(pid);
+                    }
+                    // A failed worker startup does not recover by waiting;
+                    // report it now instead of at the startup timeout.
+                    if let Some(error) = self.readiness.startup_failure(metadata.port) {
+                        return Err(InstanceError::new(
+                            InstanceErrorKind::Serving,
+                            format!(
+                                "managed instance '{}' failed to start: {error}; see {}",
+                                metadata.name,
+                                metadata.stderr_log.display()
+                            ),
+                        ));
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -684,12 +755,16 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
         config.limits.max_completion_tokens
     )
     .ok();
-    writeln!(
-        output,
-        "max_total_tokens_per_request = {}",
-        config.limits.max_total_tokens_per_request
-    )
-    .ok();
+    // Rendered only when set explicitly, so a detached worker still derives
+    // the request limit from its KV pool like a foreground one.
+    if config.memory.max_total_tokens_explicit {
+        writeln!(
+            output,
+            "max_total_tokens_per_request = {}",
+            config.limits.max_total_tokens_per_request
+        )
+        .ok();
+    }
     writeln!(
         output,
         "request_timeout_seconds = {}",
@@ -702,6 +777,12 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
         config.limits.max_vlm_images
     )
     .ok();
+    writeln!(output, "[memory]").ok();
+    writeln!(output, "utilization = {}", config.memory.utilization).ok();
+    if let Some(bytes) = config.memory.kv_cache_bytes {
+        writeln!(output, "kv_cache_bytes = {bytes}").ok();
+    }
+    writeln!(output).ok();
     writeln!(output, "[telemetry]").ok();
     writeln!(
         output,
@@ -829,24 +910,25 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 fn http_ready(port: u16) -> bool {
+    http_get(port, "/ready").is_some_and(|(status_line, _)| status_line.contains(" 200 "))
+}
+
+/// Sends one local `GET` and returns the status line and body.
+fn http_get(port: u16, path: &str) -> Option<(String, String)> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(250)) else {
-        return false;
-    };
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
-    if stream
-        .write_all(b"GET /ready HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok()
-        && response
-            .lines()
-            .next()
-            .is_some_and(|line| line.contains(" 200 "))
+    stream.read_to_string(&mut response).ok()?;
+    let status_line = response.lines().next()?.to_string();
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Some((status_line, body))
 }
 
 fn run_required(
@@ -948,6 +1030,18 @@ mod tests {
 
     struct FakeReadiness(bool);
 
+    struct FailedStartup;
+
+    impl ReadinessProbe for FailedStartup {
+        fn is_ready(&self, _port: u16) -> bool {
+            false
+        }
+
+        fn startup_failure(&self, _port: u16) -> Option<String> {
+            Some("KV_MEMORY_INSUFFICIENT: raise --memory-utilization".to_string())
+        }
+    }
+
     impl ReadinessProbe for FakeReadiness {
         fn is_ready(&self, _port: u16) -> bool {
             self.0
@@ -1020,6 +1114,24 @@ mod tests {
         for name in ["", ".", "..", "a/b", "a b", "a;rm"] {
             assert!(validate_instance_name(name).is_err(), "accepted {name}");
         }
+    }
+
+    #[test]
+    fn rendered_config_round_trips_memory_sizing() {
+        let mut config = RuntimeConfig::default();
+        config.memory.utilization = 0.75;
+        let rendered = render_runtime_config(&config).unwrap();
+        assert!(!rendered.contains("max_total_tokens_per_request"));
+        let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
+        assert_eq!(reloaded.memory, config.memory);
+
+        config.memory.kv_cache_bytes = Some(1 << 30);
+        config.memory.max_total_tokens_explicit = true;
+        config.limits.max_total_tokens_per_request = 4096;
+        let rendered = render_runtime_config(&config).unwrap();
+        let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
+        assert_eq!(reloaded.memory, config.memory);
+        assert_eq!(reloaded.limits.max_total_tokens_per_request, 4096);
     }
 
     #[test]
@@ -1182,6 +1294,98 @@ mod tests {
         assert_eq!(calls[calls.len() - 2].args[0], "disable");
         assert_eq!(calls[calls.len() - 1].args[0], "bootout");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn start_fails_fast_when_the_gateway_reports_a_failed_startup() {
+        let (root, application) = application("failed-startup");
+        let runner = FakeRunner::new(vec![
+            success(""),
+            success(""),
+            success("state = running\npid = 23\n"),
+            success(""),
+            success(""),
+            success(""),
+        ]);
+        let manager = InstanceManager::new(&application, &runner, &FailedStartup)
+            .with_timeouts(Duration::from_secs(30), Duration::ZERO);
+        let mut config = RuntimeConfig::default();
+        config.server.port = unused_port();
+        let started = Instant::now();
+
+        let error = manager
+            .start("broken", &config, Path::new("/gateway"))
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(error.kind(), InstanceErrorKind::Serving);
+        assert!(error.to_string().contains("KV_MEMORY_INSUFFICIENT"));
+        let calls = runner.calls.borrow();
+        assert_eq!(calls[calls.len() - 2].args[0], "disable");
+        assert_eq!(calls[calls.len() - 1].args[0], "bootout");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn start_fails_fast_when_launchd_restarts_the_gateway_during_startup() {
+        let (root, application) = application("restarted-startup");
+        let runner = FakeRunner::new(vec![
+            success(""),
+            success(""),
+            success("state = running\npid = 31\n"),
+            success(""),
+            success("state = running\npid = 32\n"),
+            success(""),
+            success(""),
+        ]);
+        let readiness = FakeReadiness(false);
+        let manager = InstanceManager::new(&application, &runner, &readiness)
+            .with_timeouts(Duration::from_secs(30), Duration::ZERO);
+        let mut config = RuntimeConfig::default();
+        config.server.port = unused_port();
+        let started = Instant::now();
+
+        let error = manager
+            .start("restarting", &config, Path::new("/gateway"))
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(error.kind(), InstanceErrorKind::Serving);
+        assert!(error.to_string().contains("restarted by launchd"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn last_error_line_finds_the_gateway_failure() {
+        let (root, _) = application("error-line");
+        fs::create_dir_all(&root).unwrap();
+        let log = root.join("stderr.log");
+        fs::write(
+            &log,
+            "model_state_transition from=Verifying\nError: WorkerStartup(\"no pages\")\n\n",
+        )
+        .unwrap();
+        assert_eq!(
+            last_error_line(&log).as_deref(),
+            Some("Error: WorkerStartup(\"no pages\")")
+        );
+        assert_eq!(last_error_line(&root.join("missing.log")), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_failure_message_reads_failed_startup_bodies() {
+        let failed = r#"{"status":"failed","phase":"failed","error":{"code":"KV_MEMORY_INSUFFICIENT","message":"too small"}}"#;
+        assert_eq!(
+            startup_failure_message(failed).as_deref(),
+            Some("KV_MEMORY_INSUFFICIENT: too small")
+        );
+        assert_eq!(
+            startup_failure_message(r#"{"status":"failed","error":null}"#).as_deref(),
+            Some("startup failed without an error report")
+        );
+        assert_eq!(startup_failure_message(r#"{"status":"starting"}"#), None);
+        assert_eq!(startup_failure_message("not json"), None);
     }
 
     #[test]

@@ -11,11 +11,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
-cli_describe "Validate a launchd-managed mlx-air instance: detached start, ps, bounded attach, a real request, and stop."
+cli_describe "Validate a launchd-managed mlx-air instance: detached start, ps, bounded attach, a real request, stop, and a fast failure for an instance that cannot start."
 cli_option MODEL --model MLX_AIR_DETACHED_MODEL string "mlx-community/Qwen2.5-7B-Instruct-4bit" "Model to serve."
 cli_option PORT --port MLX_AIR_DETACHED_PORT port 18004 "Instance port."
 cli_option NAME --name MLX_AIR_DETACHED_NAME string "" "Instance name; defaults to detached-<pid>."
 cli_option REQUEST_TIMEOUT --request-timeout MLX_AIR_DETACHED_REQUEST_TIMEOUT int 180 "Seconds allowed for the chat request."
+cli_option FAILURE_BOUND --failure-bound MLX_AIR_DETACHED_FAILURE_BOUND int 300 \
+    "Seconds an instance that cannot start may take to report failure (the startup timeout is 1800)."
 cli_option UV_CACHE --uv-cache-dir MLX_AIR_HOST_UV_CACHE_DIR path "$HOME/Library/Caches/uv" \
     "uv cache shared with the isolated test home."
 cli_option KEEP_WORK_DIR --keep-work-dir MLX_AIR_DETACHED_KEEP_WORK_DIR bool 0 \
@@ -36,6 +38,9 @@ INSTANCE_DIR="$TEST_HOME/Library/Application Support/mlx-air/instances/$NAME"
 STDOUT_LOG="$TEST_HOME/Library/Logs/mlx-air/$NAME.stdout.log"
 STDERR_LOG="$TEST_HOME/Library/Logs/mlx-air/$NAME.stderr.log"
 SOCKET="/tmp/mlx-air-$(id -u)/instance-$NAME.sock"
+BROKEN_NAME="$NAME-broken"
+BROKEN_DIR="$TEST_HOME/Library/Application Support/mlx-air/instances/$BROKEN_NAME"
+BROKEN_OUTPUT="$WORK_DIR/broken-start.txt"
 
 cleanup() {
     local status=$?
@@ -44,8 +49,14 @@ cleanup() {
         kill -INT "$ATTACH_PID" >/dev/null 2>&1
         wait "$ATTACH_PID" >/dev/null 2>&1
     fi
+    if [[ -n "${BROKEN_PID:-}" ]] && kill -0 "$BROKEN_PID" >/dev/null 2>&1; then
+        kill -TERM "$BROKEN_PID" >/dev/null 2>&1
+    fi
     if [[ -x "$STAGE_DIR/bin/mlx-air" ]] && [[ -d "$INSTANCE_DIR" ]]; then
         HOME="$TEST_HOME" "$STAGE_DIR/bin/mlx-air" stop "$NAME" >/dev/null 2>&1
+    fi
+    if [[ -x "$STAGE_DIR/bin/mlx-air" ]] && [[ -d "$BROKEN_DIR" ]]; then
+        HOME="$TEST_HOME" "$STAGE_DIR/bin/mlx-air" stop "$BROKEN_NAME" >/dev/null 2>&1
     fi
     if [[ "$status" -ne 0 ]]; then
         echo "managed stdout log after validation failure:" >&2
@@ -63,11 +74,11 @@ cleanup() {
 
 trap cleanup EXIT
 
-echo "[1/7] Stage the managed-service distribution"
+echo "[1/8] Stage the managed-service distribution"
 "$ROOT/scripts/stage-mlx-air.sh" --output-dir "$STAGE_DIR"
 mkdir -p "$TEST_HOME"
 
-echo "[2/7] Start one detached instance and wait for readiness"
+echo "[2/8] Start one detached instance and wait for readiness"
 HOME="$TEST_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$STAGE_DIR/bin/mlx-air" serve \
     --model "$MODEL" \
@@ -82,14 +93,14 @@ SERVER_PID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["p
 kill -0 "$SERVER_PID"
 echo "detached_start_ok=1"
 
-echo "[3/7] Validate managed-instance status"
+echo "[3/8] Validate managed-instance status"
 HOME="$TEST_HOME" "$STAGE_DIR/bin/mlx-air" ps | tee "$PS_OUTPUT"
 grep -F "$NAME" "$PS_OUTPUT" >/dev/null
 grep -F "http://127.0.0.1:$PORT" "$PS_OUTPUT" >/dev/null
 grep -F "running" "$PS_OUTPUT" >/dev/null
 echo "ps_ok=1"
 
-echo "[4/7] Bound attach with SIGINT without stopping the service"
+echo "[4/8] Bound attach with SIGINT without stopping the service"
 HOME="$TEST_HOME" "$STAGE_DIR/bin/mlx-air" attach "$NAME" >"$ATTACH_OUTPUT" 2>&1 &
 ATTACH_PID=$!
 sleep 1
@@ -101,7 +112,7 @@ curl --silent --fail --max-time 2 "http://127.0.0.1:$PORT/ready" >/dev/null
 kill -0 "$SERVER_PID"
 echo "attach_interrupt_ok=1"
 
-echo "[5/7] Serve one request through the detached instance"
+echo "[5/8] Serve one request through the detached instance"
 curl --silent --show-error --fail --max-time "$REQUEST_TIMEOUT" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: managed\"}],\"max_tokens\":16,\"temperature\":0.0,\"stream\":false}" \
@@ -109,7 +120,7 @@ curl --silent --show-error --fail --max-time "$REQUEST_TIMEOUT" \
 python3 -c 'import json,sys; data=json.load(open(sys.argv[1])); assert data["choices"][0]["message"]["content"]' "$RESPONSE"
 echo "managed_request_ok=1"
 
-echo "[6/7] Stop the instance while preserving logs"
+echo "[6/8] Stop the instance while preserving logs"
 HOME="$TEST_HOME" "$STAGE_DIR/bin/mlx-air" stop "$NAME"
 test ! -d "$INSTANCE_DIR"
 test -f "$STDOUT_LOG"
@@ -125,7 +136,7 @@ if launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; then
 fi
 echo "managed_stop_ok=1"
 
-echo "[7/7] Confirm active registration is gone"
+echo "[7/8] Confirm active registration is gone"
 HOME="$TEST_HOME" "$STAGE_DIR/bin/mlx-air" ps | tee "$PS_OUTPUT"
 if grep -F "$NAME" "$PS_OUTPUT" >/dev/null; then
     echo "stopped instance remains in mlx-air ps" >&2
@@ -133,4 +144,49 @@ if grep -F "$NAME" "$PS_OUTPUT" >/dev/null; then
 fi
 echo "registration_removed=1"
 echo "logs_preserved=1"
+
+echo "[8/8] An instance whose worker cannot start fails fast"
+# 1% of the working set cannot hold the weights, so the native worker refuses
+# to start with KV_MEMORY_INSUFFICIENT and launchd restarts the gateway.
+BROKEN_STARTED=$SECONDS
+HOME="$TEST_HOME" UV_CACHE_DIR="$UV_CACHE" \
+    "$STAGE_DIR/bin/mlx-air" serve \
+    --model "$MODEL" \
+    --backend native-mlx \
+    --memory-utilization 0.01 \
+    --port "$PORT" \
+    --detach \
+    --name "$BROKEN_NAME" >"$BROKEN_OUTPUT" 2>&1 &
+BROKEN_PID=$!
+while kill -0 "$BROKEN_PID" >/dev/null 2>&1; do
+    if ((SECONDS - BROKEN_STARTED > FAILURE_BOUND)); then
+        echo "failed detached start did not finish within ${FAILURE_BOUND}s" >&2
+        exit 1
+    fi
+    sleep 0.5
+done
+if wait "$BROKEN_PID"; then
+    echo "detached start with insufficient memory unexpectedly succeeded" >&2
+    exit 1
+fi
+unset BROKEN_PID
+cat "$BROKEN_OUTPUT"
+grep -E "failed to start|restarted by launchd" "$BROKEN_OUTPUT" >/dev/null
+# The failure names the setting to change.
+grep -F -e "raise --memory-utilization" "$BROKEN_OUTPUT" \
+    "$TEST_HOME/Library/Logs/mlx-air/$BROKEN_NAME.stderr.log" >/dev/null
+# launchd finishes `bootout` asynchronously; allow it a few seconds.
+for _ in $(seq 1 20); do
+    if ! launchctl print "gui/$(id -u)/com.mlx-air.instance.$BROKEN_NAME" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.5
+done
+if launchctl print "gui/$(id -u)/com.mlx-air.instance.$BROKEN_NAME" >/dev/null 2>&1; then
+    echo "launchd still runs the failed instance" >&2
+    exit 1
+fi
+HOME="$TEST_HOME" "$STAGE_DIR/bin/mlx-air" stop "$BROKEN_NAME" >/dev/null 2>&1 || true
+echo "failed_start_seconds=$((SECONDS - BROKEN_STARTED))"
+echo "failed_start_fast_ok=1"
 echo "cli_serve_detached_ok=1"

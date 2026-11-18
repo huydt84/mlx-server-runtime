@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import OrderedDict
 from contextlib import suppress
@@ -274,6 +275,8 @@ class NativeContinuousScheduler:
         self._scheduler_round = 0
         self._last_step_prefilled = False
         self._in_flight: _SchedulerInFlight | None = None
+        self._kv_admission_waits = 0
+        self._kv_prefix_reclaimed_pages = 0
 
     def submit(self, request: SchedulableRequest) -> None:
         if request.request_id in self._waiting or request.request_id in self._running:
@@ -691,9 +694,15 @@ class NativeContinuousScheduler:
         if decode_work and (not prefill_states or self._last_step_prefilled):
             self._last_step_prefilled = False
             return decode_work
-        return self._select_prefill(
+        selected = self._select_prefill(
             prefill_states, decode_waiting=bool(decode_work), timings=timings
         )
+        if not selected and decode_work:
+            # Every prefill candidate is waiting for KV pages; keep decoding
+            # so running requests finish and release theirs.
+            self._last_step_prefilled = False
+            return decode_work
+        return selected
 
     @staticmethod
     def _decode_work(state: _ScheduledState) -> _SelectedWork:
@@ -730,15 +739,39 @@ class NativeContinuousScheduler:
             cache_coordinator=self._cache_coordinator,
             timings=timings,
         )
+        kv_available = self._kv_available_pages()
+        admission_blocked = False
         for state in prefill_states[:prefill_limit]:
             request_id = state.work.request_id
             if state.cache_handle is None:
-                self._waiting.pop(request_id, None)
+                if admission_blocked:
+                    continue
                 probe = state.cached_probe
                 if probe is None:
                     probe_started = time.perf_counter()
                     probe = self._cache_coordinator.probe(state.work.prompt_token_ids)
                     timings["scheduler_cache_probe_ms"] += _elapsed_ms(probe_started)
+                if kv_available is not None:
+                    pages, page_size = kv_available
+                    needed = self._admission_pages(state, probe, page_size)
+                    if needed > pages:
+                        freed = self._reclaim_prefix_pages(needed - pages)
+                        if freed:
+                            # Eviction may have dropped the matched entry.
+                            probe = self._cache_coordinator.probe(
+                                state.work.prompt_token_ids
+                            )
+                            pages += freed
+                            needed = self._admission_pages(state, probe, page_size)
+                    if needed > pages and self._running:
+                        # FCFS: later arrivals wait behind this one so a long
+                        # request is not starved by shorter ones.
+                        state.cached_probe = probe
+                        admission_blocked = True
+                        self._kv_admission_waits += 1
+                        continue
+                    kv_available = (pages - needed, page_size)
+                self._waiting.pop(request_id, None)
                 state.cached_probe = None
                 acquire_started = time.perf_counter()
                 admission = self._cache_coordinator.acquire(
@@ -771,6 +804,52 @@ class NativeContinuousScheduler:
             )
         self._last_step_prefilled = True
         return selected
+
+    def _kv_available_pages(self) -> tuple[int, int] | None:
+        """Return free KV pages not promised to running requests.
+
+        Each running request may still grow to its prompt plus ``max_tokens``;
+        those pages stay promised so admitting new work never makes a running
+        request fail for lack of KV capacity.
+        """
+
+        capacity = getattr(self._cache_coordinator, "kv_admission_capacity", None)
+        if not callable(capacity):
+            return None
+        resolved = capacity()
+        if resolved is None:
+            return None
+        free_pages, page_size = resolved
+        promised = 0
+        for state in self._running.values():
+            if state.cancel_requested or state.finish_requested:
+                continue
+            final = len(state.work.prompt_token_ids) + max(0, state.work.max_tokens)
+            promised += max(
+                0,
+                math.ceil(final / page_size)
+                - math.ceil(state.cache_length / page_size),
+            )
+        return free_pages - promised, page_size
+
+    def _reclaim_prefix_pages(self, pages: int) -> int:
+        """Free ``pages`` KV pages by evicting unpinned prefix-cache entries."""
+
+        reclaim = getattr(self._cache_coordinator, "reclaim_pages", None)
+        if not callable(reclaim):
+            return 0
+        freed = int(reclaim(pages))
+        self._kv_prefix_reclaimed_pages += freed
+        return freed
+
+    @staticmethod
+    def _admission_pages(state: _ScheduledState, probe: object, page_size: int) -> int:
+        """Return pages a waiting request needs through its last token."""
+
+        final = len(state.work.prompt_token_ids) + max(0, state.work.max_tokens)
+        reused = int(getattr(probe, "matched_pages", 0) or 0)
+        # One extra page covers a copy-on-write split of a shared last page.
+        return max(0, math.ceil(final / page_size) - reused) + 1
 
     def _prefill_candidates(self) -> list[_ScheduledState]:
         """Return running and waiting states that still have prompt tokens."""
@@ -1198,6 +1277,8 @@ class NativeContinuousScheduler:
                     "batch_size": batch_size,
                     "waiting_requests": len(self._waiting),
                     "running_requests": len(self._running),
+                    "kv_admission_waits": self._kv_admission_waits,
+                    "kv_prefix_reclaimed_pages": self._kv_prefix_reclaimed_pages,
                     "scheduler_tick_latency_ms": max(
                         1, int((time.perf_counter() - started) * 1000)
                     ),

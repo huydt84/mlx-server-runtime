@@ -18,9 +18,10 @@ _PROMPT_KINDS = {
     "decode-promoting",
     "shared-prefix",
     "cache-pressure",
+    "mail-assistant",
 }
 _LOAD_MODES = {"sequential", "burst", "closed-loop"}
-_CACHE_STATES = {"cold", "warm-prefix", "cache-pressure"}
+_CACHE_STATES = {"cold", "warm-prefix", "primed", "cache-pressure"}
 _BACKENDS = {"v1", "native-mlx"}
 _PROFILERS = {"pipeline", "graph"}
 _DEFAULT_REVISION = "resolve-at-run"

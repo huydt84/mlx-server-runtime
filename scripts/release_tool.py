@@ -11,9 +11,8 @@ import re
 import stat
 import sys
 import tarfile
-from pathlib import Path
 import tomllib
-
+from pathlib import Path
 
 SEMVER_PATTERN = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -172,19 +171,17 @@ def create_archive(
             raise ReleaseError(f"refusing to replace existing release output: {path}")
 
     archive_root = f"mlx-air-{version}"
-    with archive.open("xb") as raw_archive:
-        with gzip.GzipFile(
+    with (
+        archive.open("xb") as raw_archive,
+        gzip.GzipFile(
             filename="", mode="wb", fileobj=raw_archive, mtime=0
-        ) as compressed:
-            with tarfile.open(
-                fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT
-            ) as tar:
-                _add_tar_entry(tar, stage_dir, archive_root)
-                for path in sorted(
-                    stage_dir.rglob("*"), key=lambda item: item.as_posix()
-                ):
-                    relative_path = path.relative_to(stage_dir).as_posix()
-                    _add_tar_entry(tar, path, f"{archive_root}/{relative_path}")
+        ) as compressed,
+        tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as tar,
+    ):
+        _add_tar_entry(tar, stage_dir, archive_root)
+        for path in sorted(stage_dir.rglob("*"), key=lambda item: item.as_posix()):
+            relative_path = path.relative_to(stage_dir).as_posix()
+            _add_tar_entry(tar, path, f"{archive_root}/{relative_path}")
 
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     checksum_file.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
@@ -199,9 +196,9 @@ def _add_tar_entry(tar: tarfile.TarFile, path: Path, archive_name: str) -> None:
     info.gname = "wheel"
     info.mtime = 0
     info.pax_headers = {}
-    if path.is_dir():
-        info.mode = 0o755
-    elif archive_name.endswith(("/bin/mlx-air", "/bin/mlx_runtime_gateway")):
+    if path.is_dir() or archive_name.endswith(
+        ("/bin/mlx-air", "/bin/mlx_runtime_gateway")
+    ):
         info.mode = 0o755
     else:
         info.mode = 0o644

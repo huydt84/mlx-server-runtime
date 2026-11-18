@@ -118,6 +118,11 @@ impl StagedCli {
         )
         .unwrap();
         fs::write(
+            root.join("python/mlx_benchmark/mail_assistant.py"),
+            include_str!("../../../../python/mlx_benchmark/mail_assistant.py"),
+        )
+        .unwrap();
+        fs::write(
             root.join("python/mlx_benchmark/report.py"),
             include_str!("../../../../python/mlx_benchmark/report.py"),
         )
@@ -1006,7 +1011,8 @@ fn request_failure_preserves_measurements_and_reaps_process_group() {
     let results = read_results(&output_directory);
     assert_eq!(results["status"], "failed");
     assert_eq!(results["failure_stage"], "measurement");
-    assert_eq!(all_requests(&results).len(), 11);
+    // The run stops after the first trial (two sequential requests) fails.
+    assert_eq!(all_requests(&results).len(), 2);
     assert!(all_requests(&results)
         .iter()
         .all(|request| request["status"] == "failed"));
@@ -1037,11 +1043,12 @@ fn ambiguous_transport_failure_does_not_duplicate_an_inference_post() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(50));
-    // 6 warmup requests (one per concurrency slot) plus 11 measured requests,
-    // one of which is dropped and must not be retried.
-    assert_eq!(fs::read_to_string(request_count_file).unwrap().trim(), "17");
+    // 6 warmup requests (one per concurrency slot) plus the first trial's 2
+    // measured requests, one of which is dropped and must not be retried; the
+    // failed trial stops the run.
+    assert_eq!(fs::read_to_string(request_count_file).unwrap().trim(), "8");
     let results = read_results(&output_directory);
-    assert_eq!(all_requests(&results).len(), 11);
+    assert_eq!(all_requests(&results).len(), 2);
     assert_processes_reaped(&pid_file);
 }
 

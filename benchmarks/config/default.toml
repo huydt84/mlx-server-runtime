@@ -49,6 +49,15 @@ kind = "cache-pressure"
 count = 16
 target_tokens = 2048
 
+# A local mail assistant's traffic: the client's real system prompt and
+# summary, triage, and digest task prompts with synthetic emails whose bodies
+# range up to the client's 2000-token cap. Prompts cycle through the three
+# tasks; each task's requests share their whole system message.
+[prompts.mail_assistant]
+kind = "mail-assistant"
+count = 48
+target_tokens = 2400
+
 # `tokenizer` defaults to `checkpoint`; `revision` defaults to the revision
 # the server reports at readiness. `cold_cache_allowance_tokens` (default 0) is
 # how many cached tokens a cold-cache request may reuse from a chat-template
@@ -69,18 +78,22 @@ checkpoint = "mlx-community/gemma-3-270m-it-qat-8bit"
 
 # Qwen3.5 hybrid (Gated DeltaNet + full attention) 27B checkpoints at
 # sub-2-bit weights: a 1-bit affine pack and a Hadamard-rotated ternary pack.
+# The checkpoint the mail assistant serves.
+[models.mail]
+checkpoint = "mlx-community/Qwen3-8B-4bit"
+
 [models.hybrid_binary]
 checkpoint = "prism-ml/Bonsai-27B-mlx-1bit"
 
 [models.hybrid_ternary]
 checkpoint = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
 
-# Native-MLX rejects a request with KV_CAPACITY_EXHAUSTED instead of queueing
-# it, and never reclaims prefix-cache pages for new requests, so the KV pool
-# must hold every in-flight request plus the prefix cache. 2 GiB holds ~14.5k
-# tokens on Qwen3-4B (144 KiB/token). The prefix cache counts each 16-token page
-# as one entry: 256 entries (4k tokens) keep both shared_prefix_warm_c16 prefix
-# groups and their suffixes, and leave ~10k tokens for in-flight requests.
+# These configurations pin the KV pool and the prefix-cache entry limit so
+# their results stay comparable across versions; native-mlx's own defaults size
+# both from the memory planner (see mail_native). 2 GiB holds ~14.5k tokens on
+# Qwen3-4B (144 KiB/token). The prefix cache counts each 16-token page as one
+# entry: 256 entries (4k tokens) keep both shared_prefix_warm_c16 prefix groups
+# and their suffixes, and leave ~10k tokens for in-flight requests.
 [runtime_configurations.serial]
 backend = "native-mlx"
 environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "serial", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "2147483648", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "256" }
@@ -97,9 +110,24 @@ environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUT
 backend = "v1"
 environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "0", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "0" }
 
+# The v1 backend with every worker default, as `mlx-air serve --backend v1`
+# runs it, including its prompt cache and serial request handling.
+[runtime_configurations.mail_v1]
+backend = "v1"
+environment = {}
+
+# native-mlx with its defaults, as `mlx-air serve` runs it: the overlap
+# scheduler and a KV pool sized by the memory planner.
+[runtime_configurations.mail_native]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1" }
+
 # load_mode: sequential (concurrency 1), burst (all requests at once), or
 # closed-loop (keep `concurrency` requests in flight).
-# cache_state: cold, warm-prefix, or cache-pressure.
+# cache_state: cold, warm-prefix, primed, or cache-pressure. `warm-prefix` and
+# `primed` both prime each shared prefix once per trial; `warm-prefix` requires
+# every request to reuse part of its prompt, while `primed` records whatever
+# the backend reuses, so backends with and without prefix reuse compare.
 # primary_metric: ttft, tpot, end_to_end_latency, or
 # aggregate_output_tokens_per_second.
 
@@ -196,6 +224,30 @@ requests_per_trial = 16
 cache_state = "cache-pressure"
 primary_metric = "end_to_end_latency"
 
+# One email at a time, as the interactive lane sends them, and two in flight,
+# the client's concurrency limit. The client sends JSON tasks without
+# streaming; 400 is its summary output cap. Every trial primes each task's
+# system message once, as a long-running client would have sent it before.
+[workloads.mail_assistant_c1]
+prompt_group = "mail_assistant"
+output_tokens = 400
+streaming = false
+load_mode = "sequential"
+concurrency = 1
+requests_per_trial = 6
+cache_state = "primed"
+primary_metric = "end_to_end_latency"
+
+[workloads.mail_assistant_c2]
+prompt_group = "mail_assistant"
+output_tokens = 400
+streaming = false
+load_mode = "closed-loop"
+concurrency = 2
+requests_per_trial = 6
+cache_state = "primed"
+primary_metric = "end_to_end_latency"
+
 # A focus narrows any suite to the listed models and workloads.
 
 [focuses.gateway]
@@ -217,6 +269,10 @@ workloads = ["steady_short_c4", "steady_short_c8", "mixed_c8"]
 [focuses.cache]
 models = ["primary", "dense"]
 workloads = ["cold_prefill_2k_c1", "shared_prefix_warm_c16", "cache_pressure_c4"]
+
+[focuses.mail_assistant]
+models = ["mail"]
+workloads = ["mail_assistant_c1", "mail_assistant_c2"]
 
 # Diagnostics run after measurement in separate processes and never produce
 # benchmark rows. `--profile representative` runs the first target of each
@@ -287,3 +343,12 @@ trials = 2
 runtime_configurations = ["overlap", "mlx_lm"]
 diagnostics = []
 coverage = { hybrid_binary = ["interactive_stream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "mixed_c8"], hybrid_ternary = ["interactive_stream_c1", "cold_prefill_2k_c1", "decode_128_c1", "steady_short_c4", "mixed_c8"] }
+
+# The mail assistant's workload on the backend it runs today (v1) and on
+# native-mlx.
+[suites.mail_assistant]
+rounds = 2
+trials = 2
+runtime_configurations = ["mail_v1", "mail_native"]
+diagnostics = []
+coverage = { mail = ["mail_assistant_c1", "mail_assistant_c2"] }

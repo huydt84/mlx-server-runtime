@@ -342,6 +342,10 @@ New and changed scripts declare their settings with
 `mlx-host-validation/scripts/lib/cli.sh` (`cli_option`, then `cli_parse "$@"`
 before any side effect) instead of reading environment variables directly or
 hardcoding ports, checkpoints, or timeouts.
+Scripts that start a gateway wait for it with `gateway_wait_ready` from
+`mlx-host-validation/scripts/lib/gateway.sh`. It returns as soon as `/ready`
+answers, and fails at once, printing the log tail, when the gateway exits or
+`/startup` reports a failed startup, instead of waiting out the timeout.
 
 ## Keep Changes Reviewable
 

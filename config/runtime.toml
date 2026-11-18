@@ -5,8 +5,9 @@ port = 8000
 [worker]
 python = "python/.venv/bin/python"
 module = "mlx_worker.main"
-# Experimental backend. Keep v1 default unless explicitly testing native-v2.
-backend = "v1"
+# native-mlx serves the architectures it implements with a paged KV cache.
+# Use "v1" (mlx-lm) for other checkpoints and for vlm_model.
+backend = "native-mlx"
 model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 # Uncomment to enable VLM support:
 # vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
@@ -22,10 +23,22 @@ max_pending_requests = 64
 max_active_requests = 16
 max_prompt_tokens = 32768
 max_completion_tokens = 4096
-max_total_tokens_per_request = 65536
+# Unset: native-mlx derives the limit from the KV pool (at most 65536).
+# Set explicitly, the worker refuses to start if the pool cannot hold one
+# request of this size.
+# max_total_tokens_per_request = 65536
 request_timeout_seconds = 300
 # Max images in a single VLM request (matches Python worker limit).
 # max_vlm_images = 5
+
+[memory]
+# Fraction (0, 1] of the Metal recommended working set for weights,
+# activations, and the native-mlx KV pool together (like vLLM's
+# --gpu-memory-utilization). CLI: --memory-utilization.
+utilization = 0.5
+# Absolute KV pool size; overrides utilization for the pool.
+# CLI: --kv-cache-memory. Accepts bytes or a string such as "4GiB".
+# kv_cache_bytes = "4GiB"
 
 [telemetry]
 enable_prometheus = true

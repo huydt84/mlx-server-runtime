@@ -19,7 +19,7 @@
 #   - cancellation cleanup through public streaming request cancellation
 #   - failure non-publication through an invalid public request
 #   - eviction through a deliberately tiny prefix-cache entry limit
-#   - default v1 public gateway request against the same checkpoint
+#   - v1 public gateway request against the same checkpoint
 #   - benchmark comparison of native block-hash and v1 on streaming and
 #     non-streaming single requests, shared-prefix miss/exact/partial/mixed
 #     ratios, concurrent few-long/many-short, and concurrent few-short/many-long
@@ -68,6 +68,8 @@ PYTHON_DIR="$ROOT/python"
 export PYTHONPATH="$PYTHON_DIR${PYTHONPATH:+:$PYTHONPATH}"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Validate the native-mlx block-hash prefix cache: hits, eviction, incompatible-key misses, benchmark and graph profile against v1."
 cli_option CHECKPOINT --checkpoint MLX_BLOCK_HASH_CHECKPOINT string \
     "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint served by both gateways."
@@ -94,7 +96,6 @@ cli_require_free_port "$V1_PORT" --v1-port
 REQUEST_DIR="$TMP_ROOT/requests"
 NATIVE_CONFIG="$TMP_ROOT/runtime-native.toml"
 V1_CONFIG="$TMP_ROOT/runtime-v1.toml"
-HEALTH_CAPTURE="$TMP_ROOT/health.txt"
 NATIVE_LOG="$TMP_ROOT/native.log"
 V1_LOG="$TMP_ROOT/v1.log"
 CAPTURE="$TMP_ROOT/capture.json"
@@ -121,21 +122,7 @@ trap cleanup EXIT
 wait_healthy() {
     local log_path="$1"
     local port="$2"
-    rm -f "$HEALTH_CAPTURE"
-    for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
-        if [[ -n "$GATEWAY_PID" ]] && ! kill -0 "$GATEWAY_PID" >/dev/null 2>&1; then
-            echo "gateway exited unexpectedly; inspect $log_path" >&2
-            return 1
-        fi
-        if curl -fsS "http://127.0.0.1:${port}/health" >"$HEALTH_CAPTURE"; then
-            if grep -qx 'healthy' "$HEALTH_CAPTURE"; then
-                return 0
-            fi
-        fi
-        sleep 1
-    done
-    echo "gateway did not become healthy; inspect $log_path" >&2
-    return 1
+    gateway_wait_ready "$port" "$HEALTH_TIMEOUT" "$GATEWAY_PID" "$log_path"
 }
 
 start_gateway() {

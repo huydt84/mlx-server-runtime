@@ -1040,6 +1040,13 @@ class PagedKVCacheBackend:
             staged_values=staged_values,
         )
 
+    def free_page_count(self) -> int:
+        """Return pages neither owned by a request nor reserved by a step."""
+
+        return len(self._free_pages) - sum(
+            1 for page in self._reserved_pages if self._is_free(page)
+        )
+
     def preflight(
         self,
         caches: tuple[RequestCache, ...],
@@ -1048,9 +1055,7 @@ class PagedKVCacheBackend:
         paged = tuple(_require_paged_cache(cache) for cache in caches)
         if len(paged) != len(append_lengths):
             raise ValueError("paged preflight requires matching requests")
-        available = len(self._free_pages) - sum(
-            1 for page in self._reserved_pages if self._is_free(page)
-        )
+        available = self.free_page_count()
         results: list[str | None] = []
         for cache, append_length in zip(paged, append_lengths, strict=True):
             required_pages = math.ceil((cache.size() + append_length) / self.page_size)

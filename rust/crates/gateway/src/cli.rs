@@ -102,6 +102,15 @@ struct ServeArgs {
     /// HTTP listen port.
     #[arg(long)]
     port: Option<u16>,
+    /// Fraction (0, 1] of the Metal recommended working set for weights,
+    /// activations, and the KV cache together. The KV pool gets what is left
+    /// after the weights and activation reserve.
+    #[arg(long, value_name = "FRACTION", value_parser = parse_memory_utilization)]
+    memory_utilization: Option<f32>,
+    /// Absolute KV cache pool size, such as `4GiB` or `512MiB`; overrides
+    /// `--memory-utilization` for the pool.
+    #[arg(long, value_name = "SIZE", value_parser = crate::parse_byte_size)]
+    kv_cache_memory: Option<u64>,
     /// Start a managed detached instance.
     #[arg(long, requires_all = ["name", "port"])]
     detach: bool,
@@ -493,6 +502,13 @@ impl RuntimeOperations for ProductionRuntime {
     }
 }
 
+fn parse_memory_utilization(raw: &str) -> Result<f32, String> {
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("invalid memory utilization {raw:?}"))?;
+    crate::MemoryConfig::validate_utilization(value)
+}
+
 fn resolve_serve_context(
     args: &ServeArgs,
 ) -> Result<(DistributionPaths, ApplicationPaths, crate::RuntimeConfig), RuntimeFailure> {
@@ -507,6 +523,8 @@ fn resolve_serve_context(
         model: args.model.clone(),
         backend: args.backend.map(Into::into),
         port: args.port,
+        memory_utilization: args.memory_utilization,
+        kv_cache_bytes: args.kv_cache_memory,
     };
     let config = resolve_runtime_config(
         &distribution.default_config,

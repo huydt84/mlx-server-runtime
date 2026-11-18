@@ -37,6 +37,26 @@ curl -fsSL \
 Pass `--port` to check the port you will serve on, for example
 `mlx-air doctor --port 8080`, or `--config` to read it from a runtime config.
 
+Serve a model. `--memory-utilization` (default `0.5`) is the share of the
+Mac's Metal working set for the weights and KV cache together, like vLLM's
+`--gpu-memory-utilization`; `--kv-cache-memory 4GiB` pins the KV pool instead
+(see [`[memory]`](docs/reference/configuration.md#memory)):
+
+```bash
+~/.local/bin/mlx-air serve --model mlx-community/Qwen3-8B-4bit \
+  --memory-utilization 0.6
+```
+
+The default backend is `native-mlx`, which serves the architectures listed in
+[native-mlx](docs/reference/native-mlx-v2.md#support-boundary) with a paged KV
+cache. Add `--backend v1` to serve any other `mlx-lm` checkpoint or a VLM; a
+checkpoint native-mlx does not implement fails at startup and names that flag.
+
+With `--detach --name NAME --port PORT` the command returns once the instance
+is ready. If the worker cannot start (for example the memory settings cannot
+hold the model), it stops the launchd service and reports the error right
+away instead of waiting for the startup timeout.
+
 Run the same command again to update. To install or roll back to a specific
 release, pass its version to the installer:
 

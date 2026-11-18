@@ -32,6 +32,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON_DIR="$ROOT/python"
 # shellcheck source=lib/cli.sh
 source "$ROOT/mlx-host-validation/scripts/lib/cli.sh"
+# shellcheck source=lib/gateway.sh
+source "$ROOT/mlx-host-validation/scripts/lib/gateway.sh"
 cli_describe "Profile the whole native-mlx inference pipeline for one bounded public-gateway request."
 cli_option CHECKPOINT --checkpoint MLX_PROFILE_CHECKPOINT string \
     "mlx-community/Qwen2.5-7B-Instruct-4bit" "Checkpoint or local path to serve."
@@ -83,17 +85,7 @@ trap cleanup EXIT
 echo "[1/3] Start native-mlx gateway with bounded pipeline profiling"
 cargo run -p mlx_runtime_gateway --bin mlx_runtime_gateway >"$GATEWAY_LOG" 2>&1 &
 GATEWAY_PID=$!
-for _ in $(seq 1 "$HEALTH_TIMEOUT"); do
-    if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-        break
-    fi
-    if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-        tail -100 "$GATEWAY_LOG" >&2
-        exit 1
-    fi
-    sleep 1
-done
-curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null
+gateway_wait_ready "$PORT" "$HEALTH_TIMEOUT" "$GATEWAY_PID" "$GATEWAY_LOG"
 
 echo "[2/3] Run bounded public-gateway workload and join timeline"
 PYTHONPATH="$PYTHON_DIR" uv --directory "$PYTHON_DIR" run python "$HELPER" \
