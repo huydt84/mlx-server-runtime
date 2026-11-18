@@ -17,6 +17,7 @@ from ..ipc import (
     CancelRequest,
     ModelLoadProgress,
     ModelStatus,
+    TranscriptionRequest,
     WorkerCommandError,
     WorkerError,
     WorkerReady,
@@ -42,6 +43,9 @@ from .memory import KVMemorySettings
 from .pipeline_profile import PipelineProfiler
 from .runtime import NativeRuntime as NativeRequestRuntime
 from .scheduler import NativeContinuousScheduler
+
+# Largest single socket read; audio uploads arrive as multi-megabyte lines.
+_RECV_BYTES = 1 << 20
 
 __all__ = [
     "NativeParityResult",
@@ -133,6 +137,9 @@ def run_native_worker(
     )
     client.sendall(encode_bootstrap_message(WorkerReady()))
 
+    from ..transcription import TranscriptionService
+
+    transcription = TranscriptionService(getattr(config, "transcription_model", None))
     buffer = bytearray()
     while True:
         raw = _read_line(client, buffer, block=runtime.idle())
@@ -147,6 +154,9 @@ def run_native_worker(
                     raise ValueError("unsupported worker command")
                 if isinstance(command, CancelRequest):
                     runtime.cancel(command.request_id)
+                elif isinstance(command, TranscriptionRequest):
+                    # Runs to completion here; text scheduling resumes after.
+                    client.sendall(encode_event(transcription.handle(command)))
                 elif isinstance(command, BenchmarkResetRequest):
                     if not runtime.idle():
                         raise RuntimeError("benchmark reset requires an idle scheduler")
@@ -314,18 +324,27 @@ def _warmup_prompt_lengths(executor: Any) -> tuple[int, ...]:
 
 
 def _read_line(client: socket, buffer: bytearray, *, block: bool) -> bytes | None:
-    newline = buffer.find(b"\n")
-    if newline >= 0:
-        line = bytes(buffer[: newline + 1])
-        del buffer[: newline + 1]
-        return line
-    if not block and not select.select([client], [], [], 0)[0]:
-        return None
-    chunk = client.recv(4096)
-    if not chunk:
-        return b""
-    buffer.extend(chunk)
-    return _read_line(client, buffer, block=False)
+    """Read one newline-delimited frame.
+
+    Returns ``None`` when a non-blocking read has no complete frame yet, and
+    ``b""`` on EOF. Bytes of a partial frame stay in ``buffer``.
+    """
+
+    scanned = 0
+    while True:
+        newline = buffer.find(b"\n", scanned)
+        if newline >= 0:
+            line = bytes(buffer[: newline + 1])
+            del buffer[: newline + 1]
+            return line
+        scanned = len(buffer)
+        if not block and not select.select([client], [], [], 0)[0]:
+            return None
+        chunk = client.recv(_RECV_BYTES)
+        if not chunk:
+            return b""
+        buffer.extend(chunk)
+        block = False
 
 
 def _stage_emitter(

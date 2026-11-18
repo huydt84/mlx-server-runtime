@@ -212,6 +212,87 @@ class BenchmarkResetState:
 
 
 @dataclass(frozen=True)
+class TranscriptionRequest:
+    """An audio transcription or translation request.
+
+    Attributes:
+        request_id: Gateway-assigned request identifier.
+        model: Speech-to-text model requested by the client.
+        task: ``"transcribe"`` or ``"translate"`` (any language to English).
+        audio_base64: Uploaded audio file bytes, standard base64 encoded.
+        filename: Uploaded file name, used only as a format hint.
+        language: Input language code or name; detected when ``None``.
+        prompt: Text that conditions the first decoding window.
+        temperature: Sampling temperature; ``0`` enables temperature fallback.
+        word_timestamps: Whether word-level timestamps are requested.
+    """
+
+    request_id: str
+    model: str
+    task: Literal["transcribe", "translate"]
+    audio_base64: str
+    filename: str | None = None
+    language: str | None = None
+    prompt: str | None = None
+    temperature: float = 0.0
+    word_timestamps: bool = False
+
+
+@dataclass(frozen=True)
+class TranscriptionSegment:
+    """One decoded Whisper segment."""
+
+    id: int
+    seek: int
+    start: float
+    end: float
+    text: str
+    tokens: tuple[int, ...]
+    temperature: float
+    avg_logprob: float
+    compression_ratio: float
+    no_speech_prob: float
+
+
+@dataclass(frozen=True)
+class TranscriptionWord:
+    """One word with timestamps."""
+
+    word: str
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
+class TranscriptionResponse:
+    """A completed transcription or translation.
+
+    Attributes:
+        request_id: Request identifier copied from the request.
+        model: Model that served the request.
+        task: Task that was run.
+        text: Full output text.
+        language: Input language as the lowercase English name Whisper uses.
+        duration: Decoded input duration in seconds.
+        segments: Decoded segments.
+        words: Words with timestamps, when requested.
+        audio_decode_latency_ms: Time spent decoding the upload into samples.
+        inference_latency_ms: Time spent in Whisper inference.
+    """
+
+    request_id: str
+    model: str
+    task: Literal["transcribe", "translate"]
+    text: str
+    language: str
+    duration: float
+    segments: tuple[TranscriptionSegment, ...] = ()
+    words: tuple[TranscriptionWord, ...] = ()
+    audio_decode_latency_ms: int | None = None
+    inference_latency_ms: int | None = None
+
+
+@dataclass(frozen=True)
 class WorkerCommandError:
     """A worker-side request failure."""
 
@@ -459,10 +540,32 @@ def _encode_content(
 
 def decode_command(
     raw_line: bytes,
-) -> ChatCompletionRequest | CancelRequest | BenchmarkResetRequest | None:
+) -> (
+    ChatCompletionRequest
+    | CancelRequest
+    | BenchmarkResetRequest
+    | TranscriptionRequest
+    | None
+):
     """Decode a gateway command."""
 
     payload = json.loads(raw_line.decode("utf-8"))
+    if payload.get("type") == "transcription":
+        request = payload["request"]
+        task = request["task"]
+        if task not in ("transcribe", "translate"):
+            raise ValueError(f"unsupported transcription task: {task!r}")
+        return TranscriptionRequest(
+            request_id=request["request_id"],
+            model=request["model"],
+            task=task,
+            audio_base64=request["audio_base64"],
+            filename=request.get("filename"),
+            language=request.get("language"),
+            prompt=request.get("prompt"),
+            temperature=float(request.get("temperature", 0.0)),
+            word_timestamps=bool(request.get("word_timestamps", False)),
+        )
     if payload.get("type") != "chat_completion":
         if payload.get("type") == "cancel_request":
             return CancelRequest(request_id=payload["request_id"])
@@ -502,6 +605,7 @@ def encode_event(
         | WorkerCommandError
         | SchedulerMetricsEvent
         | BenchmarkResetState
+        | TranscriptionResponse
     ),
 ) -> bytes:
     """Encode a worker event."""
@@ -609,6 +713,12 @@ def encode_event(
             "type": "scheduler_metrics",
             "metrics": asdict(event),
         }
+    elif isinstance(event, TranscriptionResponse):
+        response = asdict(event)
+        for key in ("audio_decode_latency_ms", "inference_latency_ms"):
+            if response[key] is None:
+                del response[key]
+        payload = {"type": "transcription", "response": response}
     else:
         payload = {
             "type": "benchmark_reset",
@@ -626,11 +736,31 @@ def decode_event(
     | WorkerCommandError
     | SchedulerMetricsEvent
     | BenchmarkResetState
+    | TranscriptionResponse
     | None
 ):
     """Decode a worker event."""
 
     payload = json.loads(raw_line.decode("utf-8"))
+    if payload.get("type") == "transcription":
+        response = payload["response"]
+        return TranscriptionResponse(
+            request_id=response["request_id"],
+            model=response["model"],
+            task=response["task"],
+            text=response["text"],
+            language=response["language"],
+            duration=response["duration"],
+            segments=tuple(
+                TranscriptionSegment(**{**segment, "tokens": tuple(segment["tokens"])})
+                for segment in response.get("segments", [])
+            ),
+            words=tuple(
+                TranscriptionWord(**word) for word in response.get("words", [])
+            ),
+            audio_decode_latency_ms=response.get("audio_decode_latency_ms"),
+            inference_latency_ms=response.get("inference_latency_ms"),
+        )
     if payload.get("type") == "chat_completion":
         response = payload["response"]
         return ChatCompletionResponse(

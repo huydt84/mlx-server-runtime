@@ -40,6 +40,7 @@ uv run -m mlx_worker.main
 | `MLX_RUNTIME_BACKEND` | Explicit backend selector (`v1` default, `native-mlx` experimental) |
 | `MLX_RUNTIME_MODEL` | Model identifier to load |
 | `MLX_RUNTIME_VLM_MODEL` | Optional VLM model identifier |
+| `MLX_RUNTIME_TRANSCRIPTION_MODEL` | Optional Whisper model identifier for audio endpoints |
 
 ### Exit Codes
 

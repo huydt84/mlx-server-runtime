@@ -578,6 +578,10 @@ impl MetricsRegistry {
                     "mlx_vlm_load_errors_by_backend_total",
                     "Total VLM load errors by backend.",
                 ),
+                (
+                    "mlx_audio_input_ms_by_backend_total",
+                    "Total decoded audio input duration in milliseconds by backend and task.",
+                ),
             ],
         );
         render_labeled_metrics(

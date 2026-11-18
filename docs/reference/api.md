@@ -115,7 +115,9 @@ Gateway package version used by clients that need to record the serving binary.
 
 ### GET /models
 
-List configured models and their status.
+List configured models and their status. The transcription model, when
+configured, is listed with its own state: it is `warming_up` while the worker
+loads it after startup, and audio endpoints return 503 until it is `ready`.
 
 **Response 200:**
 
@@ -258,12 +260,93 @@ data: {"id":"chatcmpl-req-2","object":"chat.completion.chunk","created":17180000
 
 Final chunk has empty `delta` and a `finish_reason`. Stream ends with `data: [DONE]`.
 
+### POST /v1/audio/transcriptions
+
+Transcribe an audio file with the configured Whisper model
+(`worker.transcription_model`, or `mlx-air serve --transcription-model`).
+OpenAI-compatible `multipart/form-data` request.
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F model=mlx-community/whisper-large-v3-turbo-asr-fp16 \
+  -F file=@speech.mp3 \
+  -F response_format=verbose_json \
+  -F "timestamp_granularities[]=word"
+```
+
+**Form fields:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `file` | file | yes | — | Audio file, at most `limits.max_audio_bytes` (25 MiB by default). WAV, MP3, and FLAC decode in the worker; m4a, mp4, ogg, and webm need `ffmpeg` on the worker's `PATH` or in `/opt/homebrew/bin` or `/usr/local/bin` (detached instances run with launchd's minimal `PATH`) |
+| `model` | string | yes | — | Must match the configured transcription model |
+| `language` | string | no | detected | Input language as an ISO-639-1 code (`en`) or Whisper language name (`english`) |
+| `prompt` | string | no | — | Text that conditions the first 30-second window, such as names or vocabulary |
+| `response_format` | string | no | `json` | `json`, `text`, `srt`, `verbose_json`, or `vtt` |
+| `temperature` | float | no | `0` | Between 0 and 1. `0` retries each window at 0.2, 0.4, … 1.0 when the decode looks repetitive or unlikely; any other value decodes at that temperature only |
+| `timestamp_granularities[]` | string | no | `segment` | `segment` and/or `word`; requires `response_format=verbose_json`. `word` adds word-level timestamps |
+
+`stream=true` is rejected with 400: Whisper transcription is not streamed.
+Other OpenAI fields are ignored.
+
+**Response 200 (`json`):**
+
+```json
+{ "text": "Hello there.", "usage": { "type": "duration", "seconds": 2 } }
+```
+
+**Response 200 (`verbose_json`):**
+
+```json
+{
+  "task": "transcribe",
+  "language": "english",
+  "duration": 1.62,
+  "text": "Hello there.",
+  "usage": { "type": "duration", "seconds": 2 },
+  "segments": [
+    {
+      "id": 0, "seek": 0, "start": 0.0, "end": 1.62, "text": " Hello there.",
+      "tokens": [50365, 2425, 456, 13], "temperature": 0.0,
+      "avg_logprob": -0.21, "compression_ratio": 0.75, "no_speech_prob": 0.01
+    }
+  ],
+  "words": [
+    { "word": " Hello", "start": 0.0, "end": 0.52 },
+    { "word": " there.", "start": 0.52, "end": 1.62 }
+  ]
+}
+```
+
+`segments` is present unless only `word` granularity was requested; `words`
+is present only when `word` granularity was requested.
+
+`text` returns the transcript followed by a newline (`text/plain`). `srt`
+(`text/plain`) and `vtt` (`text/vtt`) return one cue per segment.
+
+The worker runs a transcription to completion before it advances chat
+scheduling again, so concurrent chat requests wait for the transcription's
+inference time. Audio requests share the gateway admission queue
+(`max_active_requests`, `max_pending_requests`) with chat requests.
+
+### POST /v1/audio/translations
+
+Translate speech in any supported language into English text. Same form
+fields and response formats as `/v1/audio/transcriptions`, except `language`
+is rejected (the output is always English) and `verbose_json` reports
+`"task": "translate"` with the detected source `language`.
+
+`POST /v1/audio/speech` (text-to-speech) is not served: Whisper only converts
+speech to text.
+
 ## Error Responses
 
 | Status | Code | Meaning |
 |--------|------|---------|
 | 400 | `INVALID_REQUEST` | Malformed JSON, empty model/message, token limits exceeded |
+| 400 | `TRANSCRIPTION_NOT_CONFIGURED` | Audio endpoint called without a configured transcription model |
 | 404 | — | Unknown endpoint or model |
+| 413 | `AUDIO_TOO_LARGE` | Audio upload exceeds `limits.max_audio_bytes` |
 | 429 | `QUEUE_FULL` | Max pending requests exceeded |
 | 429 | `QUEUE_TIMEOUT` | Queue wait exceeded `request_timeout_seconds` |
 | 503 | `MODEL_NOT_READY` | Model not yet loaded or warming up |

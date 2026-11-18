@@ -731,6 +731,7 @@ version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "mlx" },
+    { name = "mlx-audio" },
     { name = "mlx-lm" },
     { name = "mlx-vlm" },
 ]
@@ -744,6 +745,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mlx", specifier = ">=0.32.4" },
+    { name = "mlx-audio", specifier = ">=0.6.5" },
     { name = "mlx-lm", specifier = ">=0.32.2" },
     { name = "mlx-vlm", specifier = ">=0.7.12" },
 ]

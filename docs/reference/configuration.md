@@ -25,6 +25,7 @@ compatibility contract.
 | `backend` | string | `"native-mlx"` | Backend selector: `native-mlx`, or `v1` (`mlx-lm`) for checkpoints native-mlx does not implement and for `vlm_model` |
 | `model` | string | `"mlx-community/Qwen2.5-7B-Instruct-4bit"` | Hugging Face model ID |
 | `vlm_model` | string or null | `null` | Optional VLM model ID |
+| `transcription_model` | string or null | `null` | Optional Whisper checkpoint served by `/v1/audio/transcriptions` and `/v1/audio/translations` through `mlx-audio`, such as `mlx-community/whisper-large-v3-turbo-asr-fp16`. Works with both backends. The worker loads it right after startup; its weights are outside the native-mlx `[memory]` budget |
 | `ipc_path` | string | `"/tmp/mlx-runtime.sock"` | Unix domain socket path |
 
 ## [generation]
@@ -45,6 +46,8 @@ compatibility contract.
 | `max_completion_tokens` | integer | `4096` | Max completion tokens per request |
 | `max_total_tokens_per_request` | integer | `65536` | Max prompt + completion per request. When unset, native-mlx lowers it to what its KV pool holds; when set and the pool cannot hold one such request, native-mlx refuses to start |
 | `request_timeout_seconds` | integer | `300` | Queue wait timeout before 429 |
+| `max_vlm_images` | integer | `5` | Max images in one VLM request |
+| `max_audio_bytes` | integer or size string | `26214400` (25 MiB) | Max audio upload size; larger uploads get 413 before the body is read. Accepts sizes such as `"50MiB"` |
 
 ## [memory]
 

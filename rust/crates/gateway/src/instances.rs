@@ -720,6 +720,14 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
     if let Some(vlm_model) = &config.worker.vlm_model {
         writeln!(output, "vlm_model = {}", toml_string(vlm_model)?).ok();
     }
+    if let Some(transcription_model) = &config.worker.transcription_model {
+        writeln!(
+            output,
+            "transcription_model = {}",
+            toml_string(transcription_model)?
+        )
+        .ok();
+    }
     writeln!(
         output,
         "ipc_path = {}\n",
@@ -771,10 +779,11 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
         config.limits.request_timeout_seconds
     )
     .ok();
+    writeln!(output, "max_vlm_images = {}", config.limits.max_vlm_images).ok();
     writeln!(
         output,
-        "max_vlm_images = {}\n",
-        config.limits.max_vlm_images
+        "max_audio_bytes = {}\n",
+        config.limits.max_audio_bytes
     )
     .ok();
     writeln!(output, "[memory]").ok();
@@ -1132,6 +1141,23 @@ mod tests {
         let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
         assert_eq!(reloaded.memory, config.memory);
         assert_eq!(reloaded.limits.max_total_tokens_per_request, 4096);
+    }
+
+    #[test]
+    fn rendered_config_round_trips_transcription_settings() {
+        let mut config = RuntimeConfig::default();
+        let rendered = render_runtime_config(&config).unwrap();
+        assert!(!rendered.contains("transcription_model"));
+
+        config.worker.transcription_model = Some("whisper-model".to_string());
+        config.limits.max_audio_bytes = 1 << 20;
+        let rendered = render_runtime_config(&config).unwrap();
+        let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
+        assert_eq!(
+            reloaded.worker.transcription_model,
+            config.worker.transcription_model
+        );
+        assert_eq!(reloaded.limits.max_audio_bytes, 1 << 20);
     }
 
     #[test]

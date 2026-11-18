@@ -4,8 +4,9 @@ use crate::openai::{ChatCompletionHttpRequest, ChatCompletionHttpResponse};
 use crate::supervisor::RuntimeState;
 use crate::telemetry::RequestTracker;
 use mlx_runtime_protocol::{
-    BenchmarkResetState, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart,
-    MessageContent, ModelState, ModelStatus,
+    AudioTask, BenchmarkResetState, ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+    ContentPart, MessageContent, ModelState, ModelStatus, TranscriptionRequest,
+    TranscriptionResponse,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -40,6 +41,16 @@ pub trait ChatCompletionService: Send + Sync {
         Ok(())
     }
 
+    /// Transcribe or translate one audio upload.
+    fn transcribe(
+        &self,
+        _request: TranscriptionRequest,
+    ) -> Result<TranscriptionResponse, GatewayError> {
+        Err(GatewayError::Protocol(
+            "audio transcription is unavailable".to_string(),
+        ))
+    }
+
     /// Reset idle worker state for an authorized benchmark process.
     fn benchmark_reset(
         &self,
@@ -72,6 +83,13 @@ impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
         (**self).cancel(request_id)
     }
 
+    fn transcribe(
+        &self,
+        request: TranscriptionRequest,
+    ) -> Result<TranscriptionResponse, GatewayError> {
+        (**self).transcribe(request)
+    }
+
     fn benchmark_reset(
         &self,
         clear_cache: bool,
@@ -101,6 +119,13 @@ impl ChatCompletionService for crate::ipc::WorkerClient {
         self.cancel_chat(request_id)
     }
 
+    fn transcribe(
+        &self,
+        request: TranscriptionRequest,
+    ) -> Result<TranscriptionResponse, GatewayError> {
+        crate::ipc::WorkerClient::transcribe(self, request)
+    }
+
     fn benchmark_reset(
         &self,
         clear_cache: bool,
@@ -118,6 +143,7 @@ struct AppState {
     admission: Arc<RequestAdmission>,
     model: String,
     vlm_model: Option<String>,
+    transcription_model: Option<String>,
     test_backend: Option<Arc<dyn ChatCompletionService>>,
 }
 
@@ -298,6 +324,7 @@ impl HttpServer {
                         admission: self.admission.clone(),
                         model: self.config.worker.model.clone(),
                         vlm_model: self.config.worker.vlm_model.clone(),
+                        transcription_model: self.config.worker.transcription_model.clone(),
                         test_backend: None,
                     };
                     connections.push(thread::spawn(move || {
@@ -363,6 +390,24 @@ fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), Gatew
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
+    let audio_task = crate::audio::audio_route(&request_line);
+    if audio_task.is_some()
+        && content_length
+            > state
+                .limits
+                .max_audio_bytes
+                .saturating_add(crate::audio::MULTIPART_OVERHEAD_BYTES)
+    {
+        let error = crate::audio::AudioRequestError::too_large(state.limits.max_audio_bytes);
+        let response = json_error_response(error.status, error.code, &error.message);
+        write_response(
+            &mut stream,
+            &response.status,
+            response.content_type,
+            &response.body,
+        )?;
+        return Ok(());
+    }
     let mut body = vec![0; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
@@ -379,6 +424,25 @@ fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), Gatew
         let disconnect_monitor = DisconnectMonitor::start(stream.try_clone()?)?;
         let response =
             handle_chat_completion(&body, &state, Some(disconnect_monitor.disconnected()));
+        drop(disconnect_monitor);
+        write_response(
+            &mut stream,
+            &response.status,
+            response.content_type,
+            &response.body,
+        )?;
+        return Ok(());
+    }
+
+    if let Some(task) = audio_task {
+        let disconnect_monitor = DisconnectMonitor::start(stream.try_clone()?)?;
+        let response = handle_audio_request(
+            task,
+            headers.get("content-type").map(String::as_str),
+            &body,
+            &state,
+            Some(disconnect_monitor.disconnected()),
+        );
         drop(disconnect_monitor);
         write_response(
             &mut stream,
@@ -681,6 +745,9 @@ fn models_response(runtime: &RuntimeState, vlm_model: Option<&str>) -> HttpRespo
                     models.push(vlm_summary);
                 }
             }
+            if let Ok(Some(transcription)) = runtime.snapshot_transcription() {
+                models.push(transcription.summary());
+            }
             HttpResponse {
                 status: "200 OK".to_string(),
                 content_type: "application/json",
@@ -696,26 +763,17 @@ fn model_status_response(
     path: &str,
     vlm_model: Option<&str>,
 ) -> HttpResponse {
-    let model_name = runtime_model_name(runtime);
-    match model_path_name(path) {
-        Some(name) if name == model_name || vlm_model.is_some_and(|v| name == v) => {
-            let is_vlm = vlm_model.is_some_and(|v| name == v);
-            let status = if is_vlm {
-                runtime.snapshot_vlm()
-            } else {
-                runtime.snapshot()
-            };
-            match status {
-                Ok(status) => HttpResponse {
-                    status: "200 OK".to_string(),
-                    content_type: "application/json",
-                    body: serde_json::to_string(&status).unwrap_or_else(|_| {
-                        "{\"error\":{\"message\":\"status serialization failed\"}}".to_string()
-                    }),
-                },
-                Err(err) => internal_error_response(&err.to_string()),
-            }
-        }
+    match model_path_name(path).and_then(|name| lookup_model_status(runtime, &name, vlm_model)) {
+        Some(status) => match status {
+            Ok(status) => HttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "application/json",
+                body: serde_json::to_string(&status).unwrap_or_else(|_| {
+                    "{\"error\":{\"message\":\"status serialization failed\"}}".to_string()
+                }),
+            },
+            Err(err) => internal_error_response(&err.to_string()),
+        },
         _ => not_found_response(),
     }
 }
@@ -725,41 +783,52 @@ fn model_ready_response(
     path: &str,
     vlm_model: Option<&str>,
 ) -> HttpResponse {
-    let model_name = runtime_model_name(runtime);
-    match model_path_name(path) {
-        Some(name) if name == model_name || vlm_model.is_some_and(|v| name == v) => {
-            let is_vlm = vlm_model.is_some_and(|v| name == v);
-            let status = if is_vlm {
-                runtime.snapshot_vlm()
-            } else {
-                runtime.snapshot()
-            };
-            match status {
-                Ok(status) if status.ready => HttpResponse {
-                    status: "200 OK".to_string(),
-                    content_type: "application/json",
-                    body: json!({
-                        "model": status.model,
-                        "ready": true,
-                        "state": status.state,
-                    })
-                    .to_string(),
-                },
-                Ok(status) => HttpResponse {
-                    status: "503 Service Unavailable".to_string(),
-                    content_type: "application/json",
-                    body: json!({
-                        "model": status.model,
-                        "ready": false,
-                        "state": status.state,
-                        "reason": readiness_reason(&status),
-                    })
-                    .to_string(),
-                },
-                Err(err) => internal_error_response(&err.to_string()),
-            }
-        }
+    match model_path_name(path).and_then(|name| lookup_model_status(runtime, &name, vlm_model)) {
+        Some(status) => match status {
+            Ok(status) if status.ready => HttpResponse {
+                status: "200 OK".to_string(),
+                content_type: "application/json",
+                body: json!({
+                    "model": status.model,
+                    "ready": true,
+                    "state": status.state,
+                })
+                .to_string(),
+            },
+            Ok(status) => HttpResponse {
+                status: "503 Service Unavailable".to_string(),
+                content_type: "application/json",
+                body: json!({
+                    "model": status.model,
+                    "ready": false,
+                    "state": status.state,
+                    "reason": readiness_reason(&status),
+                })
+                .to_string(),
+            },
+            Err(err) => internal_error_response(&err.to_string()),
+        },
         _ => not_found_response(),
+    }
+}
+
+/// Returns the lifecycle status of a served model by name, or `None` when the
+/// name is not served by this gateway.
+fn lookup_model_status(
+    runtime: &RuntimeState,
+    name: &str,
+    vlm_model: Option<&str>,
+) -> Option<Result<ModelStatus, GatewayError>> {
+    if name == runtime_model_name(runtime) {
+        return Some(runtime.snapshot());
+    }
+    if vlm_model == Some(name) {
+        return Some(runtime.snapshot_vlm());
+    }
+    match runtime.snapshot_transcription() {
+        Ok(Some(status)) if status.model == name => Some(Ok(status)),
+        Ok(_) => None,
+        Err(err) => Some(Err(err)),
     }
 }
 
@@ -931,7 +1000,11 @@ fn handle_chat_completion(
         }
     };
     let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
-    record_gateway_queue_wait(&state.runtime, is_vlm, queue_time_ms);
+    record_gateway_queue_wait(
+        &state.runtime,
+        if is_vlm { "vlm" } else { "text" },
+        queue_time_ms,
+    );
     let worker_model = worker_request.model.clone();
     let request_tracker = Arc::new(RequestTracker::new(
         state.runtime.metrics.clone(),
@@ -1018,6 +1091,121 @@ fn handle_chat_completion(
     }
 
     response
+}
+
+fn handle_audio_request(
+    task: AudioTask,
+    content_type: Option<&str>,
+    body: &[u8],
+    state: &AppState,
+    disconnected: Option<Arc<AtomicBool>>,
+) -> HttpResponse {
+    let Some(configured_model) = state.transcription_model.as_deref() else {
+        return json_error_response(
+            "400 Bad Request",
+            "TRANSCRIPTION_NOT_CONFIGURED",
+            "no transcription model is configured; start the server with --transcription-model",
+        );
+    };
+    let audio_request = match crate::audio::parse_audio_request(
+        task,
+        content_type,
+        body,
+        state.limits.max_audio_bytes,
+    ) {
+        Ok(request) => request,
+        Err(error) => return json_error_response(error.status, error.code, &error.message),
+    };
+    if audio_request.request.model != configured_model {
+        return json_error_response(
+            "400 Bad Request",
+            "INVALID_REQUEST",
+            &format!(
+                "requested model '{}' does not match configured transcription model '{}'",
+                audio_request.request.model, configured_model
+            ),
+        );
+    }
+    let status = match state.runtime.snapshot_transcription() {
+        Ok(Some(status)) => status,
+        Ok(None) => ModelStatus::new(configured_model),
+        Err(err) => return internal_error_response(&err.to_string()),
+    };
+    if !status.ready {
+        return not_ready_error(&status);
+    }
+
+    let queue_started_at = Instant::now();
+    let _permit = match state.admission.acquire_until(disconnected.as_deref()) {
+        Ok(Some(permit)) => permit,
+        Ok(None) => {
+            return HttpResponse {
+                status: "499 Client Closed Request".to_string(),
+                content_type: "application/json",
+                body: String::new(),
+            };
+        }
+        Err(response) => {
+            if response.status.starts_with("429") {
+                state.runtime.metrics.increment_queue_rejected_total();
+            }
+            return response;
+        }
+    };
+    let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
+    record_gateway_queue_wait(&state.runtime, "audio", queue_time_ms);
+    let request_tracker = RequestTracker::new(
+        state.runtime.metrics.clone(),
+        audio_request.request.request_id.clone(),
+        audio_request.request.model.clone(),
+        0,
+        false,
+        queue_time_ms,
+        false,
+        0,
+    );
+
+    let backend = if let Some(backend) = &state.test_backend {
+        Some(backend.clone())
+    } else {
+        match state.runtime.worker_client.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|client| client.clone() as Arc<dyn ChatCompletionService>),
+            Err(_) => None,
+        }
+    };
+    let Some(backend) = backend else {
+        request_tracker.finish(0, 0, None, false, Some("backend unavailable".to_string()));
+        return not_ready_error(&status);
+    };
+
+    let cancel_on_disconnect = DisconnectCancellation::start(
+        disconnected.clone(),
+        backend.clone(),
+        audio_request.request.request_id.clone(),
+    );
+    let result = backend.transcribe(audio_request.request.clone());
+    drop(cancel_on_disconnect);
+    let cancelled = disconnected
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed));
+
+    match result {
+        Ok(response) => {
+            request_tracker.finish(0, 0, Some("stop".to_string()), cancelled, None);
+            let rendered = crate::audio::render_response(&response, &audio_request);
+            HttpResponse {
+                status: "200 OK".to_string(),
+                content_type: rendered.content_type,
+                body: rendered.body,
+            }
+        }
+        Err(err) => {
+            request_tracker.finish(0, 0, None, cancelled, Some(err.to_string()));
+            gateway_error_response(&err)
+        }
+    }
 }
 
 fn stream_chat_completion(
@@ -1172,7 +1360,11 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         }
     };
     let queue_time_ms = queue_started_at.elapsed().as_millis() as u64;
-    record_gateway_queue_wait(&state.runtime, is_vlm, queue_time_ms);
+    record_gateway_queue_wait(
+        &state.runtime,
+        if is_vlm { "vlm" } else { "text" },
+        queue_time_ms,
+    );
     let worker_model = worker_request.model.clone();
     // Save the requested model name before worker_model is moved into
     // RequestTracker; used for consistent "model" field across all SSE chunks.
@@ -1397,12 +1589,12 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     Ok(())
 }
 
-fn record_gateway_queue_wait(runtime: &RuntimeState, is_vlm: bool, queue_time_ms: u64) {
+fn record_gateway_queue_wait(runtime: &RuntimeState, modality: &str, queue_time_ms: u64) {
     runtime.metrics.set_labeled_gauge(
         "mlx_latency_by_backend_ms",
         &[
             ("backend", "gateway"),
-            ("modality", if is_vlm { "vlm" } else { "text" }),
+            ("modality", modality),
             ("kind", "gateway_queue"),
         ],
         queue_time_ms,
@@ -1829,11 +2021,13 @@ mod tests {
                     max_total_tokens_per_request: 65_536,
                     request_timeout_seconds: 300,
                     max_vlm_images: 5,
+                    max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
                 },
                 telemetry: crate::config::TelemetryConfig::default(),
                 admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
                 vlm_model: None,
+                transcription_model: None,
                 test_backend: Some(Arc::new(FakeService::default())),
             },
         );
@@ -2006,10 +2200,12 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             model: "test-model".to_string(),
             vlm_model: None,
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
 
@@ -2082,11 +2278,13 @@ mod tests {
                     max_total_tokens_per_request: 65_536,
                     request_timeout_seconds: 300,
                     max_vlm_images: 5,
+                    max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
                 },
                 telemetry: crate::config::TelemetryConfig::default(),
                 admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
                 model: "test-model".to_string(),
                 vlm_model: None,
+                transcription_model: None,
                 test_backend: Some(Arc::new(FakeService::default())),
             },
         );
@@ -2146,11 +2344,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(0, 1, Duration::from_secs(300))),
             model: "test-model".to_string(),
             vlm_model: None,
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
         let _permit = match state.admission.acquire() {
@@ -2366,11 +2566,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "test-model".to_string(),
             vlm_model: None,
+            transcription_model: None,
             test_backend: Some(backend),
         }
     }
@@ -2743,11 +2945,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
         let response = response_for_request("GET /models HTTP/1.1\r\n", &[], &state);
@@ -2789,11 +2993,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
         let response =
@@ -2826,11 +3032,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
         let response =
@@ -2864,11 +3072,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
         let response =
@@ -2912,11 +3122,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service.clone()),
         };
 
@@ -2996,11 +3208,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service.clone()),
         };
 
@@ -3065,11 +3279,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service.clone()),
         };
 
@@ -3113,11 +3329,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some(vlm_model.to_string()),
+            transcription_model: None,
             test_backend: Some(service),
         }
     }
@@ -3352,11 +3570,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service),
         };
 
@@ -3541,11 +3761,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service.clone()),
         };
 
@@ -3612,11 +3834,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service.clone()),
         };
 
@@ -3664,11 +3888,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 3,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
 
@@ -3728,11 +3954,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 3,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service),
         };
 
@@ -3779,11 +4007,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 2,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(Arc::new(FakeService::default())),
         };
 
@@ -3835,11 +4065,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 3,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(Arc::new(StreamingService)),
         };
 
@@ -3902,11 +4134,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 0,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service),
         };
 
@@ -3991,11 +4225,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service),
         };
 
@@ -4042,11 +4278,13 @@ mod tests {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
             },
             telemetry: crate::config::TelemetryConfig::default(),
             admission: Arc::new(RequestAdmission::new(64, 16, Duration::from_secs(300))),
             model: "text-model".to_string(),
             vlm_model: Some("vlm-model".to_string()),
+            transcription_model: None,
             test_backend: Some(service),
         };
 
@@ -4144,5 +4382,248 @@ mod tests {
         server_thread.join().unwrap();
 
         assert!(response.starts_with("HTTP/1.1 404"), "{response:?}");
+    }
+
+    struct TranscriptionService {
+        result: Result<TranscriptionResponse, String>,
+        seen: Mutex<Vec<TranscriptionRequest>>,
+    }
+
+    impl TranscriptionService {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                result: Ok(TranscriptionResponse {
+                    request_id: "audio-1".to_string(),
+                    model: "whisper-model".to_string(),
+                    task: AudioTask::Transcribe,
+                    text: " Hello world.".to_string(),
+                    language: "english".to_string(),
+                    duration: 1.2,
+                    segments: vec![],
+                    words: vec![],
+                    audio_decode_latency_ms: None,
+                    inference_latency_ms: None,
+                }),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ChatCompletionService for TranscriptionService {
+        fn complete(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Err(GatewayError::Protocol("chat is not used".to_string()))
+        }
+
+        fn transcribe(
+            &self,
+            request: TranscriptionRequest,
+        ) -> Result<TranscriptionResponse, GatewayError> {
+            self.seen.lock().unwrap().push(request);
+            self.result.clone().map_err(GatewayError::InvalidRequest)
+        }
+    }
+
+    fn audio_state(
+        transcription: Option<ModelState>,
+        service: Arc<TranscriptionService>,
+    ) -> AppState {
+        let mut state = test_state(ModelState::Ready, service);
+        if let Some(model_state) = transcription {
+            state.transcription_model = Some("whisper-model".to_string());
+            state
+                .runtime
+                .set_transcription_model("whisper-model".to_string());
+            if model_state == ModelState::Ready {
+                state.runtime.mark_transcription_ready(5);
+            } else {
+                state.runtime.set_transcription_state(model_state);
+            }
+        }
+        state
+    }
+
+    fn audio_body(model: &str, extra: &[(&str, &str)]) -> Vec<u8> {
+        let mut fields = vec![("model", model)];
+        fields.extend_from_slice(extra);
+        crate::audio::tests::multipart_body(&fields, Some(("clip.wav", b"RIFFdata")))
+    }
+
+    fn audio_content_type() -> String {
+        format!(
+            "multipart/form-data; boundary={}",
+            crate::audio::tests::BOUNDARY
+        )
+    }
+
+    #[test]
+    fn audio_transcription_returns_openai_json_and_forwards_audio() {
+        let service = TranscriptionService::ok();
+        let state = audio_state(Some(ModelState::Ready), service.clone());
+        let response = handle_audio_request(
+            AudioTask::Transcribe,
+            Some(&audio_content_type()),
+            &audio_body("whisper-model", &[("language", "en")]),
+            &state,
+            None,
+        );
+
+        assert_eq!(response.status, "200 OK", "{}", response.body);
+        assert_eq!(response.content_type, "application/json");
+        let body: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["text"], "Hello world.");
+        let seen = service.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].audio_base64,
+            crate::audio::base64_encode(b"RIFFdata")
+        );
+        assert_eq!(seen[0].language.as_deref(), Some("en"));
+        assert_eq!(seen[0].task, AudioTask::Transcribe);
+    }
+
+    #[test]
+    fn audio_translation_renders_text_format() {
+        let service = TranscriptionService::ok();
+        let state = audio_state(Some(ModelState::Ready), service.clone());
+        let response = handle_audio_request(
+            AudioTask::Translate,
+            Some(&audio_content_type()),
+            &audio_body("whisper-model", &[("response_format", "text")]),
+            &state,
+            None,
+        );
+
+        assert_eq!(response.status, "200 OK");
+        assert_eq!(response.body, "Hello world.\n");
+        assert!(response.content_type.starts_with("text/plain"));
+        assert_eq!(service.seen.lock().unwrap()[0].task, AudioTask::Translate);
+    }
+
+    #[test]
+    fn audio_request_rejections_do_not_reach_the_worker() {
+        let cases = [
+            (
+                None,
+                "whisper-model",
+                "400 Bad Request",
+                "TRANSCRIPTION_NOT_CONFIGURED",
+            ),
+            (
+                Some(ModelState::Ready),
+                "other-model",
+                "400 Bad Request",
+                "INVALID_REQUEST",
+            ),
+            (
+                Some(ModelState::WarmingUp),
+                "whisper-model",
+                "503 Service Unavailable",
+                "MODEL_NOT_READY",
+            ),
+            (
+                Some(ModelState::Failed),
+                "whisper-model",
+                "503 Service Unavailable",
+                "MODEL_LOAD_FAILED",
+            ),
+        ];
+        for (model_state, model, status, code) in cases {
+            let service = TranscriptionService::ok();
+            let state = audio_state(model_state, service.clone());
+            let response = handle_audio_request(
+                AudioTask::Transcribe,
+                Some(&audio_content_type()),
+                &audio_body(model, &[]),
+                &state,
+                None,
+            );
+            assert_eq!(response.status, status, "{}", response.body);
+            assert!(response.body.contains(code), "{}", response.body);
+            assert!(service.seen.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn audio_worker_invalid_request_maps_to_400() {
+        let service = Arc::new(TranscriptionService {
+            result: Err("unable to decode audio".to_string()),
+            seen: Mutex::new(Vec::new()),
+        });
+        let state = audio_state(Some(ModelState::Ready), service);
+        let response = handle_audio_request(
+            AudioTask::Transcribe,
+            Some(&audio_content_type()),
+            &audio_body("whisper-model", &[]),
+            &state,
+            None,
+        );
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("unable to decode audio"));
+    }
+
+    #[test]
+    fn models_endpoints_report_transcription_model() {
+        let state = audio_state(Some(ModelState::WarmingUp), TranscriptionService::ok());
+        let models = response_for_request("GET /models HTTP/1.1\r\n", &[], &state);
+        assert!(models.body.contains("\"whisper-model\""), "{}", models.body);
+
+        let ready =
+            response_for_request("GET /models/whisper-model/ready HTTP/1.1\r\n", &[], &state);
+        assert_eq!(ready.status, "503 Service Unavailable");
+        state.runtime.mark_transcription_ready(3);
+        let ready =
+            response_for_request("GET /models/whisper-model/ready HTTP/1.1\r\n", &[], &state);
+        assert_eq!(ready.status, "200 OK");
+        let status =
+            response_for_request("GET /models/whisper-model/status HTTP/1.1\r\n", &[], &state);
+        assert!(status.body.contains("\"ready\":true"), "{}", status.body);
+    }
+
+    #[test]
+    fn oversized_audio_upload_is_rejected_before_reading_the_body() {
+        let mut config = RuntimeConfig::default();
+        config.server.port = 0;
+        config.limits.max_audio_bytes = 1024;
+        config.worker.transcription_model = Some("whisper-model".to_string());
+        let server = HttpServer::bind(config, RuntimeState::new("model")).unwrap();
+        let address = server.local_addr();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = shutdown.clone();
+        let server_thread = thread::spawn(move || {
+            server
+                .serve_until(&server_shutdown, Duration::from_millis(100))
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let declared = 1024 + crate::audio::MULTIPART_OVERHEAD_BYTES + 1;
+        client
+            .write_all(
+                format!(
+                    "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: {declared}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        shutdown.store(true, Ordering::Relaxed);
+        server_thread.join().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 413"), "{response:?}");
+        assert!(response.contains("AUDIO_TOO_LARGE"));
+    }
+
+    #[test]
+    fn speech_endpoint_is_not_routed() {
+        let state = audio_state(Some(ModelState::Ready), TranscriptionService::ok());
+        let response = response_for_request("POST /v1/audio/speech HTTP/1.1\r\n", b"{}", &state);
+        assert_eq!(response.status, "404 Not Found");
     }
 }

@@ -1,7 +1,7 @@
-use super::request::ChatCompletionRequest;
+use super::request::{ChatCompletionRequest, TranscriptionRequest};
 use super::response::{
     BenchmarkResetState, ChatCompletionDelta, ChatCompletionResponse, SchedulerMetricsEvent,
-    WorkerError, WorkerReady,
+    TranscriptionResponse, WorkerError, WorkerReady,
 };
 use super::status::ModelStatus;
 use core::fmt;
@@ -76,6 +76,8 @@ pub enum GatewayCommand {
     ChatCompletion { request: ChatCompletionRequest },
     /// Cancel an in-flight chat completion request.
     CancelRequest { request_id: String },
+    /// An audio transcription or translation request.
+    Transcription { request: TranscriptionRequest },
     /// Reset idle worker state for an authorized benchmark process.
     BenchmarkReset {
         request_id: String,
@@ -176,6 +178,8 @@ pub enum WorkerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image_height: Option<u32>,
     },
+    /// A completed audio transcription or translation.
+    Transcription { response: TranscriptionResponse },
     /// A worker-side request failure.
     Error {
         /// Machine-readable failure code.
@@ -380,6 +384,60 @@ mod tests {
         let encoded = encode_gateway_command(&command).unwrap();
         let decoded = decode_gateway_command(&encoded).unwrap();
         assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn transcription_command_and_event_round_trip() {
+        let command = GatewayCommand::Transcription {
+            request: crate::TranscriptionRequest {
+                request_id: "req-audio".to_string(),
+                model: "whisper".to_string(),
+                task: crate::AudioTask::Translate,
+                audio_base64: "UklGRg==".to_string(),
+                filename: Some("clip.wav".to_string()),
+                language: None,
+                prompt: Some("names".to_string()),
+                temperature: 0.0,
+                word_timestamps: true,
+            },
+        };
+        let encoded = encode_gateway_command(&command).unwrap();
+        assert!(encoded.contains("\"type\":\"transcription\""));
+        assert!(encoded.contains("\"task\":\"translate\""));
+        assert!(!encoded.contains("\"language\""));
+        assert_eq!(decode_gateway_command(&encoded).unwrap(), command);
+
+        let event = WorkerEvent::Transcription {
+            response: crate::TranscriptionResponse {
+                request_id: "req-audio".to_string(),
+                model: "whisper".to_string(),
+                task: crate::AudioTask::Translate,
+                text: " Hello.".to_string(),
+                language: "fr".to_string(),
+                duration: 1.5,
+                segments: vec![crate::TranscriptionSegment {
+                    id: 0,
+                    seek: 0,
+                    start: 0.0,
+                    end: 1.5,
+                    text: " Hello.".to_string(),
+                    tokens: vec![1, 2],
+                    temperature: 0.0,
+                    avg_logprob: -0.2,
+                    compression_ratio: 0.8,
+                    no_speech_prob: 0.01,
+                }],
+                words: vec![crate::TranscriptionWord {
+                    word: " Hello.".to_string(),
+                    start: 0.0,
+                    end: 1.0,
+                }],
+                audio_decode_latency_ms: Some(3),
+                inference_latency_ms: Some(40),
+            },
+        };
+        let encoded = encode_worker_event(&event).unwrap();
+        assert_eq!(decode_worker_event(&encoded).unwrap(), event);
     }
 
     #[test]

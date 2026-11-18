@@ -3,8 +3,9 @@ use crate::errors::GatewayError;
 use crate::ipc::WorkerClient;
 use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
-    decode_worker_message, ChatCompletionRequest, ChatMessage, MessageContent, MessageRole,
-    ModelError, ModelState, ModelStatus, WorkerMessage, WorkerReady,
+    decode_worker_message, AudioTask, ChatCompletionRequest, ChatMessage, MessageContent,
+    MessageRole, ModelError, ModelState, ModelStatus, TranscriptionRequest, WorkerMessage,
+    WorkerReady,
 };
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -34,6 +35,8 @@ pub struct RuntimeState {
     pub vlm_model_name: Arc<RwLock<Option<String>>>,
     /// VLM model lifecycle status.
     pub vlm_status: Arc<RwLock<Option<ModelStatus>>>,
+    /// Transcription model lifecycle status, when one is configured.
+    transcription_status: Arc<RwLock<Option<ModelStatus>>>,
 }
 
 impl RuntimeState {
@@ -55,6 +58,7 @@ impl RuntimeState {
             )),
             vlm_model_name: Arc::new(RwLock::new(None)),
             vlm_status: Arc::new(RwLock::new(None)),
+            transcription_status: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -70,6 +74,7 @@ impl RuntimeState {
             benchmark_enabled: Arc::new(AtomicBool::new(false)),
             vlm_model_name: Arc::new(RwLock::new(None)),
             vlm_status: Arc::new(RwLock::new(None)),
+            transcription_status: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -215,6 +220,53 @@ impl RuntimeState {
         Ok(())
     }
 
+    /// Initializes transcription model lifecycle tracking.
+    pub fn set_transcription_model(&self, model: String) {
+        if let Ok(mut guard) = self.transcription_status.write() {
+            *guard = Some(ModelStatus::new(model));
+        }
+    }
+
+    /// Returns the transcription model lifecycle snapshot, if one is configured.
+    pub fn snapshot_transcription(&self) -> Result<Option<ModelStatus>, GatewayError> {
+        self.transcription_status
+            .read()
+            .map(|guard| guard.clone())
+            .map_err(|_| GatewayError::Protocol("transcription status lock poisoned".to_string()))
+    }
+
+    /// Applies a lifecycle change to the transcription model, logging transitions.
+    fn update_transcription(&self, update: impl FnOnce(&mut ModelStatus)) {
+        if let Ok(mut guard) = self.transcription_status.write() {
+            if let Some(status) = guard.as_mut() {
+                let previous_state = status.state;
+                update(status);
+                if previous_state != status.state {
+                    eprintln!(
+                        "transcription_model_state_transition model={} from={:?} to={:?}",
+                        status.model, previous_state, status.state
+                    );
+                }
+            }
+        }
+    }
+
+    /// Updates only the transcription model lifecycle state.
+    pub fn set_transcription_state(&self, state: ModelState) {
+        self.update_transcription(|status| status.set_state(state));
+    }
+
+    /// Marks the transcription model ready after its warmup request.
+    pub fn mark_transcription_ready(&self, warmup_latency_ms: u64) {
+        self.update_transcription(|status| status.mark_ready(None, None, warmup_latency_ms));
+    }
+
+    /// Marks the transcription model failed with a stable error code.
+    pub fn mark_transcription_failed(&self, code: impl Into<String>, message: impl Into<String>) {
+        let (code, message) = (code.into(), message.into());
+        self.update_transcription(|status| status.mark_failed(code, message));
+    }
+
     /// Marks the model as failed and updates the bootstrap snapshot.
     pub fn mark_failed(
         &self,
@@ -318,6 +370,9 @@ impl Supervisor {
         let runtime = RuntimeState::new(config.worker.model.clone());
         if let Some(ref vlm) = config.worker.vlm_model {
             runtime.set_vlm_model(vlm.clone());
+        }
+        if let Some(ref model) = config.worker.transcription_model {
+            runtime.set_transcription_model(model.clone());
         }
 
         let socket_path = PathBuf::from(&config.worker.ipc_path);
@@ -517,7 +572,15 @@ fn bootstrap_worker(
                 *guard = Some(client.clone());
                 if let Some(vlm_model) = config.worker.vlm_model.clone() {
                     let warmup_runtime = runtime.clone();
-                    thread::spawn(move || warmup_vlm_model(warmup_runtime, client, vlm_model));
+                    let vlm_client = client.clone();
+                    thread::spawn(move || warmup_vlm_model(warmup_runtime, vlm_client, vlm_model));
+                }
+                if let Some(model) = config.worker.transcription_model.clone() {
+                    let warmup_runtime = runtime.clone();
+                    let transcription_client = client.clone();
+                    thread::spawn(move || {
+                        warmup_transcription_model(warmup_runtime, transcription_client, model)
+                    });
                 }
                 let mut status = runtime.snapshot()?;
                 if !status.ready {
@@ -572,6 +635,7 @@ fn monitor_worker(
             }
             let _ = runtime.mark_failed("WORKER_EXITED", "worker process exited");
             let _ = runtime.mark_vlm_failed("WORKER_EXITED", "worker process exited");
+            runtime.mark_transcription_failed("WORKER_EXITED", "worker process exited");
             shutdown.store(true, Ordering::Relaxed);
             break;
         }
@@ -672,6 +736,27 @@ fn warmup_vlm_model(runtime: RuntimeState, client: Arc<WorkerClient>, vlm_model:
     }
 }
 
+/// Loads the transcription model by transcribing one second of silence.
+fn warmup_transcription_model(runtime: RuntimeState, client: Arc<WorkerClient>, model: String) {
+    let started = Instant::now();
+    runtime.set_transcription_state(ModelState::WarmingUp);
+    let request = TranscriptionRequest {
+        request_id: "transcription-warmup".to_string(),
+        model,
+        task: AudioTask::Transcribe,
+        audio_base64: crate::audio::base64_encode(&crate::audio::silent_wav()),
+        filename: Some("warmup.wav".to_string()),
+        language: Some("en".to_string()),
+        prompt: None,
+        temperature: 0.0,
+        word_timestamps: false,
+    };
+    match client.transcribe(request) {
+        Ok(_) => runtime.mark_transcription_ready((started.elapsed().as_millis() as u64).max(1)),
+        Err(err) => runtime.mark_transcription_failed("TRANSCRIPTION_LOAD_FAILED", err.to_string()),
+    }
+}
+
 fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
     let mut values = vec![
         ("MLX_RUNTIME_SOCKET", config.worker.ipc_path.clone()),
@@ -683,6 +768,14 @@ fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
         (
             "MLX_RUNTIME_VLM_MODEL",
             config.worker.vlm_model.clone().unwrap_or_default(),
+        ),
+        (
+            "MLX_RUNTIME_TRANSCRIPTION_MODEL",
+            config
+                .worker
+                .transcription_model
+                .clone()
+                .unwrap_or_default(),
         ),
         (
             "MLX_RUNTIME_MAX_VLM_IMAGES",
