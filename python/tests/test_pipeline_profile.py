@@ -4,11 +4,13 @@ import json
 
 import pytest
 
+from mlx_worker.native_mlx import pipeline_profile
 from mlx_worker.native_mlx.pipeline_profile import (
     PipelineEvent,
     PipelineProfiler,
     render_pipeline_report,
     validate_pipeline_event,
+    write_pipeline_artifacts,
 )
 
 
@@ -91,3 +93,120 @@ def test_report_orders_dominant_stage_first() -> None:
     )
 
     assert report.index("dominant") < report.index("small")
+
+
+def _record_events(profiler: PipelineProfiler, count: int, start: int = 0) -> None:
+    for index in range(start, start + count):
+        profiler.record(
+            f"req-{index % 3}",
+            "mlx" if index % 2 else "runtime",
+            "async_dispatch" if index % 2 else "terminal",
+            duration_us=index,
+            details={"step": index, "nested": {"tokens": [index, index + 1]}},
+        )
+
+
+def test_incremental_artifacts_match_full_rewrite(tmp_path) -> None:
+    profiler = PipelineProfiler(tmp_path / "incremental", model="model", run_id="run")
+    _record_events(profiler, 3)
+    profiler.write_artifacts()
+    _record_events(profiler, 1, start=3)
+    profiler.write_artifacts()
+    _record_events(profiler, 5, start=4)
+    paths = profiler.write_artifacts()
+
+    expected = write_pipeline_artifacts(profiler.events(), tmp_path / "full")
+
+    for actual_path, expected_path in zip(paths, expected, strict=True):
+        assert actual_path.read_bytes() == expected_path.read_bytes()
+    assert len(json.loads(paths[1].read_text())["traceEvents"]) == 9
+
+
+@pytest.mark.parametrize("stored", [10, 1_000])
+def test_flush_cost_does_not_depend_on_stored_events(
+    monkeypatch, tmp_path, stored
+) -> None:
+    profiler = PipelineProfiler(tmp_path, model="model", run_id="run")
+    _record_events(profiler, stored)
+    jsonl, trace, _ = profiler.write_artifacts()
+    calls = {"jsonl": 0, "trace": 0, "full_rewrite": 0}
+
+    def counting(name, function):
+        def wrapper(*args, **kwargs):
+            calls[name] += 1
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        pipeline_profile,
+        "_jsonl_line",
+        counting("jsonl", pipeline_profile._jsonl_line),
+    )
+    monkeypatch.setattr(
+        pipeline_profile,
+        "_trace_entry",
+        counting("trace", pipeline_profile._trace_entry),
+    )
+    monkeypatch.setattr(
+        pipeline_profile,
+        "_write_event_artifacts",
+        counting("full_rewrite", pipeline_profile._write_event_artifacts),
+    )
+    jsonl_size = jsonl.stat().st_size
+
+    for flush in range(1, 4):
+        _record_events(profiler, 1, start=stored + flush)
+        profiler.write_artifacts()
+        assert calls == {"jsonl": flush, "trace": flush, "full_rewrite": 0}
+
+    profiler.write_artifacts()
+
+    assert calls == {"jsonl": 3, "trace": 3, "full_rewrite": 0}
+    new_lines = jsonl.read_bytes()[jsonl_size:].decode().splitlines()
+    assert [json.loads(line)["duration_us"] for line in new_lines] == [
+        stored + 1,
+        stored + 2,
+        stored + 3,
+    ]
+    assert len(json.loads(trace.read_text())["traceEvents"]) == stored + 3
+
+
+def test_incremental_flush_keeps_externally_joined_events(tmp_path) -> None:
+    profiler = PipelineProfiler(tmp_path, model="model", run_id="run")
+    _record_events(profiler, 2)
+    profiler.write_artifacts()
+    gateway = PipelineEvent(
+        schema_version=1,
+        run_id="run",
+        request_id="req-0",
+        backend="native-mlx",
+        model="model",
+        workload="workload",
+        component="gateway",
+        stage="http_round_trip",
+        monotonic_ns=1,
+        offset_us=0,
+        duration_us=5,
+    )
+    write_pipeline_artifacts((*profiler.events(), gateway), tmp_path)
+
+    _record_events(profiler, 1, start=2)
+    _, trace, _ = profiler.write_artifacts()
+
+    names = [event["cat"] for event in json.loads(trace.read_text())["traceEvents"]]
+    assert names == ["runtime", "mlx", "gateway", "runtime"]
+
+
+def test_incremental_flush_rewrites_unrecognized_trace(tmp_path) -> None:
+    profiler = PipelineProfiler(tmp_path, model="model", run_id="run")
+    _record_events(profiler, 2)
+    profiler.write_artifacts()
+    write_pipeline_artifacts((), tmp_path)
+
+    _record_events(profiler, 1, start=2)
+    paths = profiler.write_artifacts()
+
+    expected = write_pipeline_artifacts(profiler.events(), tmp_path / "full")
+    for actual_path, expected_path in zip(paths, expected, strict=True):
+        assert actual_path.read_bytes() == expected_path.read_bytes()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import textwrap
 import threading
 import time
 import uuid
@@ -37,7 +38,13 @@ class PipelineEvent:
 
 
 class PipelineProfiler:
-    """Append bounded stage events and render durable diagnostic artifacts."""
+    """Append bounded stage events and render durable diagnostic artifacts.
+
+    Artifacts are written incrementally: each call to `write_artifacts` appends
+    only the events recorded since the previous call and re-renders the report
+    from running stage totals, so the cost of a flush depends on the number of
+    new events, not on how many events the run has already stored.
+    """
 
     def __init__(
         self,
@@ -56,6 +63,10 @@ class PipelineProfiler:
         self._origin_ns = time.perf_counter_ns()
         self._events: list[PipelineEvent] = []
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._written = 0
+        self._artifacts_started = False
+        self._stage_totals: dict[tuple[str, str], int] = {}
         self._metal_capture_requested = os.environ.get(
             "MLX_RUNTIME_NATIVE_METAL_CAPTURE", "0"
         ).lower() in {"1", "true", "yes", "on"}
@@ -193,9 +204,39 @@ class PipelineProfiler:
         )
 
     def write_artifacts(self) -> tuple[Path, Path, Path]:
-        """Write JSONL, Chrome Trace JSON, and a markdown summary atomically enough for diagnostics."""
+        """Persist events recorded since the last call to the three artifacts.
 
-        return write_pipeline_artifacts(self.events(), self.output_dir)
+        The first call writes all three files from scratch. Later calls append
+        new events to the JSONL file and the Chrome Trace event array, then
+        rewrite the bounded markdown report from running stage totals. When
+        nothing was recorded since the last call, no file is touched.
+
+        Returns:
+            Paths of the JSONL events, Chrome Trace JSON, and markdown report.
+        """
+
+        paths = _artifact_paths(self.output_dir)
+        with self._write_lock:
+            with self._lock:
+                pending = self._events[self._written :]
+            if self._artifacts_started and not pending:
+                return paths
+            for event in pending:
+                key = (event.component, event.stage)
+                self._stage_totals[key] = (
+                    self._stage_totals.get(key, 0) + event.duration_us
+                )
+            written = self._written + len(pending)
+            if not self._artifacts_started or not _append_artifacts(pending, paths):
+                with self._lock:
+                    rows = tuple(self._events[:written])
+                _write_event_artifacts(rows, paths)
+            paths[2].write_text(
+                _render_report(self._stage_totals, written), encoding="utf-8"
+            )
+            self._written = written
+            self._artifacts_started = True
+        return paths
 
 
 def validate_pipeline_event(event: PipelineEvent) -> None:
@@ -224,6 +265,10 @@ def render_pipeline_report(events: Iterable[PipelineEvent]) -> str:
     for event in rows:
         key = (event.component, event.stage)
         totals[key] = totals.get(key, 0) + event.duration_us
+    return _render_report(totals, len(rows))
+
+
+def _render_report(totals: dict[tuple[str, str], int], event_count: int) -> str:
     lines = [
         "# Native MLX Inference Pipeline Profile",
         "",
@@ -250,7 +295,7 @@ def render_pipeline_report(events: Iterable[PipelineEvent]) -> str:
             totals.items(), key=lambda item: item[1], reverse=True
         )
     )
-    lines.extend(["", f"Events: {len(rows)}", ""])
+    lines.extend(["", f"Events: {event_count}", ""])
     return "\n".join(lines)
 
 
@@ -260,38 +305,97 @@ def write_pipeline_artifacts(
     """Write a supplied joined event stream, including gateway-side events."""
 
     rows = tuple(events)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    jsonl = output_dir / "pipeline-events.jsonl"
-    trace = output_dir / "pipeline-trace.json"
-    report = output_dir / "pipeline-report.md"
-    jsonl.write_text(
-        "".join(json.dumps(asdict(event), sort_keys=True) + "\n" for event in rows)
+    paths = _artifact_paths(output_dir)
+    _write_event_artifacts(rows, paths)
+    paths[2].write_text(render_pipeline_report(rows), encoding="utf-8")
+    return paths
+
+
+# `json.dumps({"traceEvents": [...]}, indent=2) + "\n"` split into a fixed head,
+# one block per event, and a fixed tail, so new events can be spliced in before
+# the tail without re-serializing the events already on disk.
+_TRACE_HEAD = '{\n  "traceEvents": ['
+_TRACE_TAIL = "\n  ]\n}\n"
+_EMPTY_TRACE = '{\n  "traceEvents": []\n}\n'
+
+
+def _artifact_paths(output_dir: Path) -> tuple[Path, Path, Path]:
+    return (
+        output_dir / "pipeline-events.jsonl",
+        output_dir / "pipeline-trace.json",
+        output_dir / "pipeline-report.md",
     )
+
+
+def _write_event_artifacts(
+    rows: tuple[PipelineEvent, ...], paths: tuple[Path, Path, Path]
+) -> None:
+    jsonl, trace, _ = paths
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    jsonl.write_text("".join(_jsonl_line(event) for event in rows), encoding="utf-8")
+    entries = [_trace_entry(event) for event in rows]
     trace.write_text(
-        json.dumps({"traceEvents": list(_trace_events(rows))}, indent=2) + "\n"
+        _TRACE_HEAD + ",".join(f"\n{entry}" for entry in entries) + _TRACE_TAIL
+        if entries
+        else _EMPTY_TRACE,
+        encoding="utf-8",
     )
-    report.write_text(render_pipeline_report(rows))
-    return jsonl, trace, report
 
 
-def _trace_events(events: Iterable[PipelineEvent]) -> Iterable[dict[str, Any]]:
-    for event in events:
-        yield {
-            "name": event.stage,
-            "cat": event.component,
-            "ph": "X",
-            "ts": event.monotonic_ns // 1_000,
-            "dur": event.duration_us,
-            "pid": event.run_id,
-            "tid": event.request_id,
-            "args": {
-                "backend": event.backend,
-                "model": event.model,
-                "phase": event.phase,
-                "state": event.state,
-                **(event.details or {}),
-            },
-        }
+def _append_artifacts(
+    pending: list[PipelineEvent], paths: tuple[Path, Path, Path]
+) -> bool:
+    """Append events to existing artifacts; return False when a rewrite is needed."""
+
+    jsonl, trace, _ = paths
+    tail = _TRACE_TAIL.encode()
+    try:
+        with trace.open("r+b") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            if size < len(tail):
+                return False
+            handle.seek(size - len(tail))
+            if handle.read(len(tail)) != tail:
+                return False
+            handle.seek(size - len(tail))
+            handle.write(
+                (
+                    "".join(f",\n{_trace_entry(event)}" for event in pending)
+                    + _TRACE_TAIL
+                ).encode()
+            )
+        with jsonl.open("a", encoding="utf-8") as handle:
+            handle.write("".join(_jsonl_line(event) for event in pending))
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _jsonl_line(event: PipelineEvent) -> str:
+    return json.dumps(asdict(event), sort_keys=True) + "\n"
+
+
+def _trace_entry(event: PipelineEvent) -> str:
+    return textwrap.indent(json.dumps(_trace_event(event), indent=2), "    ")
+
+
+def _trace_event(event: PipelineEvent) -> dict[str, Any]:
+    return {
+        "name": event.stage,
+        "cat": event.component,
+        "ph": "X",
+        "ts": event.monotonic_ns // 1_000,
+        "dur": event.duration_us,
+        "pid": event.run_id,
+        "tid": event.request_id,
+        "args": {
+            "backend": event.backend,
+            "model": event.model,
+            "phase": event.phase,
+            "state": event.state,
+            **(event.details or {}),
+        },
+    }
 
 
 __all__ = [
