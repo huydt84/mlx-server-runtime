@@ -44,7 +44,7 @@ _SOURCE = """
     threadgroup mlx_air::PagedDecodeScratch<
         SIMDGROUPS, QUERY_HEADS / KV_HEADS, HEAD_DIM> scratch;
     mlx_air::paged_decode_attention<
-        Q, QUERY_HEADS, KV_HEADS, HEAD_DIM, PAGE_SIZE, SIMDGROUPS, SPLITS>(
+        Q, KV, QUERY_HEADS, KV_HEADS, HEAD_DIM, PAGE_SIZE, SIMDGROUPS, SPLITS>(
         queries, key_pages, value_pages, block_tables, block_tables_shape[1],
         lengths, scale[0], window[0], out, partial_out, partial_max,
         partial_sum, scratch, threadgroup_position_in_grid.xy,
@@ -155,6 +155,53 @@ def warmup_key_counts(kv_heads: int) -> tuple[int, ...]:
     return tuple(counts)
 
 
+def attention_template(
+    queries: mx.array,
+    key_pages: mx.array,
+    value_pages: mx.array,
+    *,
+    simdgroups: int,
+    splits: int,
+) -> list[tuple[str, Any]]:
+    """Return the template arguments of the attention kernel for one launch.
+
+    The query (and output) dtype ``Q`` and the KV pool dtype ``KV`` are bound
+    separately: a model's activations can be float16 while its cache is
+    bfloat16, and each pairing compiles its own kernel variant.
+
+    Args:
+        queries: ``(rows, query_heads, 1, head_dim)`` decode queries.
+        key_pages: ``(pages, page_size, kv_heads, head_dim)`` key pool.
+        value_pages: Value pool; must share the key pool's dtype.
+        simdgroups: Simdgroups per threadgroup, from ``simdgroups_for``.
+        splits: Key-range splits per row, from ``splits_for``.
+
+    Returns:
+        ``(name, value)`` pairs for ``mx.fast.metal_kernel``'s ``template``.
+
+    Raises:
+        ValueError: If the key and value pools have different dtypes.
+    """
+
+    if value_pages.dtype != key_pages.dtype:
+        raise ValueError(
+            "paged decode attention needs key and value pools of one dtype, "
+            f"got {key_pages.dtype} and {value_pages.dtype}"
+        )
+    _, query_heads, _, head_dim = (int(size) for size in queries.shape)
+    _, page_size, kv_heads, _ = (int(size) for size in key_pages.shape)
+    return [
+        ("Q", queries.dtype),
+        ("KV", key_pages.dtype),
+        ("QUERY_HEADS", query_heads),
+        ("KV_HEADS", kv_heads),
+        ("HEAD_DIM", head_dim),
+        ("PAGE_SIZE", page_size),
+        ("SIMDGROUPS", simdgroups),
+        ("SPLITS", splits),
+    ]
+
+
 def paged_decode_attention(
     queries: mx.array,
     key_pages: mx.array,
@@ -172,7 +219,8 @@ def paged_decode_attention(
         queries: ``(rows, query_heads, 1, head_dim)`` decode queries.
         key_pages: ``(pages, page_size, kv_heads, head_dim)`` key pool, already
             holding this step's keys.
-        value_pages: Value pool with the same shape as ``key_pages``.
+        value_pages: Value pool with the same shape and dtype as
+            ``key_pages``. The pool dtype may differ from the query dtype.
         block_tables: ``(rows, width)`` int32 page ids; entries past a row's
             pages are ignored.
         lengths: ``(rows,)`` int32 key count per row, including this step.
@@ -186,11 +234,12 @@ def paged_decode_attention(
         dtype.
 
     Raises:
-        ValueError: If the head geometry is unsupported.
+        ValueError: If the head geometry is unsupported or the key and value
+            pools have different dtypes.
     """
 
     rows, query_heads, query_tokens, head_dim = (int(size) for size in queries.shape)
-    _, page_size, kv_heads, pool_head_dim = (int(size) for size in key_pages.shape)
+    _, _, kv_heads, pool_head_dim = (int(size) for size in key_pages.shape)
     simdgroups = simdgroups_for(query_heads, kv_heads, head_dim)
     if query_tokens != 1 or pool_head_dim != head_dim or not simdgroups:
         raise ValueError("paged decode attention geometry is unsupported")
@@ -207,15 +256,13 @@ def paged_decode_attention(
             _scalar(float(scale), mx.float32),
             _scalar(int(window_size or 0), mx.int32),
         ],
-        template=[
-            ("Q", queries.dtype),
-            ("QUERY_HEADS", query_heads),
-            ("KV_HEADS", kv_heads),
-            ("HEAD_DIM", head_dim),
-            ("PAGE_SIZE", page_size),
-            ("SIMDGROUPS", simdgroups),
-            ("SPLITS", splits),
-        ],
+        template=attention_template(
+            queries,
+            key_pages,
+            value_pages,
+            simdgroups=simdgroups,
+            splits=splits,
+        ),
         grid=(rows * kv_heads * simdgroups * _SIMD_WIDTH, splits, 1),
         threadgroup=(simdgroups * _SIMD_WIDTH, 1, 1),
         output_shapes=[

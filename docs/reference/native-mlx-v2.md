@@ -185,7 +185,8 @@ uses two attention paths:
   together with all query heads that share it. When a step has few rows, each
   row's keys are split into ranges of at least 32 keys on separate
   threadgroups and merged by a second kernel. Head dimensions that are not a multiple of 32 fall back to
-  the gather path below.
+  the gather path below. The query and the KV pool may use different
+  dtypes (float16, bfloat16, or float32); the output keeps the query dtype.
   The kernel source is
   `python/mlx_worker/native_mlx/kernels/paged_decode.metal`.
 - **Prefill and mixed steps** gather each row's pages into padded dense K/V

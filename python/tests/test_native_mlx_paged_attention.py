@@ -150,14 +150,25 @@ def test_paged_attention_builds_one_mask_per_step() -> None:
     reservation.abort()
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    ("query_dtype", "kv_dtype"),
+    [
+        (mx.float16, mx.float16),
+        (mx.bfloat16, mx.bfloat16),
+        # Quantized checkpoints can run float16 activations over a bfloat16
+        # cache (and the reverse); each pairing is its own kernel variant.
+        (mx.float16, mx.bfloat16),
+        (mx.bfloat16, mx.float16),
+    ],
+)
 @pytest.mark.parametrize(
     ("query_heads", "kv_heads", "head_dim"), [(4, 2, 64), (7, 1, 128), (4, 1, 256)]
 )
 @pytest.mark.parametrize("window_size", [None, 5, 300])
 @pytest.mark.parametrize("lengths", [[1, 4, 13, 40], [70], [700]])
 def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
-    dtype,
+    query_dtype,
+    kv_dtype,
     query_heads: int,
     kv_heads: int,
     head_dim: int,
@@ -166,8 +177,12 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
 ) -> None:
     page_size, pages = 4, 200
     mx.random.seed(3)
-    key_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(dtype)
-    value_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(dtype)
+    key_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(
+        kv_dtype
+    )
+    value_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(
+        kv_dtype
+    )
     order = [int(page) for page in mx.random.permutation(pages).tolist()]
     tables: list[list[int]] = []
     for length in lengths:
@@ -175,7 +190,9 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
         tables.append(order[:count])
         order = order[count:]
     width = max(len(table) for table in tables)
-    queries = mx.random.normal((len(lengths), query_heads, 1, head_dim)).astype(dtype)
+    queries = mx.random.normal((len(lengths), query_heads, 1, head_dim)).astype(
+        query_dtype
+    )
 
     output = paged_decode_attention(
         queries,
@@ -193,17 +210,19 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
 
         def dense(pool, table=table, length=length, start=start):
             rows = pool[mx.array(table)].reshape(-1, kv_heads, head_dim)[:length]
-            return rows[start:].transpose(1, 0, 2)[None]
+            return rows[start:].transpose(1, 0, 2)[None].astype(mx.float32)
 
+        # The reference attends in float32 over the exact stored values.
         expected = mx.fast.scaled_dot_product_attention(
-            queries[row : row + 1],
+            queries[row : row + 1].astype(mx.float32),
             dense(key_pages),
             dense(value_pages),
             scale=head_dim**-0.5,
         )
+        assert output.dtype == query_dtype
         assert mx.allclose(
             output[row : row + 1].astype(mx.float32),
-            expected.astype(mx.float32),
+            expected,
             atol=2e-2,
         ).item(), (row, length)
 

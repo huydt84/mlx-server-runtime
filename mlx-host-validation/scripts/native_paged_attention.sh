@@ -14,6 +14,8 @@
 #   - public native gateway against `mlx-community/Qwen2.5-7B-Instruct-4bit`
 #   - direct native executor with the same checkpoint
 #   - dense-reference vs native Metal paged-attention parity probe
+#   - paged decode kernel vs a float32 reference for every query/KV dtype
+#     pairing (this checkpoint runs float16 queries over a bfloat16 cache)
 #   - v1 public gateway request against the same checkpoint
 #
 # Host requirements:
@@ -28,6 +30,9 @@
 #   - `mlx_metal_available=1`
 #   - `paged_public_outputs_ok=1`
 #   - `paged_public_paged_metrics_ok=1`
+#   - `paged_public_decode_ok=1`
+#   - `paged_direct_decode_dtype_parity_ok=1`
+#   - `paged_direct_model_decode_dtypes=<query>/<kv>` (informational)
 #   - `paged_direct_paged_kernel_parity_ok=1`
 #   - `paged_direct_page_lifecycle_ok=1`
 #   - `paged_direct_capacity_failure_ok=1`
@@ -39,7 +44,10 @@
 #
 # Expected failure signals:
 #   - non-zero exit
-#   - gateway fails readiness or exits unexpectedly
+#   - gateway fails readiness or exits unexpectedly (startup warmup decodes
+#     through the checkpoint's own query/KV dtypes, so a kernel that cannot
+#     compile for them fails readiness)
+#   - a multi-token chat completion returns a non-200 status
 #   - public metrics miss `paged-mlx` or `native-metal-paged-sdpa`
 #   - direct native executor lacks mixed one-forward evidence
 #   - direct parity, page lifecycle, capacity, cancellation, or config probes fail
@@ -212,6 +220,14 @@ payloads = {
         "top_p": 1.0,
         "stream": True,
     },
+    "decode.json": {
+        "model": checkpoint,
+        "messages": [{"role": "user", "content": "List five colors, one per line."}],
+        "max_tokens": 24,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "stream": False,
+    },
     "v1.json": {
         "model": checkpoint,
         "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
@@ -227,7 +243,7 @@ PY
 
 echo "[4/7] Run public native gateway paged-KV workload"
 start_gateway "$NATIVE_LOG" "$NATIVE_PORT" "$NATIVE_CONFIG"
-uv --directory "$PYTHON_DIR" run python - <<'PY' "$REQUEST_DIR/short.json" "$REQUEST_DIR/long.json" "$PUBLIC_CAPTURE" "$PUBLIC_METRICS" "$NATIVE_PORT"
+uv --directory "$PYTHON_DIR" run python - <<'PY' "$REQUEST_DIR/short.json" "$REQUEST_DIR/long.json" "$PUBLIC_CAPTURE" "$PUBLIC_METRICS" "$NATIVE_PORT" "$REQUEST_DIR/decode.json"
 from __future__ import annotations
 
 import http.client
@@ -330,6 +346,28 @@ if short_result.get("status") != 200 or long_result.get("status") != 200:
 if not short_result.get("text") or not long_result.get("text"):
     raise SystemExit("public native output was empty")
 
+# A non-streaming request that decodes many tokens, so every decode step runs
+# the paged decode kernel in the checkpoint's own query/KV dtypes.
+decode_conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=240)
+decode_conn.request(
+    "POST",
+    "/v1/chat/completions",
+    body=load_body(sys.argv[6]),
+    headers={"Content-Type": "application/json"},
+)
+decode_response = decode_conn.getresponse()
+decode_body = decode_response.read().decode("utf-8", errors="replace")
+decode_conn.close()
+if decode_response.status != 200:
+    raise SystemExit(f"multi-token chat returned {decode_response.status}: {decode_body[:500]}")
+decode_payload = json.loads(decode_body)
+decode_text = decode_payload["choices"][0]["message"]["content"].strip()
+decode_tokens = int(decode_payload.get("usage", {}).get("completion_tokens", 0))
+if not decode_text or decode_tokens < 2:
+    raise SystemExit(f"multi-token chat decoded too little: tokens={decode_tokens} text={decode_text!r}")
+print(f"paged_public_decode_completion_tokens={decode_tokens}")
+print("paged_public_decode_ok=1")
+
 paged_metric = 'mlx_kv_cache_pages_by_backend{backend="paged-mlx",modality="text",state="used"}'
 prefill_metric = 'mlx_scheduled_tokens_by_backend{backend="native-mlx",modality="text",phase="prefill"}'
 decode_metric = 'mlx_scheduled_tokens_by_backend{backend="native-mlx",modality="text",phase="decode"}'
@@ -351,6 +389,7 @@ prefill_decode_ok = any(snapshot.get(prefill_metric, 0.0) > 0 for snapshot in sn
 summary = {
     "short": short_result,
     "long": long_result,
+    "decode": decode_payload,
     "paged_metrics_ok": paged_metrics_ok,
     "attention_ok": attention_ok,
     "prefill_decode_ok": prefill_decode_ok,
@@ -378,10 +417,12 @@ import time
 
 import mlx.core as mx
 
+import mlx_worker.native_mlx.attention as native_attention
 from mlx_worker.native_mlx.attention import DenseReferenceAttentionBackend, PagedMetalAttentionBackend
 from mlx_worker.native_mlx.bootstrap import build_native_artifacts
 from mlx_worker.native_mlx.cache import DenseKVCacheBackend, PagedKVCacheBackend
 from mlx_worker.native_mlx.interfaces import ExecutionBatch, ExecutionRequest, ForwardMode, SamplingParams
+from mlx_worker.native_mlx.paged_decode import paged_decode_attention
 
 
 def prefill_request(request_id: str, tokens: tuple[int, ...], handle: str) -> ExecutionRequest:
@@ -446,6 +487,57 @@ mx.eval(dense, paged)
 if not mx.allclose(dense, paged, atol=1e-3, rtol=1e-3).item():
     raise SystemExit("paged Metal attention did not match dense reference")
 print("paged_direct_paged_kernel_parity_ok=1")
+
+# Paged decode kernel against a float32 reference for each query/KV dtype
+# pairing, over scattered pages and enough keys to split the key range.
+decode_page_size, decode_heads, decode_kv_heads, decode_head_dim = 16, 28, 4, 128
+decode_lengths = [37, 300]
+decode_tables = [[5, 2, 9], [int(page) for page in range(40, 59)]]
+decode_width = max(len(table) for table in decode_tables)
+block_tables = mx.array(
+    [table + [0] * (decode_width - len(table)) for table in decode_tables], dtype=mx.int32
+)
+mx.random.seed(11)
+base_keys = mx.random.normal((64, decode_page_size, decode_kv_heads, decode_head_dim))
+base_values = mx.random.normal((64, decode_page_size, decode_kv_heads, decode_head_dim))
+base_queries = mx.random.normal((len(decode_lengths), decode_heads, 1, decode_head_dim))
+for query_dtype, kv_dtype in (
+    (mx.float16, mx.float16),
+    (mx.bfloat16, mx.bfloat16),
+    (mx.float16, mx.bfloat16),
+    (mx.bfloat16, mx.float16),
+):
+    key_pages = base_keys.astype(kv_dtype)
+    value_pages = base_values.astype(kv_dtype)
+    decode_queries = base_queries.astype(query_dtype)
+    output = paged_decode_attention(
+        decode_queries,
+        key_pages,
+        value_pages,
+        block_tables,
+        mx.array(decode_lengths, dtype=mx.int32),
+        max_length=max(decode_lengths),
+        scale=decode_head_dim**-0.5,
+    )
+    if output.dtype != query_dtype:
+        raise SystemExit(f"paged decode output dtype {output.dtype} != query dtype {query_dtype}")
+    for row, (length, table) in enumerate(zip(decode_lengths, decode_tables, strict=True)):
+
+        def dense(pool, table=table, length=length):
+            rows = pool[mx.array(table)].reshape(-1, decode_kv_heads, decode_head_dim)[:length]
+            return rows.transpose(1, 0, 2)[None].astype(mx.float32)
+
+        expected = mx.fast.scaled_dot_product_attention(
+            decode_queries[row : row + 1].astype(mx.float32),
+            dense(key_pages),
+            dense(value_pages),
+            scale=decode_head_dim**-0.5,
+        )
+        error = float(mx.max(mx.abs(output[row : row + 1].astype(mx.float32) - expected)).item())
+        print(f"paged_direct_decode_max_abs_error[{query_dtype}/{kv_dtype}][{length}]={error:.5f}")
+        if error > 2e-2:
+            raise SystemExit(f"paged decode {query_dtype}/{kv_dtype} diverged from reference at {length} keys")
+print("paged_direct_decode_dtype_parity_ok=1")
 
 lifecycle = PagedKVCacheBackend(
     num_layers=1,
@@ -512,6 +604,17 @@ except ValueError:
 else:
     raise SystemExit("unsupported page size did not fail")
 
+# Record the query/KV dtypes the real checkpoint hands the paged decode kernel.
+model_decode_dtypes: set[str] = set()
+real_paged_decode = native_attention.paged_decode_attention
+
+
+def recording_paged_decode(queries, key_pages, *args, **kwargs):
+    model_decode_dtypes.add(f"{queries.dtype}/{key_pages.dtype}".replace("mlx.core.", ""))
+    return real_paged_decode(queries, key_pages, *args, **kwargs)
+
+
+native_attention.paged_decode_attention = recording_paged_decode
 artifacts = build_native_artifacts(checkpoint, cache_budget_bytes=32 * 1024 * 1024, kv_page_size=16)
 executor = artifacts.executor
 coordinator = artifacts.cache_coordinator
@@ -552,6 +655,22 @@ try:
     if not mixed_ok:
         raise SystemExit("direct mixed native execution did not use one paged forward")
     print("paged_direct_mixed_single_forward_ok=1")
+
+    # A decode-only step for both rows takes the paged decode kernel path.
+    next_tokens = {result.request_id: int(result.next_token_id) for result in mixed.results}
+    decode_step = executor.execute_batch(
+        ExecutionBatch(
+            requests=tuple(
+                decode_request(request_id, next_tokens[request_id], coordinator.length(handle), handle)
+                for request_id, handle in (("paged-a", handle_a), ("paged-b", handle_b))
+            )
+        )
+    )
+    if decode_step.forward_mode.value != "decode" or len(decode_step.results) != 2:
+        raise SystemExit("direct two-row decode step did not run as decode")
+    if not model_decode_dtypes:
+        raise SystemExit("direct decode step never reached the paged decode kernel")
+    print(f"paged_direct_model_decode_dtypes={','.join(sorted(model_decode_dtypes))}")
 
     executor.execute_batch(
         ExecutionBatch(
