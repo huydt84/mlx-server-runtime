@@ -9,6 +9,7 @@ from typing import Any
 import mlx.core as mx
 from mlx import nn
 
+from ..activations import swiglu
 from ..interfaces import ForwardBatch, LayerAttentionContext, select_logits_positions
 from ..mapping import (
     WeightIndex,
@@ -38,10 +39,6 @@ class Qwen3ModelConfig:
     tie_word_embeddings: bool
     quantization: dict[str, Any] | None
     kv_cache_dtype: str = "float16"
-
-
-def _silu_gate(gate: mx.array, up: mx.array) -> mx.array:
-    return nn.silu(gate) * up
 
 
 class Qwen3Attention(nn.Module):
@@ -131,7 +128,7 @@ class Qwen3Mlp(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(_silu_gate(self.gate_proj(x), self.up_proj(x)))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Qwen3TransformerBlock(nn.Module):

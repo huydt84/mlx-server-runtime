@@ -10,6 +10,7 @@ from typing import Any
 import mlx.core as mx
 from mlx import nn
 
+from ..activations import swiglu
 from ..interfaces import (
     ForwardBatch,
     HybridLayerAttentionContext,
@@ -214,7 +215,7 @@ class SwitchGLU(nn.Module):
         up = self.up_proj(x, selected, sorted_indices=do_sort)
         gate = self.gate_proj(x, selected, sorted_indices=do_sort)
         output = self.down_proj(
-            nn.silu(gate) * up,
+            swiglu(gate, up),
             selected,
             sorted_indices=do_sort,
         )
@@ -347,7 +348,7 @@ class Lfm2Mlp(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Lfm2MoE(nn.Module):

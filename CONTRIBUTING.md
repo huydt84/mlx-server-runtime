@@ -227,6 +227,30 @@ evaluation and is intentionally separate from performance measurement.
 Tests for trace coverage and comparison behavior live in
 `python/tests/test_native_mlx_trace.py`.
 
+## Write a Metal Kernel
+
+Custom kernels live as `.metal` files in
+`python/mlx_worker/native_mlx/kernels/` and run through
+`mx.fast.metal_kernel`. Write the kernel as a templated device function in a
+`.metal` file; the Python wrapper passes the file as the `header` and keeps a
+short `source` body that only declares threadgroup scratch and forwards MLX's
+generated arguments (see `paged_decode.py`).
+
+- Share code with `#include "other.metal"`. `metal_source.metal_header`
+  inlines each local include once, because MLX compiles from a string and
+  cannot resolve them.
+- Inlined files carry `#line` markers, so a compile error reads
+  `paged_decode.metal:64:38: error: ...` rather than pointing into a
+  generated string.
+- MLX passes a single-element input in the `constant` address space and a
+  larger one in `device`. Make the pointer type of any input that can have one
+  element a template parameter.
+- Standalone syntax checks need the Metal Toolchain
+  (`xcodebuild -downloadComponent MetalToolchain`), then
+  `xcrun -sdk macosx metal -std=metal3.1 -c kernels/paged_decode.metal -o /dev/null`.
+- Prove a kernel change with a parity test against a dense MLX reference
+  (`python/tests/test_native_mlx_paged_attention.py`).
+
 ## Profile Model-Graph Inference
 
 Model-graph profiling measures MLX module categories inside a model step. It

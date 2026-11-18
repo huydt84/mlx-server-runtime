@@ -9,6 +9,7 @@ from typing import Any
 import mlx.core as mx
 from mlx import nn
 
+from ..activations import geglu_approx
 from ..interfaces import ForwardBatch, LayerAttentionContext, select_logits_positions
 from ..mapping import (
     WeightIndex,
@@ -146,7 +147,7 @@ class Gemma3Mlp(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(geglu_approx(self.gate_proj(x), self.up_proj(x)))
 
 
 class Gemma3TransformerBlock(nn.Module):

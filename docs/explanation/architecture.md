@@ -141,7 +141,8 @@ The IPC uses a **Unix domain socket** with **newline-delimited JSON frames**.
 2. Rust: spawn worker (python -m mlx_worker.main)
 3. Worker: connect to socket
 4. Worker: send STATUS frames (loading_weights → initializing_runtime → warming_up)
-5. Worker: warm up model with 1-token generation
+5. Worker: warm up model (v1: 1-token generation; native-mlx: the requests
+   described under "Startup Warmup" in docs/reference/native-mlx-v2.md)
 6. Worker: send READY frame
 7. Rust: create WorkerClient, mark service healthy
    (If step 3–6 fails or times out: Rust kills worker, returns 503)

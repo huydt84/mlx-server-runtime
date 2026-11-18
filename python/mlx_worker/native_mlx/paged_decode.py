@@ -1,5 +1,7 @@
 """Metal kernel for decode attention read directly from the paged KV pool.
 
+The kernel source is ``kernels/paged_decode.metal``.
+
 A decode step attends one new query token per row to that row's cached keys.
 Gathering every row's pages into dense K/V before SDPA copies the whole cache
 for every layer of every step, which costs more than the attention itself once
@@ -25,6 +27,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from .metal_source import metal_header
+
 _SIMD_WIDTH = 32
 _THREADGROUP_MEMORY_BYTES = 32 * 1024
 _MAX_SIMDGROUPS = 8
@@ -34,126 +38,24 @@ _TARGET_THREADGROUPS = 32
 _MIN_KEYS_PER_SPLIT = 32
 _MAX_SPLITS = 32
 
+# The kernels live in kernels/paged_decode.metal; these bodies only declare
+# threadgroup scratch and forward MLX's generated arguments.
 _SOURCE = """
-    constexpr int EPL = HEAD_DIM / 32;
-    constexpr int GQA = QUERY_HEADS / KV_HEADS;
-    uint row = threadgroup_position_in_grid.x / KV_HEADS;
-    uint kv_head = threadgroup_position_in_grid.x % KV_HEADS;
-    uint split = threadgroup_position_in_grid.y;
-    uint lane = thread_index_in_simdgroup;
-    uint simd = simdgroup_index_in_threadgroup;
-    uint tid = thread_position_in_threadgroup.x;
-
-    threadgroup float maxes[SIMDGROUPS * GQA];
-    threadgroup float sums[SIMDGROUPS * GQA];
-    threadgroup float outputs[SIMDGROUPS * GQA * HEAD_DIM];
-
-    float qv[GQA][EPL];
-    float o[GQA][EPL];
-    float max_score[GQA];
-    float sum_exp[GQA];
-    for (int g = 0; g < GQA; g++) {
-        const device Q* q = queries
-            + (row * QUERY_HEADS + kv_head * GQA + g) * HEAD_DIM + lane * EPL;
-        for (int i = 0; i < EPL; i++) {
-            qv[g][i] = static_cast<float>(q[i]) * scale[0];
-            o[g][i] = 0.0f;
-        }
-        max_score[g] = -INFINITY;
-        sum_exp[g] = 0.0f;
-    }
-
-    int length = lengths[row];
-    int start = window[0] > 0 ? max(0, length - window[0]) : 0;
-    int span = (length - start + SPLITS - 1) / SPLITS;
-    int split_start = start + int(split) * span;
-    int split_end = min(length, split_start + span);
-    // Single-element inputs arrive in the constant address space.
-    auto table = block_tables + row * block_tables_shape[1];
-    for (int t = split_start + int(simd); t < split_end; t += SIMDGROUPS) {
-        uint page = uint(table[t / PAGE_SIZE]);
-        uint base = ((page * PAGE_SIZE + uint(t % PAGE_SIZE)) * KV_HEADS + kv_head)
-            * HEAD_DIM + lane * EPL;
-        float k[EPL];
-        float v[EPL];
-        for (int i = 0; i < EPL; i++) {
-            k[i] = static_cast<float>(key_pages[base + i]);
-            v[i] = static_cast<float>(value_pages[base + i]);
-        }
-        for (int g = 0; g < GQA; g++) {
-            float score = 0.0f;
-            for (int i = 0; i < EPL; i++) {
-                score += qv[g][i] * k[i];
-            }
-            score = simd_sum(score);
-            float new_max = max(max_score[g], score);
-            float factor = fast::exp(max_score[g] - new_max);
-            float weight = fast::exp(score - new_max);
-            max_score[g] = new_max;
-            sum_exp[g] = sum_exp[g] * factor + weight;
-            for (int i = 0; i < EPL; i++) {
-                o[g][i] = o[g][i] * factor + weight * v[i];
-            }
-        }
-    }
-
-    for (int g = 0; g < GQA; g++) {
-        if (lane == 0) {
-            maxes[g * SIMDGROUPS + simd] = max_score[g];
-            sums[g * SIMDGROUPS + simd] = sum_exp[g];
-        }
-        for (int i = 0; i < EPL; i++) {
-            outputs[(simd * GQA + g) * HEAD_DIM + lane * EPL + i] = o[g][i];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint first_head = row * QUERY_HEADS + kv_head * GQA;
-    for (uint e = tid; e < GQA * HEAD_DIM; e += SIMDGROUPS * 32) {
-        uint g = e / HEAD_DIM;
-        float group_max = -INFINITY;
-        for (int s = 0; s < SIMDGROUPS; s++) {
-            group_max = max(group_max, maxes[g * SIMDGROUPS + s]);
-        }
-        float total = 0.0f;
-        float acc = 0.0f;
-        for (int s = 0; s < SIMDGROUPS; s++) {
-            float m = maxes[g * SIMDGROUPS + s];
-            float factor = m == -INFINITY ? 0.0f : fast::exp(m - group_max);
-            total += sums[g * SIMDGROUPS + s] * factor;
-            acc += outputs[(s * GQA + g) * HEAD_DIM + (e % HEAD_DIM)] * factor;
-        }
-        if (SPLITS == 1) {
-            out[first_head * HEAD_DIM + e] =
-                static_cast<Q>(total > 0.0f ? acc / total : 0.0f);
-        } else {
-            // Unnormalized partial result, scaled to this split's maximum.
-            uint head = first_head + g;
-            partial_out[(head * SPLITS + split) * HEAD_DIM + e % HEAD_DIM] = acc;
-            if (e % HEAD_DIM == 0) {
-                partial_max[head * SPLITS + split] = group_max;
-                partial_sum[head * SPLITS + split] = total;
-            }
-        }
-    }
+    threadgroup mlx_air::PagedDecodeScratch<
+        SIMDGROUPS, QUERY_HEADS / KV_HEADS, HEAD_DIM> scratch;
+    mlx_air::paged_decode_attention<
+        Q, QUERY_HEADS, KV_HEADS, HEAD_DIM, PAGE_SIZE, SIMDGROUPS, SPLITS>(
+        queries, key_pages, value_pages, block_tables, block_tables_shape[1],
+        lengths, scale[0], window[0], out, partial_out, partial_max,
+        partial_sum, scratch, threadgroup_position_in_grid.xy,
+        simdgroup_index_in_threadgroup, thread_index_in_simdgroup,
+        thread_position_in_threadgroup.x);
 """
 
 _MERGE_SOURCE = """
-    uint head = threadgroup_position_in_grid.x;
-    uint dim = thread_position_in_threadgroup.x;
-    float global_max = -INFINITY;
-    for (int s = 0; s < SPLITS; s++) {
-        global_max = max(global_max, partial_max[head * SPLITS + s]);
-    }
-    float total = 0.0f;
-    float acc = 0.0f;
-    for (int s = 0; s < SPLITS; s++) {
-        float m = partial_max[head * SPLITS + s];
-        float factor = m == -INFINITY ? 0.0f : fast::exp(m - global_max);
-        total += partial_sum[head * SPLITS + s] * factor;
-        acc += partial_out[(head * SPLITS + s) * HEAD_DIM + dim] * factor;
-    }
-    out[head * HEAD_DIM + dim] = static_cast<Q>(total > 0.0f ? acc / total : 0.0f);
+    mlx_air::paged_decode_merge<Q, HEAD_DIM, SPLITS>(
+        partial_out, partial_max, partial_sum, out,
+        threadgroup_position_in_grid.x, thread_position_in_threadgroup.x);
 """
 
 
@@ -172,6 +74,7 @@ def _kernel() -> Any:
         ],
         output_names=["out", "partial_out", "partial_max", "partial_sum"],
         source=_SOURCE,
+        header=metal_header("paged_decode.metal"),
     )
 
 
@@ -182,6 +85,7 @@ def _merge_kernel() -> Any:
         input_names=["partial_out", "partial_max", "partial_sum"],
         output_names=["out"],
         source=_MERGE_SOURCE,
+        header=metal_header("paged_decode.metal"),
     )
 
 
@@ -221,6 +125,34 @@ def splits_for(rows: int, kv_heads: int, max_keys: int) -> int:
     while splits * 2 <= limit:
         splits *= 2
     return splits
+
+
+def warmup_key_counts(kv_heads: int) -> tuple[int, ...]:
+    """Return one single-row decode length per split count a step can use.
+
+    Every split count compiles its own kernel variant on first use. Decoding
+    once at each returned length, which sits inside the range of keys that
+    selects that split count, compiles them all. Steps with more rows use a
+    subset of the same split counts.
+
+    Args:
+        kv_heads: KV heads per layer.
+
+    Returns:
+        Ascending key counts, starting with the single-split range.
+    """
+
+    counts: list[int] = []
+    splits = 1
+    while splits <= _MAX_SPLITS:
+        # Split count ``s`` covers [32 * s, 64 * s) keys; aim for the middle so
+        # a slightly longer or shorter prompt stays in range.
+        keys = (_MIN_KEYS_PER_SPLIT * 3 // 2) * splits
+        if splits_for(1, kv_heads, keys) != splits:
+            break
+        counts.append(keys)
+        splits *= 2
+    return tuple(counts)
 
 
 def paged_decode_attention(

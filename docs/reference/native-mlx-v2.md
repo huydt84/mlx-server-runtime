@@ -186,6 +186,8 @@ uses two attention paths:
   row's keys are split into ranges of at least 32 keys on separate
   threadgroups and merged by a second kernel. Head dimensions that are not a multiple of 32 fall back to
   the gather path below.
+  The kernel source is
+  `python/mlx_worker/native_mlx/kernels/paged_decode.metal`.
 - **Prefill and mixed steps** gather each row's pages into padded dense K/V
   and call `mx.fast.scaled_dot_product_attention`.
 
@@ -200,6 +202,27 @@ Attention backend identity and dispatch telemetry are owned by the attention
 adapter. Cache metrics remain owned by the KV backend. Because MLX evaluation
 is lazy, `attention_time_ms` measures attention graph construction/dispatch;
 `executor_eval_ms` contains the synchronized MLX execution boundary.
+
+## Startup Warmup
+
+MLX compiles each Metal kernel variant the first time a step uses it. Before
+the worker reports ready, warmup runs to completion every variant a typical
+request reaches, so the first public request does not pay for compilation:
+
+- one greedy request per paged-decode split count, each decoding 4 tokens
+  from a prompt sized to select that split count (48, 96, 192, ... tokens;
+  the list ends at the largest split count the model's KV head count allows,
+  for example 192 tokens at 8 KV heads and 1,536 at 1);
+- two requests at once with different prompt lengths, one sampled with
+  `temperature` 0.7 and `top_p` 0.9, which covers padded multi-row prefill,
+  multi-row decode, and top-p sampling.
+
+The prompts share a prefix, so the prefix cache spares later ones most of
+their prefill; hybrid models, which run without a prefix cache, prefill each
+in full. Lengths the KV pool cannot hold are skipped. Warmup duration is
+reported as `last_warmup_latency_ms`. On an M4 Pro it took 0.6 s for
+`Qwen3-4B-Instruct-2507-4bit`, 1.2 s for `gemma-3-270m-it-qat-8bit`, and
+1.7 s for `LFM2.5-8B-A1B-MLX-4bit`.
 
 ## Profiling
 

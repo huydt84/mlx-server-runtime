@@ -23,6 +23,16 @@ from .interfaces import (
 )
 from .scheduler import NativeContinuousScheduler
 
+# Startup warmup requests (see NativeRuntime.warmup). Each decodes a few tokens
+# so the overlap pipeline runs more than one decode step.
+_WARMUP_DECODE_TOKENS = 4
+_WARMUP_MIN_PROMPT_TOKENS = 48
+_WARMUP_PAIR_LENGTH_GAP = 8
+_WARMUP_PROBE_WORDS = 64
+_WARMUP_WORD = "warm"
+_WARMUP_SAMPLED_TEMPERATURE = 0.7
+_WARMUP_SAMPLED_TOP_P = 0.9
+
 
 @dataclass
 class _StopTextAssembler:
@@ -94,6 +104,7 @@ class NativeRuntime:
         eos_token_ids: tuple[int, ...],
         profiler: Any | None = None,
         max_total_tokens: int | None = None,
+        warmup_prompt_lengths: tuple[int, ...] = (_WARMUP_MIN_PROMPT_TOKENS,),
     ) -> None:
         self._scheduler = scheduler
         self._max_total_tokens = max_total_tokens
@@ -102,31 +113,128 @@ class NativeRuntime:
         self._decode_target = decode_target
         self._eos_token_ids = eos_token_ids
         self._profiler = profiler
+        self._warmup_prompt_lengths = warmup_prompt_lengths
+        self._warming_up = False
         self._requests: dict[str, _RuntimeState] = {}
         self.last_warmup_latency_ms = 0
         self._cancellation_count = 0
         self._error_count = 0
 
     def warmup(self) -> None:
-        started = time.perf_counter()
-        from ..ipc import ChatMessage
+        """Compile the GPU kernels a first public request would otherwise compile.
 
-        request = ChatCompletionRequest(
-            request_id="warmup",
-            model=self._model_ref,
-            messages=[ChatMessage(role="user", content="ping")],
-            max_tokens=1,
-            temperature=0.0,
-            top_p=1.0,
-            max_prompt_tokens=64,
-            max_completion_tokens=64,
-            max_total_tokens_per_request=128,
-        )
-        self.submit(request)
-        while not self.idle():
-            self.tick()
+        MLX compiles a Metal kernel variant the first time a step uses it, which
+        added hundreds of milliseconds to the first requests after startup.
+        Warmup therefore runs, to completion:
+
+        - one greedy request per ``warmup_prompt_lengths`` entry, each decoding
+          a few tokens, so decode reaches every key-count range the paged
+          decode kernel specializes on. The prompts share a prefix, so the
+          prefix cache spares later ones most of their prefill;
+        - two requests at once with different prompt lengths, one sampled with
+          ``top_p``, which compiles padded multi-row prefill, multi-row decode,
+          and top-p sampling.
+
+        Lengths that the KV pool cannot hold are skipped.
+        """
+
+        started = time.perf_counter()
+        self._warming_up = True
+        try:
+            lengths = sorted(set(self._warmup_prompt_lengths)) or [
+                _WARMUP_MIN_PROMPT_TOKENS
+            ]
+            for index, length in enumerate(lengths):
+                request = self._warmup_request(f"warmup-{index}", length)
+                if request is not None:
+                    self._run_to_completion((request,))
+            pair = (
+                self._warmup_request("warmup-greedy", lengths[0]),
+                self._warmup_request(
+                    "warmup-sampled",
+                    lengths[0] + _WARMUP_PAIR_LENGTH_GAP,
+                    temperature=_WARMUP_SAMPLED_TEMPERATURE,
+                    top_p=_WARMUP_SAMPLED_TOP_P,
+                ),
+            )
+            self._run_to_completion(
+                tuple(request for request in pair if request is not None)
+            )
+        finally:
+            self._warming_up = False
         self.last_warmup_latency_ms = max(
             1, int((time.perf_counter() - started) * 1000)
+        )
+
+    def _run_to_completion(self, requests: tuple[ChatCompletionRequest, ...]) -> None:
+        for request in requests:
+            self.submit(request)
+        while not self.idle():
+            self.tick()
+
+    def _warmup_request(
+        self,
+        request_id: str,
+        prompt_tokens: int,
+        *,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ) -> ChatCompletionRequest | None:
+        """Return a request whose prompt is about ``prompt_tokens`` long.
+
+        Returns ``None`` when the request would not fit the KV pool.
+        """
+
+        words = self._warmup_word_count(prompt_tokens)
+        prompt_limit = len(self._build_prompt(self._warmup_chat(request_id, words)))
+        total = prompt_limit + _WARMUP_DECODE_TOKENS
+        if self._max_total_tokens is not None and total > self._max_total_tokens:
+            return None
+        return self._warmup_chat(
+            request_id,
+            words,
+            temperature=temperature,
+            top_p=top_p,
+            max_prompt_tokens=prompt_limit,
+            max_total_tokens_per_request=total,
+        )
+
+    def _warmup_word_count(self, prompt_tokens: int) -> int:
+        """Return how many filler words make a prompt about ``prompt_tokens`` long."""
+
+        empty = len(self._build_prompt(self._warmup_chat("warmup-size", 0)))
+        probe = len(
+            self._build_prompt(self._warmup_chat("warmup-size", _WARMUP_PROBE_WORDS))
+        )
+        tokens_per_word = (probe - empty) / _WARMUP_PROBE_WORDS
+        if tokens_per_word <= 0:
+            return max(1, prompt_tokens)
+        return max(1, round((prompt_tokens - empty) / tokens_per_word))
+
+    def _warmup_chat(
+        self,
+        request_id: str,
+        words: int,
+        *,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        max_prompt_tokens: int = 0,
+        max_total_tokens_per_request: int = 0,
+    ) -> ChatCompletionRequest:
+        from ..ipc import ChatMessage
+
+        return ChatCompletionRequest(
+            request_id=request_id,
+            model=self._model_ref,
+            messages=[
+                ChatMessage(role="user", content=" ".join([_WARMUP_WORD] * words))
+            ],
+            max_tokens=_WARMUP_DECODE_TOKENS,
+            temperature=temperature,
+            top_p=top_p,
+            max_prompt_tokens=max_prompt_tokens,
+            max_completion_tokens=_WARMUP_DECODE_TOKENS,
+            max_total_tokens_per_request=max_total_tokens_per_request,
         )
 
     def submit(self, request: ChatCompletionRequest) -> None:
@@ -142,7 +250,7 @@ class NativeRuntime:
             detokenizer=_new_streaming_detokenizer(self._prompt_tokenizer),
         )
         self._requests[request.request_id] = state
-        if self._profiler is not None:
+        if self._profiler is not None and not self._warming_up:
             self._profiler.begin_metal_capture(request.request_id)
             self._profiler.record(
                 request.request_id,

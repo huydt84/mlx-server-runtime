@@ -8,6 +8,7 @@ import sys
 import time
 from collections.abc import Callable
 from socket import socket
+from typing import Any
 
 from ..config import WorkerConfig
 from ..ipc import (
@@ -299,7 +300,17 @@ def create_native_worker(
         eos_token_ids=artifacts.eos_token_ids,
         profiler=profiler,
         max_total_tokens=artifacts.max_total_tokens,
+        warmup_prompt_lengths=_warmup_prompt_lengths(artifacts.executor),
     )
+
+
+def _warmup_prompt_lengths(executor: Any) -> tuple[int, ...]:
+    """Return warmup prompt lengths that reach every paged-decode kernel variant."""
+
+    from .paged_decode import warmup_key_counts
+
+    kv_heads = getattr(getattr(executor, "cache_backend", None), "num_kv_heads", 0)
+    return warmup_key_counts(int(kv_heads)) if kv_heads else ()
 
 
 def _read_line(client: socket, buffer: bytearray, *, block: bool) -> bytes | None:
