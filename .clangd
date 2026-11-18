@@ -1,0 +1,29 @@
+# --- metal-lsp:begin ---
+If:
+  PathMatch: .*\.metal
+
+CompileFlags:
+  Add:
+    - -xc++
+    - -std=c++17
+    - -Wno-unknown-attributes
+    - -Wno-reserved-user-defined-literal
+    - -include
+    - /Users/huydinhtrong/.vscode/extensions/rayanhtt.metal-lsp-1.4.0/headers/metal_compat.h
+    - -isystem
+    - /Users/huydinhtrong/.vscode/extensions/rayanhtt.metal-lsp-1.4.0/stubs
+    - -I
+    - /Users/huydinhtrong/Desktop/project/mlx-server-runtime
+# --- metal-lsp:end ---
+
+---
+# Local addition outside the metal-lsp managed block: the extension stubs do not
+# define INFINITY or metal::fast, which the real Metal compiler provides.
+If:
+  PathMatch: .*\.metal
+
+CompileFlags:
+  Add:
+    - -DINFINITY=__builtin_inff()
+    - -include
+    - /Users/huydinhtrong/.config/clangd/metal_fast_shim.h
