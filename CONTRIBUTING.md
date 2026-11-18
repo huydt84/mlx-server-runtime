@@ -245,11 +245,17 @@ generated arguments (see `paged_decode.py`).
 - MLX passes a single-element input in the `constant` address space and a
   larger one in `device`. Make the pointer type of any input that can have one
   element a template parameter.
+- MLX types each generated argument by its own array dtype. Give every input
+  whose dtype can differ from the others its own template type, and bind each
+  from that array's dtype: quantized checkpoints can run float16 activations
+  over a bfloat16 KV cache, so `paged_decode.metal` takes the query dtype `Q`
+  and the cache dtype `KV` separately.
 - Standalone syntax checks need the Metal Toolchain
   (`xcodebuild -downloadComponent MetalToolchain`), then
   `xcrun -sdk macosx metal -std=metal3.1 -c kernels/paged_decode.metal -o /dev/null`.
 - Prove a kernel change with a parity test against a dense MLX reference
-  (`python/tests/test_native_mlx_paged_attention.py`).
+  (`python/tests/test_native_mlx_paged_attention.py`), covering every input
+  dtype pairing the kernel accepts.
 
 ## Profile Model-Graph Inference
 

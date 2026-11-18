@@ -9,7 +9,8 @@
 //             HEAD_DIM / 32 elements of a head.
 //
 // Pool layout: key_pages and value_pages are (pages, PAGE_SIZE, KV_HEADS,
-// HEAD_DIM). block_tables is (rows, table_width) page ids; lengths holds each
+// HEAD_DIM) in the KV cache dtype KV, which may differ from the query and
+// output dtype Q (for example float16 activations over a bfloat16 cache). block_tables is (rows, table_width) page ids; lengths holds each
 // row's key count including this step's key.
 //
 // MLX passes single-element inputs in the constant address space and larger
@@ -34,6 +35,7 @@ struct PagedDecodeScratch {
 
 template <
     typename Q,
+    typename KV,
     int QUERY_HEADS,
     int KV_HEADS,
     int HEAD_DIM,
@@ -44,8 +46,8 @@ template <
     typename Lengths>
 inline void paged_decode_attention(
     const device Q* queries,
-    const device Q* key_pages,
-    const device Q* value_pages,
+    const device KV* key_pages,
+    const device KV* value_pages,
     Table block_tables,
     int table_width,
     Lengths lengths,
