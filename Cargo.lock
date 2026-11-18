@@ -194,7 +194,7 @@ checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
 name = "mlx_runtime_gateway"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "libc",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "mlx_runtime_protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
