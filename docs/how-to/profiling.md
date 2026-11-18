@@ -57,6 +57,11 @@ The trace directory contains:
   time.
 - `gateway.log`: gateway and worker startup or failure output.
 
+The worker writes these files incrementally while it serves requests: each
+flush appends only the events recorded since the previous flush and re-renders
+the report from running stage totals, so profiler overhead per request stays
+constant over long profiled runs instead of growing with the stored event count.
+
 Every event includes the run ID, request ID, backend, model, workload,
 component, stage, monotonic timestamp, duration, and relevant token or terminal
 metadata.
