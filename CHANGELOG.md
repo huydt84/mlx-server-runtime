@@ -11,7 +11,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - `scripts/check_comments.py`: a lint that bans code comments in tracked
   Rust, Metal, Python, and shell files, enforced as a per-file ratchet against
   `scripts/comment-baseline.json`. Release CI runs it.
-- Architecture Decision Records in `docs/adr/` (ADR-0001 to ADR-0009), plus
+- Architecture Decision Records in `docs/adr/` (ADR-0001 to ADR-0010), plus
   the 2026-11-22 comment audit ledger.
 - `/delete-comment` agent skill in `.claude/skills/` and `.agents/skills/` for
   repeating the comment audit.
@@ -25,6 +25,9 @@ and versions follow [Semantic Versioning](https://semver.org/).
   6 Stale, and 12 Excuse lines were deleted, and 170 Decision Record lines
   moved into ADRs 0002–0009. Runtime behavior is unchanged. The silent-WAV
   warmup header now uses named constants instead of field comments.
+- Applied the same audit to the 13 comment lines added by the `mlx-air
+  profile` command: 4 Tautology lines deleted, 9 Decision Record lines moved
+  into ADR-0010.
 - Filed issues for the hacks that the deleted Excuse comments justified:
   [#4](https://github.com/huydt84/mlx-server-runtime/issues/4)–[#10](https://github.com/huydt84/mlx-server-runtime/issues/10).
 - `AGENTS.md` and `CONTRIBUTING.md` document the comment ban and the ratchet

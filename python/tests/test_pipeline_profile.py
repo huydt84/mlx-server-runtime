@@ -240,7 +240,6 @@ def test_runtime_terminal_span_starts_at_request_enqueue(tmp_path) -> None:
         event for event in events if event.stage not in {"terminal", "tokenization"}
     ]
     assert others
-    # Recorded at completion, the span still covers the whole request lifetime.
     assert all(terminal.monotonic_ns <= event.monotonic_ns for event in others)
     assert terminal.monotonic_ns + terminal.duration_us * 1_000 >= max(
         event.monotonic_ns for event in others

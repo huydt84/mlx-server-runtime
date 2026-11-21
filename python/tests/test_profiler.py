@@ -239,8 +239,6 @@ def test_run_refuses_a_non_empty_output_directory(
     assert "not empty" in capsys.readouterr().err
 
 
-# A stand-in gateway: reads the runtime config, answers readiness and chat
-# requests, and writes worker-style pipeline events for each request.
 _FAKE_GATEWAY = textwrap.dedent(
     """
     import json, os, re, time, tomllib

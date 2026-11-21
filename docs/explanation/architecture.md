@@ -317,9 +317,10 @@ Individual decisions behind the components above are recorded as ADRs in
 - [0007](../adr/0007-worker-startup-failure-handling.md) — fail-fast worker
   startup;
 - [0008](../adr/0008-checkpoint-loading-compatibility.md) — checkpoint loading
-  compatibility; and
+  compatibility;
 - [0009](../adr/0009-benchmark-measurement-integrity.md) — benchmark
-  measurement integrity.
+  measurement integrity; and
+- [0010](../adr/0010-pipeline-profile-timing.md) — pipeline profile timing.
 
 ## Future Design Considerations
 

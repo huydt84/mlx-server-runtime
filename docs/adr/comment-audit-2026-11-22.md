@@ -249,3 +249,20 @@ shell script header blocks, tool directives (`// SAFETY:`, `# shellcheck`,
 | `rust/crates/gateway/tests/bench_delegation.rs:1046` | 3 | Tautology | 6 warmup requests (one per concurrency slot) plus the first trial's 2 measured requests... | Deleted |
 | `rust/crates/protocol/src/events.rs:610` | 1 | Tautology | Verify the JSON structure has the expected content parts | Deleted |
 | `rust/crates/protocol/src/events.rs:673` | 1 | Excuse | Remove the escaped quotes we inserted for readability | Deleted; [#9](https://github.com/huydt84/mlx-server-runtime/issues/9) |
+
+## Addendum: `mlx-air profile` merge
+
+Comments added by `f15f6c4` (the `mlx-air profile` command), audited when
+`main` was merged into this branch. Line numbers refer to `f15f6c4`.
+
+| Location | Lines | Category | Comment (abridged) | Action |
+|---|---|---|---|---|
+| `mlx-host-validation/scripts/cli_profile.sh:77` | 1 | Tautology | mlx_air COMMAND... runs the staged CLI with a bound and the isolated home. | Deleted |
+| `mlx-host-validation/scripts/cli_profile.sh:148` | 1 | Decision Record | IPC decode and tokenization happen before the request is enqueued. | Moved to [ADR-0010](0010-pipeline-profile-timing.md) |
+| `python/mlx_benchmark/profile_analysis.py:23` | 3 | Decision Record | Spans that cover a whole request rather than one pipeline stage... | Moved to [ADR-0010](0010-pipeline-profile-timing.md) |
+| `python/mlx_benchmark/profile_analysis.py:28` | 2 | Decision Record | Fixed component order for the timeline palette... | Moved to [ADR-0010](0010-pipeline-profile-timing.md) |
+| `python/mlx_benchmark/profiler.py:492` | 1 | Decision Record | Same clock as the worker's perf_counter_ns event timestamps. | Moved to [ADR-0010](0010-pipeline-profile-timing.md) |
+| `python/mlx_worker/native_mlx/runtime.py:509` | 1 | Decision Record | Recorded when the step finishes; anchor the span at its start. | Moved to [ADR-0010](0010-pipeline-profile-timing.md) |
+| `python/mlx_worker/native_mlx/runtime.py:706` | 1 | Decision Record | The request lifetime starts at enqueue, not at this record. | Moved to [ADR-0010](0010-pipeline-profile-timing.md) |
+| `python/tests/test_pipeline_profile.py:243` | 1 | Tautology | Recorded at completion, the span still covers the whole request lifetime. | Deleted |
+| `python/tests/test_profiler.py:242` | 2 | Tautology | A stand-in gateway: reads the runtime config, answers readiness and chat... | Deleted |

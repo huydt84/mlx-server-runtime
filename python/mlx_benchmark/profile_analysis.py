@@ -20,13 +20,8 @@ REPORT_FILE = "pipeline-report.md"
 HTML_FILE = "profile.html"
 SUMMARY_FILE = "profile-summary.json"
 
-# Spans that cover a whole request rather than one pipeline stage. They are
-# reported as request latency and kept out of the stage breakdown so they do
-# not dwarf the stages they contain.
 ENVELOPE_STAGES = frozenset({("runtime", "terminal"), ("gateway", "http_round_trip")})
 
-# Fixed component order for the timeline palette. Color follows the component,
-# never its rank, so the same component has the same color in every profile.
 COMPONENT_ORDER = (
     "mlx",
     "model",

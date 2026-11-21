@@ -489,7 +489,6 @@ def _send_request(
             "Accept": "text/event-stream" if arguments.stream else "application/json",
         },
     )
-    # Same clock as the worker's perf_counter_ns event timestamps.
     started_ns = time.perf_counter_ns()
     record = _request_record(index, started_ns=started_ns)
     try:

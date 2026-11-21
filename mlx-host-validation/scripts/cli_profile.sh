@@ -74,7 +74,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# mlx_air COMMAND... runs the staged CLI with a bound and the isolated home.
 mlx_air() {
     HOME="$TEST_HOME" HF_HOME="$HOST_HF_HOME" UV_CACHE_DIR="$UV_CACHE" \
         "$STAGE_DIR/bin/mlx-air" "$@" >"$WORK_DIR/stdout" 2>>"$COMMAND_LOG" &
@@ -145,7 +144,6 @@ for label in ("baseline", "candidate"):
         own = [e for e in events if e["request_id"] == request_id]
         terminal = next(e for e in own if (e["component"], e["stage"]) == ("runtime", "terminal"))
         assert terminal["state"] in {"length", "stop", "completed"}, terminal
-        # IPC decode and tokenization happen before the request is enqueued.
         before_enqueue = {"terminal", "tokenization", "ipc_decode"}
         others = [e for e in own if e["stage"] not in before_enqueue and e["component"] != "gateway"]
         assert all(terminal["monotonic_ns"] <= e["monotonic_ns"] for e in others), request_id
