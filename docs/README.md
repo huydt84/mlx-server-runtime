@@ -22,6 +22,7 @@ A lightweight MLX inference runtime for Apple Silicon. Rust control plane + Pyth
 | **Reference** | [CLI](reference/cli.md) | Gateway and worker CLI flags |
 | **Explanation** | [Architecture](explanation/architecture.md) | Rust/Python split, IPC, lifecycle, design rationale |
 | **Explanation** | [Architecture Decision Records](adr/README.md) | Individual non-obvious decisions, with context and consequences |
+| **Explanation** | [Blog](blog/README.md) | Inference optimization deep dives: paged KV, Metal kernels, scheduling, overlap, prefix caching, benchmarking |
 
 See also the [changelog](../CHANGELOG.md).
 
