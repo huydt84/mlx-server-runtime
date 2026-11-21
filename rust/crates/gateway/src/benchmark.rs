@@ -148,10 +148,18 @@ pub(crate) fn ensure_benchmark_environment(
     Ok(environment)
 }
 
-pub(crate) fn benchmark_command(
+/// Python module that implements `mlx-air bench` actions.
+pub(crate) const BENCHMARK_MODULE: &str = "mlx_benchmark";
+/// Python module that implements `mlx-air profile` actions.
+pub(crate) const PROFILE_MODULE: &str = "mlx_benchmark.profiler";
+
+/// Builds the delegated command for one Python tool module in the benchmark
+/// environment, such as `mlx_benchmark` or `mlx_benchmark.profiler`.
+pub(crate) fn python_tool_command(
     distribution: &DistributionPaths,
     environment: &BenchmarkEnvironment,
     invocation_directory: &Path,
+    module: &str,
     action: &str,
     args: &[OsString],
 ) -> CommandSpec {
@@ -163,7 +171,7 @@ pub(crate) fn benchmark_command(
                 OsString::from("run"),
                 OsString::from("python"),
                 OsString::from("-m"),
-                OsString::from("mlx_benchmark"),
+                OsString::from(module),
                 OsString::from(action),
             ]
             .into_iter()
@@ -308,10 +316,11 @@ mod tests {
         let home = temp_path("benchmark-run-home");
         let application = ApplicationPaths::from_home(&home);
         let selected = select_benchmark_environment(&distribution, &application).unwrap();
-        let command = benchmark_command(
+        let command = python_tool_command(
             &distribution,
             &selected,
             Path::new("/invocation"),
+            BENCHMARK_MODULE,
             "run",
             &["--suite".into(), "smoke".into()],
         );
@@ -348,6 +357,44 @@ mod tests {
         );
         assert_eq!(command.current_dir, Some(distribution.root.clone()));
         assert_eq!(command.output_mode, OutputMode::Inherit);
+
+        fs::remove_dir_all(distribution_root).unwrap();
+    }
+
+    #[test]
+    fn profile_delegation_runs_the_profiler_module() {
+        let (distribution_root, distribution) = staged_distribution("profile-run");
+        let home = temp_path("profile-run-home");
+        let application = ApplicationPaths::from_home(&home);
+        let selected = select_benchmark_environment(&distribution, &application).unwrap();
+        let command = python_tool_command(
+            &distribution,
+            &selected,
+            Path::new("/invocation"),
+            PROFILE_MODULE,
+            "run",
+            &["--model".into(), "test-model".into()],
+        );
+
+        assert_eq!(
+            command.args[3..],
+            [
+                OsString::from("python"),
+                "-m".into(),
+                "mlx_benchmark.profiler".into(),
+                "run".into(),
+                "--model".into(),
+                "test-model".into(),
+            ]
+        );
+        assert_eq!(
+            command.env.get(OsStr::new(GATEWAY_EXECUTABLE_ENV)),
+            Some(&distribution.gateway_executable.as_os_str().to_owned())
+        );
+        assert_eq!(
+            command.env.get(OsStr::new(INVOCATION_DIRECTORY_ENV)),
+            Some(&OsString::from("/invocation"))
+        );
 
         fs::remove_dir_all(distribution_root).unwrap();
     }
