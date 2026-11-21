@@ -189,6 +189,19 @@ Do not casually edit:
 
 Never read, print, or modify secrets unless the user explicitly asks and the action is safe.
 
+## Merging to Main
+
+When asked to merge a branch into `main`:
+
+1. Fast-forward when possible: `git merge --ff-only <branch>`. This works when
+   `main` has no commits the branch lacks, and adds no merge commit.
+2. If a fast-forward is not possible because `main` has moved, squash instead:
+   `git merge --squash <branch>`, then commit the result on `main` as one
+   commit with a message that summarizes the branch.
+3. Do not create `--no-ff` merge commits.
+
+Do not push `main` or delete the merged branch unless asked.
+
 ## Completion Report
 
 Final responses for coding tasks should include:
