@@ -168,13 +168,16 @@ transport, Python runtime, scheduler, executor, cache, model, MLX
 synchronization, detokenization, and response streaming. It is disabled by
 default and must remain off during fair benchmark runs.
 
-Run the bounded profiling workflow on an Apple Silicon host:
+`mlx-air profile` (alias `mlx-air profiler`) captures, visualizes, and
+compares profiles on an Apple Silicon host:
 
 ```bash
-bash scripts/profile.sh
+mlx-air profile run --model mlx-community/Qwen2.5-7B-Instruct-4bit --requests 4 --concurrency 2 --open
+mlx-air profile view profiles/<run-id> --open
+mlx-air profile compare profiles/before profiles/after
 ```
 
-The workflow writes request-correlated JSONL events, a Chrome Trace/Perfetto
-timeline, and a Markdown summary. For configuration, optional Metal capture,
-artifact interpretation, and failure handling, see
-[Profile inference](docs/how-to/profiling.md).
+`run` writes request-correlated JSONL events, a Chrome Trace/Perfetto
+timeline, a Markdown stage report, and a self-contained interactive
+`profile.html`. For options, optional Metal capture, artifact interpretation,
+and failure handling, see [Profile inference](docs/how-to/profiling.md).

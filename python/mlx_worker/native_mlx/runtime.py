@@ -505,11 +505,14 @@ class NativeRuntime:
                 )
             )
             if self._profiler is not None:
+                prefill_us = int(metrics.get("step_time_ms", 0)) * 1_000
+                # Recorded when the step finishes; anchor the span at its start.
                 self._profiler.record(
                     event.request_id,
                     "runtime",
                     "prefill",
-                    duration_us=int(metrics.get("step_time_ms", 0)) * 1_000,
+                    started_ns=time.perf_counter_ns() - prefill_us * 1_000,
+                    duration_us=prefill_us,
                     phase="prefill",
                     prompt_tokens=len(state.prompt_token_ids),
                     details={
@@ -700,6 +703,8 @@ class NativeRuntime:
                 request_id,
                 "runtime",
                 "terminal",
+                # The request lifetime starts at enqueue, not at this record.
+                started_ns=int(state.enqueued_at * 1_000_000_000),
                 duration_us=max(
                     0, int((time.perf_counter() - state.enqueued_at) * 1_000_000)
                 ),
