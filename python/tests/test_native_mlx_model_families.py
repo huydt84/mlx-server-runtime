@@ -271,8 +271,6 @@ def test_lfm2_moe_routes_with_sigmoid_and_selection_only_expert_bias() -> None:
         )
     )
     moe.gate.weight = mx.array([[2.0, 0.0], [0.0, 0.0], [-1.0, 0.0]])
-    # Sigmoid scores are ~[0.881, 0.5, 0.269]; the bias makes expert 2 win the
-    # selection over expert 1 without changing the gathered weights.
     moe.expert_bias = mx.array([0.0, -1.0, 1.0])
 
     indices, scores = moe.route(mx.array([[[1.0, 0.0]]]))

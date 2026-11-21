@@ -45,6 +45,9 @@ jobs:
           test "$(uname -s)" = "Darwin"
           test "$(uname -m)" = "arm64"
 
+      - name: Check comment ratchet
+        run: python3 scripts/check_comments.py
+
       - name: Run Rust checks
         run: |
           cargo fmt --check
@@ -55,8 +58,8 @@ jobs:
         working-directory: python
         run: |
           uv sync
-          uv run ruff format --check . ../scripts/release_tool.py
-          uv run ruff check . ../scripts/release_tool.py
+          uv run ruff format --check . ../scripts/release_tool.py ../scripts/check_comments.py
+          uv run ruff check . ../scripts/release_tool.py ../scripts/check_comments.py
           uv run pytest
 
       - name: Stage and archive distribution

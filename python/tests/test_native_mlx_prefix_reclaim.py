@@ -23,7 +23,6 @@ _NEW = tuple(range(101, 117))
 
 
 def _backend(pages: int = 8) -> PagedKVCacheBackend:
-    # One layer, one head, head_dim 2, float16: 64 bytes per 8-token page.
     return PagedKVCacheBackend(
         num_layers=1,
         num_kv_heads=1,
@@ -70,7 +69,6 @@ def test_radix_reclaim_frees_least_recently_used_pages_first() -> None:
     _finish_request(backend, cache, "new", _NEW)
     assert backend.free_page_count() == 4
 
-    # The old leaf's second page is shared with nothing else.
     assert cache.reclaim(1) == 1
     assert backend.free_page_count() == 5
     assert cache.probe((*_OLD, 9)).matched_tokens == 8
@@ -138,7 +136,6 @@ def test_scheduler_reclaims_prefix_pages_before_holding_a_request() -> None:
         prefill_batch_size=4,
         prefill_step_size=256,
     )
-    # Each request needs ceil((4 + 8) / 4) + 1 = 4 pages through its last token.
     scheduler.submit(_schedulable("first", (1, 2, 3, 4), max_tokens=8))
     scheduler.submit(_schedulable("second", (5, 6, 7, 8), max_tokens=8))
 

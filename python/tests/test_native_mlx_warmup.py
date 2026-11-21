@@ -20,8 +20,6 @@ def test_warmup_key_counts_reach_every_single_row_split_count(kv_heads: int) -> 
     most = splits_for(1, kv_heads, 1 << 20)
     assert splits == [1 << index for index in range(len(counts))]
     assert splits[-1] == most
-    # Each length keeps its split count when the prompt runs a little long or
-    # short, or the warmup decodes a few more keys.
     for keys, count in zip(counts, splits, strict=True):
         assert splits_for(1, kv_heads, keys - 8) == count
         assert splits_for(1, kv_heads, keys + 8) == count
@@ -133,10 +131,8 @@ def test_warmup_decodes_at_each_length_then_runs_a_sampled_pair() -> None:
     assert sampling["warmup-0"].temperature == 0.0
     assert sampling["warmup-sampled"].temperature > 0.0
     assert sampling["warmup-sampled"].top_p < 1.0
-    # Single requests run alone; the pair shares steps.
     assert ("warmup-greedy", "warmup-sampled") in scheduler.batches
     assert all(len(batch) == 1 for batch in scheduler.batches[:4])
-    # Each request decodes more than one step after its first token.
     assert scheduler.batches.count(("warmup-0",)) == 4
     assert runtime.idle()
     assert runtime.last_warmup_latency_ms >= 1

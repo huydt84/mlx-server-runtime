@@ -23,8 +23,6 @@ from .interfaces import (
 )
 from .scheduler import NativeContinuousScheduler
 
-# Startup warmup requests (see NativeRuntime.warmup). Each decodes a few tokens
-# so the overlap pipeline runs more than one decode step.
 _WARMUP_DECODE_TOKENS = 4
 _WARMUP_MIN_PROMPT_TOKENS = 48
 _WARMUP_PAIR_LENGTH_GAP = 8

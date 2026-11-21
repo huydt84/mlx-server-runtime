@@ -44,7 +44,6 @@ from .pipeline_profile import PipelineProfiler
 from .runtime import NativeRuntime as NativeRequestRuntime
 from .scheduler import NativeContinuousScheduler
 
-# Largest single socket read; audio uploads arrive as multi-megabyte lines.
 _RECV_BYTES = 1 << 20
 
 __all__ = [
@@ -155,7 +154,6 @@ def run_native_worker(
                 if isinstance(command, CancelRequest):
                     runtime.cancel(command.request_id)
                 elif isinstance(command, TranscriptionRequest):
-                    # Runs to completion here; text scheduling resumes after.
                     client.sendall(encode_event(transcription.handle(command)))
                 elif isinstance(command, BenchmarkResetRequest):
                     if not runtime.idle():

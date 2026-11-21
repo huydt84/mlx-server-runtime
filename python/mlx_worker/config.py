@@ -150,8 +150,6 @@ def load_config() -> WorkerConfig:
         text_cache_budget_bytes > 0
         and os.environ.get("MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES", "").strip()
     ):
-        # Legacy pin for the native pool. Zero only disables the v1 prompt
-        # cache, so native-mlx then derives its pool from the utilization.
         kv_cache_bytes = text_cache_budget_bytes
     max_total_tokens_per_request = int(
         os.environ.get("MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST", "65536")

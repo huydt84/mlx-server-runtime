@@ -374,12 +374,7 @@ fn drain_connections(connections: &mut Vec<thread::JoinHandle<()>>, timeout: Dur
 }
 
 fn handle_connection(mut stream: TcpStream, state: AppState) -> Result<(), GatewayError> {
-    // On macOS an accepted socket inherits the listener's non-blocking flag, so
-    // a request whose body arrives after its headers would fail with WouldBlock.
     stream.set_nonblocking(false)?;
-    // Disable Nagle's algorithm: small SSE frames are time-sensitive and
-    // should not be delayed waiting for a TCP ACK.  This is safe for all
-    // connections (non-SSE responses also flush explicitly).
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(&stream);
     let mut request_line = String::new();
@@ -928,7 +923,6 @@ fn handle_chat_completion(
         }
     };
 
-    // Model-first routing: route based on requested model name, not image content.
     let (has_images, image_count) = match inspect_vlm_messages(&request.messages) {
         Ok(result) => result,
         Err(message) => {
@@ -950,7 +944,6 @@ fn handle_chat_completion(
         return not_ready_error(&status);
     }
 
-    // Validate: images require VLM-capable model
     if has_images && !is_vlm {
         let msg = if state.vlm_model.is_some() {
             "image content requires a VLM-capable model, but requested model is not VLM"
@@ -960,7 +953,6 @@ fn handle_chat_completion(
         return json_error_response("400 Bad Request", "VLM_NOT_CONFIGURED", msg);
     }
 
-    // Enforce VLM image-count cap before queue admission.
     if has_images && image_count > state.limits.max_vlm_images as u64 {
         return json_error_response(
             "400 Bad Request",
@@ -1072,7 +1064,6 @@ fn handle_chat_completion(
             }
         }
         Err(err) => {
-            // VLM request lifecycle: first VLM request failure marks it failed.
             if is_vlm {
                 track_vlm_lifecycle_failure(&state.runtime, &err);
             }
@@ -1247,7 +1238,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         }
     };
 
-    // Model-first routing: route based on requested model name, not image content.
     let (has_images, image_count) = match inspect_vlm_messages(&request.messages) {
         Ok(result) => result,
         Err(message) => {
@@ -1284,7 +1274,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         );
     }
 
-    // Validate: images require VLM-capable model
     if has_images && !is_vlm {
         let msg = if state.vlm_model.is_some() {
             "image content requires a VLM-capable model, but requested model is not VLM"
@@ -1300,7 +1289,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         );
     }
 
-    // Enforce VLM image-count cap before queue admission.
     if has_images && image_count > state.limits.max_vlm_images as u64 {
         let response = json_error_response(
             "400 Bad Request",
@@ -1366,8 +1354,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         queue_time_ms,
     );
     let worker_model = worker_request.model.clone();
-    // Save the requested model name before worker_model is moved into
-    // RequestTracker; used for consistent "model" field across all SSE chunks.
     let sse_model = worker_model.clone();
     let request_tracker = Arc::new(RequestTracker::new(
         state.runtime.metrics.clone(),
@@ -1446,8 +1432,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
             }],
         });
         let write_result = if !stream_started {
-            // First delta: combine SSE headers + data into a single write
-            // to save one write(2) syscall and avoid split TCP segments.
             stream_started = true;
             write!(
                 writer,
@@ -1477,7 +1461,6 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     let response = match backend.stream(worker_request, &mut on_delta) {
         Ok(response) => response,
         Err(err) => {
-            // VLM request lifecycle: first VLM request failure marks it failed.
             if is_vlm {
                 track_vlm_lifecycle_failure(&state.runtime, &err);
             }
@@ -1855,7 +1838,6 @@ fn percent_decode(segment: &str) -> Option<String> {
 
 /// Track VLM lifecycle: mark VLM as failed after first failed request.
 fn track_vlm_lifecycle_failure(runtime: &RuntimeState, err: &GatewayError) {
-    // Only non-InvalidRequest errors indicate load failure (not bad user input).
     if !matches!(err, GatewayError::InvalidRequest(_)) {
         if let Ok(vlm_status) = runtime.snapshot_vlm() {
             if vlm_status.state == ModelState::NotLoaded {
@@ -2419,8 +2401,6 @@ mod tests {
         assert!(body.contains("chat.completion.chunk"));
         assert!(body.contains("data: [DONE]"));
 
-        // Validate combined-write optimization: headers immediately followed by
-        // first data event (no empty output between them, confirming a single write).
         let header_end = "\r\n\r\n";
         let after_headers = body
             .find(header_end)
@@ -2432,7 +2412,6 @@ mod tests {
             after_headers.chars().take(30).collect::<String>()
         );
 
-        // All SSE data events must use the same model field.
         let model_ref = "\"model\":\"test-model\"";
         let model_count = body.matches(model_ref).count();
         assert!(
@@ -2598,14 +2577,11 @@ mod tests {
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let nodelay = stream.nodelay().unwrap();
-            // The stream comes from accept() without TCP_NODELAY by default.
             assert!(!nodelay, "default TcpStream should not have TCP_NODELAY");
-            // Now simulate what handle_connection does.
             stream.set_nodelay(true).unwrap();
             assert!(stream.nodelay().unwrap(), "TCP_NODELAY should be set");
         });
         let client = TcpStream::connect(addr).unwrap();
-        // Ensure stream options are not inherited from client side.
         assert!(!client.nodelay().unwrap());
         drop(client);
         server.join().unwrap();
@@ -2893,8 +2869,6 @@ mod tests {
         }
     }
 
-    // ── VLM routing tests ─────────────────────────────────────────────────
-
     #[test]
     fn inspect_vlm_messages_detects_and_counts_image_parts() {
         let text_only = vec![ChatMessage {
@@ -2966,7 +2940,6 @@ mod tests {
         let response = response_for_request("GET /models HTTP/1.1\r\n", &[], &state);
         assert_eq!(response.status, "200 OK");
         assert!(response.body.contains("\"test-model\""));
-        // Only one model in the list
         assert_eq!(response.body.matches("\"name\"").count(), 1);
     }
 
@@ -3050,8 +3023,6 @@ mod tests {
 
     #[test]
     fn vlm_model_not_ready_without_explicit_mark() {
-        // VLM model must NOT be marked ready from generic worker READY;
-        // it requires explicit warmup completion.
         let runtime = RuntimeState::new("text-model");
         let mut status = ModelStatus::new("text-model");
         status.set_state(ModelState::Ready);
@@ -3088,11 +3059,8 @@ mod tests {
         assert!(response.body.contains("\"not_loaded\""));
     }
 
-    // ── VLM HTTP request handling tests ───────────────────────────────────
-
     #[test]
     fn chat_completion_with_vlm_content_returns_200_when_vlm_configured() {
-        // POST with image content, VLM configured → 200 OK
         let service = Arc::new(FakeService {
             response: Mutex::new(Some(ChatCompletionResponse {
                 request_id: "req-vlm".to_string(),
@@ -3159,7 +3127,6 @@ mod tests {
 
     #[test]
     fn chat_completion_with_vlm_content_rejected_when_no_vlm_configured() {
-        // POST with image content, VLM NOT configured → 400 VLM_NOT_CONFIGURED
         let state = test_state(ModelState::Ready, Arc::new(FakeService::default()));
 
         let body = serde_json::to_vec(&json!({
@@ -3188,7 +3155,6 @@ mod tests {
 
     #[test]
     fn streaming_chat_completion_with_vlm_content_works() {
-        // POST stream=true with VLM content → SSE events
         let service = Arc::new(StreamingService);
         let runtime = test_runtime(ModelState::Ready);
         runtime.set_vlm_model("vlm-model".to_string());
@@ -3245,11 +3211,8 @@ mod tests {
         assert!(output.contains("data: [DONE]"));
     }
 
-    // ── Model-first routing tests ────────────────────────────────
-
     #[test]
     fn chat_completion_text_only_to_vlm_model_succeeds() {
-        // Text-only request targeting VLM model must reach VLM-capable path.
         let service = Arc::new(FakeService {
             response: Mutex::new(Some(ChatCompletionResponse {
                 request_id: "req-vlm-text".to_string(),
@@ -3289,7 +3252,6 @@ mod tests {
             test_backend: Some(service.clone()),
         };
 
-        // Text-only request explicitly targeting the VLM model name
         let body = serde_json::to_vec(&json!({
             "model": "vlm-model",
             "messages": [{"role": "user", "content": "hello from text-only"}],
@@ -3305,8 +3267,6 @@ mod tests {
         assert!(response.body.contains("\"VLM text response\""));
         assert!(response.body.contains("\"vlm-model\""));
     }
-
-    // ── Image URL validation tests ──────────────────────────────
 
     /// Helper: creates a state with VLM configured and ready.
     fn vlm_ready_state(vlm_model: &str) -> AppState {
@@ -3342,7 +3302,6 @@ mod tests {
 
     #[test]
     fn validate_image_urls_rejects_data_uri() {
-        // data: URIs are unsupported image sources.
         let result = inspect_vlm_messages(&[ChatMessage {
             role: MessageRole::User,
             content: MessageContent::Parts(vec![ContentPart::ImageUrl {
@@ -3540,7 +3499,6 @@ mod tests {
 
     #[test]
     fn chat_completion_accepts_https_image_url() {
-        // HTTPS image URLs must be accepted through the full HTTP path.
         let service = Arc::new(FakeService {
             response: Mutex::new(Some(ChatCompletionResponse {
                 request_id: "req-https".to_string(),
@@ -3630,8 +3588,6 @@ mod tests {
         assert!(!output.contains("text/event-stream"));
     }
 
-    // ── VLM lifecycle recovery tests ────────────────────────────
-
     #[test]
     fn vlm_lifecycle_recovers_from_transient_failure() {
         let runtime = RuntimeState::new("text-model");
@@ -3639,15 +3595,11 @@ mod tests {
         status.set_state(ModelState::Ready);
         runtime.set_status(status).unwrap();
         runtime.set_vlm_model("vlm-model".to_string());
-        // VLM starts as NotLoaded — deliberately not marking ready yet.
 
-        // Verify initial VLM state is NotLoaded
         let vlm_status = runtime.snapshot_vlm().unwrap();
         assert_eq!(vlm_status.state, ModelState::NotLoaded);
         assert!(!vlm_status.ready);
 
-        // First request fails with a transient (non-InvalidRequest) error →
-        // VLM should transition to Failed
         track_vlm_lifecycle_failure(
             &runtime,
             &GatewayError::Protocol("transient vlm error".to_string()),
@@ -3656,7 +3608,6 @@ mod tests {
         assert_eq!(vlm_status.state, ModelState::Failed);
         assert!(!vlm_status.ready);
 
-        // Explicit warmup completion → VLM should recover to Ready.
         runtime.mark_vlm_ready(7).unwrap();
         let vlm_status = runtime.snapshot_vlm().unwrap();
         assert_eq!(vlm_status.state, ModelState::Ready);
@@ -3666,15 +3617,12 @@ mod tests {
 
     #[test]
     fn vlm_lifecycle_invalid_request_does_not_mark_failed() {
-        // GatewayError::InvalidRequest (bad user input) must NOT mark VLM
-        // as failed; only backend/worker errors indicate VLM load issues.
         let runtime = RuntimeState::new("text-model");
         let mut status = ModelStatus::new("text-model");
         status.set_state(ModelState::Ready);
         runtime.set_status(status).unwrap();
         runtime.set_vlm_model("vlm-model".to_string());
 
-        // An InvalidRequest error should NOT trigger VLM failure transition
         track_vlm_lifecycle_failure(
             &runtime,
             &GatewayError::InvalidRequest("bad prompt".to_string()),
@@ -3689,8 +3637,6 @@ mod tests {
 
     #[test]
     fn vlm_lifecycle_already_ready_stays_ready_on_success() {
-        // Repeating explicit warmup completion when VLM is already Ready
-        // must be a safe no-op (no regression on repeated calls).
         let runtime = RuntimeState::new("text-model");
         let mut status = ModelStatus::new("text-model");
         status.set_state(ModelState::Ready);
@@ -3698,7 +3644,6 @@ mod tests {
         runtime.set_vlm_model("vlm-model".to_string());
         let _ = runtime.mark_vlm_ready(1);
 
-        // Call warmup completion again — should stay Ready, not error.
         runtime.mark_vlm_ready(3).unwrap();
         let vlm_status = runtime.snapshot_vlm().unwrap();
         assert_eq!(vlm_status.state, ModelState::Ready);
@@ -3708,8 +3653,6 @@ mod tests {
 
     #[test]
     fn vlm_lifecycle_already_failed_stays_failed_on_failure() {
-        // Calling track_vlm_lifecycle_failure when VLM is already Failed
-        // must be a safe no-op.
         let runtime = RuntimeState::new("text-model");
         let mut status = ModelStatus::new("text-model");
         status.set_state(ModelState::Ready);
@@ -3717,7 +3660,6 @@ mod tests {
         runtime.set_vlm_model("vlm-model".to_string());
         let _ = runtime.mark_vlm_failed("VLM_LOAD_FAILED", "first failure");
 
-        // Call failure again — should stay Failed, not error
         track_vlm_lifecycle_failure(
             &runtime,
             &GatewayError::Protocol("another failure".to_string()),
@@ -3725,7 +3667,6 @@ mod tests {
         let vlm_status = runtime.snapshot_vlm().unwrap();
         assert_eq!(vlm_status.state, ModelState::Failed);
         assert!(!vlm_status.ready);
-        // The original error message should be preserved, not overwritten
         assert_eq!(
             vlm_status.last_error.as_ref().map(|e| e.message.as_str()),
             Some("first failure")
@@ -3734,8 +3675,6 @@ mod tests {
 
     #[test]
     fn vlm_lifecycle_full_http_recovery_from_transient_failure() {
-        // Full HTTP-path test: user request failures do not change explicit
-        // VLM warmup readiness.
         let runtime = RuntimeState::new("text-model");
         let mut status = ModelStatus::new("text-model");
         status.set_state(ModelState::Ready);
@@ -3743,7 +3682,6 @@ mod tests {
         runtime.set_vlm_model("vlm-model".to_string());
         runtime.mark_vlm_ready(9).unwrap();
 
-        // Backend that fails on first call, succeeds on second.
         let service = Arc::new(RecoveryService::default());
 
         let state = AppState {
@@ -3788,7 +3726,6 @@ mod tests {
         }))
         .unwrap();
 
-        // First request: fails, but explicit warmup state remains Ready.
         let response =
             response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
         assert!(
@@ -3799,7 +3736,6 @@ mod tests {
         let vlm_status = runtime.snapshot_vlm().unwrap();
         assert_eq!(vlm_status.state, ModelState::Ready);
 
-        // Second request: succeeds, and readiness still stays Ready.
         let response =
             response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
         assert_eq!(response.status, "200 OK");
@@ -3814,7 +3750,6 @@ mod tests {
 
     #[test]
     fn chat_completion_with_images_to_text_model_rejected_when_vlm_configured() {
-        // Image-bearing request targeting text model must fail when VLM configured.
         let service = Arc::new(FakeService::default());
         let runtime = test_runtime(ModelState::Ready);
         runtime.set_vlm_model("vlm-model".to_string());
@@ -3865,8 +3800,6 @@ mod tests {
         assert!(response.body.contains("\"VLM_NOT_CONFIGURED\""));
         assert!(response.body.contains("requested model is not VLM"));
     }
-
-    // ── VLM image-count cap tests ──────────────────────────────
 
     #[test]
     fn vlm_non_streaming_rejects_too_many_images() {
@@ -4104,7 +4037,6 @@ mod tests {
 
     #[test]
     fn vlm_text_only_path_ignores_image_count_cap() {
-        // Text-only request targeting VLM model must not hit the image cap.
         let runtime = test_runtime(ModelState::Ready);
         runtime.set_vlm_model("vlm-model".to_string());
         let _ = runtime.mark_vlm_ready(1);
@@ -4157,8 +4089,6 @@ mod tests {
         assert!(response.body.contains("\"text-only VLM response\""));
     }
 
-    // ── VLM lifecycle cancelled/no-load guard tests ────────────────────────
-
     /// Service that always returns a cancelled response (finish_reason = "cancelled").
     /// Used to verify VLM lifecycle does NOT transition to Ready on cancelled/no-load.
     #[derive(Default)]
@@ -4185,7 +4115,6 @@ mod tests {
             request: ChatCompletionRequest,
             on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
         ) -> Result<ChatCompletionResponse, GatewayError> {
-            // Emit a delta to confirm streaming started before cancelled finish.
             on_delta("par".to_string())?;
             Ok(ChatCompletionResponse {
                 request_id: request.request_id,
@@ -4201,7 +4130,6 @@ mod tests {
 
     #[test]
     fn vlm_lifecycle_non_streaming_cancelled_response_does_not_mark_ready() {
-        // Non-streaming cancelled VLM request must not alter warmup readiness.
         let runtime = RuntimeState::new("text-model");
         let mut status = ModelStatus::new("text-model");
         status.set_state(ModelState::Ready);
@@ -4254,7 +4182,6 @@ mod tests {
 
     #[test]
     fn vlm_lifecycle_streaming_cancelled_response_does_not_mark_ready() {
-        // Streaming cancelled VLM request must not alter warmup readiness.
         let runtime = RuntimeState::new("text-model");
         let mut status = ModelStatus::new("text-model");
         status.set_state(ModelState::Ready);

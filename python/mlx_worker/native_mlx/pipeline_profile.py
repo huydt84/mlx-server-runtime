@@ -311,9 +311,6 @@ def write_pipeline_artifacts(
     return paths
 
 
-# `json.dumps({"traceEvents": [...]}, indent=2) + "\n"` split into a fixed head,
-# one block per event, and a fixed tail, so new events can be spliced in before
-# the tail without re-serializing the events already on disk.
 _TRACE_HEAD = '{\n  "traceEvents": ['
 _TRACE_TAIL = "\n  ]\n}\n"
 _EMPTY_TRACE = '{\n  "traceEvents": []\n}\n'

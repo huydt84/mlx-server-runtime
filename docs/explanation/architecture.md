@@ -299,6 +299,28 @@ The runtime does not bundle a log collector. Pipe stderr to your preferred colle
 | Observability | None | Full metrics |
 | Reliability | None | Supervision + error handling |
 
+## Decision Records
+
+Individual decisions behind the components above are recorded as ADRs in
+[`docs/adr/`](../adr/README.md):
+
+- [0002](../adr/0002-model-first-vlm-routing-and-lazy-lifecycle.md) — VLM
+  routing by model name and lazy VLM loading;
+- [0003](../adr/0003-gateway-socket-and-sse-writes.md) — gateway socket mode
+  and SSE writes;
+- [0004](../adr/0004-native-scheduler-and-sampling.md) — native scheduler
+  admission, decode chaining, and sampling;
+- [0005](../adr/0005-paged-kv-cache-writes-and-buffer-lifetime.md) — paged KV
+  writes and buffer donation;
+- [0006](../adr/0006-paged-decode-attention-kernel.md) — the paged decode
+  Metal kernel;
+- [0007](../adr/0007-worker-startup-failure-handling.md) — fail-fast worker
+  startup;
+- [0008](../adr/0008-checkpoint-loading-compatibility.md) — checkpoint loading
+  compatibility; and
+- [0009](../adr/0009-benchmark-measurement-integrity.md) — benchmark
+  measurement integrity.
+
 ## Future Design Considerations
 
 The architecture is designed to evolve without rewrites:

@@ -89,8 +89,6 @@ def _run(backend, contexts_for, cache_lengths, token_lengths, mask, head_dim):
     return _attend(backend, contexts_for, caches, token_lengths, mask, 7, head_dim)
 
 
-# head_dim 8 takes the gather path for every step; 32 sends decode steps
-# through the page-table decode kernel.
 @pytest.mark.parametrize("head_dim", [8, 32])
 @pytest.mark.parametrize(
     ("cache_lengths", "token_lengths", "mask"),
@@ -155,8 +153,6 @@ def test_paged_attention_builds_one_mask_per_step() -> None:
     [
         (mx.float16, mx.float16),
         (mx.bfloat16, mx.bfloat16),
-        # Quantized checkpoints can run float16 activations over a bfloat16
-        # cache (and the reverse); each pairing is its own kernel variant.
         (mx.float16, mx.bfloat16),
         (mx.bfloat16, mx.float16),
     ],
@@ -212,7 +208,6 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
             rows = pool[mx.array(table)].reshape(-1, kv_heads, head_dim)[:length]
             return rows[start:].transpose(1, 0, 2)[None].astype(mx.float32)
 
-        # The reference attends in float32 over the exact stored values.
         expected = mx.fast.scaled_dot_product_attention(
             queries[row : row + 1].astype(mx.float32),
             dense(key_pages),
@@ -235,7 +230,6 @@ def test_paged_decode_kernel_rejects_unsupported_geometry() -> None:
 
 
 def test_paged_decode_splits_rows_only_when_few_threadgroups_run() -> None:
-    # Every split keeps at least 32 keys.
     assert splits_for(rows=1, kv_heads=8, max_keys=40) == 1
     assert splits_for(rows=1, kv_heads=8, max_keys=64) == 2
     assert splits_for(rows=1, kv_heads=8, max_keys=4096) == 4
@@ -249,12 +243,10 @@ def test_paged_reservation_copies_consecutive_slots_as_one_slice() -> None:
     first = backend.get(backend.create("first"), "first")
     second = backend.get(backend.create("second"), "second")
 
-    # One row's slots are consecutive, even across a page boundary.
     reservation = backend.reserve_batch((first,), (12,))
     assert reservation._slot_start == 0
     reservation.abort()
 
-    # Two rows land on different pages, so their slots need a scatter.
     reservation = backend.reserve_batch((first, second), (1, 1))
     assert reservation._slot_start is None
     reservation.abort()

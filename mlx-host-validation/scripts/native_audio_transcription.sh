@@ -77,7 +77,6 @@ CAPTURE_DIR="$ARTIFACTS_DIR/captures"
 SPEECH_WAV="$ARTIFACTS_DIR/speech.wav"
 SPEECH_M4A="$ARTIFACTS_DIR/speech.m4a"
 GATEWAY_BIN="$ROOT/target/debug/mlx_runtime_gateway"
-# Unix socket paths are limited to 104 bytes, so keep it out of ARTIFACTS_DIR.
 SOCKET_PATH="/tmp/mlx-audio-transcription-$PORT.sock"
 SENTENCE="The quick brown fox jumps over the lazy dog."
 mkdir -p "$CAPTURE_DIR"
@@ -91,7 +90,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# post_audio NAME ENDPOINT EXPECTED_STATUS [curl form args...]
 post_audio() {
     local name="$1" endpoint="$2" expected="$3"
     shift 3

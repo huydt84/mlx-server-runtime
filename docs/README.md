@@ -21,6 +21,9 @@ A lightweight MLX inference runtime for Apple Silicon. Rust control plane + Pyth
 | **Reference** | [Native MLX v2](reference/native-mlx-v2.md) | Experimental native backend support, validation, metrics, and limitations |
 | **Reference** | [CLI](reference/cli.md) | Gateway and worker CLI flags |
 | **Explanation** | [Architecture](explanation/architecture.md) | Rust/Python split, IPC, lifecycle, design rationale |
+| **Explanation** | [Architecture Decision Records](adr/README.md) | Individual non-obvious decisions, with context and consequences |
+
+See also the [changelog](../CHANGELOG.md).
 
 ## Quick Links
 

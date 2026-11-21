@@ -738,15 +738,12 @@ def test_paged_backend_frees_pages_unpinned_by_a_finished_reservation(
     parent = backend.get(parent_handle, "parent")
     _stage_constant(backend, parent, 3, 1.0).commit()
     child = backend.get(backend.fork(parent_handle, "child"), "child")
-    # The child's append pins the shared page and copies it on write.
     pending = _stage_constant(backend, child, 1, 5.0)
     backend.release(parent_handle)
     assert backend.metrics()["used_pages"] == 1
 
     getattr(pending, finish)()
 
-    # A commit moves the child off the shared page, which no request now
-    # references; it must be free as soon as the reservation's pin drops.
     assert backend.metrics()["used_pages"] == 1
     other = backend.get(backend.create("other"), "other")
     assert backend.preflight((other,), (24,)) == (None,)
@@ -1429,7 +1426,6 @@ def _paged_scheduler(
 
 def test_scheduler_holds_new_requests_until_kv_pages_free_up() -> None:
     executor = _FakeExecutor()
-    # Each request needs ceil((4 + 8) / 4) + 1 = 4 pages through its last token.
     scheduler, _ = _paged_scheduler(executor, total_pages=6)
     scheduler.submit(_schedulable("first", (1, 2, 3, 4), max_tokens=8))
     scheduler.submit(_schedulable("second", (5, 6, 7, 8), max_tokens=8))
@@ -1640,7 +1636,6 @@ def test_overlap_scheduler_delays_one_result_and_preserves_cache_lifetime() -> N
     scheduler, cache_backend, model, request = _overlap_scheduler(max_tokens=2)
     scheduler.submit(request)
 
-    # Prefill is dispatched asynchronously and resolves on the next tick.
     assert scheduler.tick() == ()
     handle = scheduler._running["overlap"].cache_handle
     assert handle is not None
@@ -1703,15 +1698,12 @@ def test_overlap_scheduler_dispatches_next_decode_before_resolving() -> None:
     scheduler, cache_backend = _chaining_scheduler(model)
     scheduler.submit(_schedulable("chain", (1,), max_tokens=6))
 
-    assert scheduler.tick() == ()  # prefill dispatched
+    assert scheduler.tick() == ()
     handle = scheduler._running["chain"].cache_handle
 
-    # Resolving the prefill already built the first decode, which is enqueued
-    # on the next tick...
     assert _tokens(scheduler.tick()) == [3]
     assert len(model.calls) == 2
     assert not scheduler._in_flight.executor_step.launched
-    # ...and the decode after that decode is enqueued before it resolves.
     assert _tokens(scheduler.tick()) == [3]
     assert len(model.calls) == 3
     assert scheduler._in_flight.executor_step.launched
@@ -1721,7 +1713,6 @@ def test_overlap_scheduler_dispatches_next_decode_before_resolving() -> None:
     while scheduler._in_flight is not None:
         tokens.extend(_tokens(scheduler.tick()))
 
-    # max_tokens is known ahead, so no step runs past the last token.
     assert tokens == [3] * 6
     assert len(model.calls) == 6
     scheduler.finish("chain")
@@ -1740,8 +1731,6 @@ def test_overlap_scheduler_drops_the_chained_token_after_a_terminal_token() -> N
         tokens.extend(_tokens(scheduler.tick()))
     handle = scheduler._running["eos"].cache_handle
 
-    # 1 -> 2 -> 3 -> 0 (terminal). The step after 0 was already running when
-    # 0 resolved; its token is discarded and nothing further is scheduled.
     assert tokens == [2, 3, 0]
     assert len(model.calls) == 4
     assert scheduler._in_flight is None
@@ -1763,8 +1752,6 @@ def test_overlap_scheduler_chains_only_rows_that_continue() -> None:
             if event.kind == "token":
                 tokens[event.request_id].append(event.token_id)
 
-    # "short" leaves the chain at max_tokens, so later chained steps feed
-    # "long" only its own device-resident token.
     assert tokens == {"short": [2, 3, 0], "long": [3, 0, 1, 2, 3, 0]}
     assert [call[1] for call in model.calls] == [
         (1, 1),
@@ -1781,22 +1768,18 @@ def test_overlap_scheduler_chains_a_prefill_after_a_decode() -> None:
     model = _CountingModel()
     scheduler, _ = _chaining_scheduler(model, terminal_token_ids=())
     scheduler.submit(_schedulable("decode", (1,), max_tokens=8))
-    scheduler.tick()  # prefill dispatched
-    scheduler.tick()  # first decode dispatched
+    scheduler.tick()
+    scheduler.tick()
 
     scheduler.submit(_schedulable("prefill", (1, 2, 3), max_tokens=3))
     events = scheduler.tick()
 
-    # The pending prefill was built before the first decode resolved, and is
-    # enqueued only on the next tick, after the decode's token is returned.
     assert _tokens(events) == [3]
     assert [call[1] for call in model.calls] == [(1,), (1,), (3,)]
     assert scheduler._in_flight is not None
     assert [item.request.phase for item in scheduler._in_flight.selected] == ["prefill"]
     assert not scheduler._in_flight.executor_step.launched
 
-    # The decode after it mixes the prefill's device-resident token with the
-    # resolved token of the request that was already decoding.
     events = scheduler.tick()
     assert [
         (event.request_id, event.token_id) for event in events if event.kind == "token"

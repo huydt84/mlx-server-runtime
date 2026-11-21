@@ -441,7 +441,6 @@ mod tests {
             stream: None,
             stream_options: None,
         };
-        // No VLM model configured, so "vlm-model" should be rejected
         let result = request.into_worker_request(
             &default_generation(),
             &default_limits(),

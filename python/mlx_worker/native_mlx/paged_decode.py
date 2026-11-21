@@ -32,14 +32,10 @@ from .metal_source import metal_header
 _SIMD_WIDTH = 32
 _THREADGROUP_MEMORY_BYTES = 32 * 1024
 _MAX_SIMDGROUPS = 8
-# Split a row's keys until a step launches about this many threadgroups...
 _TARGET_THREADGROUPS = 32
-# ...but give every split at least this many keys.
 _MIN_KEYS_PER_SPLIT = 32
 _MAX_SPLITS = 32
 
-# The kernels live in kernels/paged_decode.metal; these bodies only declare
-# threadgroup scratch and forward MLX's generated arguments.
 _SOURCE = """
     threadgroup mlx_air::PagedDecodeScratch<
         SIMDGROUPS, QUERY_HEADS / KV_HEADS, HEAD_DIM> scratch;
@@ -145,8 +141,6 @@ def warmup_key_counts(kv_heads: int) -> tuple[int, ...]:
     counts: list[int] = []
     splits = 1
     while splits <= _MAX_SPLITS:
-        # Split count ``s`` covers [32 * s, 64 * s) keys; aim for the middle so
-        # a slightly longer or shorter prompt stays in range.
         keys = (_MIN_KEYS_PER_SPLIT * 3 // 2) * splits
         if splits_for(1, kv_heads, keys) != splits:
             break

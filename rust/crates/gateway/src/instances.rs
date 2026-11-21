@@ -402,8 +402,6 @@ impl<'a> InstanceManager<'a> {
         loop {
             let status = self.query_service(&metadata.label)?;
             if let Some(pid) = status.pid {
-                // launchd restarts a gateway that exits; a new pid before
-                // readiness means startup failed and will keep failing.
                 match first_pid {
                     None => first_pid = Some(pid),
                     Some(first) if first != pid => {
@@ -426,8 +424,6 @@ impl<'a> InstanceManager<'a> {
                     if self.readiness.is_ready(metadata.port) {
                         return Ok(pid);
                     }
-                    // A failed worker startup does not recover by waiting;
-                    // report it now instead of at the startup timeout.
                     if let Some(error) = self.readiness.startup_failure(metadata.port) {
                         return Err(InstanceError::new(
                             InstanceErrorKind::Serving,
@@ -763,8 +759,6 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
         config.limits.max_completion_tokens
     )
     .ok();
-    // Rendered only when set explicitly, so a detached worker still derives
-    // the request limit from its KV pool like a foreground one.
     if config.memory.max_total_tokens_explicit {
         writeln!(
             output,

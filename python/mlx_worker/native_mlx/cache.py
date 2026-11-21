@@ -640,9 +640,6 @@ class PagedBatchReservation:
         slot_array = self._slot_array
         sequence = int(keys.shape[2])
         if all(length == sequence for length in self.append_lengths):
-            # No row is padded (every decode step, for one): the slot order is
-            # the row-major (row, position) order, so a single reshape packs
-            # the step without per-row slices and a concatenation.
             packed_key_rows = keys.swapaxes(1, 2).reshape(
                 -1, self.backend.num_kv_heads, self.backend.head_dim
             )
@@ -672,8 +669,6 @@ class PagedBatchReservation:
         flat_keys = key_cache.reshape(flat_shape)
         flat_values = value_cache.reshape(flat_shape)
         if self._slot_start is not None:
-            # Consecutive slots (one decode row, for one) take a plain slice
-            # copy, which is cheaper on the GPU than an indexed scatter.
             end = self._slot_start + int(packed_key_rows.shape[0])
             flat_keys[self._slot_start : end] = packed_key_rows
             flat_values[self._slot_start : end] = packed_value_rows
@@ -682,8 +677,6 @@ class PagedBatchReservation:
             flat_values[slot_array] = packed_value_rows
         key_cache = flat_keys.reshape(key_cache.shape)
         value_cache = flat_values.reshape(value_cache.shape)
-        # Drop the pool's reference to the previous buffer so the scatter above
-        # can donate it rather than allocate and copy a whole new pool layer.
         self.backend.key_pages[layer_index] = key_cache
         self.backend.value_pages[layer_index] = value_cache
         self.staged_keys[layer_index] = key_cache
@@ -917,8 +910,6 @@ class PagedKVCacheBackend:
             self.num_kv_heads,
             self.head_dim,
         )
-        # State-only layers keep an empty placeholder so per-layer indexing
-        # stays uniform; staging KV into one fails on its zero-page shape.
         empty = (0, *shape[1:])
         self.key_pages = [
             mx.zeros(shape if index in kv_layers else empty, dtype=self.dtype)
@@ -1197,8 +1188,6 @@ class PagedKVCacheBackend:
             cache.length += append_length
         for page in reservation.reserved_pages:
             self._remove_free(page)
-        # Only pages this step stopped referencing can have become unused;
-        # pages whose last pin drops are freed by ``_finish_reservation``.
         for page in old_counts:
             self._free_if_unused(page)
         self._finish_reservation(reservation)
@@ -1208,8 +1197,6 @@ class PagedKVCacheBackend:
         self._finish_reservation(reservation)
 
     def _finish_reservation(self, reservation: PagedBatchReservation) -> None:
-        # A finished reservation must not keep pool buffers alive, or the next
-        # step's in-place page write would fall back to a full copy.
         reservation.staged_keys[:] = [None] * len(reservation.staged_keys)
         reservation.staged_values[:] = [None] * len(reservation.staged_values)
         self._reserved_pages.difference_update(reservation.reserved_pages)

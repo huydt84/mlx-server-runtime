@@ -161,8 +161,6 @@ def main(
 
         engine_factory = MlxWorkerEngine
 
-    # Default VLM engine factory when env var is set (production path).
-    # Engine is NOT constructed eagerly — lazy init on first VLM request.
     if vlm_engine_factory is None:
         vlm_model = getattr(config, "vlm_model", None)
         if vlm_model is not None:
@@ -333,13 +331,11 @@ def main(
                     )
                 else:
                     try:
-                        # Model-first dispatch: route by model name, not image presence.
                         vlm_model_cfg: str | None = getattr(config, "vlm_model", None)
                         should_cancel = _make_should_cancel(
                             client, read_buffer, pending_lines, request.request_id
                         )
                         if vlm_model_cfg is not None and request.model == vlm_model_cfg:
-                            # Lazy initialize VLM engine on first request.
                             if vlm_engine is None:
                                 vlm_engine = vlm_engine_factory(config.vlm_model)
                                 vlm_engine.max_images_per_request = getattr(
@@ -359,19 +355,11 @@ def main(
                                 )
                             )
 
-                        # Text-only engine cannot process image content.
                         if active_engine is engine and request_has_images(request):
                             raise ValueError(
                                 f"model '{config.model}' is a text-only model "
                                 "and does not support image content"
                             )
-
-                        # VLM engine initialization is deferred to
-                        # ``_generate_vlm`` / ``_stream_vlm`` where the
-                        # ``should_cancel`` closure is already available.
-                        # The engine checks cancellation before the blocking
-                        # ``mlx_vlm.load`` call so a cancelled first request
-                        # never blocks on cold-start model loading.
 
                         if request.stream:
                             event = active_engine.stream_chat(  # type: ignore[attr-defined]
@@ -380,8 +368,6 @@ def main(
                                 should_cancel,
                             )
                         else:
-                            # Non-stream: only VLM engine accepts should_cancel.
-                            # Text engine's complete_chat does not accept it.
                             kwargs: dict[str, object] = {}
                             if active_engine is vlm_engine:
                                 kwargs["should_cancel"] = should_cancel

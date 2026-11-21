@@ -25,7 +25,6 @@ gateway_log_tail() {
     fi
 }
 
-# gateway_wait_ready PORT TIMEOUT_SECONDS [PID] [LOG_PATH]
 gateway_wait_ready() {
     local port="$1"
     local timeout="$2"

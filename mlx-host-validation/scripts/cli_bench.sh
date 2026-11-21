@@ -132,7 +132,6 @@ wait_ready() {
     gateway_wait_ready "$1" "$READY_TIMEOUT" "${GATEWAY_PID:-}" "$MANUAL_LOG"
 }
 
-# Start a regular gateway from the cache-state run's runtime config.
 start_manual_gateway() {
     local name="$1"
     shift
@@ -317,12 +316,9 @@ import sys
 startup = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert startup["status"] == "failed", startup
 assert startup["failure_stage"] == "readiness", startup
-# The foreground gateway exits when its worker fails to start; a gateway that
-# stays up reports the failure through /startup instead.
 message = startup["error"]["message"]
 assert "exited before readiness" in message or "startup failed" in message, startup
 assert startup["trials"] == [], startup
-# The readiness timeout is 1800 s; failing fast means well under it.
 assert int(sys.argv[2]) < 300, sys.argv[2]
 PY
 assert_no_staged_gateway
@@ -571,9 +567,6 @@ PY
 assert_no_staged_gateway
 echo "explicit_diagnostic_family_ok=1"
 
-# Calibration and the failed-trial check run last because they replace the
-# staged gateway with a proxy that adds a known response delay or injects
-# request failures.
 echo "[8/9] Calibration: repeated runs see a controlled 120 ms delay"
 mv "$STAGE_DIR/bin/mlx_runtime_gateway" "$STAGE_DIR/bin/mlx_runtime_gateway.real"
 cp "$DELAY_PROXY" "$STAGE_DIR/bin/mlx_runtime_gateway"
@@ -642,7 +635,6 @@ import sys
 data = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert data["status"] == "failed", data
 assert data["failure_stage"] == "measurement", data
-# Two workloads are configured; the run stops after the first one's trial.
 assert [trial["workload_name"] for trial in data["trials"]] == ["cold"], data["trials"]
 assert data["trials"][0]["error_count"] == 2, data["trials"][0]
 assert "first error" in data["error"]["message"], data["error"]

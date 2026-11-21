@@ -173,7 +173,6 @@ impl RuntimeState {
             .read()
             .map_err(|_| GatewayError::Protocol("vlm status lock poisoned".to_string()))?;
         Ok(guard.clone().unwrap_or_else(|| {
-            // VLM not yet initialized: return NotLoaded fallback.
             let name = self
                 .vlm_model_name
                 .read()
@@ -555,9 +554,6 @@ fn bootstrap_worker(
 
         match decode_worker_message(&line) {
             Some(WorkerMessage::Status(status)) => {
-                // Only update the text model lifecycle from this STATUS.
-                // VLM loads lazily on first VLM request and must NOT
-                // be marked ready from the generic text bootstrap STATUS.
                 let _ = runtime.set_status(*status);
             }
             Some(WorkerMessage::Ready(WorkerReady)) => {

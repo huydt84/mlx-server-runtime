@@ -213,8 +213,6 @@ def build_native_artifacts(
         cache_budget_bytes = kv_memory.pool_bytes
     try:
         native_model = plan.create_model(config, weights)
-        # A model may refine its config from the loaded weights, for example
-        # the K/V activation dtype that sizes the KV pool.
         config = getattr(native_model, "resolved_config", config)
         if graph_profile:
             native_model = GraphProfiledModel(native_model)
@@ -430,8 +428,6 @@ def detect_native_architecture(model: str) -> NativeArchitecture:
 
 
 def _load_tokenizer(model_path: Path) -> tuple[Any, Any, tuple[int, ...]]:
-    # Some valid MLX exports (including LFM2) store special-token metadata in
-    # tokenizer.json/tokenizer_config.json and omit the optional sidecar.
     required = ("tokenizer.json", "tokenizer_config.json")
     missing = [name for name in required if not (model_path / name).exists()]
     if missing:
@@ -464,8 +460,6 @@ def _load_tokenizer(model_path: Path) -> tuple[Any, Any, tuple[int, ...]]:
         eos = [eos]
     eos = [int(value) for value in eos]
     if is_prism_hadamard_checkpoint(model_path):
-        # Hadamard packs list every end-of-generation id in
-        # generation_config.json; the tokenizer alone knows only one.
         eos += [
             value for value in generation_eos_token_ids(model_path) if value not in eos
         ]

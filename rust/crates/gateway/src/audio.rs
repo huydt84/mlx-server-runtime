@@ -428,18 +428,23 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
 /// and warm the transcription model after worker startup.
 pub(crate) fn silent_wav() -> Vec<u8> {
     const SAMPLE_RATE: u32 = 16_000;
-    let data_len: u32 = SAMPLE_RATE * 2;
+    const PCM_FORMAT: u16 = 1;
+    const MONO_CHANNELS: u16 = 1;
+    const BITS_PER_SAMPLE: u16 = 16;
+    const BLOCK_ALIGN: u16 = MONO_CHANNELS * BITS_PER_SAMPLE / 8;
+    const BYTE_RATE: u32 = SAMPLE_RATE * BLOCK_ALIGN as u32;
+    let data_len: u32 = BYTE_RATE;
     let mut wav = Vec::with_capacity(44 + data_len as usize);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36 + data_len).to_le_bytes());
     wav.extend_from_slice(b"WAVEfmt ");
     wav.extend_from_slice(&16_u32.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&PCM_FORMAT.to_le_bytes());
+    wav.extend_from_slice(&MONO_CHANNELS.to_le_bytes());
     wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
-    wav.extend_from_slice(&2_u16.to_le_bytes()); // block align
-    wav.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(&BYTE_RATE.to_le_bytes());
+    wav.extend_from_slice(&BLOCK_ALIGN.to_le_bytes());
+    wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
     wav.resize(44 + data_len as usize, 0);

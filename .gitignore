@@ -100,8 +100,11 @@ Desktop.ini
 *.sln
 *.sw?
 
-# Vibe-code
-.agents/
+# Vibe-code (repository-owned skills under .agents/skills are tracked)
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/delete-comment/
 .codex/
 .opencode/
 prompts/

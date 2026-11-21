@@ -284,7 +284,6 @@ esac
             "PATH": f"{fake_bin}{os.pathsep}{original_path}",
             "FAKE_ARCHIVE": str(archive),
             "FAKE_CHECKSUM": str(checksum),
-            # A generic VERSION in the caller's shell must not pin the install.
             "VERSION": "0.0.1",
         },
     )

@@ -77,7 +77,6 @@ if [[ "$XCTRACE_CAPTURE" == "1" ]] && ! xcrun xctrace list templates \
     exit 1
 fi
 
-# Metal refuses to overwrite an existing capture, so drop the last run's.
 rm -rf "$PROFILE_DIR" "$SERIAL_XCTRACE_PROFILE_DIR" "$OVERLAP_XCTRACE_PROFILE_DIR"
 mkdir -p "$TRACE_DIR" "$PROFILE_DIR"
 sed -e "s/port = 8000/port = $PORT/" \

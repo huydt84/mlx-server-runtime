@@ -14,6 +14,8 @@ Full documentation is in the [`docs/`](docs/) directory:
 |----------|-------------|
 | [Getting Started](docs/tutorial/getting-started.md) | Zero to first inference in 10 steps |
 | [Architecture](docs/explanation/architecture.md) | Design rationale and system design |
+| [Architecture Decision Records](docs/adr/README.md) | Individual decisions, with context and consequences |
+| [Changelog](CHANGELOG.md) | Notable changes per release |
 | [HTTP API Reference](docs/reference/api.md) | All endpoints, schemas, error codes |
 | [Configuration Reference](docs/reference/configuration.md) | All TOML fields and defaults |
 | [IPC Protocol](docs/reference/protocol.md) | UDS handshake and frame format |

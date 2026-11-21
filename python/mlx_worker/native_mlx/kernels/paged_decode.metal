@@ -1,21 +1,3 @@
-// Decode attention read directly from the paged KV pool.
-//
-// Launch geometry (see paged_decode.py):
-//   grid.x  = rows * KV_HEADS threadgroups, one per (row, KV head) pair, each
-//             handling every query head that shares that KV head;
-//   grid.y  = SPLITS key ranges per row, merged by paged_decode_merge when
-//             SPLITS > 1;
-//   threads = SIMDGROUPS simdgroups of 32 lanes; each lane owns
-//             HEAD_DIM / 32 elements of a head.
-//
-// Pool layout: key_pages and value_pages are (pages, PAGE_SIZE, KV_HEADS,
-// HEAD_DIM) in the KV cache dtype KV, which may differ from the query and
-// output dtype Q (for example float16 activations over a bfloat16 cache). block_tables is (rows, table_width) page ids; lengths holds each
-// row's key count including this step's key.
-//
-// MLX passes single-element inputs in the constant address space and larger
-// ones in the device address space, so the table and length pointer types are
-// template parameters.
 #pragma once
 
 #include <metal_stdlib>
@@ -69,8 +51,6 @@ inline void paged_decode_attention(
   uint kv_head = group.x % KV_HEADS;
   uint split = group.y;
 
-  // Each simdgroup accumulates an online softmax over a strided subset of
-  // this split's keys.
   float qv[GQA][EPL];
   float o[GQA][EPL];
   OnlineSoftmax state[GQA];
@@ -113,7 +93,6 @@ inline void paged_decode_attention(
     }
   }
 
-  // Merge the simdgroups through threadgroup memory.
   for (int g = 0; g < GQA; g++) {
     if (lane == 0) {
       scratch.maxes[g * SIMDGROUPS + simd] = state[g].max_score;
@@ -144,7 +123,6 @@ inline void paged_decode_attention(
       out[first_head * HEAD_DIM + e] =
           static_cast<Q>(total > 0.0f ? acc / total : 0.0f);
     } else {
-      // Unnormalized partial result, scaled to this split's maximum.
       uint head = first_head + g;
       partial_out[(head * SPLITS + split) * HEAD_DIM + e % HEAD_DIM] = acc;
       if (e % HEAD_DIM == 0) {
@@ -155,8 +133,6 @@ inline void paged_decode_attention(
   }
 }
 
-// Combines the SPLITS partial results of one head. One threadgroup per head,
-// one thread per head element.
 template <typename Q, int HEAD_DIM, int SPLITS>
 inline void paged_decode_merge(
     const device float* partial_out,
@@ -180,4 +156,4 @@ inline void paged_decode_merge(
   out[head * HEAD_DIM + dim] = static_cast<Q>(total > 0.0f ? acc / total : 0.0f);
 }
 
-}  // namespace mlx_air
+}

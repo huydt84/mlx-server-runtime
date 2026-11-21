@@ -66,8 +66,6 @@ def _sample_row(logits: mx.array, sampling: SamplingParams, position: int) -> mx
     order = mx.argsort(-scaled, axis=-1)
     sorted_logits = mx.take(scaled, order, axis=-1)
     sorted_probs = mx.softmax(sorted_logits, axis=-1)
-    # Drop a token once the more likely tokens already reach top_p; the most
-    # likely token always stays.
     exceeded = (mx.cumsum(sorted_probs, axis=-1) - sorted_probs) >= sampling.top_p
     kept = mx.where(exceeded, -mx.inf, sorted_logits)
     choice = mx.argmax(kept + noise, axis=-1)
@@ -83,7 +81,6 @@ def _gumbel(vocab: int, seed: int, position: int) -> mx.array:
 
 
 def _row_seed(seed: int, position: int) -> int:
-    # SplitMix64-style mixing so neighbouring positions get unrelated keys.
     value = (seed * 0x9E3779B97F4A7C15 + position + 1) & ((1 << 64) - 1)
     value ^= value >> 30
     value = (value * 0xBF58476D1CE4E5B9) & ((1 << 64) - 1)

@@ -120,8 +120,6 @@ if not mx.allclose(dense, paged, atol=1e-3, rtol=1e-3).item():
     raise SystemExit("registered backend does not match dense reference")
 print("attention_backend_parity_ok=1")
 
-# Decode steps with a head dimension that is a multiple of 32 run the
-# page-table decode kernel; compare a three-row decode with the dense reference.
 decode_geometry = KVCacheGeometry(1, 2, 64, mx.float16)
 decode_bundle = build_native_execution_backend(
     DEFAULT_NATIVE_EXECUTION_BACKEND,

@@ -1005,10 +1005,6 @@ def _validate_batch_generator_contract(
     """Fail fast when the installed mlx-lm batching API is incompatible."""
 
     required_parameters = {
-        # ``all_tokens`` was added after the pinned legacy mlx-lm release.  It
-        # is an optional cache metadata hint, not a prerequisite for text
-        # generation, so callers must omit it when the installed generator
-        # does not expose the keyword.
         "insert": {"prompts", "max_tokens", "caches", "samplers"},
         "next_generated": set(),
         "close": set(),

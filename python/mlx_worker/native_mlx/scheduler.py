@@ -100,8 +100,6 @@ class _BasePolicy:
         timings: dict[str, int],
     ) -> list[_ScheduledState]:
         del scheduler_round, cache_coordinator, timings
-        # OrderedDict insertion order is the arrival order used by FCFS.  Do
-        # not allocate a sorted copy on every decode tick.
         return states
 
 
@@ -360,7 +358,6 @@ class NativeContinuousScheduler:
         """
 
         if self._in_flight is not None:
-            # Resolving the step reports a launch failure for its rows.
             with suppress(Exception):
                 self._executor.launch_batch(self._in_flight.executor_step)  # type: ignore[attr-defined]
         events = self._pending_events
@@ -496,7 +493,6 @@ class NativeContinuousScheduler:
         try:
             self._executor.commit_dispatched(step.executor_step)  # type: ignore[attr-defined]
         except Exception:
-            # Resolving ``step`` reports the commit failure for its rows.
             return False, None
         batch = ExecutionBatch(
             requests=tuple(item.request for item in selected),
@@ -565,7 +561,6 @@ class NativeContinuousScheduler:
                 request=ExecutionRequest(
                     request_id=item.request.request_id,
                     phase="decode",
-                    # Placeholder: the executor reads the device-resident token.
                     token_ids=(0,),
                     positions=(item.request.positions[-1] + 1,),
                     cache_handle=item.state.cache_handle,
@@ -698,8 +693,6 @@ class NativeContinuousScheduler:
             prefill_states, decode_waiting=bool(decode_work), timings=timings
         )
         if not selected and decode_work:
-            # Every prefill candidate is waiting for KV pages; keep decoding
-            # so running requests finish and release theirs.
             self._last_step_prefilled = False
             return decode_work
         return selected
@@ -757,15 +750,12 @@ class NativeContinuousScheduler:
                     if needed > pages:
                         freed = self._reclaim_prefix_pages(needed - pages)
                         if freed:
-                            # Eviction may have dropped the matched entry.
                             probe = self._cache_coordinator.probe(
                                 state.work.prompt_token_ids
                             )
                             pages += freed
                             needed = self._admission_pages(state, probe, page_size)
                     if needed > pages and self._running:
-                        # FCFS: later arrivals wait behind this one so a long
-                        # request is not starved by shorter ones.
                         state.cached_probe = probe
                         admission_blocked = True
                         self._kv_admission_waits += 1
@@ -848,7 +838,6 @@ class NativeContinuousScheduler:
 
         final = len(state.work.prompt_token_ids) + max(0, state.work.max_tokens)
         reused = int(getattr(probe, "matched_pages", 0) or 0)
-        # One extra page covers a copy-on-write split of a shared last page.
         return max(0, math.ceil(final / page_size) - reused) + 1
 
     def _prefill_candidates(self) -> list[_ScheduledState]:
@@ -930,8 +919,6 @@ class NativeContinuousScheduler:
                 or state.finish_requested
                 or state.generation_complete
             ):
-                # A chained decode step can run one token past a terminal
-                # token; that token is discarded.
                 continue
             item = results.get(request.request_id)
             if item is None:

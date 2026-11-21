@@ -395,10 +395,6 @@ def analyze_timeline(args: argparse.Namespace) -> None:
         for line in args.events.read_text().splitlines()
         if line.strip()
     ]
-    # A step's events are recorded together when it resolves, so each
-    # synchronize_eval belongs to the preceding async_dispatch of the same
-    # request. Pairing by timestamp would be wrong: the next step is often
-    # dispatched before the previous step synchronizes.
     steps = []
     open_dispatches: dict[Any, dict[str, Any]] = {}
     for event in events:

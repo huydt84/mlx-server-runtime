@@ -80,8 +80,11 @@ fails for lack of KV pages. `kv_admission_waits` in the worker metrics counts
 those waits.
 
 The legacy `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` environment variable still
-pins the pool when `kv_cache_bytes` is unset. The v1 backend does not use the
-KV pool; it keeps its own `mlx_lm` prompt cache.
+pins the pool when `kv_cache_bytes` is unset and the variable is non-zero.
+Zero only disables the v1 prompt cache. The v1 backend does not use the KV
+pool; it keeps its own `mlx_lm` prompt cache. Removing this overload is
+tracked in [#8](https://github.com/huydt84/mlx-server-runtime/issues/8); see
+[ADR-0007](../adr/0007-worker-startup-failure-handling.md).
 
 ## [telemetry]
 

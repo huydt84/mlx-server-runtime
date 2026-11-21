@@ -607,7 +607,6 @@ mod tests {
         let decoded = decode_gateway_command(&encoded).unwrap();
         assert_eq!(decoded, command);
 
-        // Verify the JSON structure has the expected content parts
         assert!(encoded.contains("\"type\":\"text\""));
         assert!(encoded.contains("\"type\":\"image_url\""));
         assert!(encoded.contains("\"image_url\":{\"url\":"));
@@ -670,7 +669,6 @@ mod tests {
                 \"stream\": false
             }
         }"#;
-        // Remove the escaped quotes we inserted for readability
         let clean = json.replace("\\\"", "\"");
         let decoded = decode_gateway_command(&clean).unwrap();
         if let GatewayCommand::ChatCompletion { request } = &decoded {

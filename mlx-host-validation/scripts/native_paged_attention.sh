@@ -346,8 +346,6 @@ if short_result.get("status") != 200 or long_result.get("status") != 200:
 if not short_result.get("text") or not long_result.get("text"):
     raise SystemExit("public native output was empty")
 
-# A non-streaming request that decodes many tokens, so every decode step runs
-# the paged decode kernel in the checkpoint's own query/KV dtypes.
 decode_conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=240)
 decode_conn.request(
     "POST",
@@ -488,8 +486,6 @@ if not mx.allclose(dense, paged, atol=1e-3, rtol=1e-3).item():
     raise SystemExit("paged Metal attention did not match dense reference")
 print("paged_direct_paged_kernel_parity_ok=1")
 
-# Paged decode kernel against a float32 reference for each query/KV dtype
-# pairing, over scattered pages and enough keys to split the key range.
 decode_page_size, decode_heads, decode_kv_heads, decode_head_dim = 16, 28, 4, 128
 decode_lengths = [37, 300]
 decode_tables = [[5, 2, 9], [int(page) for page in range(40, 59)]]
@@ -604,7 +600,6 @@ except ValueError:
 else:
     raise SystemExit("unsupported page size did not fail")
 
-# Record the query/KV dtypes the real checkpoint hands the paged decode kernel.
 model_decode_dtypes: set[str] = set()
 real_paged_decode = native_attention.paged_decode_attention
 
@@ -656,7 +651,6 @@ try:
         raise SystemExit("direct mixed native execution did not use one paged forward")
     print("paged_direct_mixed_single_forward_ok=1")
 
-    # A decode-only step for both rows takes the paged decode kernel path.
     next_tokens = {result.request_id: int(result.next_token_id) for result in mixed.results}
     decode_step = executor.execute_batch(
         ExecutionBatch(
