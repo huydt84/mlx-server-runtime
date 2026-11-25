@@ -389,7 +389,6 @@ class BlockHashPrefixCache:
         return max(1, min(self.max_entries, self.max_bytes // bytes_per_page))
 
     def _stored_bytes(self) -> int:
-        # Every entry holds exactly one page of its own.
         return len(self._entries) * self._bytes_for_pages(1)
 
     def _tick(self) -> int:

@@ -397,3 +397,70 @@ pub struct SchedulerMetricsEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radix_leaf_evictions: Option<u64>,
 }
+
+/// One decoded Whisper segment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptionSegment {
+    /// Segment index within the response.
+    pub id: u32,
+    /// Mel-frame offset of the decoding window that produced the segment.
+    pub seek: u64,
+    /// Segment start in seconds.
+    pub start: f64,
+    /// Segment end in seconds.
+    pub end: f64,
+    /// Segment text.
+    pub text: String,
+    /// Decoded token ids.
+    #[serde(default)]
+    pub tokens: Vec<u32>,
+    /// Temperature that produced the accepted decode.
+    pub temperature: f64,
+    /// Average token log probability.
+    pub avg_logprob: f64,
+    /// Gzip compression ratio of the text.
+    pub compression_ratio: f64,
+    /// Probability that the window contains no speech.
+    pub no_speech_prob: f64,
+}
+
+/// One word with timestamps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptionWord {
+    /// The word text, including its leading space.
+    pub word: String,
+    /// Word start in seconds.
+    pub start: f64,
+    /// Word end in seconds.
+    pub end: f64,
+}
+
+/// A completed transcription or translation from the worker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptionResponse {
+    /// Request identifier copied from the request.
+    pub request_id: String,
+    /// Model that served the request.
+    pub model: String,
+    /// Task that was run.
+    pub task: crate::AudioTask,
+    /// Full output text.
+    pub text: String,
+    /// Detected or requested input language, as the lowercase English name
+    /// Whisper uses (for example `english`).
+    pub language: String,
+    /// Decoded input duration in seconds.
+    pub duration: f64,
+    /// Decoded segments.
+    #[serde(default)]
+    pub segments: Vec<TranscriptionSegment>,
+    /// Words with timestamps, when requested.
+    #[serde(default)]
+    pub words: Vec<TranscriptionWord>,
+    /// Time spent decoding the uploaded file into samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_decode_latency_ms: Option<u32>,
+    /// Time spent in Whisper inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_latency_ms: Option<u32>,
+}

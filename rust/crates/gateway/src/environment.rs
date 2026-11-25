@@ -97,8 +97,6 @@ pub(crate) fn ensure_runtime_environment(
             "--frozen".into(),
             "--no-dev".into(),
             "--no-editable".into(),
-            // The worker is a local, non-editable package: rebuild it from
-            // this distribution instead of reusing an older build.
             "--reinstall-package".into(),
             "mlx-worker".into(),
         ])

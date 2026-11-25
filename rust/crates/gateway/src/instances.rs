@@ -402,8 +402,6 @@ impl<'a> InstanceManager<'a> {
         loop {
             let status = self.query_service(&metadata.label)?;
             if let Some(pid) = status.pid {
-                // launchd restarts a gateway that exits; a new pid before
-                // readiness means startup failed and will keep failing.
                 match first_pid {
                     None => first_pid = Some(pid),
                     Some(first) if first != pid => {
@@ -426,8 +424,6 @@ impl<'a> InstanceManager<'a> {
                     if self.readiness.is_ready(metadata.port) {
                         return Ok(pid);
                     }
-                    // A failed worker startup does not recover by waiting;
-                    // report it now instead of at the startup timeout.
                     if let Some(error) = self.readiness.startup_failure(metadata.port) {
                         return Err(InstanceError::new(
                             InstanceErrorKind::Serving,
@@ -720,6 +716,14 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
     if let Some(vlm_model) = &config.worker.vlm_model {
         writeln!(output, "vlm_model = {}", toml_string(vlm_model)?).ok();
     }
+    if let Some(transcription_model) = &config.worker.transcription_model {
+        writeln!(
+            output,
+            "transcription_model = {}",
+            toml_string(transcription_model)?
+        )
+        .ok();
+    }
     writeln!(
         output,
         "ipc_path = {}",
@@ -761,8 +765,6 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
         config.limits.max_completion_tokens
     )
     .ok();
-    // Rendered only when set explicitly, so a detached worker still derives
-    // the request limit from its KV pool like a foreground one.
     if config.memory.max_total_tokens_explicit {
         writeln!(
             output,
@@ -777,10 +779,11 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
         config.limits.request_timeout_seconds
     )
     .ok();
+    writeln!(output, "max_vlm_images = {}", config.limits.max_vlm_images).ok();
     writeln!(
         output,
-        "max_vlm_images = {}\n",
-        config.limits.max_vlm_images
+        "max_audio_bytes = {}\n",
+        config.limits.max_audio_bytes
     )
     .ok();
     writeln!(output, "[memory]").ok();
@@ -1149,6 +1152,23 @@ mod tests {
 
         let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
         assert_eq!(reloaded.worker, config.worker);
+    }
+
+    #[test]
+    fn rendered_config_round_trips_transcription_settings() {
+        let mut config = RuntimeConfig::default();
+        let rendered = render_runtime_config(&config).unwrap();
+        assert!(!rendered.contains("transcription_model"));
+
+        config.worker.transcription_model = Some("whisper-model".to_string());
+        config.limits.max_audio_bytes = 1 << 20;
+        let rendered = render_runtime_config(&config).unwrap();
+        let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
+        assert_eq!(
+            reloaded.worker.transcription_model,
+            config.worker.transcription_model
+        );
+        assert_eq!(reloaded.limits.max_audio_bytes, 1 << 20);
     }
 
     #[test]

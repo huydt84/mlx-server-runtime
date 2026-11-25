@@ -153,9 +153,6 @@ def run_cancel_probe(args: argparse.Namespace) -> None:
     """Cancel public requests and verify bounded cleanup/health signals."""
 
     request_dir = pathlib.Path(args.request_dir)
-    # Rust-waiting is exercised by a short timeout/queue-full config in the
-    # phase script. Python-waiting, prefill, and decode are observed through
-    # worker cancellation metrics after concurrent public requests.
     rows = _cancel_concurrently(
         args.port,
         [request_dir / "cancel_prefill.json", request_dir / "cancel_decode.json"],

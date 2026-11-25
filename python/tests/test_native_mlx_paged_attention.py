@@ -89,8 +89,6 @@ def _run(backend, contexts_for, cache_lengths, token_lengths, mask, head_dim):
     return _attend(backend, contexts_for, caches, token_lengths, mask, 7, head_dim)
 
 
-# head_dim 8 takes the gather path for every step; 32 sends decode steps
-# through the page-table decode kernel.
 @pytest.mark.parametrize("head_dim", [8, 32])
 @pytest.mark.parametrize(
     ("cache_lengths", "token_lengths", "mask"),
@@ -150,14 +148,23 @@ def test_paged_attention_builds_one_mask_per_step() -> None:
     reservation.abort()
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    ("query_dtype", "kv_dtype"),
+    [
+        (mx.float16, mx.float16),
+        (mx.bfloat16, mx.bfloat16),
+        (mx.float16, mx.bfloat16),
+        (mx.bfloat16, mx.float16),
+    ],
+)
 @pytest.mark.parametrize(
     ("query_heads", "kv_heads", "head_dim"), [(4, 2, 64), (7, 1, 128), (4, 1, 256)]
 )
 @pytest.mark.parametrize("window_size", [None, 5, 300])
 @pytest.mark.parametrize("lengths", [[1, 4, 13, 40], [70], [700]])
 def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
-    dtype,
+    query_dtype,
+    kv_dtype,
     query_heads: int,
     kv_heads: int,
     head_dim: int,
@@ -166,8 +173,12 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
 ) -> None:
     page_size, pages = 4, 200
     mx.random.seed(3)
-    key_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(dtype)
-    value_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(dtype)
+    key_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(
+        kv_dtype
+    )
+    value_pages = mx.random.normal((pages, page_size, kv_heads, head_dim)).astype(
+        kv_dtype
+    )
     order = [int(page) for page in mx.random.permutation(pages).tolist()]
     tables: list[list[int]] = []
     for length in lengths:
@@ -175,7 +186,9 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
         tables.append(order[:count])
         order = order[count:]
     width = max(len(table) for table in tables)
-    queries = mx.random.normal((len(lengths), query_heads, 1, head_dim)).astype(dtype)
+    queries = mx.random.normal((len(lengths), query_heads, 1, head_dim)).astype(
+        query_dtype
+    )
 
     output = paged_decode_attention(
         queries,
@@ -193,17 +206,18 @@ def test_paged_decode_kernel_matches_sdpa_over_scattered_pages(
 
         def dense(pool, table=table, length=length, start=start):
             rows = pool[mx.array(table)].reshape(-1, kv_heads, head_dim)[:length]
-            return rows[start:].transpose(1, 0, 2)[None]
+            return rows[start:].transpose(1, 0, 2)[None].astype(mx.float32)
 
         expected = mx.fast.scaled_dot_product_attention(
-            queries[row : row + 1],
+            queries[row : row + 1].astype(mx.float32),
             dense(key_pages),
             dense(value_pages),
             scale=head_dim**-0.5,
         )
+        assert output.dtype == query_dtype
         assert mx.allclose(
             output[row : row + 1].astype(mx.float32),
-            expected.astype(mx.float32),
+            expected,
             atol=2e-2,
         ).item(), (row, length)
 
@@ -216,7 +230,6 @@ def test_paged_decode_kernel_rejects_unsupported_geometry() -> None:
 
 
 def test_paged_decode_splits_rows_only_when_few_threadgroups_run() -> None:
-    # Every split keeps at least 32 keys.
     assert splits_for(rows=1, kv_heads=8, max_keys=40) == 1
     assert splits_for(rows=1, kv_heads=8, max_keys=64) == 2
     assert splits_for(rows=1, kv_heads=8, max_keys=4096) == 4
@@ -230,12 +243,10 @@ def test_paged_reservation_copies_consecutive_slots_as_one_slice() -> None:
     first = backend.get(backend.create("first"), "first")
     second = backend.get(backend.create("second"), "second")
 
-    # One row's slots are consecutive, even across a page boundary.
     reservation = backend.reserve_batch((first,), (12,))
     assert reservation._slot_start == 0
     reservation.abort()
 
-    # Two rows land on different pages, so their slots need a scatter.
     reservation = backend.reserve_batch((first, second), (1, 1))
     assert reservation._slot_start is None
     reservation.abort()

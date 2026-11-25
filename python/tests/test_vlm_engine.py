@@ -845,8 +845,6 @@ def test_vlm_engine_stream_chat_cancelled_in_loop() -> None:
     def should_cancel() -> bool:
         nonlocal call_count
         call_count += 1
-        # Cancel on the 9th call = inside the 2nd loop iteration,
-        # after the first token delta has been emitted.
         return call_count >= 9
 
     deltas: list[str] = []
@@ -857,8 +855,8 @@ def test_vlm_engine_stream_chat_cancelled_in_loop() -> None:
     response = engine.stream_chat(_vlm_request(), emit_delta, should_cancel)
     assert isinstance(response, ChatCompletionResponse)
     assert response.finish_reason == "cancelled"
-    assert response.text == ""  # no full text accumulator on loop cancel
-    assert len(deltas) == 1  # only first token emitted before cancel
+    assert response.text == ""
+    assert len(deltas) == 1
 
 
 def test_vlm_engine_stream_chat_cancelled_before_any_work() -> None:
@@ -884,7 +882,7 @@ def test_vlm_engine_stream_chat_cancelled_before_any_work() -> None:
     assert response.text == ""
     assert response.prompt_tokens == 0
     assert response.completion_tokens == 0
-    assert len(deltas) == 0  # no deltas emitted at all
+    assert len(deltas) == 0
 
 
 def test_vlm_engine_stream_chat_cancelled_before_prompt_build() -> None:
@@ -911,7 +909,6 @@ def test_vlm_engine_stream_chat_cancelled_before_prompt_build() -> None:
     def should_cancel() -> bool:
         nonlocal call_count
         call_count += 1
-        # Cancel on the 6th call = after preprocessing, before prompt build.
         return call_count >= 6
 
     deltas: list[str] = []
@@ -927,7 +924,6 @@ def test_vlm_engine_stream_chat_cancelled_before_prompt_build() -> None:
     assert response.completion_tokens == 0
     assert len(deltas) == 0
 
-    # Telemetry reflects preprocessing that already ran.
     timings = engine.last_vlm_timings
     assert timings["image_count"] == 1
     assert timings["image_preprocess_ms"] >= 0.0
@@ -1039,7 +1035,7 @@ def test_vlm_engine_last_timings_after_vlm_request() -> None:
     )
     _ = engine.complete_chat(_vlm_request())
     timings = engine.last_vlm_timings
-    assert timings["image_count"] == 1  # one image in _vlm_request
+    assert timings["image_count"] == 1
     assert timings["image_preprocess_ms"] >= 0.0
     assert timings["prompt_template_ms"] >= 0.0
 
@@ -1114,11 +1110,6 @@ def test_vlm_engine_last_timings_defaults() -> None:
     }
 
 
-# ------------------------------------------------------------------
-# Cancel via public complete_chat
-# ------------------------------------------------------------------
-
-
 def test_vlm_engine_complete_chat_cancelled_via_public_method() -> None:
     """Public complete_chat with should_cancel returns cancelled response."""
     engine = MlxVlmEngine(
@@ -1163,11 +1154,6 @@ def test_vlm_engine_complete_chat_uses_non_stream_generate_when_cancel_checked()
     assert isinstance(response, ChatCompletionResponse)
     assert response.text == "mock VLM output"
     assert called == ["generate"]
-
-
-# ------------------------------------------------------------------
-# Image source validation
-# ------------------------------------------------------------------
 
 
 def test_validate_image_source_rejects_data_uri() -> None:
@@ -1221,11 +1207,6 @@ def test_validate_image_source_rejects_long_url() -> None:
 def test_validate_image_source_accepts_max_length_url() -> None:
     """Image URL at exactly max length passes validation."""
     _validate_image_source("https://example.com/short.jpg")
-
-
-# ------------------------------------------------------------------
-# Image count validation in _extract_chat_and_image
-# ------------------------------------------------------------------
 
 
 def _multi_image_request(image_count: int) -> ChatCompletionRequest:
@@ -1316,11 +1297,6 @@ def test_vlm_engine_rejects_invalid_scheme_in_request() -> None:
         engine.complete_chat(bad_request)
 
 
-# ------------------------------------------------------------------
-# Lazy initialization
-# ------------------------------------------------------------------
-
-
 def test_vlm_engine_lazy_init_not_loaded_at_construction() -> None:
     """Engine construction does not load the VLM model."""
     engine = MlxVlmEngine(
@@ -1380,7 +1356,7 @@ def test_vlm_engine_lazy_init_idempotent() -> None:
     )
     engine.initialize()
     assert engine.is_initialized
-    engine.initialize()  # second call should be safe
+    engine.initialize()
     assert engine.is_initialized
 
 
@@ -1405,7 +1381,6 @@ def test_vlm_engine_initialize_cancelled_skips_load() -> None:
     )
     assert not engine.is_initialized
 
-    # Cancel BEFORE the load call.
     engine.initialize(should_cancel=lambda: True)
 
     assert load_called == [], "model load must NOT be invoked"
@@ -1426,7 +1401,6 @@ def test_vlm_engine_initialize_cancelled_after_load_keeps_state() -> None:
 
     def cancel_after_load() -> bool:
         call_count[0] += 1
-        # Return False on first call (before load), True on second (after).
         return call_count[0] > 1
 
     engine = MlxVlmEngine(
@@ -1439,8 +1413,6 @@ def test_vlm_engine_initialize_cancelled_after_load_keeps_state() -> None:
 
     engine.initialize(should_cancel=cancel_after_load)
 
-    # Model was loaded (first should_cancel returned False). Even though
-    # second should_cancel returned True, the loaded state is KEPT.
     assert engine.is_initialized, "engine must be initialized"
     assert engine.model is not None, "loaded model must be preserved"
     assert engine.processor is not None, "loaded processor must be preserved"
@@ -1485,9 +1457,6 @@ def test_vlm_engine_cancelled_after_load_then_next_request_succeeds() -> None:
 
     def cancel_after_load() -> bool:
         cancel_after_load.call_count += 1  # type: ignore[attr-defined]
-        # Call 1 = generate_vlm check before init,
-        # Call 2 = initialize check before load,
-        # Call 3 = initialize check after load → cancel here.
         return cancel_after_load.call_count > 2  # type: ignore[attr-defined]
 
     cancel_after_load.call_count = 0  # type: ignore[attr-defined]
@@ -1501,7 +1470,6 @@ def test_vlm_engine_cancelled_after_load_then_next_request_succeeds() -> None:
     assert not engine.is_initialized
     assert load_count[0] == 0
 
-    # First request — cancelled after load.
     response1 = engine.complete_chat(_text_request(), should_cancel=cancel_after_load)
     assert isinstance(response1, ChatCompletionResponse)
     assert response1.finish_reason == "cancelled"
@@ -1509,7 +1477,6 @@ def test_vlm_engine_cancelled_after_load_then_next_request_succeeds() -> None:
     assert engine.model is not None, "model must survive cancellation"
     assert load_count[0] == 1, "model must have been loaded exactly once"
 
-    # Second request — should succeed without reloading.
     response2 = engine.complete_chat(_text_request())
     assert isinstance(response2, ChatCompletionResponse)
     assert response2.finish_reason == "stop"

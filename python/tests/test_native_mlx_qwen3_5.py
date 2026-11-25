@@ -344,9 +344,8 @@ def test_hadamard_linear_and_embedding_undo_folded_rotation() -> None:
     mx.random.seed(5)
     width, rows, block = 1024, 8, 512
     signs = mx.where(mx.random.uniform(shape=(width,)) < 0.5, -1.0, 1.0)
-    rotation = _rotation_matrix(width, block, signs)  # row i = rotate(e_i)
+    rotation = _rotation_matrix(width, block, signs)
     dense = mx.random.normal((rows, width)) * 0.05
-    # Linear: stored W' = W R^T, so W' rotate(x) = W x.
     folded = (dense @ rotation).astype(mx.float16)
     linear = HadamardQuantizedLinear(width, rows, block=block, group_size=128, bits=8)
     linear.weight, linear.scales, linear.biases = mx.quantize(folded, 128, 8)
@@ -354,7 +353,6 @@ def test_hadamard_linear_and_embedding_undo_folded_rotation() -> None:
     x = mx.random.normal((2, width)).astype(mx.float16)
     expected = x.astype(mx.float32) @ dense.T
     assert mx.allclose(linear(x).astype(mx.float32), expected, atol=5e-2).item()
-    # Embedding: stored rows are rotate(e), returned rows are e.
     rotated_rows = hadamard_rotate(dense, block, signs).astype(mx.float16)
     embedding = HadamardQuantizedEmbedding(
         rows, width, block=block, group_size=128, bits=8
@@ -455,7 +453,6 @@ def test_hadamard_pack_native_model_matches_mlx_lm_reference(tmp_path: Path) -> 
     model = build_qwen3_5_model(config, weights)
     assert isinstance(model.model.embed_tokens, HadamardQuantizedEmbedding)
     assert isinstance(model.lm_head, HadamardQuantizedLinear)
-    # float32 norms keep the reference residual stream, and so K/V, in float32.
     assert model.resolved_config.kv_cache_dtype == "float32"
 
     tokens = [1, 4, 9, 16, 25, 3]

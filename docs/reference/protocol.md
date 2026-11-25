@@ -130,6 +130,27 @@ Messages carry these fields when they are set:
 }
 ```
 
+**Transcription:** an audio upload for the transcription model. The audio is
+the uploaded file, base64 encoded, so a 25 MiB upload is a ~33 MiB frame.
+`task` is `transcribe` or `translate`; optional fields are omitted when unset.
+
+```json
+{
+  "type": "transcription",
+  "request": {
+    "request_id": "audio-1",
+    "model": "mlx-community/whisper-large-v3-turbo-asr-fp16",
+    "task": "transcribe",
+    "audio_base64": "UklGRiQ...",
+    "filename": "speech.wav",
+    "language": "en",
+    "prompt": "Kenobi",
+    "temperature": 0.0,
+    "word_timestamps": false
+  }
+}
+```
+
 ### Worker → Gateway Events
 
 **ChatCompletionResponse** (non-streaming response or final response):
@@ -172,6 +193,36 @@ The response of a request with tools adds these fields to `response`:
 | `tool_calls` | array | Completed calls, in the shape above; absent without any |
 | `tool_parser` | string | Parser that read the output |
 | `tool_parse_failures` | int | Calls returned as text because they could not be parsed |
+
+**Transcription** (result of a transcription command): `language` is the
+lowercase Whisper language name, `duration` the decoded input length in
+seconds, and `words` is empty unless `word_timestamps` was requested.
+
+```json
+{
+  "type": "transcription",
+  "response": {
+    "request_id": "audio-1",
+    "model": "mlx-community/whisper-large-v3-turbo-asr-fp16",
+    "task": "transcribe",
+    "text": " Hello there.",
+    "language": "english",
+    "duration": 1.62,
+    "segments": [
+      {"id": 0, "seek": 0, "start": 0.0, "end": 1.62, "text": " Hello there.",
+       "tokens": [50365, 2425], "temperature": 0.0, "avg_logprob": -0.21,
+       "compression_ratio": 0.75, "no_speech_prob": 0.01}
+    ],
+    "words": [],
+    "audio_decode_latency_ms": 4,
+    "inference_latency_ms": 310
+  }
+}
+```
+
+A transcription failure is an `error` event: `INVALID_REQUEST` for input the
+worker cannot use (undecodable audio, a format that needs a missing `ffmpeg`,
+an unknown language) and `WORKER_ERROR` for model failures.
 
 **Error:**
 

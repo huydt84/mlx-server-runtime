@@ -245,11 +245,20 @@ generated arguments (see `paged_decode.py`).
 - MLX passes a single-element input in the `constant` address space and a
   larger one in `device`. Make the pointer type of any input that can have one
   element a template parameter.
+- MLX types each generated argument by its own array dtype. Give every input
+  whose dtype can differ from the others its own template type, and bind each
+  from that array's dtype: quantized checkpoints can run float16 activations
+  over a bfloat16 KV cache, so `paged_decode.metal` takes the query dtype `Q`
+  and the cache dtype `KV` separately.
 - Standalone syntax checks need the Metal Toolchain
   (`xcodebuild -downloadComponent MetalToolchain`), then
   `xcrun -sdk macosx metal -std=metal3.1 -c kernels/paged_decode.metal -o /dev/null`.
+- Record launch geometry, split heuristics, and dtype rules in
+  [ADR-0006](docs/adr/0006-paged-decode-attention-kernel.md), not in kernel
+  comments.
 - Prove a kernel change with a parity test against a dense MLX reference
-  (`python/tests/test_native_mlx_paged_attention.py`).
+  (`python/tests/test_native_mlx_paged_attention.py`), covering every input
+  dtype pairing the kernel accepts.
 
 ## Profile Model-Graph Inference
 
@@ -332,6 +341,8 @@ Run focused tests while developing, then the repository checks before opening
 a pull request:
 
 ```bash
+python3 scripts/check_comments.py
+
 cd python
 uv sync
 uv run ruff format --check .
@@ -373,6 +384,10 @@ answers, and fails at once, printing the log tail, when the gateway exits or
 
 ## Keep Changes Reviewable
 
+- Do not add code comments. `scripts/check_comments.py` rejects them
+  ([ADR-0001](docs/adr/0001-ban-code-comments.md)). Put the reason for a
+  non-obvious decision in an ADR under [`docs/adr/`](docs/adr/README.md) and
+  file an issue for a known hack.
 - Keep architecture changes inside the model and registry seams.
 - Add tests for every behavior change and failure boundary.
 - Do not add dependencies for small helpers already covered by the standard

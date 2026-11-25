@@ -43,10 +43,6 @@ def _make_sampler(temp: float, top_p: float) -> Callable[[Any], Any]:
     return make_sampler(temp, top_p)
 
 
-# ---------------------------------------------------------------------------
-# Image source validation constants
-# ---------------------------------------------------------------------------
-
 _MAX_IMAGES_PER_REQUEST = 5
 """Maximum allowed images in a single VLM request."""
 
@@ -430,22 +426,16 @@ class MlxVlmEngine:
             self._vlm_generate = self.vlm_generate_fn
             self._vlm_stream_generate = self.vlm_stream_generate_fn
 
-        # Deferred model state — populated by initialize().
         self.model: Any | None = None
         self.processor: Any | None = None
         self._vlm_config: dict[str, Any] | None = None
         self._initialized: bool = False
 
-        # Telemetry state.
         self._last_image_count: int = 0
         self._last_image_preprocess_ms: float = 0.0
         self._last_prompt_template_ms: float = 0.0
         self._last_vision_encoder_ms: float = 0.0
         self._last_embedding_ms: float = 0.0
-
-    # ------------------------------------------------------------------
-    # Initialization
-    # ------------------------------------------------------------------
 
     def initialize(self, should_cancel: Callable[[], bool] | None = None) -> None:
         """Load the VLM model and processor on demand.
@@ -466,13 +456,10 @@ class MlxVlmEngine:
         if self._initialized:
             return
         if should_cancel is not None and should_cancel():
-            return  # caller handles cancelled response
+            return
         self.model, self.processor = self._vlm_loader(self.model_id)
         self._vlm_config = self._load_vlm_config()
         if should_cancel is not None and should_cancel():
-            # Load completed but request was cancelled.
-            # Keep loaded model/processor so next request reuses them
-            # instead of cold-loading again (expensive memory churn).
             self._initialized = True
             return
         self._initialized = True
@@ -481,10 +468,6 @@ class MlxVlmEngine:
     def is_initialized(self) -> bool:
         """True after the VLM model and processor have been loaded."""
         return self._initialized
-
-    # ------------------------------------------------------------------
-    # Config loader
-    # ------------------------------------------------------------------
 
     def _load_vlm_config(self) -> dict[str, Any] | None:
         """Load model configuration via ``mlx_vlm.utils.load_config``.
@@ -667,7 +650,6 @@ class MlxVlmEngine:
         try:
             config = getattr(self, "_vlm_config", None)
             if config is not None:
-                # Use the full mlx-vlm prompt utility stack.
                 from mlx_vlm.prompt_utils import (
                     apply_chat_template,
                     get_chat_template,
@@ -682,14 +664,11 @@ class MlxVlmEngine:
                 )
                 if isinstance(result, str):
                     return result
-                # Some model types return a dict or list; finalise through
-                # the template.
                 inner = [result] if isinstance(result, dict) else list(result)
                 return get_chat_template(
                     self.processor, inner, add_generation_prompt=True
                 )
 
-            # No loaded config (test fixtures): use processor directly.
             if hasattr(self.processor, "apply_chat_template"):
                 return self.processor.apply_chat_template(
                     chat_messages,
@@ -897,10 +876,6 @@ class MlxVlmEngine:
             if final_response is not None
             else None,
         )
-
-    # ------------------------------------------------------------------
-    # Telemetry accessors
-    # ------------------------------------------------------------------
 
     @property
     def last_vlm_timings(self) -> dict[str, int | float]:

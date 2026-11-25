@@ -39,9 +39,6 @@ class _HttpConnection:
     async def post_json(
         self, path: str, payload: dict[str, Any], streaming: bool
     ) -> tuple[dict[str, Any], bool]:
-        # A transport failure after write/drain is ambiguous: the server may
-        # already have executed the request. Retrying would duplicate measured
-        # inference work and corrupt request, cache, and runtime-counter totals.
         return await self._post_json(path, payload, streaming)
 
     async def _post_json(
@@ -323,7 +320,7 @@ async def _execute_trial(
                     active.add(submit(next_index))
                     next_index += 1
         policy = "replace-each-completed-request"
-    else:  # Configuration validation makes this unreachable.
+    else:
         raise AssertionError(f"unsupported load mode: {mode}")
 
     requests.sort(key=lambda request: request["request_index"])

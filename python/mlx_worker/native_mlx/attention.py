@@ -267,8 +267,6 @@ class PagedLayerAttentionContext:
             self.reservation.backend.num_kv_heads,
             int(queries.shape[3]),
         ):
-            # Decode reads keys straight from the pages instead of gathering
-            # every row's cache into dense K/V first.
             block_tables, lengths = self.reservation.page_table_inputs()
             output = paged_decode_attention(
                 queries,
@@ -286,8 +284,6 @@ class PagedLayerAttentionContext:
             )
             return output
         if self.reservation.cache_lengths == (0,):
-            # A single row with no cached prefix attends only to its own new
-            # K/V, which are already dense: skip the page gather.
             dense_keys, dense_values = keys, values
         else:
             dense_keys, dense_values = self._dense_kv_rows(key_cache, value_cache)
@@ -513,9 +509,6 @@ def _dense_causal_mask(
     *,
     window_size: int | None = None,
 ) -> mx.array:
-    # Keep mask construction lazy and device-side.  The previous Python loop
-    # called ``tolist`` once per layer, synchronizing MLX and rebuilding a
-    # nested Python list for every request row.
     offsets = cache_offsets.astype(mx.int32)[:, None, None]
     query_indices = mx.arange(max_tokens, dtype=mx.int32)[None, :, None]
     query_positions = offsets + query_indices

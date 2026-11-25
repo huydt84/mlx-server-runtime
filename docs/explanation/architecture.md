@@ -67,6 +67,7 @@ The Python worker now has two serving paths with different ownership splits:
 |---------|---------------------|---------------------|
 | Text LLM (`native-mlx`) | Repo-owned native runtime, scheduler, executor, and registered MLX architecture plans | Iteration-level continuous batching with chunked prefill, alternating decode and prefill steps |
 | VLM | `mlx_vlm.generate.BatchGenerator` plus repo-owned worker lifecycle/cache policy | Continuous batching with APC reuse and vision-feature caching |
+| Speech-to-text (optional, either backend) | `mlx_audio` Whisper (`model.generate`) | One request at a time, run to completion between text/VLM scheduler steps |
 
 For native text serving, Rust still owns HTTP/SSE, outer admission, worker
 supervision, and telemetry projection. Python owns prompt construction,
@@ -106,6 +107,13 @@ and repeated-image feature caching through the worker. This is not
 PagedAttention and not literal vLLM parity; it is the closest Apple Silicon
 implementation of the same serving shape. Mixed text+VLM serving uses the same
 worker process under bounded arbitration.
+
+The optional transcription model runs inside the same worker process. Rust
+parses the OpenAI multipart upload, enforces the size limit, and sends the file
+base64-encoded over IPC; Python decodes the audio and runs Whisper. Because a
+transcription runs synchronously on the worker's model thread, chat scheduling
+pauses for its inference time. The gateway loads the model with a one-second
+silent warmup request right after the worker reports ready.
 
 Worker scheduling and cache behavior are controlled with backend-specific
 environment variables:
@@ -290,6 +298,29 @@ The runtime does not bundle a log collector. Pipe stderr to your preferred colle
 | Concurrency | None | Queue + worker dispatch |
 | Observability | None | Full metrics |
 | Reliability | None | Supervision + error handling |
+
+## Decision Records
+
+Individual decisions behind the components above are recorded as ADRs in
+[`docs/adr/`](../adr/README.md):
+
+- [0002](../adr/0002-model-first-vlm-routing-and-lazy-lifecycle.md) — VLM
+  routing by model name and lazy VLM loading;
+- [0003](../adr/0003-gateway-socket-and-sse-writes.md) — gateway socket mode
+  and SSE writes;
+- [0004](../adr/0004-native-scheduler-and-sampling.md) — native scheduler
+  admission, decode chaining, and sampling;
+- [0005](../adr/0005-paged-kv-cache-writes-and-buffer-lifetime.md) — paged KV
+  writes and buffer donation;
+- [0006](../adr/0006-paged-decode-attention-kernel.md) — the paged decode
+  Metal kernel;
+- [0007](../adr/0007-worker-startup-failure-handling.md) — fail-fast worker
+  startup;
+- [0008](../adr/0008-checkpoint-loading-compatibility.md) — checkpoint loading
+  compatibility;
+- [0009](../adr/0009-benchmark-measurement-integrity.md) — benchmark
+  measurement integrity; and
+- [0010](../adr/0010-pipeline-profile-timing.md) — pipeline profile timing.
 
 ## Future Design Considerations
 

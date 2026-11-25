@@ -5,6 +5,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct CliConfigOverrides {
     pub(crate) model: Option<String>,
+    pub(crate) transcription_model: Option<String>,
     pub(crate) backend: Option<BackendKind>,
     pub(crate) port: Option<u16>,
     pub(crate) memory_utilization: Option<f32>,
@@ -46,6 +47,9 @@ pub(crate) fn resolve_runtime_config(
 
     if let Some(model) = &overrides.model {
         config.worker.model.clone_from(model);
+    }
+    if let Some(model) = &overrides.transcription_model {
+        config.worker.transcription_model = Some(model.clone());
     }
     if let Some(backend) = overrides.backend {
         config.worker.backend = backend;
@@ -126,6 +130,7 @@ mod tests {
         );
         let overrides = CliConfigOverrides {
             model: Some("cli-model".to_string()),
+            transcription_model: Some("cli-whisper".to_string()),
             backend: Some(BackendKind::NativeMlx),
             port: Some(8003),
             memory_utilization: Some(0.75),
@@ -143,6 +148,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.worker.model, "cli-model");
+        assert_eq!(
+            config.worker.transcription_model.as_deref(),
+            Some("cli-whisper")
+        );
         assert_eq!(config.worker.backend, BackendKind::NativeMlx);
         assert_eq!(config.server.port, 8003);
         assert_eq!(config.worker.python, "/managed/bin/python");

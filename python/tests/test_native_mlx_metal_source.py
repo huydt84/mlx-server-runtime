@@ -30,7 +30,6 @@ def test_local_includes_are_inlined_once_with_line_markers(kernel_dir) -> None:
 
     assert source.count("inline float twice") == 1
     assert "#pragma once" not in source
-    # System includes are left for the Metal compiler.
     assert "#include <metal_stdlib>" in source
     assert source.splitlines() == [
         '#line 1 "main.metal"',

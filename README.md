@@ -14,6 +14,9 @@ Full documentation is in the [`docs/`](docs/) directory:
 |----------|-------------|
 | [Getting Started](docs/tutorial/getting-started.md) | Zero to first inference in 10 steps |
 | [Architecture](docs/explanation/architecture.md) | Design rationale and system design |
+| [Architecture Decision Records](docs/adr/README.md) | Individual decisions, with context and consequences |
+| [Blog](docs/blog/README.md) | Inference optimization deep dives, in general and on Apple Silicon |
+| [Changelog](CHANGELOG.md) | Notable changes per release |
 | [HTTP API Reference](docs/reference/api.md) | All endpoints, schemas, error codes |
 | [Configuration Reference](docs/reference/configuration.md) | All TOML fields and defaults |
 | [IPC Protocol](docs/reference/protocol.md) | UDS handshake and frame format |
@@ -51,6 +54,18 @@ The default backend is `native-mlx`, which serves the architectures listed in
 [native-mlx](docs/reference/native-mlx-v2.md#support-boundary) with a paged KV
 cache. Add `--backend v1` to serve any other `mlx-lm` checkpoint or a VLM; a
 checkpoint native-mlx does not implement fails at startup and names that flag.
+
+Add `--transcription-model` to serve Whisper speech-to-text next to the chat
+model on `/v1/audio/transcriptions` and `/v1/audio/translations`. WAV, MP3,
+and FLAC work out of the box; m4a, mp4, ogg, and webm uploads need `ffmpeg`
+(`brew install ffmpeg`):
+
+```bash
+~/.local/bin/mlx-air serve --model mlx-community/Qwen3-8B-4bit \
+  --transcription-model mlx-community/whisper-large-v3-turbo-asr-fp16
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F model=mlx-community/whisper-large-v3-turbo-asr-fp16 -F file=@speech.wav
+```
 
 With `--detach --name NAME --port PORT` the command returns once the instance
 is ready. If the worker cannot start (for example the memory settings cannot
@@ -103,6 +118,10 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
 - `GET /models/{model}/status` returns detailed model lifecycle state.
 - `GET /models/{model}/ready` returns model-specific readiness.
 - `GET /metrics` exposes Prometheus metrics.
+- `POST /v1/chat/completions` serves OpenAI-compatible chat completions.
+- `POST /v1/audio/transcriptions` and `POST /v1/audio/translations` serve
+  OpenAI-compatible Whisper speech-to-text when a transcription model is
+  configured (see below).
 
 ## Telemetry
 
@@ -150,13 +169,16 @@ transport, Python runtime, scheduler, executor, cache, model, MLX
 synchronization, detokenization, and response streaming. It is disabled by
 default and must remain off during fair benchmark runs.
 
-Run the bounded profiling workflow on an Apple Silicon host:
+`mlx-air profile` (alias `mlx-air profiler`) captures, visualizes, and
+compares profiles on an Apple Silicon host:
 
 ```bash
-bash scripts/profile.sh
+mlx-air profile run --model mlx-community/Qwen2.5-7B-Instruct-4bit --requests 4 --concurrency 2 --open
+mlx-air profile view profiles/<run-id> --open
+mlx-air profile compare profiles/before profiles/after
 ```
 
-The workflow writes request-correlated JSONL events, a Chrome Trace/Perfetto
-timeline, and a Markdown summary. For configuration, optional Metal capture,
-artifact interpretation, and failure handling, see
-[Profile inference](docs/how-to/profiling.md).
+`run` writes request-correlated JSONL events, a Chrome Trace/Perfetto
+timeline, a Markdown stage report, and a self-contained interactive
+`profile.html`. For options, optional Metal capture, artifact interpretation,
+and failure handling, see [Profile inference](docs/how-to/profiling.md).

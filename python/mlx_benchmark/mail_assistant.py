@@ -66,9 +66,7 @@ Return exactly these keys:
 
 NO_THINK_TAG = "/no_think"
 OUTPUT_LANGUAGE = "English"
-# Header, wrapper, language line, and chat-template overhead around the body.
 _ENVELOPE_TOKENS = 64
-# Rough tokens per generated body word; bodies are sized from it.
 _TOKENS_PER_WORD = 1.3
 
 _SENDERS = (

@@ -1268,7 +1268,6 @@ def _wait_for_readiness(
             if status == 200 and payload.get("ready") is True:
                 return payload
             last_error = f"readiness returned HTTP {status}: {payload}"
-            # A failed worker startup does not recover; stop waiting now.
             _, startup = _get_json(f"{base_url}/startup", timeout=2)
             if startup.get("status") == "failed":
                 raise _RunFailure(

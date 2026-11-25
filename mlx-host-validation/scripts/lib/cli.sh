@@ -244,9 +244,6 @@ cli_parse() {
     cli_print_config
 }
 
-# Fail fast when a port the script will bind is already taken.
-#
-# Arguments: PORT FLAG. FLAG names the option that changes the port.
 cli_require_free_port() {
     local port="$1" flag="$2" pid
     command -v lsof >/dev/null 2>&1 || return 0
@@ -257,7 +254,6 @@ cli_require_free_port() {
     fi
 }
 
-# Split a list option into the named array: cli_split_list NAME VALUE.
 cli_split_list() {
     IFS=',' read -r -a "$1" <<<"$2"
 }

@@ -55,6 +55,29 @@ If a required tool is unavailable:
 
 Do not substitute another formatter, linter, test runner, or package manager without explicit user approval.
 
+## Code Comments
+
+Code comments are banned (`docs/adr/0001-ban-code-comments.md`). Rust doc
+comments, Python docstrings, shell script header blocks, and tool directives
+(`// SAFETY:`, `# noqa`, `# shellcheck`, ...) are allowed.
+
+- Do not write a comment to explain code. Rename, extract a function, or name
+  a constant instead.
+- Record an important, non-obvious decision in an ADR under `docs/adr/`, and
+  name the code by file and symbol.
+- Do not write a comment that excuses a hack. Fix the hack, or file an issue
+  for it.
+- Run the ratchet before finishing any change:
+
+```bash
+python3 scripts/check_comments.py
+```
+
+The per-file baseline in `scripts/comment-baseline.json` may only go down.
+Lower it with `python3 scripts/check_comments.py --update`. Never raise it
+without explicit user approval. Use the `/delete-comment` skill to audit
+existing comments.
+
 ## Rust Checks
 
 For Rust changes, use the workspace commands when practical:
@@ -188,6 +211,19 @@ Do not casually edit:
 - broad architecture documents unrelated to the task
 
 Never read, print, or modify secrets unless the user explicitly asks and the action is safe.
+
+## Merging to Main
+
+When asked to merge a branch into `main`:
+
+1. Fast-forward when possible: `git merge --ff-only <branch>`. This works when
+   `main` has no commits the branch lacks, and adds no merge commit.
+2. If a fast-forward is not possible because `main` has moved, squash instead:
+   `git merge --squash <branch>`, then commit the result on `main` as one
+   commit with a message that summarizes the branch.
+3. Do not create `--no-ff` merge commits.
+
+Do not push `main` or delete the merged branch unless asked.
 
 ## Completion Report
 

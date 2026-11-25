@@ -420,6 +420,7 @@ mod tests {
             max_total_tokens_per_request: 65_536,
             request_timeout_seconds: 300,
             max_vlm_images: 5,
+            max_audio_bytes: crate::config::DEFAULT_MAX_AUDIO_BYTES,
         }
     }
 
@@ -554,7 +555,6 @@ mod tests {
             stream_options: None,
             ..Default::default()
         };
-        // No VLM model configured, so "vlm-model" should be rejected
         let result = request.into_worker_request(
             &default_generation(),
             &default_limits(),

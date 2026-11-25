@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .batching import (
     BatchEventSink,
@@ -31,6 +31,8 @@ from .ipc import (
     ModelLoadProgress,
     ModelStatus,
     ToolCallDelta,
+    TranscriptionRequest,
+    TranscriptionResponse,
     WorkerCommandError,
     WorkerError,
     WorkerReady,
@@ -40,6 +42,9 @@ from .ipc import (
     request_has_images,
 )
 from .tool_calling import request_error_code
+
+if TYPE_CHECKING:
+    from .transcription import TranscriptionService
 
 
 def _pop_buffered_line(read_buffer: bytearray) -> bytes | None:
@@ -73,7 +78,7 @@ def _read_command_line(
         if not block and not select.select([client], [], [], 0)[0]:
             return None
 
-        chunk = client.recv(4096)
+        chunk = client.recv(1 << 20)
         if not chunk:
             return b""
 
@@ -158,8 +163,6 @@ def main(
 
         engine_factory = MlxWorkerEngine
 
-    # Default VLM engine factory when env var is set (production path).
-    # Engine is NOT constructed eagerly — lazy init on first VLM request.
     if vlm_engine_factory is None:
         vlm_model = getattr(config, "vlm_model", None)
         if vlm_model is not None:
@@ -268,12 +271,18 @@ def main(
 
         client.sendall(encode_bootstrap_message(WorkerReady()))
 
+        from .transcription import TranscriptionService
+
+        transcription = TranscriptionService(
+            getattr(config, "transcription_model", None)
+        )
         if getattr(config, "continuous_batching", False):
             _run_continuous_batch_loop(
                 client,
                 config,
                 engine,
                 vlm_engine_factory,
+                transcription,
             )
             return 0
 
@@ -295,6 +304,7 @@ def main(
                     ChatCompletionResponse
                     | WorkerCommandError
                     | BenchmarkResetState
+                    | TranscriptionResponse
                     | None
                 ) = WorkerCommandError(
                     code="INVALID_REQUEST",
@@ -310,6 +320,8 @@ def main(
                     )
                 elif isinstance(request, CancelRequest):
                     continue
+                elif isinstance(request, TranscriptionRequest):
+                    event = transcription.handle(request)
                 elif isinstance(request, BenchmarkResetRequest):
                     cache_state = engine.benchmark_reset(
                         clear_cache=request.clear_cache,
@@ -322,13 +334,11 @@ def main(
                     )
                 else:
                     try:
-                        # Model-first dispatch: route by model name, not image presence.
                         vlm_model_cfg: str | None = getattr(config, "vlm_model", None)
                         should_cancel = _make_should_cancel(
                             client, read_buffer, pending_lines, request.request_id
                         )
                         if vlm_model_cfg is not None and request.model == vlm_model_cfg:
-                            # Lazy initialize VLM engine on first request.
                             if vlm_engine is None:
                                 vlm_engine = vlm_engine_factory(config.vlm_model)
                                 vlm_engine.max_images_per_request = getattr(
@@ -348,19 +358,11 @@ def main(
                                 )
                             )
 
-                        # Text-only engine cannot process image content.
                         if active_engine is engine and request_has_images(request):
                             raise ValueError(
                                 f"model '{config.model}' is a text-only model "
                                 "and does not support image content"
                             )
-
-                        # VLM engine initialization is deferred to
-                        # ``_generate_vlm`` / ``_stream_vlm`` where the
-                        # ``should_cancel`` closure is already available.
-                        # The engine checks cancellation before the blocking
-                        # ``mlx_vlm.load`` call so a cancelled first request
-                        # never blocks on cold-start model loading.
 
                         if request.stream:
                             event = active_engine.stream_chat(  # type: ignore[attr-defined]
@@ -369,8 +371,6 @@ def main(
                                 should_cancel,
                             )
                         else:
-                            # Non-stream: only VLM engine accepts should_cancel.
-                            # Text engine's complete_chat does not accept it.
                             kwargs: dict[str, object] = {}
                             if active_engine is vlm_engine:
                                 kwargs["should_cancel"] = should_cancel
@@ -426,8 +426,12 @@ def _run_continuous_batch_loop(
     config: object,
     engine: object,
     vlm_engine_factory: Callable[[str], object] | None,
+    transcription: TranscriptionService | None = None,
 ) -> None:
-    """Run the shared text and VLM continuous batching loop."""
+    """Run the shared text and VLM continuous batching loop.
+
+    Transcription requests run to completion between scheduler ticks.
+    """
 
     from .vlm_engine import VlmContinuousBatchScheduler
 
@@ -617,6 +621,15 @@ def _run_continuous_batch_loop(
                         emit_error(
                             "unknown", "INVALID_REQUEST", "unsupported worker command"
                         )
+                    elif isinstance(command, TranscriptionRequest):
+                        if transcription is None:
+                            emit_error(
+                                command.request_id,
+                                "INVALID_REQUEST",
+                                "no transcription model is configured",
+                            )
+                        else:
+                            client.sendall(encode_event(transcription.handle(command)))
                     elif isinstance(command, CancelRequest):
                         handled = text_scheduler.cancel(command.request_id)
                         if not handled and vlm_scheduler is not None:

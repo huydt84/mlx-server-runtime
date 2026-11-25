@@ -1,6 +1,8 @@
 //! Parser and dispatch for the public `mlx-air` CLI.
 
-use crate::benchmark::{benchmark_command, ensure_benchmark_environment};
+use crate::benchmark::{
+    ensure_benchmark_environment, python_tool_command, BENCHMARK_MODULE, PROFILE_MODULE,
+};
 use crate::command_runner::{CommandRunner, ProcessCommandRunner};
 use crate::configuration::{resolve_runtime_config, CliConfigOverrides};
 use crate::distribution::{ApplicationPaths, DistributionPaths};
@@ -86,6 +88,12 @@ enum Command {
         #[command(subcommand)]
         command: Option<BenchCommand>,
     },
+    /// Capture, view, and compare inference-pipeline profiles.
+    #[command(visible_alias = "profiler")]
+    Profile {
+        #[command(subcommand)]
+        command: Option<ProfileCommand>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -93,6 +101,10 @@ struct ServeArgs {
     /// Model identifier or local model path.
     #[arg(long)]
     model: Option<String>,
+    /// Whisper speech-to-text model identifier or local path served by
+    /// `/v1/audio/transcriptions` and `/v1/audio/translations`.
+    #[arg(long, value_name = "MODEL")]
+    transcription_model: Option<String>,
     /// Runtime configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -159,6 +171,7 @@ enum HelpTopic {
     Version,
     Help,
     Bench,
+    Profile,
 }
 
 impl HelpTopic {
@@ -172,6 +185,7 @@ impl HelpTopic {
             Self::Version => "version",
             Self::Help => "help",
             Self::Bench => "bench",
+            Self::Profile => "profile",
         }
     }
 }
@@ -202,6 +216,36 @@ impl BenchmarkAction {
             Self::Run => "run",
             Self::Diagnose => "diagnose",
             Self::Calibrate => "calibrate",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// Serve a model with profiling enabled and profile bounded requests.
+    #[command(disable_help_flag = true)]
+    Run(BenchmarkArgs),
+    /// Build the interactive HTML view for an existing profile.
+    #[command(disable_help_flag = true)]
+    View(BenchmarkArgs),
+    /// Compare per-stage time between a baseline and a candidate profile.
+    #[command(disable_help_flag = true)]
+    Compare(BenchmarkArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileAction {
+    Run,
+    View,
+    Compare,
+}
+
+impl ProfileAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::View => "view",
+            Self::Compare => "compare",
         }
     }
 }
@@ -267,6 +311,7 @@ fn dispatch(cli: Cli, runtime: &dyn RuntimeOperations) -> CliOutput {
         None => help_output(None),
         Some(Command::Help { command }) => help_output(command.map(HelpTopic::as_str)),
         Some(Command::Bench { command: None }) => help_output(Some("bench")),
+        Some(Command::Profile { command: None }) => help_output(Some("profile")),
         Some(Command::Version) => CliOutput::stdout(
             ExitCode::NormalTermination,
             format!("mlx-air {}\n", env!("CARGO_PKG_VERSION")),
@@ -323,6 +368,21 @@ fn dispatch(cli: Cli, runtime: &dyn RuntimeOperations) -> CliOutput {
                 }
             }
         }
+        Some(Command::Profile {
+            command: Some(command),
+        }) => {
+            let (action, args) = match command {
+                ProfileCommand::Run(args) => (ProfileAction::Run, args.args),
+                ProfileCommand::View(args) => (ProfileAction::View, args.args),
+                ProfileCommand::Compare(args) => (ProfileAction::Compare, args.args),
+            };
+            match runtime.profile(action, &args) {
+                Ok(()) => CliOutput::stdout(ExitCode::NormalTermination, String::new()),
+                Err(failure) => {
+                    CliOutput::stderr(failure.code, format!("error: {}\n", failure.message))
+                }
+            }
+        }
     }
 }
 
@@ -334,6 +394,7 @@ trait RuntimeOperations {
     fn stop(&self, name: &str) -> Result<String, RuntimeFailure>;
     fn doctor(&self, args: &DoctorArgs) -> Result<DoctorReport, String>;
     fn benchmark(&self, action: BenchmarkAction, args: &[OsString]) -> Result<(), RuntimeFailure>;
+    fn profile(&self, action: ProfileAction, args: &[OsString]) -> Result<(), RuntimeFailure>;
 }
 
 struct RuntimeFailure {
@@ -484,27 +545,41 @@ impl RuntimeOperations for ProductionRuntime {
     }
 
     fn benchmark(&self, action: BenchmarkAction, args: &[OsString]) -> Result<(), RuntimeFailure> {
-        let distribution = DistributionPaths::from_current_executable()
-            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        let application = ApplicationPaths::from_environment()
-            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        let environment =
-            ensure_benchmark_environment(&distribution, &application, &ProcessCommandRunner)
-                .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
-        let invocation_directory = std::env::current_dir().map_err(|err| {
-            RuntimeFailure::environment(format!("resolve current directory: {err}"))
-        })?;
-        let command = benchmark_command(
-            &distribution,
-            &environment,
-            &invocation_directory,
-            action.as_str(),
-            args,
-        );
-        ProcessCommandRunner
-            .replace(&command)
-            .map_err(|err| RuntimeFailure::benchmark(err.to_string()))
+        replace_with_python_tool(BENCHMARK_MODULE, action.as_str(), args)
     }
+
+    fn profile(&self, action: ProfileAction, args: &[OsString]) -> Result<(), RuntimeFailure> {
+        replace_with_python_tool(PROFILE_MODULE, action.as_str(), args)
+    }
+}
+
+/// Replaces this process with a Python tool module run in the managed
+/// benchmark environment, which also hosts the profiler.
+fn replace_with_python_tool(
+    module: &str,
+    action: &str,
+    args: &[OsString],
+) -> Result<(), RuntimeFailure> {
+    let distribution = DistributionPaths::from_current_executable()
+        .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    let application = ApplicationPaths::from_environment()
+        .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    let environment =
+        ensure_benchmark_environment(&distribution, &application, &ProcessCommandRunner)
+            .map_err(|err| RuntimeFailure::environment(err.to_string()))?;
+    let invocation_directory = std::env::current_dir()
+        .map_err(|err| RuntimeFailure::environment(format!("resolve current directory: {err}")))?;
+    let command = python_tool_command(
+        &distribution,
+        &environment,
+        &invocation_directory,
+        module,
+        action,
+        args,
+    );
+    ProcessCommandRunner
+        .replace(&command)
+        .map_err(|err| RuntimeFailure::benchmark(err.to_string()))
 }
 
 fn parse_memory_utilization(raw: &str) -> Result<f32, String> {
@@ -526,6 +601,7 @@ fn resolve_serve_context(
     let environment_config = std::env::var_os("MLX_RUNTIME_CONFIG").map(PathBuf::from);
     let overrides = CliConfigOverrides {
         model: args.model.clone(),
+        transcription_model: args.transcription_model.clone(),
         backend: args.backend.map(Into::into),
         port: args.port,
         memory_utilization: args.memory_utilization,
@@ -592,11 +668,12 @@ fn clap_output(error: clap::Error) -> CliOutput {
 mod tests {
     use super::*;
     use crate::doctor::DoctorCheck;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     struct FakeRuntime {
         calls: Cell<usize>,
         doctor_port: Cell<Option<u16>>,
+        profile_call: RefCell<Option<(ProfileAction, Vec<OsString>)>>,
     }
 
     impl FakeRuntime {
@@ -604,6 +681,7 @@ mod tests {
             Self {
                 calls: Cell::new(0),
                 doctor_port: Cell::new(None),
+                profile_call: RefCell::new(None),
             }
         }
     }
@@ -656,6 +734,12 @@ mod tests {
             _args: &[OsString],
         ) -> Result<(), RuntimeFailure> {
             self.calls.set(self.calls.get() + 1);
+            Ok(())
+        }
+
+        fn profile(&self, action: ProfileAction, args: &[OsString]) -> Result<(), RuntimeFailure> {
+            self.calls.set(self.calls.get() + 1);
+            self.profile_call.replace(Some((action, args.to_vec())));
             Ok(())
         }
     }
@@ -732,6 +816,8 @@ mod tests {
             "9000",
             "--tool-call-parser",
             "none",
+            "--transcription-model",
+            "mlx-community/whisper-large-v3-turbo-asr-fp16",
         ]);
 
         assert!(result.is_ok(), "unexpected parse error: {result:?}");
@@ -853,6 +939,62 @@ mod tests {
 
         assert_eq!(result.code, ExitCode::NormalTermination);
         assert_eq!(runtime.calls.get(), 1);
+    }
+
+    #[test]
+    fn profile_help_invocations_render_identical_output() {
+        let runtime = FakeRuntime::new();
+        let no_action = execute(["mlx-air", "profile"], &runtime);
+        let help_command = execute(["mlx-air", "help", "profile"], &runtime);
+        let help_flag = execute(["mlx-air", "profile", "--help"], &runtime);
+
+        assert_eq!(
+            (no_action.code, &no_action.stdout),
+            (help_command.code, &help_command.stdout)
+        );
+        assert_eq!(help_command.stdout, help_flag.stdout);
+        assert!(help_flag.stdout.contains("compare"));
+        assert_eq!(runtime.calls.get(), 0);
+    }
+
+    #[test]
+    fn profile_actions_forward_arguments_unchanged() {
+        for (action, expected) in [
+            ("run", ProfileAction::Run),
+            ("view", ProfileAction::View),
+            ("compare", ProfileAction::Compare),
+        ] {
+            let runtime = FakeRuntime::new();
+            let result = execute(
+                ["mlx-air", "profile", action, "--model", "m", "--help"],
+                &runtime,
+            );
+
+            assert_eq!(result.code, ExitCode::NormalTermination);
+            assert_eq!(
+                runtime.profile_call.borrow().clone(),
+                Some((
+                    expected,
+                    vec![
+                        OsString::from("--model"),
+                        OsString::from("m"),
+                        OsString::from("--help")
+                    ]
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn profiler_alias_dispatches_to_profile() {
+        let runtime = FakeRuntime::new();
+        let result = execute(["mlx-air", "profiler", "view", "profiles/a"], &runtime);
+
+        assert_eq!(result.code, ExitCode::NormalTermination);
+        assert_eq!(
+            runtime.profile_call.borrow().clone(),
+            Some((ProfileAction::View, vec![OsString::from("profiles/a")]))
+        );
     }
 
     #[test]

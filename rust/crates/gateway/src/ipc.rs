@@ -2,7 +2,8 @@ use crate::errors::GatewayError;
 use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
     decode_worker_event, encode_gateway_command, BenchmarkResetState, ChatCompletionDelta,
-    ChatCompletionRequest, ChatCompletionResponse, GatewayCommand, WorkerEvent,
+    ChatCompletionRequest, ChatCompletionResponse, GatewayCommand, TranscriptionRequest,
+    TranscriptionResponse, WorkerEvent,
 };
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -73,6 +74,78 @@ impl WorkerClient {
         self.send_command(GatewayCommand::CancelRequest {
             request_id: request_id.to_string(),
         })
+    }
+
+    /// Sends an audio transcription or translation request and waits for its result.
+    pub fn transcribe(
+        &self,
+        request: TranscriptionRequest,
+    ) -> Result<TranscriptionResponse, GatewayError> {
+        let request_id = request.request_id.clone();
+        let task = request.task;
+        let (sender, receiver) = mpsc::channel();
+        self.register_request(&request_id, sender)?;
+        if let Err(error) = self.send_command(GatewayCommand::Transcription { request }) {
+            self.unregister_request(&request_id);
+            return Err(error);
+        }
+        let roundtrip_started = std::time::Instant::now();
+
+        loop {
+            let event = match receiver.recv() {
+                Ok(RoutedWorkerEvent::Event(event)) => *event,
+                Ok(RoutedWorkerEvent::Failure(message)) => {
+                    self.unregister_request(&request_id);
+                    return Err(GatewayError::Protocol(message));
+                }
+                Err(_) => {
+                    self.unregister_request(&request_id);
+                    return Err(GatewayError::Protocol(
+                        "worker closed the inference socket".to_string(),
+                    ));
+                }
+            };
+            match event {
+                WorkerEvent::Transcription { response } if response.request_id == request_id => {
+                    self.unregister_request(&request_id);
+                    self.metrics.record_ipc_roundtrip_latency_ms(
+                        roundtrip_started.elapsed().as_millis() as u64,
+                    );
+                    let labels = [("backend", "mlx-audio"), ("modality", "audio")];
+                    for (kind, value) in [
+                        ("audio_decode", response.audio_decode_latency_ms),
+                        ("audio_inference", response.inference_latency_ms),
+                    ] {
+                        if let Some(value) = value {
+                            self.metrics.set_labeled_gauge(
+                                "mlx_latency_by_backend_ms",
+                                &[labels[0], labels[1], ("kind", kind)],
+                                u64::from(value),
+                            );
+                        }
+                    }
+                    self.metrics.increment_labeled_counter(
+                        "mlx_audio_input_ms_by_backend_total",
+                        &[labels[0], ("task", task.as_str())],
+                        (response.duration.max(0.0) * 1000.0).round() as u64,
+                    );
+                    return Ok(response);
+                }
+                WorkerEvent::Error {
+                    code,
+                    request_id: response_id,
+                    message,
+                } if response_id == request_id => {
+                    self.unregister_request(&request_id);
+                    return if code == "INVALID_REQUEST" {
+                        Err(GatewayError::InvalidRequest(message))
+                    } else {
+                        Err(GatewayError::Protocol(message))
+                    };
+                }
+                _ => continue,
+            }
+        }
     }
 
     /// Reset idle worker cache and benchmark-counter state.
@@ -155,6 +228,7 @@ impl WorkerClient {
                 Ok(RoutedWorkerEvent::Event(event)) => match *event {
                     WorkerEvent::SchedulerMetrics { .. } => continue,
                     WorkerEvent::BenchmarkReset { .. } => continue,
+                    WorkerEvent::Transcription { .. } => continue,
                     WorkerEvent::ChatCompletionDelta { delta } => {
                         if !stream {
                             self.unregister_request(&request_id);
@@ -1135,6 +1209,7 @@ impl WorkerClient {
                     WorkerEvent::BenchmarkReset { state } => state.request_id.clone(),
                     WorkerEvent::ChatCompletionDelta { delta } => delta.request_id.clone(),
                     WorkerEvent::ChatCompletion { response, .. } => response.request_id.clone(),
+                    WorkerEvent::Transcription { response } => response.request_id.clone(),
                     WorkerEvent::Error { request_id, .. } => request_id.clone(),
                 };
 
@@ -1355,6 +1430,78 @@ mod tests {
         assert_eq!(first.text, "first");
         assert_eq!(second.request_id, "req-2");
         assert_eq!(second.text, "second");
+    }
+
+    #[test]
+    fn transcription_routes_result_and_worker_errors_by_request_id() {
+        use mlx_runtime_protocol::{AudioTask, TranscriptionRequest, TranscriptionResponse};
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let metrics = Arc::new(MetricsRegistry::new());
+        let worker = Arc::new(WorkerClient::new(client, metrics.clone()).unwrap());
+        let audio_request = |request_id: &str| TranscriptionRequest {
+            request_id: request_id.to_string(),
+            model: "whisper".to_string(),
+            task: AudioTask::Transcribe,
+            audio_base64: "AAAA".to_string(),
+            filename: None,
+            language: None,
+            prompt: None,
+            temperature: 0.0,
+            word_timestamps: false,
+        };
+
+        let server_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let GatewayCommand::Transcription { request } =
+                    decode_gateway_command(&line).unwrap()
+                else {
+                    panic!("expected transcription command");
+                };
+                let event = if request.request_id == "audio-ok" {
+                    WorkerEvent::Transcription {
+                        response: TranscriptionResponse {
+                            request_id: request.request_id,
+                            model: request.model,
+                            task: request.task,
+                            text: "hello".to_string(),
+                            language: "english".to_string(),
+                            duration: 2.5,
+                            segments: vec![],
+                            words: vec![],
+                            audio_decode_latency_ms: Some(4),
+                            inference_latency_ms: Some(30),
+                        },
+                    }
+                } else {
+                    WorkerEvent::Error {
+                        code: "INVALID_REQUEST".to_string(),
+                        request_id: request.request_id,
+                        message: "unable to decode audio".to_string(),
+                    }
+                };
+                writeln!(writer, "{}", encode_worker_event(&event).unwrap()).unwrap();
+                writer.flush().unwrap();
+            }
+        });
+
+        let response = worker.transcribe(audio_request("audio-ok")).unwrap();
+        assert_eq!(response.text, "hello");
+        let error = worker.transcribe(audio_request("audio-bad")).unwrap_err();
+        assert!(
+            matches!(error, GatewayError::InvalidRequest(message) if message.contains("decode"))
+        );
+        server_thread.join().unwrap();
+
+        let rendered = metrics.render_prometheus(0);
+        assert!(rendered.contains(
+            "mlx_audio_input_ms_by_backend_total{backend=\"mlx-audio\",task=\"transcribe\"} 2500"
+        ));
+        assert!(rendered.contains("kind=\"audio_inference\""));
     }
 
     #[test]

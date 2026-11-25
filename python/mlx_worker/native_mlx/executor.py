@@ -532,9 +532,6 @@ class MlxOverlapGenerationExecutor(MlxGenerationExecutor):
     def __post_init__(self) -> None:
         if not mx.metal.is_available():
             raise ValueError("native overlap execution requires MLX Metal")
-        # Keep model, cache, and async evaluation on the owner thread's default
-        # GPU stream.  A separate stream adds a command-queue handoff without
-        # enabling additional dependency overlap for this one-model pipeline.
         self._stream = mx.default_stream(mx.gpu)
 
     def dispatch_batch(

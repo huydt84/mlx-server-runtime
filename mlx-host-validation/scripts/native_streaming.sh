@@ -224,9 +224,6 @@ write_request "$REQUEST_DIR/cancel.json" "Write a long alphabetic sequence with 
 write_request "$REQUEST_DIR/sampled.json" "Name three colors, one per line." 24 false "" 0.7 0.9
 write_request "$REQUEST_DIR/sampled_stream.json" "Write one short sentence about the sea." 24 true "" 0.7 0.9
 
-# Keep enough paged KV capacity for the larger probe families.  The worker's
-# 8 MiB default is sufficient for the tiny default smoke test but can exhaust
-# before the cancellation request on a 4B model with a 64-token budget.
 start_gateway "$NATIVE_LOG" \
     MLX_RUNTIME_CONFIG="$NATIVE_CONFIG" \
     MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES="$TEXT_CACHE_BUDGET_BYTES"

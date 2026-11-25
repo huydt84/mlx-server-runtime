@@ -30,8 +30,6 @@ from .interfaces import (
 )
 from .scheduler import NativeContinuousScheduler
 
-# Startup warmup requests (see NativeRuntime.warmup). Each decodes a few tokens
-# so the overlap pipeline runs more than one decode step.
 _WARMUP_DECODE_TOKENS = 4
 _WARMUP_MIN_PROMPT_TOKENS = 48
 _WARMUP_PAIR_LENGTH_GAP = 8
@@ -518,11 +516,13 @@ class NativeRuntime:
                 )
             )
             if self._profiler is not None:
+                prefill_us = int(metrics.get("step_time_ms", 0)) * 1_000
                 self._profiler.record(
                     event.request_id,
                     "runtime",
                     "prefill",
-                    duration_us=int(metrics.get("step_time_ms", 0)) * 1_000,
+                    started_ns=time.perf_counter_ns() - prefill_us * 1_000,
+                    duration_us=prefill_us,
                     phase="prefill",
                     prompt_tokens=len(state.prompt_token_ids),
                     details={
@@ -728,6 +728,7 @@ class NativeRuntime:
                 request_id,
                 "runtime",
                 "terminal",
+                started_ns=int(state.enqueued_at * 1_000_000_000),
                 duration_us=max(
                     0, int((time.perf_counter() - state.enqueued_at) * 1_000_000)
                 ),

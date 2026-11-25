@@ -250,8 +250,6 @@ def post_stream(body: bytes, close_after_first_delta: bool, result: dict[str, An
         lines.append(line)
         if line.startswith("data: ") and line != "data: [DONE]":
             first_delta_seen = True
-            # Publish immediately: the main thread starts the next stream as
-            # soon as this one has produced its first delta.
             result["first_delta_seen"] = True
             if close_after_first_delta:
                 result["client_closed"] = True
@@ -317,10 +315,6 @@ for _ in range(240):
     metrics_history.append(snapshot)
     running = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="running"}', 0.0)
     waiting = snapshot.get('mlx_scheduler_requests_by_backend{backend="native-mlx",modality="text",state="waiting"}', 0.0)
-    # The scheduler runs decode and prefill in separate steps, so batch growth
-    # shows up on the decode gauge. The mixed gauge is still read in case a
-    # mixed forward is reported. Require a later single-request decode as the
-    # shrink signal.
     decode_batch = snapshot.get(
         'mlx_executor_physical_batch_size_by_backend{backend="native-mlx",modality="text",forward_mode="decode"}',
         0.0,

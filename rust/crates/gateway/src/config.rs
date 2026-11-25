@@ -26,6 +26,9 @@ pub struct WorkerConfig {
     pub model: String,
     /// Optional VLM model identifier.
     pub vlm_model: Option<String>,
+    /// Optional Whisper speech-to-text model identifier served by
+    /// `/v1/audio/transcriptions` and `/v1/audio/translations`.
+    pub transcription_model: Option<String>,
     /// Unix socket path used for bootstrap IPC.
     pub ipc_path: String,
     /// Tool-call format of the text model: `auto`, `none`, or a parser name.
@@ -91,7 +94,12 @@ pub struct RequestLimits {
     pub request_timeout_seconds: u64,
     /// Maximum images allowed in a single VLM request (enforced before queue).
     pub max_vlm_images: usize,
+    /// Maximum uploaded audio file size in bytes for audio endpoints.
+    pub max_audio_bytes: usize,
 }
+
+/// Default maximum audio upload size, matching the OpenAI API limit (25 MiB).
+pub const DEFAULT_MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 /// Default share of the Metal recommended working set the worker may use.
 pub const DEFAULT_MEMORY_UTILIZATION: f32 = 0.5;
@@ -212,6 +220,7 @@ impl Default for RuntimeConfig {
                 backend: BackendKind::NativeMlx,
                 model: "mlx-community/Qwen2.5-7B-Instruct-4bit".to_string(),
                 vlm_model: None,
+                transcription_model: None,
                 ipc_path: "/tmp/mlx-runtime.sock".to_string(),
                 tool_call_parser: "auto".to_string(),
             },
@@ -228,6 +237,7 @@ impl Default for RuntimeConfig {
                 max_total_tokens_per_request: 65_536,
                 request_timeout_seconds: 300,
                 max_vlm_images: 5,
+                max_audio_bytes: DEFAULT_MAX_AUDIO_BYTES,
             },
             memory: MemoryConfig::default(),
             telemetry: TelemetryConfig {
@@ -305,6 +315,9 @@ impl RuntimeConfig {
                 ("worker", "model", Value::String(model)) => config.worker.model = model,
                 ("worker", "vlm_model", Value::String(vlm_model)) => {
                     config.worker.vlm_model = Some(vlm_model)
+                }
+                ("worker", "transcription_model", Value::String(model)) => {
+                    config.worker.transcription_model = (!model.trim().is_empty()).then_some(model)
                 }
                 ("worker", "ipc_path", Value::String(ipc_path)) => {
                     config.worker.ipc_path = ipc_path
@@ -408,6 +421,27 @@ impl RuntimeConfig {
                         )
                     })?
                 }
+                ("limits", "max_audio_bytes", Value::Integer(value)) => {
+                    config.limits.max_audio_bytes = usize::try_from(value)
+                        .ok()
+                        .filter(|bytes| *bytes > 0)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "limits.max_audio_bytes must be positive",
+                            )
+                        })?
+                }
+                ("limits", "max_audio_bytes", Value::String(value)) => {
+                    let bytes = parse_byte_size(&value)
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                    config.limits.max_audio_bytes = usize::try_from(bytes).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "limits.max_audio_bytes out of range",
+                        )
+                    })?
+                }
                 ("telemetry", "enable_prometheus", Value::Bool(value)) => {
                     config.telemetry.enable_prometheus = value
                 }
@@ -432,12 +466,13 @@ impl RuntimeConfig {
         );
         let _ = writeln!(
             rendered,
-            "worker python={} module={} backend={} model={} vlm_model={} ipc_path={}",
+            "worker python={} module={} backend={} model={} vlm_model={} transcription_model={} ipc_path={}",
             self.worker.python,
             self.worker.module,
             self.worker.backend.as_str(),
             self.worker.model,
             self.worker.vlm_model.as_deref().unwrap_or("<none>"),
+            self.worker.transcription_model.as_deref().unwrap_or("<none>"),
             self.worker.ipc_path
         );
         let _ = writeln!(
@@ -452,14 +487,15 @@ impl RuntimeConfig {
         );
         let _ = writeln!(
             rendered,
-            "limits max_pending_requests={} max_active_requests={} max_prompt_tokens={} max_completion_tokens={} max_total_tokens_per_request={} request_timeout_seconds={} max_vlm_images={}",
+            "limits max_pending_requests={} max_active_requests={} max_prompt_tokens={} max_completion_tokens={} max_total_tokens_per_request={} request_timeout_seconds={} max_vlm_images={} max_audio_bytes={}",
             self.limits.max_pending_requests,
             self.limits.max_active_requests,
             self.limits.max_prompt_tokens,
             self.limits.max_completion_tokens,
             self.limits.max_total_tokens_per_request,
             self.limits.request_timeout_seconds,
-            self.limits.max_vlm_images
+            self.limits.max_vlm_images,
+            self.limits.max_audio_bytes
         );
         let _ = writeln!(
             rendered,
@@ -650,6 +686,7 @@ mod tests {
             backend = "native-mlx"
             model = "test-model"
             vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
+            transcription_model = "mlx-community/whisper-large-v3-turbo-asr-fp16"
             ipc_path = "/tmp/test.sock"
             tool_call_parser = "none"
 
@@ -666,6 +703,7 @@ mod tests {
             max_total_tokens_per_request = 2048
             request_timeout_seconds = 10
             max_vlm_images = 5
+            max_audio_bytes = "10MiB"
 
             [telemetry]
             enable_prometheus = false
@@ -698,6 +736,11 @@ mod tests {
         assert_eq!(config.limits.max_total_tokens_per_request, 2048);
         assert_eq!(config.limits.request_timeout_seconds, 10);
         assert_eq!(config.limits.max_vlm_images, 5);
+        assert_eq!(
+            config.worker.transcription_model.as_deref(),
+            Some("mlx-community/whisper-large-v3-turbo-asr-fp16")
+        );
+        assert_eq!(config.limits.max_audio_bytes, 10 * 1024 * 1024);
         assert!(!config.telemetry.enable_prometheus);
         assert_eq!(config.telemetry.metrics_path, "/custom-metrics");
     }
@@ -708,6 +751,7 @@ mod tests {
         config.worker.backend = BackendKind::NativeMlx;
         config.worker.model = "native-model".to_string();
         config.worker.vlm_model = Some("vlm-model".to_string());
+        config.worker.transcription_model = Some("whisper-model".to_string());
         config.worker.ipc_path = "/tmp/native.sock".to_string();
         config.worker.tool_call_parser = "pythonic".to_string();
 
@@ -717,8 +761,30 @@ mod tests {
         assert!(rendered.contains("backend=native-mlx"));
         assert!(rendered.contains("model=native-model"));
         assert!(rendered.contains("vlm_model=vlm-model"));
+        assert!(rendered.contains("transcription_model=whisper-model"));
+        assert!(rendered.contains(&format!("max_audio_bytes={DEFAULT_MAX_AUDIO_BYTES}")));
         assert!(rendered.contains("ipc_path=/tmp/native.sock"));
         assert!(rendered.contains("tool_calling parser=pythonic"));
+    }
+
+    #[test]
+    fn audio_limits_reject_zero_and_default_to_openai_limit() {
+        assert_eq!(
+            RuntimeConfig::default().limits.max_audio_bytes,
+            25 * 1024 * 1024
+        );
+        assert!(RuntimeConfig::apply_contents(
+            RuntimeConfig::default(),
+            "[limits]\nmax_audio_bytes = 0\n"
+        )
+        .is_err());
+        let config = RuntimeConfig::apply_contents(
+            RuntimeConfig::default(),
+            "[worker]\ntranscription_model = \"\"\n[limits]\nmax_audio_bytes = 2048\n",
+        )
+        .unwrap();
+        assert_eq!(config.worker.transcription_model, None);
+        assert_eq!(config.limits.max_audio_bytes, 2048);
     }
 
     #[test]

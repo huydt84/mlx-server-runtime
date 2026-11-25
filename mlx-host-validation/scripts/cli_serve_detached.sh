@@ -146,8 +146,6 @@ echo "registration_removed=1"
 echo "logs_preserved=1"
 
 echo "[8/8] An instance whose worker cannot start fails fast"
-# 1% of the working set cannot hold the weights, so the native worker refuses
-# to start with KV_MEMORY_INSUFFICIENT and launchd restarts the gateway.
 BROKEN_STARTED=$SECONDS
 HOME="$TEST_HOME" UV_CACHE_DIR="$UV_CACHE" \
     "$STAGE_DIR/bin/mlx-air" serve \
@@ -172,10 +170,8 @@ fi
 unset BROKEN_PID
 cat "$BROKEN_OUTPUT"
 grep -E "failed to start|restarted by launchd" "$BROKEN_OUTPUT" >/dev/null
-# The failure names the setting to change.
 grep -F -e "raise --memory-utilization" "$BROKEN_OUTPUT" \
     "$TEST_HOME/Library/Logs/mlx-air/$BROKEN_NAME.stderr.log" >/dev/null
-# launchd finishes `bootout` asynchronously; allow it a few seconds.
 for _ in $(seq 1 20); do
     if ! launchctl print "gui/$(id -u)/com.mlx-air.instance.$BROKEN_NAME" >/dev/null 2>&1; then
         break

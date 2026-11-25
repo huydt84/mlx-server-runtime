@@ -41,6 +41,7 @@ uv run -m mlx_worker.main
 | `MLX_RUNTIME_MODEL` | Model identifier to load |
 | `MLX_RUNTIME_TOOL_CALL_PARSER` | Tool-call format of the text model (`auto` default), set from `worker.tool_call_parser` / `mlx-air serve --tool-call-parser` |
 | `MLX_RUNTIME_VLM_MODEL` | Optional VLM model identifier |
+| `MLX_RUNTIME_TRANSCRIPTION_MODEL` | Optional Whisper model identifier for audio endpoints |
 
 ### Exit Codes
 

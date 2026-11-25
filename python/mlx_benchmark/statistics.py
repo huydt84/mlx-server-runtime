@@ -7,7 +7,6 @@ import statistics as stdlib_statistics
 from collections import defaultdict
 from typing import Any
 
-# Metric name -> (unit, better direction).
 METRICS = {
     "ttft": ("ms", "lower"),
     "tpot": ("ms", "lower"),

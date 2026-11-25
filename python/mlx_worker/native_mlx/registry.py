@@ -202,8 +202,6 @@ _REGISTRY: dict[str, ArchitectureSpec] = {
     ),
 }
 
-# Checkpoints that declare no ``architectures`` but a model type whose weight
-# format a registered architecture implements.
 _MODEL_TYPE_ARCHITECTURES: dict[str, str] = {
     "prism_hadamard_qwen35": "Qwen3_5ForConditionalGeneration",
 }

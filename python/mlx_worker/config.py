@@ -23,6 +23,9 @@ class WorkerConfig:
         model: Text-only model identifier (e.g. an ``mlx-community`` hub path).
         vlm_model: Optional VLM model identifier. When ``None`` or empty,
             no VLM engine is constructed and the worker runs text-only.
+        transcription_model: Optional Whisper speech-to-text model served
+            through ``mlx-audio``. When ``None``, transcription requests are
+            rejected.
         memory_utilization: Fraction in (0, 1] of the Metal recommended
             working set for weights, activations, and the native KV pool.
         kv_cache_bytes: Absolute native KV pool size; overrides
@@ -42,6 +45,7 @@ class WorkerConfig:
     model: str
     backend: str = "native-mlx"
     vlm_model: str | None = None
+    transcription_model: str | None = None
     max_vlm_images: int = 5
     continuous_batching: bool = False
     prompt_concurrency: int = 4
@@ -80,12 +84,15 @@ def load_config() -> WorkerConfig:
     """Load the worker bootstrap configuration from environment variables.
 
     Reads ``MLX_RUNTIME_SOCKET``, ``MLX_RUNTIME_BACKEND``,
-    ``MLX_RUNTIME_MODEL``, and the optional ``MLX_RUNTIME_VLM_MODEL``.
-    An empty VLM model variable is treated the same as unset (no VLM engine).
+    ``MLX_RUNTIME_MODEL``, and the optional ``MLX_RUNTIME_VLM_MODEL`` and
+    ``MLX_RUNTIME_TRANSCRIPTION_MODEL``. An empty optional model variable is
+    treated the same as unset.
     """
 
     raw_vlm = os.environ.get("MLX_RUNTIME_VLM_MODEL", "")
     vlm_model: str | None = raw_vlm if raw_vlm.strip() else None
+    raw_transcription = os.environ.get("MLX_RUNTIME_TRANSCRIPTION_MODEL", "").strip()
+    transcription_model: str | None = raw_transcription or None
     backend = (
         os.environ.get("MLX_RUNTIME_BACKEND", "native-mlx").strip() or "native-mlx"
     )
@@ -148,8 +155,6 @@ def load_config() -> WorkerConfig:
         text_cache_budget_bytes > 0
         and os.environ.get("MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES", "").strip()
     ):
-        # Legacy pin for the native pool. Zero only disables the v1 prompt
-        # cache, so native-mlx then derives its pool from the utilization.
         kv_cache_bytes = text_cache_budget_bytes
     max_total_tokens_per_request = int(
         os.environ.get("MLX_RUNTIME_MAX_TOTAL_TOKENS_PER_REQUEST", "65536")
@@ -243,6 +248,7 @@ def load_config() -> WorkerConfig:
             "MLX_RUNTIME_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit"
         ),
         vlm_model=vlm_model,
+        transcription_model=transcription_model,
         max_vlm_images=max_vlm_images,
         continuous_batching=continuous_batching,
         prompt_concurrency=prompt_concurrency,

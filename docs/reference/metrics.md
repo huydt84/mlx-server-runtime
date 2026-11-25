@@ -17,6 +17,7 @@ All Prometheus metrics exposed at `GET /metrics` (configurable via `telemetry.me
 | `mlx_ipc_messages_received_total` | Total IPC messages received by gateway from worker |
 | `mlx_tool_calls_total` | Tool calls returned, by `backend`, `modality` and `parser`; present after the first request with tools |
 | `mlx_tool_call_parse_failures_total` | Generated tool calls returned as text because they could not be parsed, by the same labels |
+| `mlx_audio_input_ms_by_backend_total{backend="mlx-audio",task}` | Total decoded audio input duration in milliseconds, by `task` (`transcribe` or `translate`) |
 
 ## Gauges
 
@@ -30,6 +31,8 @@ All Prometheus metrics exposed at `GET /metrics` (configurable via `telemetry.me
 | `mlx_ipc_roundtrip_latency_ms` | Latest IPC roundtrip latency |
 | `mlx_worker_memory_bytes` | Latest worker memory estimate |
 | `mlx_kv_cache_bytes` | Latest KV cache memory estimate |
+| `mlx_latency_by_backend_ms{backend="mlx-audio",modality="audio",kind}` | Latest audio latency: `kind="audio_decode"` (upload to samples) or `kind="audio_inference"` (Whisper) |
+| `mlx_latency_by_backend_ms{backend="gateway",modality="audio",kind="gateway_queue"}` | Latest admission queue wait of an audio request |
 
 ## Histograms
 

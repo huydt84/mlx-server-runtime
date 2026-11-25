@@ -57,7 +57,6 @@ def _expand(path: Path, seen: set[Path]) -> list[str]:
             parts.extend(_expand(path.parent / include.group(1), seen))
             parts.append(f'#line {number + 1} "{label}"\n')
         elif _PRAGMA_ONCE.match(line):
-            # Pragma once is meaningless in a single string and warns there.
             parts.append("\n")
         else:
             parts.append(line)

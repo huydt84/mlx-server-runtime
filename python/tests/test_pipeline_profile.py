@@ -210,3 +210,37 @@ def test_incremental_flush_rewrites_unrecognized_trace(tmp_path) -> None:
     expected = write_pipeline_artifacts(profiler.events(), tmp_path / "full")
     for actual_path, expected_path in zip(paths, expected, strict=True):
         assert actual_path.read_bytes() == expected_path.read_bytes()
+
+
+def test_runtime_terminal_span_starts_at_request_enqueue(tmp_path) -> None:
+    from mlx_worker.native_mlx.runtime import NativeRuntime
+    from tests.test_native_mlx_warmup import _CompletingScheduler, _WordTokenizer
+
+    tokenizer = _WordTokenizer()
+    profiler = PipelineProfiler(tmp_path, model="model", run_id="run")
+    runtime = NativeRuntime(
+        _CompletingScheduler(),  # type: ignore[arg-type]
+        model_ref="test-model",
+        prompt_tokenizer=tokenizer,
+        decode_target=tokenizer,
+        eos_token_ids=(0,),
+        profiler=profiler,
+    )
+    runtime.submit(
+        runtime._warmup_chat(
+            "public", 3, max_prompt_tokens=16, max_total_tokens_per_request=32
+        )
+    )
+    while not runtime.idle():
+        runtime.tick()
+
+    events = [event for event in profiler.events() if event.request_id == "public"]
+    terminal = next(event for event in events if event.stage == "terminal")
+    others = [
+        event for event in events if event.stage not in {"terminal", "tokenization"}
+    ]
+    assert others
+    assert all(terminal.monotonic_ns <= event.monotonic_ns for event in others)
+    assert terminal.monotonic_ns + terminal.duration_us * 1_000 >= max(
+        event.monotonic_ns for event in others
+    )

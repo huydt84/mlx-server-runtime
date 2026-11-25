@@ -83,7 +83,6 @@ def test_temperature_sampling_follows_the_distribution() -> None:
 
 
 def test_top_p_keeps_the_smallest_set_reaching_the_mass() -> None:
-    # 0.4 + 0.3 reaches 0.5 only with the second token; the rest are dropped.
     counts = _draws(_PROBS, SamplingParams(temperature=1.0, top_p=0.5), 400)
 
     assert set(counts) == {0, 1}
@@ -140,6 +139,4 @@ def test_serial_and_overlap_sample_identical_tokens() -> None:
 
     assert len(serial) == 12
     assert serial == overlap
-    # The recording model's logits are [0, 1, 2, 3]; at temperature 1.5 more
-    # than the greedy token appears.
     assert len(set(serial)) > 1

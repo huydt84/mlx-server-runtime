@@ -857,7 +857,6 @@ def test_main_rejects_image_request_to_text_model(monkeypatch) -> None:
     exit_code = worker_main.main(engine_factory=FakeTextEngine)
 
     assert exit_code == 0
-    # Text engine should NOT have been called.
     assert text_seen == []
     events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
     errors = [e for e in events if isinstance(e, WorkerCommandError)]
@@ -909,7 +908,6 @@ def test_main_routes_text_only_vlm_request_to_vlm_engine(monkeypatch) -> None:
                 completion_tokens=1,
             )
 
-    # Text-only request targeting VLM model.
     text_only_vlm_request = (
         b'{"type":"chat_completion"'
         b',"request":{"request_id":"vlm-text","model":"vlm-model"'
@@ -1225,7 +1223,6 @@ def test_main_vlm_engine_not_warmed_eagerly(monkeypatch) -> None:
                 completion_tokens=1,
             )
 
-    # Request targets the text model — VLM should stay uninitialized.
     text_request_json = (
         b'{"type":"chat_completion"'
         b',"request":{"request_id":"text-1","model":"text-model"'
@@ -1261,7 +1258,6 @@ def test_main_vlm_engine_not_warmed_eagerly(monkeypatch) -> None:
 def test_main_default_vlm_engine_lazy_construction(monkeypatch) -> None:
     """When vlm_model is configured without injection, MlxVlmEngine is
     lazily constructed on first VLM request, not during bootstrap."""
-    # Must patch before main() triggers the local import.
     import mlx_worker.vlm_engine as vlm_mod
     from mlx_worker import main as worker_main
 
@@ -1335,12 +1331,10 @@ def test_main_default_vlm_engine_lazy_construction(monkeypatch) -> None:
     exit_code = worker_main.main(engine_factory=FakeTextEngine)
 
     assert exit_code == 0
-    # VLM engine was lazily constructed once on first VLM request.
     assert constructed_ids == ["vlm-model"], (
         "VLM engine should be constructed lazily on first VLM request"
     )
     assert constructed_engines[0].max_images_per_request == 7
-    # Verify the VLM request actually routed to the VLM engine.
     events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
     responses = [e for e in events if isinstance(e, ChatCompletionResponse)]
     assert len(responses) >= 1
@@ -1365,7 +1359,6 @@ def test_main_vlm_cancel_before_init_skips_initialize(monkeypatch) -> None:
         def complete_chat(
             self, request, should_cancel: Callable[[], bool] | None = None
         ) -> ChatCompletionResponse:
-            # Simulate the real engine: check cancel before initialize().
             if should_cancel is not None and should_cancel():
                 return ChatCompletionResponse(
                     request_id=request.request_id,
@@ -1402,7 +1395,6 @@ def test_main_vlm_cancel_before_init_skips_initialize(monkeypatch) -> None:
                 completion_tokens=1,
             )
 
-    # VLM request followed immediately by cancel for the same request.
     vlm_request = (
         b'{"type":"chat_completion"'
         b',"request":{"request_id":"vlm-1","model":"vlm-model"'
@@ -1425,7 +1417,6 @@ def test_main_vlm_cancel_before_init_skips_initialize(monkeypatch) -> None:
             vlm_model="vlm-model",
         ),
     )
-    # Force select to return readable so should_cancel picks up the cancel.
     monkeypatch.setattr(
         worker_main.select, "select", lambda *args, **kwargs: ([fake_socket], [], [])
     )
@@ -1453,7 +1444,7 @@ def test_main_vlm_non_stream_cancellation(monkeypatch) -> None:
     class FakeVlmEngine:
         def __init__(self, model_id: str) -> None:
             self.model_id = model_id
-            self._initialized = True  # skip deferred init for this test
+            self._initialized = True
 
         @property
         def is_initialized(self) -> bool:
@@ -1466,7 +1457,6 @@ def test_main_vlm_non_stream_cancellation(monkeypatch) -> None:
             self, request, should_cancel: Callable[[], bool] | None = None
         ):
             vlm_seen.append(request.request_id)
-            # Simulate cancellation check inside the engine.
             if should_cancel is not None and should_cancel():
                 return ChatCompletionResponse(
                     request_id=request.request_id,
@@ -1502,7 +1492,6 @@ def test_main_vlm_non_stream_cancellation(monkeypatch) -> None:
                 completion_tokens=1,
             )
 
-    # VLM non-stream request followed by cancel.
     vlm_request = (
         b'{"type":"chat_completion"'
         b',"request":{"request_id":"vlm-1","model":"vlm-model"'
@@ -1536,6 +1525,5 @@ def test_main_vlm_non_stream_cancellation(monkeypatch) -> None:
     events = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
     responses = [e for e in events if isinstance(e, ChatCompletionResponse)]
     assert len(responses) >= 1
-    # The VLM engine saw cancel and returned cancelled.
     assert responses[0].finish_reason == "cancelled"
     assert responses[0].text == ""
