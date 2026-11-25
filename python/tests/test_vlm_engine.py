@@ -22,6 +22,7 @@ from mlx_worker.vlm_engine import (
     _MAX_IMAGES_PER_REQUEST,
     MlxVlmEngine,
     VlmContinuousBatchScheduler,
+    _ScheduledVlmRequest,
     _validate_image_source,
     validate_vlm_continuous_batching_backend,
 )  # fmt: skip
@@ -585,6 +586,101 @@ def test_vlm_continuous_batch_scheduler_admits_join_while_decoding(
     assert generator.insert_calls[1]["prompt_kwargs"][0]["inputs_embeds"]
     assert any(event[0] == "delta" and event[1] == "vlm-text" for event in events)
     assert any(event[0] == "response" and event[1] == "vlm-image" for event in events)
+
+
+@pytest.mark.parametrize("stream", [True, False], ids=["stream", "non-stream"])
+@pytest.mark.parametrize(
+    ("script", "text", "deltas", "completion_tokens"),
+    [
+        pytest.param(
+            [(72, None), (105, None), (0, "stop")],
+            "Hi",
+            ["H", "i"],
+            2,
+            id="stop-token",
+        ),
+        pytest.param([(0, "stop")], "", [], 0, id="stop-token-only"),
+        pytest.param(
+            [(72, None), (105, "length")],
+            "Hi",
+            ["H", "i"],
+            2,
+            id="length",
+        ),
+        pytest.param(
+            [(72, None), (0xE3, None), (0, "stop")],
+            "H�",
+            ["H", "�"],
+            2,
+            id="incomplete-character",
+        ),
+    ],
+)
+def test_vlm_continuous_batch_scheduler_excludes_stop_token(
+    script: list[tuple[int, str | None]],
+    text: str,
+    deltas: list[str],
+    completion_tokens: int,
+    stream: bool,
+) -> None:
+    def decode(tokens: list[int]) -> str:
+        return b"".join(
+            b"<|im_end|>" if token == 0 else bytes([token]) for token in tokens
+        ).decode("utf-8", errors="replace")
+
+    steps = [
+        (
+            [],
+            [SimpleNamespace(uid=101, token=token, finish_reason=finish_reason)],
+        )
+        for token, finish_reason in script
+    ]
+    engine = MlxVlmEngine(
+        "vlm-model",
+        vlm_loader=_fake_vlm_load,
+        vlm_generate_fn=_fake_vlm_generate,
+        vlm_stream_generate_fn=_fake_vlm_stream_generate,
+    )
+    engine.processor = SimpleNamespace(tokenizer=SimpleNamespace(decode=decode))
+    emitted: list[str] = []
+    responses: list[ChatCompletionResponse] = []
+    scheduler = VlmContinuousBatchScheduler(
+        engine,
+        sink=SimpleNamespace(
+            emit_delta=lambda request_id, delta: emitted.append(delta),
+            emit_response=responses.append,
+            emit_error=lambda request_id, code, message: pytest.fail(message),
+        ),
+    )
+    scheduler._generator = SimpleNamespace(
+        next=lambda: steps.pop(0), close=lambda: None
+    )
+    scheduler._active[101] = _ScheduledVlmRequest(
+        request=_text_request(),
+        stream=stream,
+        full_prompt_tokens=[1],
+        prompt_tokens=[1],
+        prompt="hello",
+        prompt_kwargs={},
+        image_paths=(),
+        apc_cache_key=(),
+        cached_prompt=None,
+        apc_extra_hash=0,
+        vision_feature_cache_hit=False,
+        vision_feature_cache_bytes=None,
+        image_width=None,
+        image_height=None,
+        uid=101,
+    )
+
+    for _ in script:
+        scheduler.tick()
+
+    assert emitted == (deltas if stream else [])
+    assert [response.text for response in responses] == [text]
+    assert responses[0].completion_tokens == completion_tokens
+    assert responses[0].finish_reason == script[-1][1]
+    assert scheduler.idle()
 
 
 def test_vlm_continuous_batch_scheduler_reuses_image_prompt_cache(

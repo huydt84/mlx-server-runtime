@@ -1191,10 +1191,10 @@ class VlmContinuousBatchScheduler:
                 job.stage = "decoding"
 
             job.decode_batch_size = max(job.decode_batch_size, len(self._active))
-            token = getattr(response, "token", None)
-            if token is not None:
-                job.generated_tokens.append(int(token))
             finish_reason = getattr(response, "finish_reason", None)
+            token = getattr(response, "token", None)
+            if token is not None and finish_reason != "stop":
+                job.generated_tokens.append(int(token))
             tokenizer = getattr(self._engine.processor, "tokenizer", None)
             if tokenizer is not None and job.generated_tokens:
                 decoded = tokenizer.decode(job.generated_tokens)

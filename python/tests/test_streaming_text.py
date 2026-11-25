@@ -75,8 +75,6 @@ class ScriptedGenerator:
 
     def next(self) -> tuple[list[Any], list[SimpleNamespace]]:
         (response,) = self.next_generated()
-        if response.finish_reason == "stop":
-            response.token = None
         return [], [response]
 
     def close(self) -> None:
