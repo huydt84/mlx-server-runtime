@@ -7,15 +7,21 @@ from typing import ClassVar, Self
 
 from mlx_worker.ipc import (
     ChatCompletionDelta,
+    ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatMessage,
     ModelError,
     ModelStatus,
+    ToolCall,
+    ToolCallDelta,
     WorkerCommandError,
     WorkerError,
     WorkerReady,
     decode_bootstrap_message,
     decode_event,
+    encode_command,
 )
+from mlx_worker.tool_calling import ToolsNotSupportedError
 
 
 class FakeSocket:
@@ -933,6 +939,78 @@ def test_main_routes_text_only_vlm_request_to_vlm_engine(monkeypatch) -> None:
 
     assert exit_code == 0
     assert vlm_calls == ["vlm-text"]
+
+
+def test_main_forwards_tool_calls_and_tool_errors(monkeypatch) -> None:
+    from mlx_worker import main as worker_main
+
+    call = ToolCall("call_1", "f", "{}")
+
+    class FakeTextEngine:
+        def __init__(self, model_id: str, **kwargs) -> None:
+            self.kwargs = kwargs
+            FakeTextEngine.last = self
+
+        def warmup(self):
+            return SimpleNamespace()
+
+        def stream_chat(self, request, emit_delta, should_cancel=None):
+            if request.request_id == "rejected":
+                raise ToolsNotSupportedError("text-model")
+            emit_delta("", reasoning="why", tool_calls=(ToolCallDelta(0, call),))
+            return ChatCompletionResponse(
+                request_id=request.request_id,
+                model=request.model,
+                text="",
+                finish_reason="tool_calls",
+                prompt_tokens=1,
+                completion_tokens=1,
+                tool_calls=(call,),
+            )
+
+    frames = b"".join(
+        encode_command(
+            ChatCompletionRequest(
+                request_id=request_id,
+                model="text-model",
+                messages=[ChatMessage(role="user", content="hello")],
+                max_tokens=1,
+                temperature=0.0,
+                top_p=1.0,
+                max_prompt_tokens=8,
+                max_completion_tokens=8,
+                max_total_tokens_per_request=16,
+                stream=True,
+                tools=({"type": "function", "function": {"name": "f"}},),
+            )
+        )
+        for request_id in ("accepted", "rejected")
+    )
+    fake_socket = FakeSocket(io.BytesIO(frames))
+    monkeypatch.setattr(
+        worker_main.socket, "socket", lambda *args, **kwargs: fake_socket
+    )
+    monkeypatch.setattr(
+        worker_main,
+        "load_config",
+        lambda: SimpleNamespace(
+            socket_path="/tmp/test.sock",
+            model="text-model",
+            tool_call_parser="json_tools",
+        ),
+    )
+
+    exit_code = worker_main.main(engine_factory=FakeTextEngine)
+
+    assert exit_code == 0
+    assert FakeTextEngine.last.kwargs["tool_call_parser"] == "json_tools"
+    delta, response, error = [decode_event(chunk) for chunk in fake_socket.sent[5:]]
+    assert delta == ChatCompletionDelta(
+        "accepted", "", "why", (ToolCallDelta(0, call),)
+    )
+    assert response.tool_calls == (call,)
+    assert error.code == "TOOLS_NOT_SUPPORTED"
+    assert error.request_id == "rejected"
 
 
 def test_main_rejects_unknown_model(monkeypatch) -> None:

@@ -13,7 +13,15 @@ from .batching import (
     PromptCacheStore,
     create_default_batch_backend,
 )
+from .chat_template import render_prompt_tokens, text_content
 from .ipc import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
+from .tool_call_parsers import AUTO_TOOL_CALL_PARSER
+from .tool_calling import (
+    OutputDelta,
+    ToolOutputParser,
+    ToolsNotSupportedError,
+    resolve_tool_format,
+)
 
 
 def _load_mlx_components() -> tuple[
@@ -54,6 +62,15 @@ def _local_model_path(model_id: str) -> Path | None:
         return None
 
 
+def _emit_tool_delta(emit_delta: Callable[..., None], delta: OutputDelta) -> None:
+    if delta:
+        emit_delta(
+            delta.content,
+            reasoning=delta.reasoning or None,
+            tool_calls=delta.tool_calls,
+        )
+
+
 def _noop_sampler(_temp: float, _top_p: float) -> Callable[[Any], Any]:
     """Fallback sampler used only when tests inject their own backend."""
 
@@ -81,6 +98,9 @@ class MlxWorkerEngine:
     prompt_cache_max_bytes: int = field(
         default=8 * 1024 * 1024, repr=False, compare=False
     )
+    tool_call_parser: str = field(
+        default=AUTO_TOOL_CALL_PARSER, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         """Load the configured model and configure batching."""
@@ -99,22 +119,14 @@ class MlxWorkerEngine:
                 self._make_sampler = _noop_sampler
 
         self.model, self.tokenizer = self._model_loader(self.model_id)
+        self._tool_format = resolve_tool_format(self.tokenizer, self.tool_call_parser)
         self._prompt_cache_store = PromptCacheStore(
             name="text_kv",
             max_entries=self.prompt_cache_max_entries,
             max_bytes=self.prompt_cache_max_bytes,
         )
-        context = BatchBackendContext(
-            model_id=self.model_id,
-            model=self.model,
-            tokenizer=self.tokenizer,
-            prompt_cache_store=self._prompt_cache_store,
-            build_prompt_tokens=self._build_prompt_tokens,
-            validate_token_limits=self._validate_token_limits,
-            make_sampler=self._make_sampler,
-        )
         backend_factory = self.batch_backend_factory or create_default_batch_backend
-        self._batch_backend = backend_factory(context)
+        self._batch_backend = backend_factory(self.batch_context())
 
     def complete_chat(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Generate one non-streaming chat completion."""
@@ -145,6 +157,7 @@ class MlxWorkerEngine:
             build_prompt_tokens=self._build_prompt_tokens,
             validate_token_limits=self._validate_token_limits,
             make_sampler=self._make_sampler,
+            create_tool_output=self._create_tool_output,
         )
 
     def benchmark_reset(
@@ -168,10 +181,17 @@ class MlxWorkerEngine:
     def stream_chat(
         self,
         request: ChatCompletionRequest,
-        emit_delta: Callable[[str], None],
+        emit_delta: Callable[..., None],
         should_cancel: Callable[[], bool] | None = None,
     ) -> ChatCompletionResponse:
-        """Generate a streaming chat completion and emit text deltas."""
+        """Generate a streaming chat completion and emit deltas.
+
+        Args:
+            request: Request to complete.
+            emit_delta: Called with each text delta. Requests with tools also
+                pass ``reasoning`` and ``tool_calls`` keyword arguments.
+            should_cancel: Polled between tokens.
+        """
 
         if request.model != self.model_id:
             raise ValueError(
@@ -184,8 +204,22 @@ class MlxWorkerEngine:
             raise RuntimeError("streaming requires the MLX runtime components")
 
         sampler = self._make_sampler(request.temperature, request.top_p)
+        tool_output = self._create_tool_output(request, prompt_tokens)
         text_segments: list[str] = []
         final_response = None
+        stopped_after_call = False
+
+        def emit(text: str) -> None:
+            if tool_output is None:
+                text_segments.append(text)
+                emit_delta(text)
+            else:
+                _emit_tool_delta(emit_delta, tool_output.push(text))
+
+        def output_fields() -> dict[str, Any]:
+            if tool_output is None:
+                return {"text": "".join(text_segments)}
+            return tool_output.response_fields()
 
         for response in self._stream_generate(
             self.model,
@@ -198,35 +232,46 @@ class MlxWorkerEngine:
                 return ChatCompletionResponse(
                     request_id=request.request_id,
                     model=self.model_id,
-                    text="".join(text_segments),
                     finish_reason="cancelled",
                     prompt_tokens=0,
                     completion_tokens=0,
+                    **output_fields(),
                 )
             if response.text:
-                text_segments.append(response.text)
-                emit_delta(response.text)
+                emit(response.text)
             final_response = response
             if should_cancel is not None and should_cancel():
                 return ChatCompletionResponse(
                     request_id=request.request_id,
                     model=self.model_id,
-                    text="".join(text_segments),
                     finish_reason="cancelled",
                     prompt_tokens=0,
                     completion_tokens=0,
+                    **output_fields(),
                 )
+            if tool_output is not None and tool_output.done:
+                stopped_after_call = True
+                break
 
         if final_response is None:
             raise RuntimeError("mlx-lm returned no completion response")
 
+        finish_reason = final_response.finish_reason or "stop"
+        if tool_output is not None:
+            _emit_tool_delta(
+                emit_delta,
+                tool_output.finish(
+                    turn_ended=not stopped_after_call and finish_reason == "stop"
+                ),
+            )
+            finish_reason = tool_output.finish_reason(finish_reason)
         return ChatCompletionResponse(
             request_id=request.request_id,
             model=self.model_id,
-            text="".join(text_segments),
-            finish_reason=final_response.finish_reason or "stop",
+            finish_reason=finish_reason,
             prompt_tokens=int(final_response.prompt_tokens),
             completion_tokens=int(final_response.generation_tokens),
+            **output_fields(),
         )
 
     def warmup(self) -> ChatCompletionResponse:
@@ -249,30 +294,35 @@ class MlxWorkerEngine:
     def _build_prompt_tokens(self, request: ChatCompletionRequest) -> list[int]:
         """Convert chat messages into prompt token ids."""
 
-        messages = [
-            {"role": message.role, "content": message.content}
-            for message in request.messages
-        ]
+        has_chat_template = getattr(self.tokenizer, "has_chat_template", False)
+        if request.tools and (self._tool_format is None or not has_chat_template):
+            raise ToolsNotSupportedError(self.model_id)
+        if has_chat_template:
+            return render_prompt_tokens(self.tokenizer, request)
 
-        if getattr(self.tokenizer, "has_chat_template", False):
-            tokens = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
+        prompt = (
+            "\n".join(
+                f"{message.role.capitalize()}: {text_content(message)}"
+                for message in request.messages
             )
-        else:
-            prompt = (
-                "\n".join(
-                    f"{message.role.capitalize()}: {message.content}"
-                    for message in request.messages
-                )
-                + "\nAssistant:"
-            )
-            tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+            + "\nAssistant:"
+        )
+        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
 
         if hasattr(tokens, "tolist"):
             tokens = tokens.tolist()
         return list(tokens)
+
+    def _create_tool_output(
+        self, request: ChatCompletionRequest, prompt_tokens: Sequence[int]
+    ) -> ToolOutputParser | None:
+        """Return an output parser when the request sends tools."""
+
+        if not request.tools or self._tool_format is None:
+            return None
+        return self._tool_format.create_parser(
+            request.tools, prompt_tokens, parallel=request.parallel_tool_calls
+        )
 
     def _validate_token_limits(
         self,

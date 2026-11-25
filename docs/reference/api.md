@@ -218,11 +218,14 @@ Generate a chat completion. Supports streaming and non-streaming modes.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `model` | string | yes | — | Must match configured `worker.model` |
-| `messages` | array | yes | — | Chat messages, at least one non-empty |
+| `messages` | array | yes | — | Chat messages with role `system`, `user`, `assistant` or `tool`. `content` is a string or a list of parts; text parts are joined. It may be empty or null only on `tool` messages and on `assistant` messages with `tool_calls` or `reasoning_content` |
 | `max_tokens` | integer | no | config default | Max generation tokens |
 | `temperature` | float | no | config default | Sampling temperature |
 | `top_p` | float | no | config default | Nucleus sampling threshold |
 | `stream` | boolean | no | false | Enable SSE streaming |
+| `tools` | array | no | — | Functions the model may call; see [Tool calling](#tool-calling) |
+| `tool_choice` | string | no | `"auto"` | `"auto"`, or `"none"` to hide the tools from the model |
+| `parallel_tool_calls` | boolean | no | true | `false` ends the reply after one call |
 
 **Response 200 (non-streaming):**
 
@@ -258,11 +261,95 @@ data: {"id":"chatcmpl-req-2","object":"chat.completion.chunk","created":17180000
 
 Final chunk has empty `delta` and a `finish_reason`. Stream ends with `data: [DONE]`.
 
+#### Tool calling
+
+Available for text models with a tool-call parser, on native-mlx and v1.
+[Tool Calling](../explanation/tool-calling.md) describes parser selection,
+malformed and unfinished calls, and the reasons behind the limits.
+
+**Request:**
+
+```json
+{
+  "model": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+  "messages": [{ "role": "user", "content": "What is the weather in Hanoi?" }],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": { "city": { "type": "string" } },
+          "required": ["city"]
+        }
+      }
+    }
+  ]
+}
+```
+
+**Response choice:**
+
+```json
+{
+  "index": 0,
+  "message": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "call_0f8a3c5d7e9b1a2c4d6e8f0a",
+        "type": "function",
+        "function": { "name": "get_weather", "arguments": "{\"city\": \"Hanoi\"}" }
+      }
+    ]
+  },
+  "finish_reason": "tool_calls"
+}
+```
+
+`content` is null only when the reply holds calls and no text. With tools,
+thinking is returned in `reasoning_content` on the message instead of in
+`content`. `arguments` is JSON text of an object; it is not checked against the
+schema.
+
+**Next request,** with the assistant message returned as received and one `tool`
+message per call:
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "What is the weather in Hanoi?" },
+    { "role": "assistant", "content": null, "tool_calls": [{ "id": "call_0f8a3c5d7e9b1a2c4d6e8f0a", "type": "function", "function": { "name": "get_weather", "arguments": "{\"city\": \"Hanoi\"}" } }] },
+    { "role": "tool", "tool_call_id": "call_0f8a3c5d7e9b1a2c4d6e8f0a", "content": "31 degrees, sunny" }
+  ]
+}
+```
+
+A `tool` message may also carry the function `name`, and an `assistant` message
+its earlier `reasoning_content`.
+
+**Streaming** sends each call whole, in one delta, once it is complete:
+
+```
+data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_0f8a3c5d7e9b1a2c4d6e8f0a","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"Hanoi\"}"}}]},"finish_reason":null}], ...}
+```
+
+Thinking deltas carry `reasoning_content`. `content` is left out of a delta that
+only carries thinking or calls.
+
+`tool_choice: "required"`, a named function, `functions` and `function_call` are
+rejected with `INVALID_REQUEST`. `strict` and `reasoning_effort` are accepted
+and have no effect.
+
 ## Error Responses
 
 | Status | Code | Meaning |
 |--------|------|---------|
-| 400 | `INVALID_REQUEST` | Malformed JSON, empty model/message, token limits exceeded |
+| 400 | `INVALID_REQUEST` | Malformed JSON, empty model/message, malformed tools or tool history, unsupported `tool_choice`, token limits exceeded |
+| 400 | `TOOLS_NOT_SUPPORTED` | Tools sent to a model without a tool-call parser or to a VLM |
 | 404 | — | Unknown endpoint or model |
 | 429 | `QUEUE_FULL` | Max pending requests exceeded |
 | 429 | `QUEUE_TIMEOUT` | Queue wait exceeded `request_timeout_seconds` |

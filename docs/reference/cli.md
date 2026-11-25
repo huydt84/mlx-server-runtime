@@ -39,6 +39,7 @@ uv run -m mlx_worker.main
 | `MLX_RUNTIME_SOCKET` | Unix domain socket path (must match `worker.ipc_path` in config) |
 | `MLX_RUNTIME_BACKEND` | Explicit backend selector (`v1` default, `native-mlx` experimental) |
 | `MLX_RUNTIME_MODEL` | Model identifier to load |
+| `MLX_RUNTIME_TOOL_CALL_PARSER` | Tool-call format of the text model (`auto` default), set from `worker.tool_call_parser` / `mlx-air serve --tool-call-parser` |
 | `MLX_RUNTIME_VLM_MODEL` | Optional VLM model identifier |
 
 ### Exit Codes

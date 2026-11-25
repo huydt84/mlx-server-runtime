@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from .ipc import ChatCompletionRequest, ChatCompletionResponse
+from .tool_calling import OutputDelta, ToolOutputParser, request_error_code
 
 CacheMatchKind = Literal["exact", "shorter_prefix", "trimmed_longer_prefix"]
 
@@ -277,6 +278,12 @@ class BatchCompletionBackend(Protocol):
         """Complete a batch of chat requests."""
 
 
+def _no_tool_output(
+    _request: ChatCompletionRequest, _prompt_tokens: Sequence[int]
+) -> ToolOutputParser | None:
+    return None
+
+
 @dataclass(frozen=True)
 class BatchBackendContext:
     """Inputs needed to build a batch completion backend."""
@@ -288,13 +295,20 @@ class BatchBackendContext:
     build_prompt_tokens: Callable[[ChatCompletionRequest], list[int]]
     validate_token_limits: Callable[[ChatCompletionRequest, Sequence[int]], None]
     make_sampler: Callable[[float, float], Callable[[Any], Any]]
+    create_tool_output: Callable[
+        [ChatCompletionRequest, Sequence[int]], ToolOutputParser | None
+    ] = _no_tool_output
 
 
 @dataclass(frozen=True)
 class BatchEventSink:
-    """Callbacks used by continuous batching to emit worker events."""
+    """Callbacks used by continuous batching to emit worker events.
 
-    emit_delta: Callable[[str, str], None]
+    ``emit_delta`` takes a request id and text; deltas of requests with tools
+    also pass ``reasoning`` and ``tool_calls`` keyword arguments.
+    """
+
+    emit_delta: Callable[..., None]
     emit_response: Callable[[ChatCompletionResponse], None]
     emit_error: Callable[[str, str, str], None]
 
@@ -402,6 +416,14 @@ class MlxBatchCompletionBackend:
                 raise RuntimeError(f"batch generator returned duplicate UIDs: {uids}")
 
             uid_to_index = {uid: index for index, uid in enumerate(uids)}
+            tool_texts = {
+                uid: _ToolText(tool_output)
+                for uid, request, tokens in zip(
+                    uids, requests, prompt_tokens, strict=True
+                )
+                if (tool_output := self._context.create_tool_output(request, tokens))
+                is not None
+            }
             generated_tokens: dict[int, list[int]] = {uid: [] for uid in uids}
             finish_reasons: dict[int, str] = {}
             prompt_caches: dict[int, tuple[Sequence[Any], Sequence[int] | None]] = {}
@@ -428,6 +450,14 @@ class MlxBatchCompletionBackend:
 
                         if response.finish_reason is None:
                             generated_tokens[uid].append(response.token)
+                            if self._reached_call_limit(
+                                tool_texts.get(uid),
+                                requests[uid_to_index[uid]],
+                                generated_tokens[uid],
+                            ):
+                                finish_reasons[uid] = "stop"
+                                pending_uids.discard(uid)
+                                _remove_from_generator(generator, uid)
                             continue
 
                         if response.finish_reason != "stop":
@@ -449,12 +479,18 @@ class MlxBatchCompletionBackend:
             index = uid_to_index[uid]
             text = self._context.tokenizer.decode(generated_tokens[uid])
             finish_reason = finish_reasons.get(uid, "stop")
+            output_fields: dict[str, Any] = {"text": text}
+            tool_text = tool_texts.get(uid)
+            if tool_text is not None:
+                tool_text.finish(text, turn_ended=finish_reason == "stop")
+                finish_reason = tool_text.output.finish_reason(finish_reason)
+                output_fields = tool_text.output.response_fields()
             sequence_tokens = prompt_tokens[index] + generated_tokens[uid]
             response = ChatCompletionResponse(
                 request_id=requests[index].request_id,
                 model=self._context.model_id,
-                text=text,
                 finish_reason=finish_reason,
+                **output_fields,
                 prompt_tokens=len(prompt_tokens[index]),
                 completion_tokens=len(generated_tokens[uid]),
                 prompt_cache_hit=prompt_cache_hits[index],
@@ -488,6 +524,19 @@ class MlxBatchCompletionBackend:
 
         return responses
 
+    def _reached_call_limit(
+        self,
+        tool_text: _ToolText | None,
+        request: ChatCompletionRequest,
+        tokens: Sequence[int],
+    ) -> bool:
+        """Return whether generation may stop because no more calls are allowed."""
+
+        if tool_text is None or request.parallel_tool_calls:
+            return False
+        tool_text.push(self._context.tokenizer.decode(tokens))
+        return tool_text.output.done
+
     def _get_batch_generator_cls(self) -> type[Any]:
         if self._batch_generator_cls is not None:
             return self._batch_generator_cls
@@ -505,6 +554,42 @@ def create_default_batch_backend(
     return MlxBatchCompletionBackend(context)
 
 
+class _ToolText:
+    """Feed the repeatedly decoded text of one request to its output parser.
+
+    An incomplete multi-byte character decodes to a replacement character that
+    later tokens rewrite, so trailing ones are held back until the end.
+    """
+
+    def __init__(self, output: ToolOutputParser) -> None:
+        self.output = output
+        self._consumed = 0
+
+    def push(self, decoded: str) -> OutputDelta:
+        end = len(decoded.rstrip("\ufffd"))
+        text = decoded[self._consumed : end]
+        self._consumed = max(self._consumed, end)
+        return self.output.push(text)
+
+    def finish(self, decoded: str, *, turn_ended: bool) -> OutputDelta:
+        step = self.output.push(decoded[self._consumed :])
+        self._consumed = len(decoded)
+        last = self.output.finish(turn_ended=turn_ended)
+        return OutputDelta(
+            content=step.content + last.content,
+            reasoning=step.reasoning + last.reasoning,
+            tool_calls=step.tool_calls + last.tool_calls,
+        )
+
+
+def _remove_from_generator(generator: Any, uid: int) -> None:
+    """Stop generating for one request; its later tokens are ignored anyway."""
+
+    remove = getattr(generator, "remove", None)
+    if remove is not None:
+        remove([uid])
+
+
 @dataclass
 class _ScheduledRequest:
     request: ChatCompletionRequest
@@ -520,6 +605,7 @@ class _ScheduledRequest:
     stage: str = "pending"
     cancelled_stage: str | None = None
     timing: RequestTiming = field(default_factory=RequestTiming)
+    tool_text: _ToolText | None = None
 
     def __post_init__(self) -> None:
         if self.generated_tokens is None:
@@ -579,15 +665,17 @@ class ContinuousBatchScheduler:
             self._context.validate_token_limits(request, tokens)
         except ValueError as exc:
             self._worker_error_count += 1
-            self._sink.emit_error(request.request_id, "INVALID_REQUEST", str(exc))
+            self._sink.emit_error(request.request_id, request_error_code(exc), str(exc))
             return
 
+        tool_output = self._context.create_tool_output(request, tokens)
         self._pending.append(
             _ScheduledRequest(
                 request=request,
                 stream=stream,
                 prompt_tokens=tokens,
                 cached_prompt=self._context.prompt_cache_store.lookup(tokens),
+                tool_text=_ToolText(tool_output) if tool_output is not None else None,
             )
         )
 
@@ -669,6 +757,10 @@ class ContinuousBatchScheduler:
             if response.finish_reason is None:
                 job.generated_tokens.append(response.token)
                 self._emit_delta(job)
+                if job.tool_text is not None and job.tool_text.output.done:
+                    self._active.pop(response.uid, None)
+                    self._finish(job, "stop", None, None)
+                    self._maybe_cancel_generator(response.uid)
                 continue
 
             if response.finish_reason != "stop":
@@ -779,6 +871,10 @@ class ContinuousBatchScheduler:
         return batch_generator_cls
 
     def _emit_delta(self, job: _ScheduledRequest) -> None:
+        if job.tool_text is not None:
+            decoded = self._context.tokenizer.decode(job.generated_tokens)
+            self._emit_tool_delta(job, job.tool_text.push(decoded))
+            return
         if not job.stream:
             job.rendered_text = self._context.tokenizer.decode(job.generated_tokens)
             return
@@ -791,6 +887,25 @@ class ContinuousBatchScheduler:
                 job.timing.first_token_at = time.perf_counter()
         job.rendered_text = decoded
 
+    def _emit_tool_delta(self, job: _ScheduledRequest, delta: OutputDelta) -> None:
+        if not delta:
+            return
+        if job.timing.first_token_at is None:
+            job.timing.first_token_at = time.perf_counter()
+        if job.stream:
+            self._sink.emit_delta(
+                job.request.request_id,
+                delta.content,
+                reasoning=delta.reasoning or None,
+                tool_calls=delta.tool_calls,
+            )
+
+    @staticmethod
+    def _output_fields(job: _ScheduledRequest) -> dict[str, Any]:
+        if job.tool_text is None:
+            return {"text": job.rendered_text}
+        return job.tool_text.output.response_fields()
+
     def _finish(
         self,
         job: _ScheduledRequest,
@@ -798,7 +913,14 @@ class ContinuousBatchScheduler:
         prompt_cache: Sequence[Any] | None,
         all_tokens: Sequence[int] | None,
     ) -> None:
-        if not job.stream:
+        if job.tool_text is not None:
+            decoded = self._context.tokenizer.decode(job.generated_tokens)
+            self._emit_tool_delta(
+                job,
+                job.tool_text.finish(decoded, turn_ended=finish_reason == "stop"),
+            )
+            finish_reason = job.tool_text.output.finish_reason(finish_reason)
+        elif not job.stream:
             job.rendered_text = self._context.tokenizer.decode(job.generated_tokens)
             if job.generated_tokens and job.timing.first_token_at is None:
                 now = time.perf_counter()
@@ -830,8 +952,8 @@ class ContinuousBatchScheduler:
             ChatCompletionResponse(
                 request_id=job.request.request_id,
                 model=self._context.model_id,
-                text=job.rendered_text,
                 finish_reason=finish_reason,
+                **self._output_fields(job),
                 prompt_tokens=len(job.prompt_tokens),
                 completion_tokens=len(job.generated_tokens),
                 prompt_cache_hit=job.cached_prompt is not None,
@@ -880,8 +1002,8 @@ class ContinuousBatchScheduler:
             ChatCompletionResponse(
                 request_id=job.request.request_id,
                 model=self._context.model_id,
-                text=job.rendered_text,
                 finish_reason="cancelled",
+                **self._output_fields(job),
                 prompt_tokens=len(job.prompt_tokens),
                 completion_tokens=len(job.generated_tokens),
                 prompt_cache_hit=job.cached_prompt is not None,

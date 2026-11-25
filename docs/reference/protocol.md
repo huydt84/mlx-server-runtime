@@ -105,6 +105,22 @@ After bootstrap, the gateway sends JSON commands and reads JSON events over the 
 }
 ```
 
+Requests that offer tools also carry:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tools` | string | JSON text of the tool definitions array, as the client sent it. Text keeps the key order |
+| `parallel_tool_calls` | bool | Whether one reply may hold several calls |
+
+Messages carry these fields when they are set:
+
+| Field | Role | Description |
+|-------|------|-------------|
+| `tool_calls` | `assistant` | `[{"id", "type": "function", "function": {"name", "arguments"}}]`; `arguments` is JSON text of an object |
+| `reasoning_content` | `assistant` | Thinking of an earlier reply |
+| `tool_call_id` | `tool` | Id of the call this message answers |
+| `name` | `tool` | Optional function name |
+
 **CancelRequest:**
 
 ```json
@@ -144,6 +160,19 @@ After bootstrap, the gateway sends JSON commands and reads JSON events over the 
 }
 ```
 
+A delta of a request with tools may also carry `reasoning` (string) and
+`tool_calls`, an array of `{"index", "id", "type", "function"}` where each call
+is complete. `delta` may then be empty.
+
+The response of a request with tools adds these fields to `response`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reasoning` | string | Thinking split from `text`; absent without any |
+| `tool_calls` | array | Completed calls, in the shape above; absent without any |
+| `tool_parser` | string | Parser that read the output |
+| `tool_parse_failures` | int | Calls returned as text because they could not be parsed |
+
 **Error:**
 
 ```json
@@ -154,6 +183,10 @@ After bootstrap, the gateway sends JSON commands and reads JSON events over the 
   "message": "generation failed"
 }
 ```
+
+`code` is `INVALID_REQUEST`, `TOOLS_NOT_SUPPORTED` (the request offers tools and
+the model has no tool-call parser), `WORKER_ERROR`, or another worker failure
+code. The gateway answers the first two with HTTP 400.
 
 ## Encoding
 

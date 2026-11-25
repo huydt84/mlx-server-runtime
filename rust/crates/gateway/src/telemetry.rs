@@ -571,6 +571,14 @@ impl MetricsRegistry {
                     "Total worker-side errors by backend.",
                 ),
                 (
+                    "mlx_tool_calls_total",
+                    "Total tool calls returned by backend and parser.",
+                ),
+                (
+                    "mlx_tool_call_parse_failures_total",
+                    "Total generated tool calls returned as text because they could not be parsed.",
+                ),
+                (
                     "mlx_vlm_image_count_by_backend_total",
                     "Total VLM images processed by backend.",
                 ),

@@ -111,6 +111,11 @@ struct ServeArgs {
     /// `--memory-utilization` for the pool.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_byte_size)]
     kv_cache_memory: Option<u64>,
+    /// Tool-call format of the text model: `auto` infers it from the
+    /// checkpoint, `none` rejects requests with tools, and a parser name such
+    /// as `json_tools`, `qwen3_coder`, `pythonic` or `inkling2` selects it.
+    #[arg(long, value_name = "PARSER")]
+    tool_call_parser: Option<String>,
     /// Start a managed detached instance.
     #[arg(long, requires_all = ["name", "port"])]
     detach: bool,
@@ -525,6 +530,7 @@ fn resolve_serve_context(
         port: args.port,
         memory_utilization: args.memory_utilization,
         kv_cache_bytes: args.kv_cache_memory,
+        tool_call_parser: args.tool_call_parser.clone(),
     };
     let config = resolve_runtime_config(
         &distribution.default_config,
@@ -724,6 +730,8 @@ mod tests {
             "native-mlx",
             "--port",
             "9000",
+            "--tool-call-parser",
+            "none",
         ]);
 
         assert!(result.is_ok(), "unexpected parse error: {result:?}");

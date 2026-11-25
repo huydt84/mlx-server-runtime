@@ -273,10 +273,7 @@ mod tests {
             request: ChatCompletionRequest {
                 request_id: "req-1".to_string(),
                 model: "test-model".to_string(),
-                messages: vec![ChatMessage {
-                    role: MessageRole::User,
-                    content: "hello".into(),
-                }],
+                messages: vec![ChatMessage::new(MessageRole::User, "hello")],
                 max_tokens: 16,
                 temperature: 0.2,
                 top_p: 0.9,
@@ -285,6 +282,8 @@ mod tests {
                 max_total_tokens_per_request: 20,
                 stop: vec!["END".to_string()],
                 stream: false,
+                tools: None,
+                parallel_tool_calls: None,
             },
         };
 
@@ -454,6 +453,7 @@ mod tests {
                 peak_memory_bytes: Some(1024),
                 image_width: Some(640),
                 image_height: Some(480),
+                ..Default::default()
             },
             image_count: Some(1),
             image_preprocess_latency_ms: Some(8),
@@ -520,9 +520,9 @@ mod tests {
             request: ChatCompletionRequest {
                 request_id: "vlm-req".to_string(),
                 model: "vlm-model".to_string(),
-                messages: vec![ChatMessage {
-                    role: MessageRole::User,
-                    content: crate::request::MessageContent::Parts(vec![
+                messages: vec![ChatMessage::new(
+                    MessageRole::User,
+                    crate::request::MessageContent::Parts(vec![
                         crate::request::ContentPart::Text {
                             text: "describe".to_string(),
                         },
@@ -533,7 +533,7 @@ mod tests {
                             },
                         },
                     ]),
-                }],
+                )],
                 max_tokens: 32,
                 temperature: 0.2,
                 top_p: 0.9,
@@ -542,6 +542,8 @@ mod tests {
                 max_total_tokens_per_request: 128,
                 stop: vec![],
                 stream: true,
+                tools: None,
+                parallel_tool_calls: None,
             },
         };
 
@@ -561,9 +563,9 @@ mod tests {
             request: ChatCompletionRequest {
                 request_id: "vlm-detail".to_string(),
                 model: "vlm-model".to_string(),
-                messages: vec![ChatMessage {
-                    role: MessageRole::User,
-                    content: crate::request::MessageContent::Parts(vec![
+                messages: vec![ChatMessage::new(
+                    MessageRole::User,
+                    crate::request::MessageContent::Parts(vec![
                         crate::request::ContentPart::ImageUrl {
                             image_url: crate::request::ImageUrl {
                                 url: "http://example.com/img.jpg".to_string(),
@@ -571,7 +573,7 @@ mod tests {
                             },
                         },
                     ]),
-                }],
+                )],
                 max_tokens: 32,
                 temperature: 0.2,
                 top_p: 0.9,
@@ -580,6 +582,8 @@ mod tests {
                 max_total_tokens_per_request: 128,
                 stop: vec![],
                 stream: false,
+                tools: None,
+                parallel_tool_calls: None,
             },
         };
 
@@ -636,11 +640,43 @@ mod tests {
             delta: ChatCompletionDelta {
                 request_id: "req-1".to_string(),
                 delta: "hello".to_string(),
+                ..Default::default()
             },
         };
 
         let encoded = encode_worker_event(&event).unwrap();
         let decoded = decode_worker_event(&encoded).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn worker_delta_with_tool_calls_uses_openai_call_objects() {
+        let encoded = r#"{"type":"chat_completion_delta","delta":{"request_id":"req-1","delta":"","reasoning":"why","tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"weather","arguments":"{\"city\": \"Hanoi\"}"}}]}}"#;
+
+        let decoded = decode_worker_event(encoded).unwrap();
+
+        let expected = WorkerEvent::ChatCompletionDelta {
+            delta: ChatCompletionDelta {
+                request_id: "req-1".to_string(),
+                delta: String::new(),
+                reasoning: Some("why".to_string()),
+                tool_calls: vec![crate::response::ToolCallDelta {
+                    index: 1,
+                    call: crate::request::ToolCall {
+                        id: "call_1".to_string(),
+                        kind: crate::request::ToolKind::Function,
+                        function: crate::request::FunctionCall {
+                            name: "weather".to_string(),
+                            arguments: r#"{"city": "Hanoi"}"#.to_string(),
+                        },
+                    },
+                }],
+            },
+        };
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            decode_worker_event(&encode_worker_event(&expected).unwrap()).unwrap(),
+            expected
+        );
     }
 }

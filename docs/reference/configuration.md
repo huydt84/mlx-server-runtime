@@ -26,6 +26,7 @@ compatibility contract.
 | `model` | string | `"mlx-community/Qwen2.5-7B-Instruct-4bit"` | Hugging Face model ID |
 | `vlm_model` | string or null | `null` | Optional VLM model ID |
 | `ipc_path` | string | `"/tmp/mlx-runtime.sock"` | Unix domain socket path |
+| `tool_call_parser` | string | `"auto"` | Tool-call format of the text model: `auto` infers it, `none` rejects requests with tools, and `json_tools`, `qwen3_coder`, `pythonic` or `inkling2` selects one. An unknown name stops the worker at startup. CLI: `mlx-air serve --tool-call-parser`. See [Tool Calling](../explanation/tool-calling.md) |
 
 ## [generation]
 

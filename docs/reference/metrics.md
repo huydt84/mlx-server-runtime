@@ -15,6 +15,8 @@ All Prometheus metrics exposed at `GET /metrics` (configurable via `telemetry.me
 | `mlx_completion_tokens_total` | Total completion tokens observed |
 | `mlx_ipc_messages_sent_total` | Total IPC messages sent from gateway to worker |
 | `mlx_ipc_messages_received_total` | Total IPC messages received by gateway from worker |
+| `mlx_tool_calls_total` | Tool calls returned, by `backend`, `modality` and `parser`; present after the first request with tools |
+| `mlx_tool_call_parse_failures_total` | Generated tool calls returned as text because they could not be parsed, by the same labels |
 
 ## Gauges
 

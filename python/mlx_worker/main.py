@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from typing import Any
 
 from .batching import (
     BatchEventSink,
@@ -29,6 +30,7 @@ from .ipc import (
     ModelError,
     ModelLoadProgress,
     ModelStatus,
+    ToolCallDelta,
     WorkerCommandError,
     WorkerError,
     WorkerReady,
@@ -37,6 +39,7 @@ from .ipc import (
     encode_event,
     request_has_images,
 )
+from .tool_calling import request_error_code
 
 
 def _pop_buffered_line(read_buffer: bytearray) -> bytes | None:
@@ -196,6 +199,7 @@ def main(
                     prompt_cache_max_bytes=getattr(
                         config, "text_cache_budget_bytes", 8 * 1024 * 1024
                     ),
+                    tool_call_parser=getattr(config, "tool_call_parser", "auto"),
                 )
             except TypeError:
                 engine = engine_factory(config.model)
@@ -375,7 +379,7 @@ def main(
                             )
                     except Exception as exc:
                         code = (
-                            "INVALID_REQUEST"
+                            request_error_code(exc)
                             if isinstance(exc, ValueError)
                             else "WORKER_ERROR"
                         )
@@ -394,12 +398,24 @@ def main(
     return 0
 
 
-def _delta_emitter(client: socket.socket, request_id: str) -> Callable[[str], None]:
-    """Return a callback that streams text deltas for one request over ``client``."""
+def _delta_emitter(client: socket.socket, request_id: str) -> Callable[..., None]:
+    """Return a callback that streams deltas for one request over ``client``."""
 
-    def emit_delta(delta: str) -> None:
+    def emit_delta(
+        delta: str,
+        *,
+        reasoning: str | None = None,
+        tool_calls: tuple[ToolCallDelta, ...] = (),
+    ) -> None:
         client.sendall(
-            encode_event(ChatCompletionDelta(request_id=request_id, delta=delta))
+            encode_event(
+                ChatCompletionDelta(
+                    request_id=request_id,
+                    delta=delta,
+                    reasoning=reasoning,
+                    tool_calls=tool_calls,
+                )
+            )
         )
 
     return emit_delta
@@ -454,10 +470,8 @@ def _run_continuous_batch_loop(
     )
     reader_thread.start()
 
-    def emit_delta(request_id: str, delta: str) -> None:
-        client.sendall(
-            encode_event(ChatCompletionDelta(request_id=request_id, delta=delta))
-        )
+    def emit_delta(request_id: str, delta: str, **tool_output: Any) -> None:
+        _delta_emitter(client, request_id)(delta, **tool_output)
 
     def emit_response(response: ChatCompletionResponse) -> None:
         client.sendall(encode_event(response))

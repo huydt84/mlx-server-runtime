@@ -647,10 +647,10 @@ fn warmup_vlm_model(runtime: RuntimeState, client: Arc<WorkerClient>, vlm_model:
     let request = ChatCompletionRequest {
         request_id: "vlm-warmup".to_string(),
         model: vlm_model,
-        messages: vec![ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Text("warmup".to_string()),
-        }],
+        messages: vec![ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Text("warmup".to_string()),
+        )],
         max_tokens: 1,
         temperature: 0.0,
         top_p: 1.0,
@@ -659,6 +659,8 @@ fn warmup_vlm_model(runtime: RuntimeState, client: Arc<WorkerClient>, vlm_model:
         max_total_tokens_per_request: 128,
         stop: vec![],
         stream: false,
+        tools: None,
+        parallel_tool_calls: None,
     };
 
     match client.complete_chat(request) {
@@ -699,6 +701,10 @@ fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
         (
             "MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT",
             u8::from(config.memory.max_total_tokens_explicit).to_string(),
+        ),
+        (
+            "MLX_RUNTIME_TOOL_CALL_PARSER",
+            config.worker.tool_call_parser.clone(),
         ),
     ];
     if let Some(bytes) = config.memory.kv_cache_bytes {
@@ -1014,6 +1020,22 @@ mod tests {
         assert!(supervisor.child_id().is_none());
         assert!(!socket_path.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_env_forwards_the_tool_call_parser() {
+        let parser = |config: &RuntimeConfig| {
+            worker_env(config)
+                .into_iter()
+                .find(|(key, _)| *key == "MLX_RUNTIME_TOOL_CALL_PARSER")
+                .map(|(_, value)| value)
+        };
+        let mut config = RuntimeConfig::default();
+        assert_eq!(parser(&config).as_deref(), Some("auto"));
+
+        config.worker.tool_call_parser = "inkling2".to_string();
+
+        assert_eq!(parser(&config).as_deref(), Some("inkling2"));
     }
 
     #[test]

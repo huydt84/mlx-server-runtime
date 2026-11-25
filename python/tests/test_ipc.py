@@ -17,6 +17,8 @@ from mlx_worker.ipc import (
     ModelStatus,
     SchedulerMetricsEvent,
     TextContent,
+    ToolCall,
+    ToolCallDelta,
     WorkerCommandError,
     WorkerError,
     WorkerReady,
@@ -32,6 +34,138 @@ from mlx_worker.ipc import (
 
 
 class IpcEncodingTests(unittest.TestCase):
+    def test_tool_request_round_trip_keeps_key_order(self) -> None:
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {"type": "object", "properties": {"b": {}, "a": {}}},
+            },
+        }
+        request = ChatCompletionRequest(
+            request_id="req-1",
+            model="m",
+            messages=[
+                ChatMessage(role="user", content="hi"),
+                ChatMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=(ToolCall("call_1", "f", '{"b": 1}'),),
+                    reasoning_content="why",
+                ),
+                ChatMessage(role="tool", content="1", tool_call_id="call_1", name="f"),
+            ],
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=8,
+            max_completion_tokens=8,
+            max_total_tokens_per_request=16,
+            tools=(tool,),
+            parallel_tool_calls=False,
+        )
+
+        decoded = decode_command(encode_command(request))
+
+        self.assertEqual(decoded, request)
+        properties = decoded.tools[0]["function"]["parameters"]["properties"]
+        self.assertEqual(list(properties), ["b", "a"])
+
+    def test_gateway_tool_request_frame_decodes(self) -> None:
+        frame = {
+            "type": "chat_completion",
+            "request": {
+                "request_id": "req-1",
+                "model": "m",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "f", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                ],
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "max_prompt_tokens": 8,
+                "max_completion_tokens": 8,
+                "max_total_tokens_per_request": 16,
+                "tools": '[{"type": "function", "function": {"name": "f"}}]',
+                "parallel_tool_calls": True,
+            },
+        }
+
+        request = decode_command((json.dumps(frame) + "\n").encode())
+
+        self.assertEqual(request.tools[0]["function"]["name"], "f")
+        self.assertEqual(
+            request.messages[0].tool_calls, (ToolCall("call_1", "f", "{}"),)
+        )
+
+    def test_malformed_tools_text_is_a_value_error(self) -> None:
+        request = ChatCompletionRequest(
+            request_id="req-1",
+            model="m",
+            messages=[ChatMessage(role="user", content="hi")],
+            max_tokens=1,
+            temperature=0.0,
+            top_p=1.0,
+            max_prompt_tokens=8,
+            max_completion_tokens=8,
+            max_total_tokens_per_request=16,
+        )
+        frame = json.loads(encode_command(request))
+        frame["request"]["tools"] = "[{"
+
+        with self.assertRaises(ValueError):
+            decode_command((json.dumps(frame) + "\n").encode())
+
+    def test_tool_events_round_trip(self) -> None:
+        call = ToolCall("call_1", "f", '{"city": "Huế"}')
+        for event in (
+            ChatCompletionDelta("req-1", "", "why", (ToolCallDelta(0, call),)),
+            ChatCompletionResponse(
+                request_id="req-1",
+                model="m",
+                text="",
+                finish_reason="tool_calls",
+                prompt_tokens=1,
+                completion_tokens=2,
+                reasoning="why",
+                tool_calls=(call,),
+                tool_parser="json_tools",
+                tool_parse_failures=1,
+            ),
+        ):
+            self.assertEqual(decode_event(encode_event(event)), event)
+
+    def test_frames_without_tools_carry_no_tool_fields(self) -> None:
+        delta = json.loads(encode_event(ChatCompletionDelta("req-1", "hi")))
+        response = json.loads(
+            encode_event(
+                ChatCompletionResponse(
+                    request_id="req-1",
+                    model="m",
+                    text="hi",
+                    finish_reason="stop",
+                    prompt_tokens=1,
+                    completion_tokens=2,
+                )
+            )
+        )
+
+        self.assertEqual(delta["delta"], {"request_id": "req-1", "delta": "hi"})
+        self.assertFalse(
+            {"reasoning", "tool_calls", "tool_parser", "tool_parse_failures"}
+            & set(response["response"])
+        )
+
     def test_encode_ready_round_trip(self) -> None:
         message = WorkerReady()
         encoded = encode_bootstrap_message(message)

@@ -722,8 +722,14 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
     }
     writeln!(
         output,
-        "ipc_path = {}\n",
+        "ipc_path = {}",
         toml_string(&config.worker.ipc_path)?
+    )
+    .ok();
+    writeln!(
+        output,
+        "tool_call_parser = {}\n",
+        toml_string(&config.worker.tool_call_parser)?
     )
     .ok();
     writeln!(output, "[generation]").ok();
@@ -1132,6 +1138,17 @@ mod tests {
         let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
         assert_eq!(reloaded.memory, config.memory);
         assert_eq!(reloaded.limits.max_total_tokens_per_request, 4096);
+    }
+
+    #[test]
+    fn rendered_config_round_trips_the_tool_call_parser() {
+        let mut config = RuntimeConfig::default();
+        config.worker.tool_call_parser = "pythonic".to_string();
+
+        let rendered = render_runtime_config(&config).unwrap();
+
+        let reloaded = RuntimeConfig::overlay_contents_for_test(&rendered);
+        assert_eq!(reloaded.worker, config.worker);
     }
 
     #[test]

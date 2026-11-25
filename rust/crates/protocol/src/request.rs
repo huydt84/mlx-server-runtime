@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Health check marker reserved for future worker ping support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +30,12 @@ impl MessageContent {
                     })
             }
         }
+    }
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
     }
 }
 
@@ -76,8 +82,77 @@ pub struct ImageUrl {
 pub struct ChatMessage {
     /// The message role.
     pub role: MessageRole,
-    /// The message content (text or structured parts with images).
+    /// The message content (text or structured parts with images). A missing
+    /// or null content is empty text.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub content: MessageContent,
+    /// Tool calls the assistant made in this message.
+    #[serde(
+        default,
+        deserialize_with = "null_as_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tool_calls: Vec<ToolCall>,
+    /// Id of the tool call a tool message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Name of the function a tool message answers for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Thinking text of an earlier assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    /// Creates a message that holds only content.
+    pub fn new(role: MessageRole, content: impl Into<MessageContent>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+        }
+    }
+}
+
+/// A function call made by the assistant, in OpenAI-compatible format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Call identifier that tool messages refer to.
+    pub id: String,
+    /// The kind of tool; only functions exist.
+    #[serde(rename = "type")]
+    pub kind: ToolKind,
+    /// The called function.
+    pub function: FunctionCall,
+}
+
+/// The supported tool kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    /// A function tool.
+    Function,
+}
+
+/// Name and arguments of a called function.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionCall {
+    /// Function name.
+    pub name: String,
+    /// JSON text of the arguments object.
+    pub arguments: String,
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// The supported chat roles.
@@ -90,6 +165,8 @@ pub enum MessageRole {
     User,
     /// Assistant message.
     Assistant,
+    /// Result of a tool call.
+    Tool,
 }
 
 /// A single non-streaming chat completion request sent to the worker.
@@ -119,4 +196,60 @@ pub struct ChatCompletionRequest {
     /// Whether the request should stream token deltas.
     #[serde(default)]
     pub stream: bool,
+    /// JSON text of the offered tool definitions. Text keeps the key order the
+    /// client sent, which chat templates render into the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<String>,
+    /// Whether one reply may hold several tool calls; sent only with tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_message_serializes_without_tool_fields() {
+        let message = ChatMessage::new(MessageRole::User, "hello");
+
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"role":"user","content":"hello"}"#
+        );
+    }
+
+    #[test]
+    fn null_content_and_null_tool_calls_are_empty() {
+        let message: ChatMessage = serde_json::from_str(
+            r#"{"role":"assistant","content":null,"tool_calls":null,"refusal":null}"#,
+        )
+        .unwrap();
+
+        assert_eq!(message, ChatMessage::new(MessageRole::Assistant, ""));
+    }
+
+    #[test]
+    fn tool_history_round_trips() {
+        let encoded = concat!(
+            r#"{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","#,
+            r#""function":{"name":"weather","arguments":"{}"}}],"reasoning_content":"why"}"#
+        );
+
+        let message: ChatMessage = serde_json::from_str(encoded).unwrap();
+
+        assert_eq!(message.tool_calls[0].function.name, "weather");
+        assert_eq!(serde_json::to_string(&message).unwrap(), encoded);
+    }
+
+    #[test]
+    fn tool_call_without_id_or_with_another_type_is_rejected() {
+        for call in [
+            r#"{"type":"function","function":{"name":"f","arguments":"{}"}}"#,
+            r#"{"id":"call_1","type":"custom","function":{"name":"f","arguments":"{}"}}"#,
+            r#"{"id":"call_1","type":"function","function":{"name":"f","arguments":{}}}"#,
+        ] {
+            assert!(serde_json::from_str::<ToolCall>(call).is_err(), "{call}");
+        }
+    }
 }

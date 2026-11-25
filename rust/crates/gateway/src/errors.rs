@@ -11,6 +11,8 @@ pub enum GatewayError {
     WorkerStartup(String),
     /// Invalid client request or worker-side request validation failure.
     InvalidRequest(String),
+    /// Request uses tools with a model that cannot call them.
+    ToolsNotSupported(String),
     /// Benchmark reset was requested while scheduler work was active.
     BenchmarkBusy(String),
     /// Request/response protocol failure.
@@ -23,6 +25,9 @@ impl fmt::Display for GatewayError {
             GatewayError::Io(err) => write!(f, "io error: {err}"),
             GatewayError::WorkerStartup(message) => write!(f, "worker startup error: {message}"),
             GatewayError::InvalidRequest(message) => write!(f, "invalid request: {message}"),
+            GatewayError::ToolsNotSupported(message) => {
+                write!(f, "tools not supported: {message}")
+            }
             GatewayError::BenchmarkBusy(message) => write!(f, "benchmark busy: {message}"),
             GatewayError::Protocol(message) => write!(f, "protocol error: {message}"),
         }

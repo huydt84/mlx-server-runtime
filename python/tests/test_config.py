@@ -20,6 +20,22 @@ def test_load_config_defaults_backend_to_native(monkeypatch) -> None:
     assert config.backend == "native-mlx"
 
 
+def test_load_config_parses_the_tool_call_parser(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_TOOL_CALL_PARSER", raising=False)
+    assert load_config().tool_call_parser == "auto"
+
+    for setting in ("", "auto", "none", "json_tools", "inkling2"):
+        monkeypatch.setenv("MLX_RUNTIME_TOOL_CALL_PARSER", setting)
+        assert load_config().tool_call_parser == (setting or "auto")
+
+
+def test_load_config_rejects_an_unknown_tool_call_parser(monkeypatch) -> None:
+    monkeypatch.setenv("MLX_RUNTIME_TOOL_CALL_PARSER", "mistral")
+
+    with pytest.raises(ValueError, match="MLX_RUNTIME_TOOL_CALL_PARSER.*json_tools"):
+        load_config()
+
+
 def test_load_config_parses_v1_backend(monkeypatch) -> None:
     monkeypatch.setenv("MLX_RUNTIME_BACKEND", "v1")
 

@@ -12,6 +12,10 @@ model = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 # Uncomment to enable VLM support:
 # vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
 ipc_path = "/tmp/mlx-runtime.sock"
+# Tool-call format of the text model. "auto" infers it from the checkpoint,
+# "none" rejects requests with tools, and "json_tools", "qwen3_coder",
+# "pythonic" or "inkling2" selects one. CLI: --tool-call-parser.
+tool_call_parser = "auto"
 
 [generation]
 temperature = 0.7

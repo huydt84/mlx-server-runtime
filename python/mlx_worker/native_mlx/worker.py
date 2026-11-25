@@ -24,6 +24,7 @@ from ..ipc import (
     encode_bootstrap_message,
     encode_event,
 )
+from ..tool_calling import request_error_code, resolve_tool_format
 from .bootstrap import (
     NativeBootstrapFailure,
     build_native_artifacts,
@@ -181,7 +182,7 @@ def run_native_worker(
                                 if isinstance(
                                     locals().get("command"), BenchmarkResetRequest
                                 )
-                                else "INVALID_REQUEST"
+                                else request_error_code(exc)
                             ),
                             request_id=getattr(command, "request_id", "unknown")
                             if "command" in locals()
@@ -292,6 +293,14 @@ def create_native_worker(
         terminal_token_ids=artifacts.eos_token_ids,
         profiler=profiler,
     )
+    tool_format = resolve_tool_format(
+        artifacts.tokenizer, getattr(config, "tool_call_parser", "auto")
+    )
+    print(
+        f"native-mlx tool_call_parser={tool_format.name if tool_format else 'none'}",
+        file=sys.stderr,
+        flush=True,
+    )
     return NativeRequestRuntime(
         scheduler,
         model_ref=config.model,
@@ -301,6 +310,7 @@ def create_native_worker(
         profiler=profiler,
         max_total_tokens=artifacts.max_total_tokens,
         warmup_prompt_lengths=_warmup_prompt_lengths(artifacts.executor),
+        tool_format=tool_format,
     )
 
 

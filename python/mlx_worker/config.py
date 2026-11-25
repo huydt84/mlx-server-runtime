@@ -9,6 +9,7 @@ from .native_backend_ids import (
     DEFAULT_NATIVE_EXECUTION_BACKEND,
     NATIVE_EXECUTION_BACKEND_IDS,
 )
+from .tool_call_parsers import AUTO_TOOL_CALL_PARSER, TOOL_CALL_PARSER_SETTINGS
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,9 @@ class WorkerConfig:
         text_cache_max_entries_explicit: Whether the operator set
             ``text_cache_max_entries``. When false, the native prefix cache
             may hold every page of the KV pool and gives pages back on demand.
+        tool_call_parser: Tool-call format of the text model: ``auto`` infers
+            it from the checkpoint, ``none`` rejects requests with tools, and a
+            parser name overrides the inference.
     """
 
     socket_path: str
@@ -69,6 +73,7 @@ class WorkerConfig:
     vlm_apc_cache_max_entries: int = 32
     vision_feature_cache_budget_bytes: int = 8 * 1024 * 1024
     vision_feature_cache_max_entries: int = 20
+    tool_call_parser: str = AUTO_TOOL_CALL_PARSER
 
 
 def load_config() -> WorkerConfig:
@@ -221,6 +226,15 @@ def load_config() -> WorkerConfig:
         None,
         20,
     )
+    tool_call_parser = (
+        os.environ.get("MLX_RUNTIME_TOOL_CALL_PARSER", "").strip()
+        or AUTO_TOOL_CALL_PARSER
+    )
+    if tool_call_parser not in TOOL_CALL_PARSER_SETTINGS:
+        raise ValueError(
+            "MLX_RUNTIME_TOOL_CALL_PARSER must be one of: "
+            + ", ".join(TOOL_CALL_PARSER_SETTINGS)
+        )
 
     return WorkerConfig(
         socket_path=os.environ.get("MLX_RUNTIME_SOCKET", "/tmp/mlx-runtime.sock"),
@@ -262,6 +276,7 @@ def load_config() -> WorkerConfig:
         vlm_apc_cache_max_entries=vlm_apc_cache_max_entries,
         vision_feature_cache_budget_bytes=vision_feature_cache_budget_bytes,
         vision_feature_cache_max_entries=vision_feature_cache_max_entries,
+        tool_call_parser=tool_call_parser,
     )
 
 

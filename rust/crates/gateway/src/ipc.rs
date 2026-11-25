@@ -1,8 +1,8 @@
 use crate::errors::GatewayError;
 use crate::telemetry::MetricsRegistry;
 use mlx_runtime_protocol::{
-    decode_worker_event, encode_gateway_command, BenchmarkResetState, ChatCompletionRequest,
-    ChatCompletionResponse, GatewayCommand, WorkerEvent,
+    decode_worker_event, encode_gateway_command, BenchmarkResetState, ChatCompletionDelta,
+    ChatCompletionRequest, ChatCompletionResponse, GatewayCommand, WorkerEvent,
 };
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -62,7 +62,7 @@ impl WorkerClient {
     pub fn stream_chat(
         &self,
         mut request: ChatCompletionRequest,
-        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         request.stream = true;
         self.execute_chat(request, true, on_delta)
@@ -138,7 +138,7 @@ impl WorkerClient {
         &self,
         request: ChatCompletionRequest,
         stream: bool,
-        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         let request_id = request.request_id.clone();
         let (sender, receiver) = mpsc::channel();
@@ -162,7 +162,7 @@ impl WorkerClient {
                                 "received unexpected stream delta".to_string(),
                             ));
                         }
-                        if let Err(err) = on_delta(delta.delta) {
+                        if let Err(err) = on_delta(delta) {
                             self.unregister_request(&request_id);
                             return Err(err);
                         }
@@ -573,6 +573,23 @@ impl WorkerClient {
                                 value,
                             );
                         }
+                        if let Some(parser) = response.tool_parser.as_deref() {
+                            let labels = [
+                                ("backend", backend),
+                                ("modality", modality),
+                                ("parser", parser),
+                            ];
+                            self.metrics.increment_labeled_counter(
+                                "mlx_tool_calls_total",
+                                &labels,
+                                response.tool_calls.len() as u64,
+                            );
+                            self.metrics.increment_labeled_counter(
+                                "mlx_tool_call_parse_failures_total",
+                                &labels,
+                                response.tool_parse_failures.unwrap_or(0).into(),
+                            );
+                        }
                         if let Some(mode) = apc_mode.as_deref() {
                             self.metrics.set_labeled_gauge(
                                 "mlx_apc_mode_by_backend",
@@ -592,10 +609,11 @@ impl WorkerClient {
                             continue;
                         }
                         self.unregister_request(&request_id);
-                        if code == "INVALID_REQUEST" {
-                            return Err(GatewayError::InvalidRequest(message));
-                        }
-                        return Err(GatewayError::Protocol(message));
+                        return Err(match code.as_str() {
+                            "INVALID_REQUEST" => GatewayError::InvalidRequest(message),
+                            "TOOLS_NOT_SUPPORTED" => GatewayError::ToolsNotSupported(message),
+                            _ => GatewayError::Protocol(message),
+                        });
                     }
                 },
                 Err(_) => {
@@ -1168,10 +1186,7 @@ mod tests {
         ChatCompletionRequest {
             request_id: request_id.to_string(),
             model: "test-model".to_string(),
-            messages: vec![ChatMessage {
-                role: MessageRole::User,
-                content: "hello".into(),
-            }],
+            messages: vec![ChatMessage::new(MessageRole::User, "hello")],
             max_tokens: 4,
             temperature: 0.0,
             top_p: 1.0,
@@ -1180,6 +1195,8 @@ mod tests {
             max_total_tokens_per_request: 32,
             stop: vec![],
             stream: false,
+            tools: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -1533,5 +1550,72 @@ mod tests {
         assert!(rendered.contains("mlx_radix_cache_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\",kind=\"nodes\"} 5"));
         assert!(rendered.contains("mlx_radix_cache_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\",kind=\"splits\"} 2"));
         assert!(rendered.contains("mlx_radix_cache_by_backend{backend=\"native-mlx\",modality=\"text\",strategy=\"block-hash\",kind=\"tree_depth\"} 8"));
+    }
+
+    fn answer_with(server: UnixStream, lines: &[&str]) -> std::thread::JoinHandle<()> {
+        let lines = lines.join("\n");
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            let mut writer = server;
+            let mut command = String::new();
+            assert!(reader.read_line(&mut command).unwrap() > 0);
+            writeln!(writer, "{lines}").unwrap();
+            writer.flush().unwrap();
+            let mut rest = String::new();
+            let _ = reader.read_line(&mut rest);
+        })
+    }
+
+    #[test]
+    fn streamed_tool_calls_are_delivered_and_counted() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let metrics = Arc::new(MetricsRegistry::new());
+        let worker = WorkerClient::new(client, Arc::clone(&metrics)).unwrap();
+        let server_thread = answer_with(
+            server,
+            &[
+                r#"{"type":"chat_completion_delta","delta":{"request_id":"req-1","delta":"","reasoning":"why"}}"#,
+                r#"{"type":"chat_completion_delta","delta":{"request_id":"req-1","delta":"","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"weather","arguments":"{}"}}]}}"#,
+                r#"{"type":"chat_completion","response":{"request_id":"req-1","model":"test-model","text":"","finish_reason":"tool_calls","prompt_tokens":4,"completion_tokens":2,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"weather","arguments":"{}"}}],"tool_parser":"json_tools","tool_parse_failures":3},"backend":"native-mlx","modality":"text"}"#,
+            ],
+        );
+
+        let mut deltas = Vec::new();
+        let response = worker
+            .stream_chat(request("req-1"), &mut |delta| {
+                deltas.push(delta);
+                Ok(())
+            })
+            .unwrap();
+        drop(worker);
+        server_thread.join().unwrap();
+
+        assert_eq!(deltas[0].reasoning.as_deref(), Some("why"));
+        assert_eq!(deltas[1].tool_calls[0].call.function.name, "weather");
+        assert_eq!(response.tool_calls.len(), 1);
+        let rendered = metrics.render_prometheus(0);
+        assert!(rendered.contains("mlx_tool_calls_total{"), "{rendered}");
+        assert!(rendered.contains("mlx_tool_call_parse_failures_total{"));
+        assert!(rendered.contains("parser=\"json_tools\""));
+    }
+
+    #[test]
+    fn tools_not_supported_error_keeps_its_kind() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let worker = WorkerClient::new(client, Arc::new(MetricsRegistry::new())).unwrap();
+        let server_thread = answer_with(
+            server,
+            &[
+                r#"{"type":"error","code":"TOOLS_NOT_SUPPORTED","request_id":"req-1","message":"model 'm'"}"#,
+            ],
+        );
+
+        let result = worker.complete_chat(request("req-1"));
+        drop(worker);
+        server_thread.join().unwrap();
+
+        assert!(
+            matches!(result, Err(GatewayError::ToolsNotSupported(message)) if message == "model 'm'")
+        );
     }
 }

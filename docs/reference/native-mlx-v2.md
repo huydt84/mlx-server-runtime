@@ -105,6 +105,7 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_DIR` | directory path | Required output directory when pipeline profiling is enabled |
 | `MLX_RUNTIME_NATIVE_PIPELINE_PROFILE_RUN_ID` | string | Optional run ID shared by gateway-side and worker-side events |
 | `MLX_RUNTIME_NATIVE_METAL_CAPTURE` | `0`, `1` | Requests optional heavy Metal capture preflight; requires process-start `MTL_CAPTURE_ENABLED=1` |
+| `MLX_RUNTIME_TOOL_CALL_PARSER` | `auto`, `none`, `json_tools`, `qwen3_coder`, `pythonic`, `inkling2` | Tool-call format of the model; set from `[worker] tool_call_parser` / `--tool-call-parser` |
 | `MLX_RUNTIME_TEXT_PROMPT_CONCURRENCY` | positive integer | Text prompt/prefill admission width |
 | `MLX_RUNTIME_TEXT_PREFILL_CHUNK_SIZE` | positive integer | Chunked-prefill token budget |
 | `MLX_RUNTIME_MEMORY_UTILIZATION` | float in (0, 1] | Share of the Metal recommended working set for weights, activations, and the KV pool; the pool gets the remainder after the weights load. Set from `[memory] utilization` / `--memory-utilization` |

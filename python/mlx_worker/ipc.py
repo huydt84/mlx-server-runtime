@@ -97,15 +97,40 @@ ContentPart = ImageContent | TextContent
 
 
 @dataclass(frozen=True)
+class ToolCall:
+    """One function call made by the assistant.
+
+    *arguments* is JSON text for an object, as in the OpenAI API.
+    """
+
+    id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class ToolCallDelta:
+    """A complete tool call streamed at *index* within the reply."""
+
+    index: int
+    call: ToolCall
+
+
+@dataclass(frozen=True)
 class ChatMessage:
     """One chat message from the OpenAI-style request.
 
     For text-only requests, *content* is a plain string (backward compatible).
     For VLM requests, *content* is a list of ``ContentPart`` items (text or image).
+    An assistant message that only calls tools has empty *content*.
     """
 
-    role: Literal["system", "user", "assistant"]
+    role: Literal["system", "user", "assistant", "tool"]
     content: str | tuple[ContentPart, ...]
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
+    name: str | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +148,8 @@ class ChatCompletionRequest:
     max_total_tokens_per_request: int
     stop: tuple[str, ...] = ()
     stream: bool = False
+    tools: tuple[dict[str, Any], ...] = ()
+    parallel_tool_calls: bool = True
 
 
 @dataclass(frozen=True)
@@ -174,6 +201,10 @@ class ChatCompletionResponse:
     peak_memory_bytes: int | None = None
     image_width: int | None = None
     image_height: int | None = None
+    reasoning: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_parser: str | None = None
+    tool_parse_failures: int | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +213,8 @@ class ChatCompletionDelta:
 
     request_id: str
     delta: str
+    reasoning: str | None = None
+    tool_calls: tuple[ToolCallDelta, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -393,13 +426,7 @@ def encode_command(request: ChatCompletionRequest) -> bytes:
         "request": {
             "request_id": request.request_id,
             "model": request.model,
-            "messages": [
-                {
-                    "role": message.role,
-                    "content": _encode_content(message.content),
-                }
-                for message in request.messages
-            ],
+            "messages": [_encode_chat_message(message) for message in request.messages],
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
             "top_p": request.top_p,
@@ -410,7 +437,62 @@ def encode_command(request: ChatCompletionRequest) -> bytes:
             "stream": request.stream,
         },
     }
+    if request.tools:
+        payload["request"]["tools"] = json.dumps(list(request.tools))
+        payload["request"]["parallel_tool_calls"] = request.parallel_tool_calls
     return (json.dumps(payload) + "\n").encode("utf-8")
+
+
+def _encode_chat_message(message: ChatMessage) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "role": message.role,
+        "content": _encode_content(message.content),
+    }
+    if message.tool_calls:
+        payload["tool_calls"] = [_encode_tool_call(call) for call in message.tool_calls]
+    for key in ("tool_call_id", "name", "reasoning_content"):
+        value = getattr(message, key)
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _decode_chat_message(payload: dict[str, Any]) -> ChatMessage:
+    return ChatMessage(
+        role=payload["role"],
+        content=_decode_content(payload["content"]),
+        tool_calls=_decode_tool_calls(payload.get("tool_calls")),
+        tool_call_id=payload.get("tool_call_id"),
+        name=payload.get("name"),
+        reasoning_content=payload.get("reasoning_content"),
+    )
+
+
+def _encode_tool_call(call: ToolCall) -> dict[str, Any]:
+    return {
+        "id": call.id,
+        "type": "function",
+        "function": {"name": call.name, "arguments": call.arguments},
+    }
+
+
+def _decode_tool_call(payload: dict[str, Any]) -> ToolCall:
+    function = payload["function"]
+    return ToolCall(
+        id=payload["id"],
+        name=function["name"],
+        arguments=function["arguments"],
+    )
+
+
+def _decode_tool_calls(payload: list[dict[str, Any]] | None) -> tuple[ToolCall, ...]:
+    return tuple(_decode_tool_call(call) for call in payload or ())
+
+
+def _decode_tools(raw: str | None) -> tuple[dict[str, Any], ...]:
+    """Decode tool definitions, which travel as JSON text to keep key order."""
+
+    return tuple(json.loads(raw)) if raw else ()
 
 
 def _decode_content(
@@ -477,13 +559,7 @@ def decode_command(
     return ChatCompletionRequest(
         request_id=request["request_id"],
         model=request["model"],
-        messages=[
-            ChatMessage(
-                role=message["role"],
-                content=_decode_content(message["content"]),
-            )
-            for message in request["messages"]
-        ],
+        messages=[_decode_chat_message(message) for message in request["messages"]],
         max_tokens=request["max_tokens"],
         temperature=request["temperature"],
         top_p=request["top_p"],
@@ -492,6 +568,8 @@ def decode_command(
         max_total_tokens_per_request=request["max_total_tokens_per_request"],
         stop=tuple(str(item) for item in request.get("stop", [])),
         stream=request.get("stream", False),
+        tools=_decode_tools(request.get("tools")),
+        parallel_tool_calls=request.get("parallel_tool_calls", True),
     )
 
 
@@ -589,6 +667,15 @@ def encode_event(
             "image_width": event.image_width,
             "image_height": event.image_height,
         }
+        if event.reasoning is not None:
+            payload["response"]["reasoning"] = event.reasoning
+        if event.tool_calls:
+            payload["response"]["tool_calls"] = [
+                _encode_tool_call(call) for call in event.tool_calls
+            ]
+        if event.tool_parser is not None:
+            payload["response"]["tool_parser"] = event.tool_parser
+            payload["response"]["tool_parse_failures"] = event.tool_parse_failures
     elif isinstance(event, ChatCompletionDelta):
         payload = {
             "type": "chat_completion_delta",
@@ -597,6 +684,13 @@ def encode_event(
                 "delta": event.delta,
             },
         }
+        if event.reasoning is not None:
+            payload["delta"]["reasoning"] = event.reasoning
+        if event.tool_calls:
+            payload["delta"]["tool_calls"] = [
+                {"index": item.index, **_encode_tool_call(item.call)}
+                for item in event.tool_calls
+            ]
     elif isinstance(event, WorkerCommandError):
         payload = {
             "type": "error",
@@ -664,12 +758,21 @@ def decode_event(
             vision_feature_cache_bytes=response.get("vision_feature_cache_bytes"),
             vision_encoder_latency_ms=response.get("vision_encoder_latency_ms"),
             embedding_latency_ms=response.get("embedding_latency_ms"),
+            reasoning=response.get("reasoning"),
+            tool_calls=_decode_tool_calls(response.get("tool_calls")),
+            tool_parser=response.get("tool_parser"),
+            tool_parse_failures=response.get("tool_parse_failures"),
         )
     if payload.get("type") == "chat_completion_delta":
         delta = payload["delta"]
         return ChatCompletionDelta(
             request_id=delta["request_id"],
             delta=delta["delta"],
+            reasoning=delta.get("reasoning"),
+            tool_calls=tuple(
+                ToolCallDelta(index=item["index"], call=_decode_tool_call(item))
+                for item in delta.get("tool_calls") or ()
+            ),
         )
     if payload.get("type") == "error":
         return WorkerCommandError(

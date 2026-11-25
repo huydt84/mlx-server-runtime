@@ -28,6 +28,9 @@ pub struct WorkerConfig {
     pub vlm_model: Option<String>,
     /// Unix socket path used for bootstrap IPC.
     pub ipc_path: String,
+    /// Tool-call format of the text model: `auto`, `none`, or a parser name.
+    /// The worker owns the names and refuses to start on an unknown one.
+    pub tool_call_parser: String,
 }
 
 /// Supported worker backends.
@@ -210,6 +213,7 @@ impl Default for RuntimeConfig {
                 model: "mlx-community/Qwen2.5-7B-Instruct-4bit".to_string(),
                 vlm_model: None,
                 ipc_path: "/tmp/mlx-runtime.sock".to_string(),
+                tool_call_parser: "auto".to_string(),
             },
             generation: GenerationConfig {
                 temperature: 0.7,
@@ -304,6 +308,9 @@ impl RuntimeConfig {
                 }
                 ("worker", "ipc_path", Value::String(ipc_path)) => {
                     config.worker.ipc_path = ipc_path
+                }
+                ("worker", "tool_call_parser", Value::String(parser)) => {
+                    config.worker.tool_call_parser = parser
                 }
                 ("generation", "temperature", Value::Float(temperature)) => {
                     config.generation.temperature = temperature
@@ -432,6 +439,11 @@ impl RuntimeConfig {
             self.worker.model,
             self.worker.vlm_model.as_deref().unwrap_or("<none>"),
             self.worker.ipc_path
+        );
+        let _ = writeln!(
+            rendered,
+            "tool_calling parser={}",
+            self.worker.tool_call_parser
         );
         let _ = writeln!(
             rendered,
@@ -639,6 +651,7 @@ mod tests {
             model = "test-model"
             vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
             ipc_path = "/tmp/test.sock"
+            tool_call_parser = "none"
 
             [generation]
             temperature = 0.1
@@ -674,6 +687,7 @@ mod tests {
             Some("mlx-community/Qwen3-VL-2B-Instruct-4bit".to_string())
         );
         assert_eq!(config.worker.ipc_path, "/tmp/test.sock");
+        assert_eq!(config.worker.tool_call_parser, "none");
         assert_eq!(config.generation.temperature, 0.1);
         assert_eq!(config.generation.top_p, 0.8);
         assert_eq!(config.generation.max_tokens, 42);
@@ -695,6 +709,7 @@ mod tests {
         config.worker.model = "native-model".to_string();
         config.worker.vlm_model = Some("vlm-model".to_string());
         config.worker.ipc_path = "/tmp/native.sock".to_string();
+        config.worker.tool_call_parser = "pythonic".to_string();
 
         let rendered = config.startup_log("/tmp/runtime.toml");
 
@@ -703,6 +718,7 @@ mod tests {
         assert!(rendered.contains("model=native-model"));
         assert!(rendered.contains("vlm_model=vlm-model"));
         assert!(rendered.contains("ipc_path=/tmp/native.sock"));
+        assert!(rendered.contains("tool_calling parser=pythonic"));
     }
 
     #[test]

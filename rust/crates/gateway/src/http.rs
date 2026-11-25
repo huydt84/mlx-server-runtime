@@ -4,10 +4,10 @@ use crate::openai::{ChatCompletionHttpRequest, ChatCompletionHttpResponse};
 use crate::supervisor::RuntimeState;
 use crate::telemetry::RequestTracker;
 use mlx_runtime_protocol::{
-    BenchmarkResetState, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ContentPart,
-    MessageContent, ModelState, ModelStatus,
+    BenchmarkResetState, ChatCompletionDelta, ChatCompletionRequest, ChatCompletionResponse,
+    ChatMessage, ContentPart, MessageContent, MessageRole, ModelState, ModelStatus,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -29,7 +29,7 @@ pub trait ChatCompletionService: Send + Sync {
     fn stream(
         &self,
         request: ChatCompletionRequest,
-        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         let _ = on_delta;
         self.complete(request)
@@ -63,7 +63,7 @@ impl<T: ChatCompletionService + ?Sized> ChatCompletionService for Arc<T> {
     fn stream(
         &self,
         request: ChatCompletionRequest,
-        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         (**self).stream(request, on_delta)
     }
@@ -92,7 +92,7 @@ impl ChatCompletionService for crate::ipc::WorkerClient {
     fn stream(
         &self,
         request: ChatCompletionRequest,
-        on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+        on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         self.stream_chat(request, on_delta)
     }
@@ -912,6 +912,11 @@ fn handle_chat_completion(
         Ok(request) => request,
         Err(message) => return json_error_response("400 Bad Request", "INVALID_REQUEST", &message),
     };
+    if is_vlm {
+        if let Err(err) = reject_vlm_tools(&worker_request) {
+            return gateway_error_response(&err);
+        }
+    }
 
     let queue_started_at = Instant::now();
     let _permit = match state.admission.acquire_until(disconnected.as_deref()) {
@@ -1152,6 +1157,17 @@ fn stream_chat_completion_with_disconnect<W: Write>(
             );
         }
     };
+    if is_vlm {
+        if let Err(err) = reject_vlm_tools(&worker_request) {
+            let response = gateway_error_response(&err);
+            return write_response(
+                writer,
+                &response.status,
+                response.content_type,
+                &response.body,
+            );
+        }
+    }
 
     let queue_started_at = Instant::now();
     let _permit = match state.admission.acquire_until(disconnected.as_deref()) {
@@ -1237,7 +1253,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
         DisconnectCancellation::start(disconnected.clone(), backend.clone(), request_id.clone());
     let disconnect_on_write = disconnected.clone();
 
-    let mut on_delta = |delta: String| -> Result<(), GatewayError> {
+    let mut on_delta = |delta: ChatCompletionDelta| -> Result<(), GatewayError> {
         request_tracker.record_first_delta();
         let event = json!({
             "id": format!("chatcmpl-{}", request_id),
@@ -1246,10 +1262,7 @@ fn stream_chat_completion_with_disconnect<W: Write>(
             "model": model,
             "choices": [{
                 "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": delta,
-                },
+                "delta": chunk_delta(&delta),
                 "finish_reason": null,
             }],
         });
@@ -1397,6 +1410,38 @@ fn stream_chat_completion_with_disconnect<W: Write>(
     Ok(())
 }
 
+/// Renders the `delta` object of one streamed chunk.
+fn chunk_delta(delta: &ChatCompletionDelta) -> Value {
+    let mut payload = json!({"role": "assistant"});
+    if let Some(reasoning) = &delta.reasoning {
+        payload["reasoning_content"] = json!(reasoning);
+    }
+    if !delta.tool_calls.is_empty() {
+        payload["tool_calls"] = json!(delta.tool_calls);
+    }
+    let text_only = delta.reasoning.is_none() && delta.tool_calls.is_empty();
+    if text_only || !delta.delta.is_empty() {
+        payload["content"] = json!(delta.delta);
+    }
+    payload
+}
+
+/// Rejects tool use in a request to the VLM, which has no tool support.
+fn reject_vlm_tools(request: &ChatCompletionRequest) -> Result<(), GatewayError> {
+    let uses_tools = request.tools.is_some()
+        || request
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Tool || !message.tool_calls.is_empty());
+    if uses_tools {
+        return Err(GatewayError::ToolsNotSupported(format!(
+            "model '{}' does not support tool calling: tools are available only with text models",
+            request.model
+        )));
+    }
+    Ok(())
+}
+
 fn record_gateway_queue_wait(runtime: &RuntimeState, is_vlm: bool, queue_time_ms: u64) {
     runtime.metrics.set_labeled_gauge(
         "mlx_latency_by_backend_ms",
@@ -1428,6 +1473,9 @@ fn gateway_error_response(err: &GatewayError) -> HttpResponse {
     match err {
         GatewayError::InvalidRequest(message) => {
             json_error_response("400 Bad Request", "INVALID_REQUEST", message)
+        }
+        GatewayError::ToolsNotSupported(message) => {
+            json_error_response("400 Bad Request", "TOOLS_NOT_SUPPORTED", message)
         }
         GatewayError::WorkerStartup(message) => {
             json_error_response("503 Service Unavailable", "WORKER_UNAVAILABLE", message)
@@ -1704,8 +1752,8 @@ mod tests {
     use crate::supervisor::RuntimeState;
     use crate::telemetry::MetricsRegistry;
     use mlx_runtime_protocol::{
-        ChatMessage, ContentPart, ImageUrl, MessageContent, MessageRole, ModelLoadProgress,
-        ModelState, ModelStatus,
+        ChatMessage, ContentPart, FunctionCall, ImageUrl, MessageContent, MessageRole,
+        ModelLoadProgress, ModelState, ModelStatus, ToolCall, ToolCallDelta, ToolKind,
     };
     use std::io::Cursor;
     use std::net::TcpStream;
@@ -2409,6 +2457,13 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn text_delta(text: &str) -> ChatCompletionDelta {
+        ChatCompletionDelta {
+            delta: text.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[derive(Default)]
     struct FakeService {
         response: Mutex<Option<ChatCompletionResponse>>,
@@ -2438,11 +2493,11 @@ mod tests {
         fn stream(
             &self,
             request: ChatCompletionRequest,
-            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+            on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
         ) -> Result<ChatCompletionResponse, GatewayError> {
             let response = self.complete(request.clone())?;
-            on_delta("hel".to_string())?;
-            on_delta("lo".to_string())?;
+            on_delta(text_delta("hel"))?;
+            on_delta(text_delta("lo"))?;
             Ok(ChatCompletionResponse {
                 request_id: request.request_id,
                 model: response.model,
@@ -2491,10 +2546,10 @@ mod tests {
         fn stream(
             &self,
             request: ChatCompletionRequest,
-            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+            on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
         ) -> Result<ChatCompletionResponse, GatewayError> {
-            on_delta("hel".to_string())?;
-            on_delta("lo".to_string())?;
+            on_delta(text_delta("hel"))?;
+            on_delta(text_delta("lo"))?;
             Ok(ChatCompletionResponse {
                 request_id: request.request_id,
                 model: request.model,
@@ -2529,7 +2584,7 @@ mod tests {
         fn stream(
             &self,
             _request: ChatCompletionRequest,
-            _on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+            _on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
         ) -> Result<ChatCompletionResponse, GatewayError> {
             Err(GatewayError::InvalidRequest("prompt too long".to_string()))
         }
@@ -2596,7 +2651,7 @@ mod tests {
         fn stream(
             &self,
             _request: ChatCompletionRequest,
-            _on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+            _on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
         ) -> Result<ChatCompletionResponse, GatewayError> {
             while !self.cancelled.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(10));
@@ -2642,10 +2697,10 @@ mod tests {
         fn stream(
             &self,
             request: ChatCompletionRequest,
-            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+            on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
         ) -> Result<ChatCompletionResponse, GatewayError> {
-            on_delta("A".to_string())?;
-            on_delta("B".to_string())?;
+            on_delta(text_delta("A"))?;
+            on_delta(text_delta("B"))?;
             while !self.cancelled.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -2695,10 +2750,7 @@ mod tests {
 
     #[test]
     fn inspect_vlm_messages_detects_and_counts_image_parts() {
-        let text_only = vec![ChatMessage {
-            role: MessageRole::User,
-            content: "hello".into(),
-        }];
+        let text_only = vec![ChatMessage::new(MessageRole::User, "hello")];
         assert_eq!(inspect_vlm_messages(&text_only), Ok((false, 0)));
 
         let image = |url: &str| ContentPart::ImageUrl {
@@ -2707,16 +2759,16 @@ mod tests {
                 detail: None,
             },
         };
-        let with_images = vec![ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![
+        let with_images = vec![ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "compare".to_string(),
                 },
                 image("https://example.com/a.jpg"),
                 image("https://example.com/b.jpg"),
             ]),
-        }];
+        )];
         assert_eq!(inspect_vlm_messages(&with_images), Ok((true, 2)));
     }
 
@@ -3125,15 +3177,15 @@ mod tests {
     #[test]
     fn validate_image_urls_rejects_data_uri() {
         // data: URIs are unsupported image sources.
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+        let result = inspect_vlm_messages(&[ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "data:image/png;base64,abc123".to_string(),
                     detail: None,
                 },
             }]),
-        }]);
+        )]);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("unsupported image URL scheme"));
@@ -3142,43 +3194,43 @@ mod tests {
 
     #[test]
     fn validate_image_urls_accepts_loopback_http_scheme() {
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+        let result = inspect_vlm_messages(&[ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "http://127.0.0.1:8000/img.jpg".to_string(),
                     detail: None,
                 },
             }]),
-        }]);
+        )]);
         assert!(result.is_ok());
     }
 
     #[test]
     fn validate_image_urls_accepts_ipv6_loopback_http_scheme() {
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+        let result = inspect_vlm_messages(&[ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "http://[::1]:8000/img.jpg".to_string(),
                     detail: None,
                 },
             }]),
-        }]);
+        )]);
         assert!(result.is_ok());
     }
 
     #[test]
     fn validate_image_urls_rejects_remote_http_scheme() {
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+        let result = inspect_vlm_messages(&[ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "http://example.com/img.jpg".to_string(),
                     detail: None,
                 },
             }]),
-        }]);
+        )]);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("localhost, 127.0.0.1, or ::1"));
@@ -3192,30 +3244,30 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("vlm_local_{unique}.ppm"));
         std::fs::write(&path, "P3\n1 1\n255\n255 0 0\n").unwrap();
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+        let result = inspect_vlm_messages(&[ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: path.to_string_lossy().into_owned(),
                     detail: None,
                 },
             }]),
-        }]);
+        )]);
         assert!(result.is_ok());
     }
 
     #[test]
     fn validate_image_urls_rejects_long_url() {
         let long_url = "https://example.com/".to_string() + &"x".repeat(4096);
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+        let result = inspect_vlm_messages(&[ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: long_url,
                     detail: None,
                 },
             }]),
-        }]);
+        )]);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -3224,24 +3276,21 @@ mod tests {
 
     #[test]
     fn validate_image_urls_accepts_https_scheme() {
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+        let result = inspect_vlm_messages(&[ChatMessage::new(
+            MessageRole::User,
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "https://example.com/img.jpg".to_string(),
                     detail: None,
                 },
             }]),
-        }]);
+        )]);
         assert!(result.is_ok());
     }
 
     #[test]
     fn validate_image_urls_accepts_text_only() {
-        let result = inspect_vlm_messages(&[ChatMessage {
-            role: MessageRole::User,
-            content: "just text".into(),
-        }]);
+        let result = inspect_vlm_messages(&[ChatMessage::new(MessageRole::User, "just text")]);
         assert!(result.is_ok());
     }
 
@@ -3949,10 +3998,10 @@ mod tests {
         fn stream(
             &self,
             request: ChatCompletionRequest,
-            on_delta: &mut dyn FnMut(String) -> Result<(), GatewayError>,
+            on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
         ) -> Result<ChatCompletionResponse, GatewayError> {
             // Emit a delta to confirm streaming started before cancelled finish.
-            on_delta("par".to_string())?;
+            on_delta(text_delta("par"))?;
             Ok(ChatCompletionResponse {
                 request_id: request.request_id,
                 model: request.model,
@@ -4144,5 +4193,249 @@ mod tests {
         server_thread.join().unwrap();
 
         assert!(response.starts_with("HTTP/1.1 404"), "{response:?}");
+    }
+
+    struct ToolService {
+        received: Mutex<Vec<ChatCompletionRequest>>,
+        deltas: Vec<ChatCompletionDelta>,
+        result: fn() -> Result<ChatCompletionResponse, GatewayError>,
+    }
+
+    impl ToolService {
+        fn new(
+            deltas: Vec<ChatCompletionDelta>,
+            result: fn() -> Result<ChatCompletionResponse, GatewayError>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                received: Mutex::new(Vec::new()),
+                deltas,
+                result,
+            })
+        }
+    }
+
+    impl ChatCompletionService for ToolService {
+        fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            self.received.lock().unwrap().push(request);
+            (self.result)()
+        }
+
+        fn stream(
+            &self,
+            request: ChatCompletionRequest,
+            on_delta: &mut dyn FnMut(ChatCompletionDelta) -> Result<(), GatewayError>,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            self.received.lock().unwrap().push(request);
+            for delta in &self.deltas {
+                on_delta(delta.clone())?;
+            }
+            (self.result)()
+        }
+    }
+
+    fn weather_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: ToolKind::Function,
+            function: FunctionCall {
+                name: "weather".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    fn tool_response() -> Result<ChatCompletionResponse, GatewayError> {
+        Ok(ChatCompletionResponse {
+            request_id: "req-1".to_string(),
+            model: "test-model".to_string(),
+            finish_reason: "tool_calls".to_string(),
+            tool_calls: vec![weather_call("call_1")],
+            ..Default::default()
+        })
+    }
+
+    fn tools_not_supported() -> Result<ChatCompletionResponse, GatewayError> {
+        Err(GatewayError::ToolsNotSupported(
+            "model 'test-model' does not support tool calling".to_string(),
+        ))
+    }
+
+    fn tool_request(model: &str, stream: bool) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "stream": stream,
+        }))
+        .unwrap()
+    }
+
+    fn stream_body(state: &AppState, body: &[u8]) -> String {
+        let mut buffer = Cursor::new(Vec::new());
+        stream_chat_completion_with_disconnect(&mut buffer, body, state, None).unwrap();
+        String::from_utf8(buffer.into_inner()).unwrap()
+    }
+
+    fn sse_events(body: &str) -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn chat_completion_returns_tool_calls() {
+        let service = ToolService::new(Vec::new(), tool_response);
+        let state = test_state(ModelState::Ready, service.clone());
+
+        let response = response_for_request(
+            "POST /v1/chat/completions HTTP/1.1\r\n",
+            &tool_request("test-model", false),
+            &state,
+        );
+
+        assert_eq!(response.status, "200 OK");
+        let body: Value = serde_json::from_str(&response.body).unwrap();
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert_eq!(choice["message"]["content"], Value::Null);
+        assert_eq!(
+            choice["message"]["tool_calls"],
+            json!([weather_call("call_1")])
+        );
+        assert!(service.received.lock().unwrap()[0].tools.is_some());
+    }
+
+    #[test]
+    fn streaming_chat_completion_writes_tool_call_chunks() {
+        let service = ToolService::new(
+            vec![
+                ChatCompletionDelta {
+                    reasoning: Some("why".to_string()),
+                    ..Default::default()
+                },
+                text_delta("Checking."),
+                ChatCompletionDelta {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        call: weather_call("call_1"),
+                    }],
+                    ..Default::default()
+                },
+            ],
+            tool_response,
+        );
+        let state = test_state(ModelState::Ready, service);
+
+        let body = stream_body(&state, &tool_request("test-model", true));
+
+        let events = sse_events(&body);
+        let deltas: Vec<&Value> = events
+            .iter()
+            .map(|event| &event["choices"][0]["delta"])
+            .collect();
+        assert_eq!(
+            deltas,
+            [
+                &json!({"role": "assistant", "reasoning_content": "why"}),
+                &json!({"role": "assistant", "content": "Checking."}),
+                &json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": "{}"},
+                    }],
+                }),
+                &json!({}),
+            ]
+        );
+        assert_eq!(events[3]["choices"][0]["finish_reason"], "tool_calls");
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn model_without_tool_support_returns_its_own_error_code() {
+        let state = test_state(
+            ModelState::Ready,
+            ToolService::new(Vec::new(), tools_not_supported),
+        );
+
+        let response = response_for_request(
+            "POST /v1/chat/completions HTTP/1.1\r\n",
+            &tool_request("test-model", false),
+            &state,
+        );
+        let streamed = stream_body(&state, &tool_request("test-model", true));
+
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"TOOLS_NOT_SUPPORTED\""));
+        assert!(response.body.contains("test-model"));
+        assert!(streamed.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(streamed.contains("\"TOOLS_NOT_SUPPORTED\""));
+    }
+
+    #[test]
+    fn vlm_requests_cannot_use_tools() {
+        let state = vlm_ready_state("vlm-model");
+        let history = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [{"role": "tool", "tool_call_id": "call_1", "content": "x"}],
+        }))
+        .unwrap();
+
+        for body in [tool_request("vlm-model", false), history] {
+            let response =
+                response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+            let streamed = stream_body(&state, &body);
+
+            assert_eq!(response.status, "400 Bad Request");
+            assert!(response.body.contains("\"TOOLS_NOT_SUPPORTED\""));
+            assert!(response.body.contains("vlm-model"));
+            assert!(streamed.starts_with("HTTP/1.1 400 Bad Request"));
+            assert!(streamed.contains("\"TOOLS_NOT_SUPPORTED\""));
+        }
+    }
+
+    #[test]
+    fn vlm_request_with_tool_choice_none_succeeds() {
+        let state = vlm_ready_state("vlm-model");
+        let body = serde_json::to_vec(&json!({
+            "model": "vlm-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "none",
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+
+        assert_eq!(response.status, "200 OK");
+    }
+
+    #[test]
+    fn unsupported_tool_choice_returns_invalid_request() {
+        let service = ToolService::new(Vec::new(), tool_response);
+        let state = test_state(ModelState::Ready, service.clone());
+        let body = serde_json::to_vec(&json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "weather"}}],
+            "tool_choice": "required",
+        }))
+        .unwrap();
+
+        let response =
+            response_for_request("POST /v1/chat/completions HTTP/1.1\r\n", &body, &state);
+
+        assert_eq!(response.status, "400 Bad Request");
+        assert!(response.body.contains("\"INVALID_REQUEST\""));
+        assert!(service.received.lock().unwrap().is_empty());
     }
 }

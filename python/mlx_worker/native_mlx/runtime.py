@@ -8,12 +8,19 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from ..chat_template import render_prompt_tokens
 from ..ipc import (
     ChatCompletionDelta,
     ChatCompletionRequest,
     ChatCompletionResponse,
     SchedulerMetricsEvent,
     WorkerCommandError,
+)
+from ..tool_calling import (
+    OutputDelta,
+    ToolCallFormat,
+    ToolOutputParser,
+    ToolsNotSupportedError,
 )
 from .interfaces import (
     RuntimeEvent,
@@ -89,6 +96,7 @@ class _RuntimeState:
     scheduler_queue_wait_ms: int = 0
     cancellation_latency_ms: int | None = None
     cached_tokens: int = 0
+    tool_output: ToolOutputParser | None = None
 
 
 class NativeRuntime:
@@ -105,6 +113,7 @@ class NativeRuntime:
         profiler: Any | None = None,
         max_total_tokens: int | None = None,
         warmup_prompt_lengths: tuple[int, ...] = (_WARMUP_MIN_PROMPT_TOKENS,),
+        tool_format: ToolCallFormat | None = None,
     ) -> None:
         self._scheduler = scheduler
         self._max_total_tokens = max_total_tokens
@@ -114,6 +123,7 @@ class NativeRuntime:
         self._eos_token_ids = eos_token_ids
         self._profiler = profiler
         self._warmup_prompt_lengths = warmup_prompt_lengths
+        self._tool_format = tool_format
         self._warming_up = False
         self._requests: dict[str, _RuntimeState] = {}
         self.last_warmup_latency_ms = 0
@@ -248,6 +258,7 @@ class NativeRuntime:
             enqueued_at=time.perf_counter(),
             completion_token_ids=[],
             detokenizer=_new_streaming_detokenizer(self._prompt_tokenizer),
+            tool_output=self._new_tool_output(request, prompt),
         )
         self._requests[request.request_id] = state
         if self._profiler is not None and not self._warming_up:
@@ -557,7 +568,7 @@ class NativeRuntime:
     ) -> None:
         state.completion_token_ids.append(token_id)
         if token_id in self._eos_token_ids:
-            self._finish(state, "stop", output)
+            self._finish(state, "stop", output, turn_ended=True)
             return
         detokenize_started_ns = time.perf_counter_ns()
         if state.detokenizer is not None:
@@ -583,69 +594,84 @@ class NativeRuntime:
                 phase="decode",
                 completion_tokens=len(state.completion_token_ids),
             )
-        if emitted and state.request.stream:
-            stream_started_ns = time.perf_counter_ns()
-            output.append(
-                RuntimeEvent(
-                    kind="delta",
-                    payload=ChatCompletionDelta(
-                        request_id=state.request.request_id,
-                        delta=emitted,
-                    ),
-                )
+        stream_started_ns = time.perf_counter_ns()
+        delta_sent = bool(emitted) and self._emit_text(state, emitted, output)
+        if delta_sent and self._profiler is not None:
+            self._profiler.record(
+                state.request.request_id,
+                "streaming",
+                "emit_delta",
+                started_ns=stream_started_ns,
+                duration_us=(time.perf_counter_ns() - stream_started_ns) // 1_000,
+                phase="decode",
+                details={"chunk_chars": len(emitted)},
             )
-            if self._profiler is not None:
-                self._profiler.record(
-                    state.request.request_id,
-                    "streaming",
-                    "emit_delta",
-                    started_ns=stream_started_ns,
-                    duration_us=(time.perf_counter_ns() - stream_started_ns) // 1_000,
-                    phase="decode",
-                    details={"chunk_chars": len(emitted)},
-                )
         if emitted and state.ttft_ms is None:
             state.ttft_ms = max(
                 1, int((time.perf_counter() - state.enqueued_at) * 1000)
             )
-        if stop_hit:
+        if state.tool_output is not None and state.tool_output.done:
+            self._finish(state, "tool_calls", output)
+        elif stop_hit:
             self._finish(state, "stop", output)
         elif len(state.completion_token_ids) >= state.request.max_tokens:
             self._finish(state, "length", output)
+
+    def _emit_text(
+        self, state: _RuntimeState, text: str, output: list[RuntimeEvent]
+    ) -> bool:
+        """Route generated text to the client; return whether a delta was sent."""
+
+        if state.tool_output is not None:
+            return self._emit_delta(state, state.tool_output.push(text), output)
+        return self._emit_delta(state, OutputDelta(content=text), output)
+
+    @staticmethod
+    def _emit_delta(
+        state: _RuntimeState, delta: OutputDelta, output: list[RuntimeEvent]
+    ) -> bool:
+        if not delta or not state.request.stream:
+            return False
+        output.append(
+            RuntimeEvent(
+                kind="delta",
+                payload=ChatCompletionDelta(
+                    request_id=state.request.request_id,
+                    delta=delta.content,
+                    reasoning=delta.reasoning or None,
+                    tool_calls=delta.tool_calls,
+                ),
+            )
+        )
+        return True
 
     def _finish(
         self,
         state: _RuntimeState,
         reason: str,
         output: list[RuntimeEvent],
+        *,
+        turn_ended: bool = False,
     ) -> None:
-        final_emitted = ""
-        if reason != "cancelled" and state.detokenizer is not None:
-            state.detokenizer.finalize()
-            final_segment = str(state.detokenizer.last_segment)
-            if final_segment:
-                final_emitted, _ = state.stop.push(final_segment)
-        if final_emitted and state.request.stream:
-            output.append(
-                RuntimeEvent(
-                    kind="delta",
-                    payload=ChatCompletionDelta(
-                        request_id=state.request.request_id,
-                        delta=final_emitted,
-                    ),
+        response_fields: dict[str, Any] = {}
+        if reason != "cancelled":
+            if state.detokenizer is not None:
+                state.detokenizer.finalize()
+                final_segment = str(state.detokenizer.last_segment)
+                if final_segment:
+                    final_emitted, stop_hit = state.stop.push(final_segment)
+                    turn_ended = turn_ended and not stop_hit
+                    self._emit_text(state, final_emitted, output)
+            self._emit_text(state, state.stop.finish(), output)
+        if state.tool_output is not None:
+            if reason != "cancelled":
+                self._emit_delta(
+                    state, state.tool_output.finish(turn_ended=turn_ended), output
                 )
-            )
-        trailing = "" if reason == "cancelled" else state.stop.finish()
-        if trailing and state.request.stream:
-            output.append(
-                RuntimeEvent(
-                    kind="delta",
-                    payload=ChatCompletionDelta(
-                        request_id=state.request.request_id,
-                        delta=trailing,
-                    ),
-                )
-            )
+            reason = state.tool_output.finish_reason(reason)
+            response_fields = state.tool_output.response_fields()
+        else:
+            response_fields["text"] = state.stop.text()
         request_id = state.request.request_id
         if self._profiler is not None:
             self._profiler.end_metal_capture(request_id)
@@ -668,7 +694,6 @@ class NativeRuntime:
                 payload=ChatCompletionResponse(
                     request_id=request_id,
                     model=self._model_ref,
-                    text=state.stop.text(),
                     finish_reason=reason,
                     prompt_tokens=len(state.prompt_token_ids),
                     completion_tokens=len(state.completion_token_ids),
@@ -693,6 +718,7 @@ class NativeRuntime:
                     ),
                     worker_cancellation_count=self._cancellation_count,
                     worker_error_count=self._error_count,
+                    **response_fields,
                 ),
             )
         )
@@ -749,19 +775,18 @@ class NativeRuntime:
             self._profiler.write_artifacts()
 
     def _build_prompt(self, request: ChatCompletionRequest) -> tuple[int, ...]:
-        messages: list[dict[str, str]] = []
-        for message in request.messages:
-            if not isinstance(message.content, str):
-                raise ValueError(
-                    "native-mlx text backend does not support image content"
-                )
-            messages.append({"role": message.role, "content": message.content})
-        tokens = self._prompt_tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
+        if request.tools and self._tool_format is None:
+            raise ToolsNotSupportedError(self._model_ref)
+        return tuple(render_prompt_tokens(self._prompt_tokenizer, request))
+
+    def _new_tool_output(
+        self, request: ChatCompletionRequest, prompt: tuple[int, ...]
+    ) -> ToolOutputParser | None:
+        if not request.tools or self._tool_format is None:
+            return None
+        return self._tool_format.create_parser(
+            request.tools, prompt, parallel=request.parallel_tool_calls
         )
-        return tuple(int(token) for token in tokens)
 
     def _validate(
         self,
