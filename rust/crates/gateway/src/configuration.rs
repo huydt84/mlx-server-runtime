@@ -6,6 +6,7 @@ use std::path::Path;
 pub(crate) struct CliConfigOverrides {
     pub(crate) model: Option<String>,
     pub(crate) transcription_model: Option<String>,
+    pub(crate) drafter: Option<String>,
     pub(crate) backend: Option<BackendKind>,
     pub(crate) port: Option<u16>,
     pub(crate) memory_utilization: Option<f32>,
@@ -51,6 +52,9 @@ pub(crate) fn resolve_runtime_config(
     if let Some(model) = &overrides.transcription_model {
         config.worker.transcription_model = Some(model.clone());
     }
+    if let Some(drafter) = &overrides.drafter {
+        config.worker.drafter = Some(drafter.clone());
+    }
     if let Some(backend) = overrides.backend {
         config.worker.backend = backend;
     }
@@ -69,6 +73,11 @@ pub(crate) fn resolve_runtime_config(
     if config.worker.model.trim().is_empty() {
         return Err(ConfigError::new(
             "a model is required through --model or resolved configuration",
+        ));
+    }
+    if config.worker.drafter.is_some() && config.worker.backend != BackendKind::NativeMlx {
+        return Err(ConfigError::new(
+            "a drafter requires the native-mlx backend; remove --drafter or worker.drafter",
         ));
     }
     config.worker.python = managed_python.to_string_lossy().into_owned();
@@ -131,6 +140,7 @@ mod tests {
         let overrides = CliConfigOverrides {
             model: Some("cli-model".to_string()),
             transcription_model: Some("cli-whisper".to_string()),
+            drafter: Some("cli-drafter".to_string()),
             backend: Some(BackendKind::NativeMlx),
             port: Some(8003),
             memory_utilization: Some(0.75),
@@ -152,6 +162,7 @@ mod tests {
             config.worker.transcription_model.as_deref(),
             Some("cli-whisper")
         );
+        assert_eq!(config.worker.drafter.as_deref(), Some("cli-drafter"));
         assert_eq!(config.worker.backend, BackendKind::NativeMlx);
         assert_eq!(config.server.port, 8003);
         assert_eq!(config.worker.python, "/managed/bin/python");
@@ -218,6 +229,32 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("a model is required"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drafter_with_the_v1_backend_is_an_error() {
+        let root = temp_path("config-drafter-v1");
+        let default_path = root.join("default.toml");
+        write(
+            &default_path,
+            "[worker]\nmodel = \"default-model\"\nbackend = \"v1\"\n",
+        );
+        let overrides = CliConfigOverrides {
+            drafter: Some("cli-drafter".to_string()),
+            ..CliConfigOverrides::default()
+        };
+
+        let error = resolve_runtime_config(
+            &default_path,
+            None,
+            None,
+            &overrides,
+            Path::new("/managed/bin/python"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("native-mlx backend"));
         fs::remove_dir_all(root).unwrap();
     }
 

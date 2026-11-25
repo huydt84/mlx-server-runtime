@@ -21,6 +21,7 @@ class WorkerConfig:
         backend: Backend selected by Rust startup. ``native-mlx`` is the
             default; ``v1`` serves through ``mlx-lm``.
         model: Text-only model identifier (e.g. an ``mlx-community`` hub path).
+        drafter: Optional drafter checkpoint that enables speculative decoding.
         vlm_model: Optional VLM model identifier. When ``None`` or empty,
             no VLM engine is constructed and the worker runs text-only.
         transcription_model: Optional Whisper speech-to-text model served
@@ -44,6 +45,7 @@ class WorkerConfig:
     socket_path: str
     model: str
     backend: str = "native-mlx"
+    drafter: str | None = None
     vlm_model: str | None = None
     transcription_model: str | None = None
     max_vlm_images: int = 5
@@ -84,9 +86,9 @@ def load_config() -> WorkerConfig:
     """Load the worker bootstrap configuration from environment variables.
 
     Reads ``MLX_RUNTIME_SOCKET``, ``MLX_RUNTIME_BACKEND``,
-    ``MLX_RUNTIME_MODEL``, and the optional ``MLX_RUNTIME_VLM_MODEL`` and
-    ``MLX_RUNTIME_TRANSCRIPTION_MODEL``. An empty optional model variable is
-    treated the same as unset.
+    ``MLX_RUNTIME_MODEL``, and the optional ``MLX_RUNTIME_DRAFTER``,
+    ``MLX_RUNTIME_VLM_MODEL`` and ``MLX_RUNTIME_TRANSCRIPTION_MODEL``. An empty
+    optional model variable is treated the same as unset.
     """
 
     raw_vlm = os.environ.get("MLX_RUNTIME_VLM_MODEL", "")
@@ -247,6 +249,7 @@ def load_config() -> WorkerConfig:
         model=os.environ.get(
             "MLX_RUNTIME_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit"
         ),
+        drafter=os.environ.get("MLX_RUNTIME_DRAFTER", "").strip() or None,
         vlm_model=vlm_model,
         transcription_model=transcription_model,
         max_vlm_images=max_vlm_images,

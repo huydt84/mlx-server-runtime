@@ -273,12 +273,14 @@ def create_native_worker(
         execution_mode=getattr(config, "native_execution_mode", "overlap"),
         prefix_cache_strategy=config.native_prefix_cache_strategy,
         graph_profile=config.native_graph_profile,
+        drafter=getattr(config, "drafter", None),
     )
     artifacts.executor.load(artifacts.options)
     if artifacts.kv_memory is not None:
         print(
             f"native-mlx memory {artifacts.kv_memory.describe()} "
-            f"max_total_tokens_per_request={artifacts.max_total_tokens}",
+            f"max_total_tokens_per_request={artifacts.max_total_tokens} "
+            f"drafter={getattr(config, 'drafter', None) or 'none'}",
             file=sys.stderr,
             flush=True,
         )

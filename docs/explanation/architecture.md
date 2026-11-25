@@ -76,7 +76,8 @@ executor batch preparation, and native MLX model execution. Bootstrap resolves
 one lazy architecture manifest into a frozen execution plan, so unrelated model
 families are not imported or inspected on the request path. Pure transformer
 families use the pure paged-KV/attention bundle; LFM2 selects its separate
-hybrid convolution-state bundle at startup. Shared batch packing, sampling,
+hybrid convolution-state bundle at startup, and Inkling-2-Mini its windowed
+two-pool bundle. Shared batch packing, sampling,
 diagnostics orchestration, and request lifecycle remain outside `models/`, so
 another compatible model does not require another executor or scheduler.
 

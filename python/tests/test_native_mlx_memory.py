@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import mlx.core as mx
 import pytest
 
+from mlx_worker.native_mlx.bootstrap import _loading_buffers
 from mlx_worker.native_mlx.memory import (
     KVMemoryError,
     activation_reserve_bytes,
     plan_kv_pool,
     resolve_max_total_tokens,
+    step_reserve_bytes,
     weights_nbytes,
 )
+from mlx_worker.native_mlx.registry import StepMemory
 
 GIB = 1024**3
 
@@ -155,6 +159,29 @@ def test_activation_reserve_reads_nested_text_config() -> None:
     ) == activation_reserve_bytes(
         flat, prefill_tokens=2, prefill_rows=1, buffer_cache_limit_bytes=0
     )
+
+
+def test_step_reserve_uses_the_measurements_of_a_family() -> None:
+    reserve = step_reserve_bytes(
+        StepMemory(base_bytes=GIB, bytes_per_token=1000, buffer_cache_bytes=GIB),
+        prefill_tokens=512,
+        buffer_cache_limit_bytes=77,
+    )
+
+    assert reserve == GIB + 512 * 1000 + 77
+
+
+def test_loading_keeps_no_freed_buffers() -> None:
+    before = mx.set_cache_limit(GIB)
+    try:
+        with _loading_buffers(GIB // 4):
+            assert mx.set_cache_limit(0) == 0
+        assert mx.set_cache_limit(GIB) == GIB // 4
+        with _loading_buffers(None):
+            pass
+        assert mx.set_cache_limit(GIB) == GIB
+    finally:
+        mx.set_cache_limit(before)
 
 
 def test_weights_nbytes_sums_loaded_arrays() -> None:

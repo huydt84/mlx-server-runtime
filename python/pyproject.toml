@@ -35,4 +35,4 @@ where = ["."]
 include = ["mlx_benchmark*", "mlx_worker*"]
 
 [tool.setuptools.package-data]
-"mlx_worker.native_mlx" = ["kernels/*.metal"]
+"mlx_worker.native_mlx" = ["kernels/*.metal", "kernels/LICENSE.*"]

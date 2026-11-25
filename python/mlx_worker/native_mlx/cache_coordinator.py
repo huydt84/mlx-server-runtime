@@ -92,6 +92,17 @@ class NativeCacheCoordinator:
             return None
         return int(free_page_count()), int(page_size)
 
+    def kv_window_pages(self) -> int:
+        """Return pages reserved for sliding-window layers, 0 without any."""
+
+        return int(getattr(self.backend, "num_window_pages", 0))
+
+    def kv_window_pages_for(self, tokens: int) -> int:
+        """Return the most windowed pages a request of ``tokens`` tokens holds."""
+
+        pages_for = getattr(self.backend, "window_pages_for", None)
+        return int(pages_for(tokens)) if callable(pages_for) else 0
+
     def reclaim_pages(self, pages: int) -> int:
         """Evict unpinned prefix-cache entries until ``pages`` pages are free.
 

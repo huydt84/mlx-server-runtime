@@ -277,6 +277,9 @@ def test_models_directory_has_registered_architecture_modules() -> None:
     assert sorted(path.name for path in models.glob("*.py")) == [
         "__init__.py",
         "gemma3.py",
+        "inkling2.py",
+        "inkling2_checkpoint.py",
+        "inkling2_drafter.py",
         "lfm2.py",
         "qwen2.py",
         "qwen3.py",
@@ -1470,6 +1473,44 @@ def test_scheduler_admits_requests_that_fit_together() -> None:
     assert [request.request_id for request in executor.batches[0].requests] == [
         "first",
         "second",
+    ]
+
+
+@dataclass
+class _WindowedFakeCacheCoordinator(_PagedFakeCacheCoordinator):
+    window_pages: int = 0
+
+    def kv_window_pages(self) -> int:
+        return self.window_pages
+
+    def kv_window_pages_for(self, tokens: int) -> int:
+        return min(3, -(-tokens // self.page_size))
+
+
+def test_scheduler_holds_new_requests_until_window_pages_free_up() -> None:
+    executor = _FakeExecutor()
+    coordinator = _WindowedFakeCacheCoordinator(
+        executor.lengths, total_pages=100, window_pages=5
+    )
+    scheduler = NativeContinuousScheduler(
+        executor,
+        coordinator,  # type: ignore[arg-type]
+        prefill_batch_size=4,
+        prefill_step_size=256,
+    )
+    scheduler.submit(_schedulable("first", (1, 2, 3, 4), max_tokens=8))
+    scheduler.submit(_schedulable("second", (5, 6, 7, 8), max_tokens=8))
+
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[0].requests] == ["first"]
+    assert "second" in scheduler._waiting
+
+    scheduler.finish("first")
+    scheduler.tick()
+
+    assert [request.request_id for request in executor.batches[-1].requests] == [
+        "second"
     ]
 
 

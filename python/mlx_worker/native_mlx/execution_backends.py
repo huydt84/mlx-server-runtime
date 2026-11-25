@@ -20,6 +20,8 @@ from .cache import (
     KVCacheGeometry,
     PagedKVCacheBackend,
 )
+from .windowed_attention import WindowedMetalAttentionBackend
+from .windowed_cache import WindowedPagedKVCacheBackend
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,8 @@ def _build_native_metal_paged_sdpa(
     cache_budget_bytes: int,
     cache_family: str = "kv",
 ) -> NativeExecutionBackendBundle:
+    if cache_family == "windowed":
+        return _build_windowed(geometry, page_size, cache_budget_bytes)
     backend_type = (
         HybridPagedKVCacheBackend if cache_family == "hybrid" else PagedKVCacheBackend
     )
@@ -75,6 +79,28 @@ def _build_native_metal_paged_sdpa(
         backend_id=DEFAULT_NATIVE_EXECUTION_BACKEND,
         cache_backend=cache_backend,
         attention_backend=attention_type(),
+    )
+    bundle.validate()
+    return bundle
+
+
+def _build_windowed(
+    geometry: KVCacheGeometry, page_size: int, cache_budget_bytes: int
+) -> NativeExecutionBackendBundle:
+    bundle = NativeExecutionBackendBundle(
+        backend_id=DEFAULT_NATIVE_EXECUTION_BACKEND,
+        cache_backend=WindowedPagedKVCacheBackend(
+            num_layers=geometry.num_layers,
+            num_kv_heads=geometry.num_kv_heads,
+            head_dim=geometry.head_dim,
+            page_size=page_size,
+            budget_bytes=cache_budget_bytes,
+            window_layers=frozenset(geometry.window_layer_indices),
+            window_size=geometry.window_size,
+            max_append_tokens=geometry.max_append_tokens,
+            dtype=geometry.dtype,
+        ),
+        attention_backend=WindowedMetalAttentionBackend(),
     )
     bundle.validate()
     return bundle

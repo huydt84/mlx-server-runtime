@@ -52,8 +52,10 @@ Use the architecture module that matches the checkpoint's exact
 
 - `Qwen2ForCausalLM` — `mlx-community/Qwen2.5-7B-Instruct-4bit`;
 - `Qwen3ForCausalLM` — `mlx-community/Qwen3-4B-Instruct-2507-4bit`;
-- `Gemma3ForCausalLM` — `mlx-community/gemma-3-270m-it-qat-8bit`; and
-- `Lfm2MoeForCausalLM` — `mlx-community/LFM2.5-8B-A1B-MLX-4bit`.
+- `Gemma3ForCausalLM` — `mlx-community/gemma-3-270m-it-qat-8bit`;
+- `Lfm2MoeForCausalLM` — `mlx-community/LFM2.5-8B-A1B-MLX-4bit`; and
+- `Inkling2LoopForConditionalGeneration` — LookAtMyQuant packs such as
+  `shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB`.
 
 LFM2's hybrid convolution state is request-local, so native prefix-cache reuse
 is deliberately disabled for that family until state snapshots are supported.

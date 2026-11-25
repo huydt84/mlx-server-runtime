@@ -16,7 +16,10 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .registry import StepMemory
 
 _GIB = 1024**3
 _ACTIVATION_SLACK_BYTES = 256 * 1024 * 1024
@@ -157,6 +160,24 @@ def activation_reserve_bytes(
         + max(0, prefill_tokens) * per_token
         + logits
         + _ACTIVATION_SLACK_BYTES
+    )
+
+
+def step_reserve_bytes(
+    step_memory: StepMemory, *, prefill_tokens: int, buffer_cache_limit_bytes: int
+) -> int:
+    """Return memory outside the KV pool for a family with measured steps.
+
+    Args:
+        step_memory: The family's measurements.
+        prefill_tokens: Tokens in the largest prefill step.
+        buffer_cache_limit_bytes: Freed buffers MLX may retain.
+    """
+
+    return (
+        step_memory.base_bytes
+        + max(0, prefill_tokens) * step_memory.bytes_per_token
+        + max(0, buffer_cache_limit_bytes)
     )
 
 

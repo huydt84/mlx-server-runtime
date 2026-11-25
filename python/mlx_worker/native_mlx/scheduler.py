@@ -6,7 +6,7 @@ import math
 import time
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Protocol
 
@@ -355,6 +355,8 @@ class NativeContinuousScheduler:
         other chained step is enqueued at the start of the next tick, after
         N's events are returned: enqueueing blocks while a long step fills
         Metal's command queue, which would otherwise hold back N's tokens.
+        A step that verifies proposed tokens needs N's result, so it waits for
+        the next tick for the same reason.
         """
 
         if self._in_flight is not None:
@@ -404,7 +406,7 @@ class NativeContinuousScheduler:
             self._reap_cancelled(events, protected_request_ids=protected)
             self._reap_finished(protected_request_ids=protected)
 
-        if not chained:
+        if not chained and not (resolved is not None and self._drafts_next()):
             select_started = time.perf_counter()
             timings = self._new_timings()
             selected = self._select_work(timings)
@@ -534,9 +536,12 @@ class NativeContinuousScheduler:
         decode selection lists first the rows whose input token is ``step``'s
         unresolved sample, and returns how many there are. Returns ``None``
         when the next step depends on ``step``'s resolved state: another
-        prefill chunk after a prefill step.
+        prefill chunk after a prefill step, or a step that verifies proposed
+        tokens or follows one.
         """
 
+        if any(item.request.draft_tokens for item in step.selected):
+            return None
         in_step = {item.request.request_id for item in step.selected}
         continuing = [item for item in step.selected if self._feeds_next_decode(item)]
         resolved = [
@@ -553,6 +558,12 @@ class NativeContinuousScheduler:
                 )
                 return (selected, 0) if selected else None
         if not has_decode:
+            return None
+        if (
+            len(continuing) == 1
+            and not resolved
+            and self._draft_tokens(continuing[0].state, unresolved=1)
+        ):
             return None
         self._last_step_prefilled = False
         selected = [
@@ -688,6 +699,8 @@ class NativeContinuousScheduler:
         prefill_states = self._prefill_candidates()
         if decode_work and (not prefill_states or self._last_step_prefilled):
             self._last_step_prefilled = False
+            if len(decode_work) == 1 and not prefill_states:
+                return [self._with_draft(decode_work[0])]
             return decode_work
         selected = self._select_prefill(
             prefill_states, decode_waiting=bool(decode_work), timings=timings
@@ -711,6 +724,38 @@ class NativeContinuousScheduler:
             ),
         )
 
+    def _drafts_next(self) -> bool:
+        """Return whether the next step verifies proposed tokens."""
+
+        ready = [state for state in self._running.values() if self._decode_ready(state)]
+        return (
+            len(ready) == 1
+            and not self._prefill_candidates()
+            and self._draft_tokens(ready[0]) > 0
+        )
+
+    def _with_draft(self, work: _SelectedWork) -> _SelectedWork:
+        """Let a request that decodes alone verify proposed tokens."""
+
+        count = self._draft_tokens(work.state)
+        if not count:
+            return work
+        return replace(work, request=replace(work.request, draft_tokens=count))
+
+    def _draft_tokens(self, state: _ScheduledState, *, unresolved: int = 0) -> int:
+        """Return how many proposed tokens a request's next step verifies.
+
+        Args:
+            state: The only decoding request.
+            unresolved: Its tokens that are still being computed.
+        """
+
+        choose = getattr(self._executor, "draft_tokens", None)
+        if not callable(choose):
+            return 0
+        remaining = state.work.max_tokens - state.generated_tokens - unresolved
+        return int(choose(state.work.request_id, state.cache_handle, remaining - 1))
+
     def _select_prefill(
         self,
         prefill_states: list[_ScheduledState],
@@ -733,6 +778,7 @@ class NativeContinuousScheduler:
             timings=timings,
         )
         kv_available = self._kv_available_pages()
+        window_available = self._window_available_pages()
         admission_blocked = False
         for state in prefill_states[:prefill_limit]:
             request_id = state.work.request_id
@@ -755,12 +801,16 @@ class NativeContinuousScheduler:
                             )
                             pages += freed
                             needed = self._admission_pages(state, probe, page_size)
-                    if needed > pages and self._running:
+                    window_needed = self._window_pages(state)
+                    if self._running and (
+                        needed > pages or window_needed > window_available
+                    ):
                         state.cached_probe = probe
                         admission_blocked = True
                         self._kv_admission_waits += 1
                         continue
                     kv_available = (pages - needed, page_size)
+                    window_available -= window_needed
                 self._waiting.pop(request_id, None)
                 state.cached_probe = None
                 acquire_started = time.perf_counter()
@@ -821,6 +871,31 @@ class NativeContinuousScheduler:
                 - math.ceil(state.cache_length / page_size),
             )
         return free_pages - promised, page_size
+
+    def _window_available_pages(self) -> int:
+        """Return windowed KV pages not promised to running requests.
+
+        Only windowed cache families have them; a running request may use its
+        whole promise at any time because its window slides.
+        """
+
+        total = getattr(self._cache_coordinator, "kv_window_pages", None)
+        if not callable(total):
+            return 0
+        return int(total()) - sum(
+            self._window_pages(state)
+            for state in self._running.values()
+            if not state.cancel_requested and not state.finish_requested
+        )
+
+    def _window_pages(self, state: _ScheduledState) -> int:
+        """Return the most windowed KV pages a request holds at once."""
+
+        pages_for = getattr(self._cache_coordinator, "kv_window_pages_for", None)
+        if not callable(pages_for):
+            return 0
+        final = len(state.work.prompt_token_ids) + max(0, state.work.max_tokens)
+        return int(pages_for(final))
 
     def _reclaim_prefix_pages(self, pages: int) -> int:
         """Free ``pages`` KV pages by evicting unpinned prefix-cache entries."""
@@ -949,6 +1024,9 @@ class NativeContinuousScheduler:
                 state.finish_requested = True
                 continue
             state.cache_length = item.cache_length
+            item = self._until_terminal(item)
+            for token_id in item.accepted_token_ids:
+                self._mark_generated(state, token_id)
             if request.phase == "prefill":
                 state.prompt_cursor += len(request.token_ids)
                 if state.prompt_cursor == len(state.work.prompt_token_ids):
@@ -960,6 +1038,18 @@ class NativeContinuousScheduler:
             applied.append((selected_work, item))
         timings["scheduler_apply_ms"] += _elapsed_ms(apply_started)
         return applied
+
+    def _until_terminal(self, item: StepRequestResult) -> StepRequestResult:
+        """Drop verified tokens that follow a terminal token."""
+
+        for index, token_id in enumerate(item.accepted_token_ids):
+            if token_id in self._terminal_token_ids:
+                return replace(
+                    item,
+                    accepted_token_ids=item.accepted_token_ids[:index],
+                    next_token_id=token_id,
+                )
+        return item
 
     def _emit_step_result(
         self,
@@ -1123,21 +1213,24 @@ class NativeContinuousScheduler:
         result: StepResult,
         events: list[SchedulerEvent],
     ) -> None:
-        events.append(
-            SchedulerEvent(
-                kind="token",
-                request_id=state.work.request_id,
-                token_id=item.next_token_id,
-                cache_length=item.cache_length,
-                phase="decode",
-                metrics={
-                    "step_time_ms": result.step_time_ms,
-                    "batch_size": sum(
-                        result_item.phase == "decode" for result_item in result.results
-                    ),
-                },
+        metrics: dict[str, Any] | None = {
+            "step_time_ms": result.step_time_ms,
+            "batch_size": sum(
+                result_item.phase == "decode" for result_item in result.results
+            ),
+        }
+        for token_id in (*item.accepted_token_ids, item.next_token_id):
+            events.append(
+                SchedulerEvent(
+                    kind="token",
+                    request_id=state.work.request_id,
+                    token_id=token_id,
+                    cache_length=item.cache_length,
+                    phase="decode",
+                    metrics=metrics,
+                )
             )
-        )
+            metrics = None
 
     def _mark_generated(
         self,

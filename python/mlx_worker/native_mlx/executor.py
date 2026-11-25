@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import mlx.core as mx
@@ -22,6 +22,7 @@ from .interfaces import (
     StepResult,
 )
 from .sampling import sample_next_tokens
+from .speculative import Speculator
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class _BatchLayout:
     input_ids: mx.array
     positions: mx.array
     forward_mode: ForwardMode
+    draft_tokens: int = 0
 
 
 @dataclass
@@ -71,6 +73,24 @@ class InFlightStep:
     """Cache lengths when the reservation was committed before resolution."""
     launched: bool = False
     """Whether the graph was already enqueued for asynchronous evaluation."""
+    draft: mx.array | None = None
+    """Proposed tokens this step verifies, possibly none of them."""
+    confidences: tuple[float, ...] = ()
+    """The drafter's probability of each verified token."""
+    taps: mx.array | None = None
+    """Target states of a verified step, read once its length is known."""
+    side_outputs: list[mx.array] = field(default_factory=list)
+    """Drafter state to evaluate with the step."""
+    sequence: int = 0
+    """Position of this step among the executor's dispatched steps."""
+
+    @property
+    def outputs(self) -> list[mx.array]:
+        """Return every array this step must evaluate."""
+
+        arrays = [self.logits, self.next_tokens, *self.side_outputs]
+        arrays.extend(value for value in (self.draft, self.taps) if value is not None)
+        return arrays
 
 
 @dataclass
@@ -81,7 +101,12 @@ class MlxGenerationExecutor:
     model: NativeModel
     cache_backend: KVCacheBackend
     attention_backend: AttentionBackend
+    speculator: Speculator | None = None
     execution_mode: str = field(init=False, default="serial")
+    _dispatched_steps: int = field(init=False, default=0, repr=False)
+    _last_plain_completed: tuple[str, bool, float] | None = field(
+        init=False, default=None, repr=False
+    )
 
     def load(self, options: NativeBackendOptions) -> None:
         if options.architecture_class != self.architecture_class:
@@ -91,6 +116,25 @@ class MlxGenerationExecutor:
         """Execute all valid scheduler-selected work in one model invocation."""
 
         return self.execute_prepared(self.prepare_batch(batch))
+
+    def draft_tokens(
+        self, request_id: str, cache_handle: str | None, limit: int
+    ) -> int:
+        """Return how many tokens a request's next step should verify.
+
+        Args:
+            request_id: Request that decodes alone.
+            cache_handle: Its cache.
+            limit: Most tokens it can use beyond the next one.
+        """
+
+        if self.speculator is None or limit <= 0 or cache_handle is None:
+            return 0
+        try:
+            cache = self.cache_backend.get(cache_handle, request_id)
+        except ValueError:
+            return 0
+        return self.speculator.draft_tokens(cache, limit)
 
     def prepare_batch(self, batch: ExecutionBatch) -> PreparedStep:
         """Build request-independent tensors and cache metadata on the CPU."""
@@ -113,11 +157,22 @@ class MlxGenerationExecutor:
         return self.resolve_batch(self.dispatch_batch(prepared))
 
     def dispatch_batch(self, prepared: PreparedStep) -> InFlightStep:
-        """Submit one MLX graph without reading device results."""
+        """Submit one MLX graph without reading its results.
+
+        A step that verifies proposed tokens first reads the proposals.
+        """
 
         layout = prepared.layout
         if layout is None:
             raise BatchExecutionError("EMPTY_EXECUTION_STEP", "nothing to dispatch")
+        draft: mx.array | None = None
+        confidences: tuple[float, ...] = ()
+        if layout.draft_tokens:
+            try:
+                layout, draft, confidences = self._propose(layout)
+            except Exception as exc:
+                raise BatchExecutionError("MODEL_EXECUTION_FAILED", str(exc)) from exc
+            prepared = replace(prepared, layout=layout)
         reserve_started = time.perf_counter()
         try:
             reservation = self.cache_backend.reserve_batch(
@@ -136,31 +191,66 @@ class MlxGenerationExecutor:
                 reservation,
                 layout.forward_mode,
             ),
-            logits_positions=tuple(length - 1 for length in layout.token_lengths),
+            logits_positions=(
+                None
+                if draft is not None
+                else tuple(length - 1 for length in layout.token_lengths)
+            ),
+            device_idle=draft is not None,
         )
+        taps: mx.array | None = None
+        side_outputs: list[mx.array] = []
         try:
             reset_graph_profile = getattr(self.model, "reset_graph_profile", None)
             if callable(reset_graph_profile):
                 reset_graph_profile()
             forward_started = time.perf_counter()
-            logits = self.model(layout.input_ids, layout.positions, forward_batch)
+            if self.speculator is None:
+                logits = self.model(layout.input_ids, layout.positions, forward_batch)
+            else:
+                input_ids = layout.input_ids
+                if draft is not None:
+                    input_ids = mx.concatenate([input_ids, draft[None]], axis=1)
+                logits, taps = self.model.forward_with_taps(  # type: ignore[attr-defined]
+                    input_ids, forward_batch, self.speculator.drafter.taps
+                )
             forward_ms = _elapsed_ms(forward_started)
             sample_started = time.perf_counter()
-            next_tokens = sample_next_tokens(
-                _last_token_logits(logits, layout.token_lengths),
-                [request.sampling for request in layout.requests],
-                [
-                    cache_length + token_length
-                    for cache_length, token_length in zip(
-                        layout.cache_lengths, layout.token_lengths, strict=True
-                    )
-                ],
-            )
+            if draft is not None:
+                next_tokens = sample_next_tokens(
+                    logits[0],
+                    [layout.requests[0].sampling] * layout.token_lengths[0],
+                    [
+                        layout.cache_lengths[0] + index + 1
+                        for index in range(layout.token_lengths[0])
+                    ],
+                )
+            else:
+                next_tokens = sample_next_tokens(
+                    _last_token_logits(logits, layout.token_lengths),
+                    [request.sampling for request in layout.requests],
+                    [
+                        cache_length + token_length
+                        for cache_length, token_length in zip(
+                            layout.cache_lengths, layout.token_lengths, strict=True
+                        )
+                    ],
+                )
             sample_ms = _elapsed_ms(sample_started)
+            if self.speculator is not None and draft is None:
+                assert taps is not None
+                side_outputs = self.speculator.read(
+                    layout.request_caches,
+                    layout.cache_lengths,
+                    layout.token_lengths,
+                    taps,
+                )
+                taps = None
         except Exception as exc:
             reservation.abort()
             raise BatchExecutionError("MODEL_EXECUTION_FAILED", str(exc)) from exc
 
+        self._dispatched_steps += 1
         return InFlightStep(
             prepared=prepared,
             reservation=reservation,
@@ -172,7 +262,26 @@ class MlxGenerationExecutor:
             dispatch_ms=0,
             dispatch_started_ns=0,
             forward_mode=layout.forward_mode,
+            draft=draft,
+            confidences=confidences,
+            taps=taps,
+            side_outputs=side_outputs,
+            sequence=self._dispatched_steps,
         )
+
+    def _propose(
+        self, layout: _BatchLayout
+    ) -> tuple[_BatchLayout, mx.array, tuple[float, ...]]:
+        """Propose tokens and shrink the step to those worth verifying."""
+
+        assert self.speculator is not None
+        draft, confidences = self.speculator.propose(
+            layout.request_caches[0], layout.input_ids[0], layout.draft_tokens
+        )
+        count = len(confidences)
+        length = layout.token_lengths[0] - layout.draft_tokens + count
+        layout = replace(layout, token_lengths=(length,), draft_tokens=count)
+        return layout, draft, confidences
 
     def resolve_batch(self, in_flight: InFlightStep) -> StepResult:
         """Resolve device outputs and commit cache state exactly once."""
@@ -183,24 +292,37 @@ class MlxGenerationExecutor:
         eval_started = time.perf_counter()
         eval_started_ns = time.perf_counter_ns()
         try:
-            mx.eval(in_flight.logits, in_flight.next_tokens)
+            mx.eval(*in_flight.outputs)
             token_ids = [int(value) for value in in_flight.next_tokens.tolist()]
         except Exception as exc:
             in_flight.reservation.abort()
             raise BatchExecutionError("MODEL_EXECUTION_FAILED", str(exc)) from exc
         eval_ms = _elapsed_ms(eval_started)
         eval_completed_ns = time.perf_counter_ns()
+        accepted_token_ids: tuple[int, ...] = ()
+        accepted_lengths: tuple[int, ...] | None = None
+        if in_flight.draft is not None:
+            accepted_token_ids = _accepted_tokens(in_flight.draft, token_ids)
+            accepted_lengths = (len(accepted_token_ids) + 1,)
+            token_ids = [token_ids[len(accepted_token_ids)]]
         if in_flight.committed_lengths is not None:
             committed_lengths = in_flight.committed_lengths
             commit_ms = 0
         else:
             try:
                 commit_started = time.perf_counter()
-                committed_lengths = in_flight.reservation.commit()
+                if accepted_lengths is None:
+                    committed_lengths = in_flight.reservation.commit()
+                else:
+                    committed_lengths = in_flight.reservation.commit(
+                        accepted=accepted_lengths
+                    )
                 commit_ms = _elapsed_ms(commit_started)
             except Exception as exc:
                 in_flight.reservation.abort()
                 raise BatchExecutionError("CACHE_COMMIT_FAILED", str(exc)) from exc
+        if self.speculator is not None:
+            self._record_speculation(in_flight, layout, len(accepted_token_ids))
         graph_profile_metrics = _graph_profile_metrics(self.model)
         for source_index, request, cache_length, token_id in zip(
             layout.source_indices,
@@ -216,6 +338,7 @@ class MlxGenerationExecutor:
                 cache_handle=request.cache_handle,
                 cache_length=cache_length,
                 next_token_id=token_id,
+                accepted_token_ids=accepted_token_ids,
             )
         return StepResult(
             forward_mode=layout.forward_mode,
@@ -237,6 +360,39 @@ class MlxGenerationExecutor:
                 **graph_profile_metrics,
             ),
         )
+
+    def _record_speculation(
+        self, in_flight: InFlightStep, layout: _BatchLayout, accepted: int
+    ) -> None:
+        """Extend the drafter context and record what the step cost."""
+
+        assert self.speculator is not None
+        now = time.perf_counter()
+        if in_flight.draft is not None:
+            assert in_flight.taps is not None
+            self.speculator.read(
+                layout.request_caches,
+                layout.cache_lengths,
+                (accepted + 1,),
+                in_flight.taps,
+            )
+            self.speculator.controller.record(
+                in_flight.confidences,
+                accepted,
+                (now - in_flight.prepared.started) * 1000.0,
+            )
+            self._last_plain_completed = None
+        elif layout.forward_mode is ForwardMode.DECODE and len(layout.requests) == 1:
+            request_id = layout.requests[0].request_id
+            chained = self._dispatched_steps != in_flight.sequence
+            previous = self._last_plain_completed
+            elapsed_ms = None
+            if previous is not None and previous[:2] == (request_id, chained):
+                elapsed_ms = (now - previous[2]) * 1000.0
+            self.speculator.controller.record_plain(elapsed_ms)
+            self._last_plain_completed = (request_id, chained, now)
+        else:
+            self._last_plain_completed = None
 
     def device_next_tokens(
         self, in_flight: InFlightStep, request_ids: tuple[str, ...]
@@ -279,7 +435,7 @@ class MlxGenerationExecutor:
         """Synchronize outstanding work, then release its uncommitted reservation."""
 
         try:
-            mx.eval(in_flight.logits, in_flight.next_tokens)
+            mx.eval(*in_flight.outputs)
         finally:
             in_flight.reservation.abort()
 
@@ -325,6 +481,16 @@ class MlxGenerationExecutor:
                 "INVALID_EXECUTION_BATCH",
                 "execution batch contains duplicate request IDs",
             )
+        if any(request.draft_tokens for request in batch.requests) and (
+            self.speculator is None
+            or len(batch.requests) != 1
+            or batch.requests[0].phase != "decode"
+            or batch.pending_token_ids is not None
+        ):
+            raise BatchExecutionError(
+                "INVALID_EXECUTION_BATCH",
+                "proposed tokens require a drafter and a single decode request",
+            )
         caches: list[RequestCache] = []
         valid_requests: list[ExecutionRequest] = []
         source_indices: list[int] = []
@@ -345,7 +511,7 @@ class MlxGenerationExecutor:
             valid_requests.append(request)
             source_indices.append(index)
             caches.append(cache)
-            token_lengths.append(len(request.token_ids))
+            token_lengths.append(len(request.token_ids) + request.draft_tokens)
             cache_lengths.append(cache.size())
 
         if valid_requests:
@@ -401,7 +567,8 @@ class MlxGenerationExecutor:
                 ordered_results,
             )
 
-        max_tokens = max(token_lengths)
+        draft_tokens = valid_requests[0].draft_tokens
+        max_tokens = max(token_lengths) - draft_tokens
         token_rows: list[list[int]] = []
         position_rows: list[list[int]] = []
         for request in valid_requests:
@@ -426,6 +593,7 @@ class MlxGenerationExecutor:
                 forward_mode=ForwardMode.from_phases(
                     tuple(request.phase for request in valid_requests)
                 ),
+                draft_tokens=draft_tokens,
             ),
             ordered_results,
         )
@@ -561,8 +729,9 @@ class MlxOverlapGenerationExecutor(MlxGenerationExecutor):
         with mx.stream(self._stream):
             started = time.perf_counter()
             in_flight.dispatch_started_ns = time.perf_counter_ns()
-            mx.async_eval(in_flight.logits, in_flight.next_tokens)
+            mx.async_eval(*in_flight.outputs)
             in_flight.dispatch_ms = _elapsed_ms(started)
+            in_flight.side_outputs = []
         in_flight.launched = True
 
     def resolve_batch(self, in_flight: InFlightStep) -> StepResult:
@@ -604,6 +773,18 @@ def _last_token_logits(logits: mx.array, token_lengths: tuple[int, ...]) -> mx.a
         return logits[:, 0, :]
     indices = mx.array([length - 1 for length in token_lengths], dtype=mx.int32)
     return mx.take_along_axis(logits, indices[:, None, None], axis=1)[:, 0, :]
+
+
+def _accepted_tokens(draft: mx.array, drawn: list[int]) -> tuple[int, ...]:
+    """Return the leading proposals that equal the target's own tokens."""
+
+    accepted: list[int] = []
+    proposals = draft.tolist() if draft.size else []
+    for proposed, token in zip(proposals, drawn[:-1], strict=True):
+        if proposed != token:
+            break
+        accepted.append(token)
+    return tuple(accepted)
 
 
 def _elapsed_ms(started: float) -> int:

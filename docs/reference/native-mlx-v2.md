@@ -21,6 +21,7 @@ The registered architecture classes and their known-good checkpoints are:
 | `Gemma3ForCausalLM` | `mlx-community/gemma-3-270m-it-qat-8bit` |
 | `Lfm2MoeForCausalLM` | `mlx-community/LFM2.5-8B-A1B-MLX-4bit` |
 | `Qwen3_5ForConditionalGeneration` (dense, text only) | `prism-ml/Bonsai-27B-mlx-1bit`, `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` |
+| `Inkling2LoopForConditionalGeneration` (LookAtMyQuant packs, text only) | `shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB`, `shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-12.8GB` |
 
 A checkpoint without `architectures` is matched by model type only where a
 registered class implements its weight format: `prism_hadamard_qwen35` maps to
@@ -97,6 +98,7 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_BACKEND` | `v1`, `native-mlx` | Worker backend selector |
 | `MLX_RUNTIME_NATIVE_EXECUTION_BACKEND` | `native-metal-paged-sdpa` | Compatible native cache-and-attention bundle; defaults to the existing production path |
 | `MLX_RUNTIME_NATIVE_EXECUTION_MODE` | `overlap`, `serial` | Startup execution coordinator; `overlap` (the default) pipelines decode on the owner thread, `serial` resolves every step before building the next |
+| `MLX_RUNTIME_DRAFTER` | model ID or local directory | Drafter for [speculative decoding](#speculative-decoding); off when unset. Set from `[worker] drafter` / `--drafter` |
 | `MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` | `8`, `16`, `32` | Native paged-KV page size |
 | `MLX_RUNTIME_NATIVE_PREFIX_CACHE_STRATEGY` | `radix`, `block-hash` | Prefix-cache strategy; `radix` is the native-v2 default |
 | `MLX_RUNTIME_NATIVE_SCHEDULING_POLICY` | `fcfs`, `lpm`, `lof`, `priority` | Python scheduler waiting-queue policy |
@@ -112,7 +114,7 @@ Useful native-v2 environment variables:
 | `MLX_RUNTIME_KV_CACHE_BYTES` | positive integer | Absolute KV page-pool size; overrides the utilization. Set from `[memory] kv_cache_bytes` / `--kv-cache-memory` |
 | `MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES` | positive integer | Legacy name for `MLX_RUNTIME_KV_CACHE_BYTES`, used when that is unset. The pool is allocated at startup and shared by in-flight requests and the prefix cache; new requests wait until their prompt plus `max_tokens` fits |
 | `MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES` | positive integer | Prefix-cache entry bound; each cached KV page (`MLX_RUNTIME_NATIVE_KV_PAGE_SIZE` tokens) is one entry. Unset, the prefix cache may hold every page of the KV pool: when admitting a request needs pages, the scheduler first evicts least recently used prefix entries that no running request uses |
-| `MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES` | non-negative integer | Freed MLX device buffers kept for reuse; defaults to 1 GiB so changing batch shapes cannot fill device memory and push the host into swap |
+| `MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES` | non-negative integer | Freed MLX device buffers kept for reuse; defaults to 1 GiB so changing batch shapes cannot fill device memory and push the host into swap. A model family can lower it: Inkling-2-Mini keeps at most 256 MiB |
 
 Invalid native execution-backend, execution-mode, page-size, prefix-cache
 strategy, or scheduler-policy values must fail startup. They must not silently
@@ -160,6 +162,94 @@ when it loads such a pack, apply the activation rotation before each packed
 matmul and rotate looked-up embedding rows back. Plain `mlx_lm.load` cannot
 load these packs. Their norms and other unquantized tensors are float32, so
 the residual stream and the KV cache are float32.
+
+## Packed Inkling-2-Mini Checkpoints
+
+`Inkling2LoopForConditionalGeneration` is served from the LookAtMyQuant packs
+published as `shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-<size>`, with sizes
+12.8GB, 11.2GB, 8.9GB, 5.4GB, 4.7GB, and 3.9GB. Any other layout of the model
+fails at startup with `INVALID_WEIGHT_ARTIFACTS`.
+
+The packs keep their weights in `.npz` archives, so download the whole
+repository first:
+
+```bash
+hf download shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB
+```
+
+On a 24 GB Mac the 8.9 GB pack and larger need more than the default
+`--memory-utilization 0.5`, which is 8.9 GiB there. The 12.8 GB pack leaves
+about 1.5 GiB for KV at 0.85; stop other GPU work and large applications before
+serving it on that machine.
+
+- **Weights** stay packed in memory. `packed_matmul` decodes rows inside the
+  kernel (hash-trellis, trellis, NVFP4, and Lloyd-Max formats). A step with at
+  least 128 inputs decodes each dense weight bank once and multiplies it with
+  MLX instead, which needs about 0.3–0.5 GB more transient memory. A step with
+  at most 8 tokens computes exactly what one-token steps compute, so verified
+  proposals reproduce plain decoding.
+- **Model graph**: 24 layers run as 48 visits, because layers 6 to 17 run three
+  times. Every visit has its own KV and convolution history. Attention adds a
+  relative-position bias, and 40 of the 48 visits see only the last 1,024
+  tokens.
+- **KV memory**: the windowed execution bundle splits the KV budget into two
+  page pools at startup. Global visits use one; sliding-window visits use the
+  other, and their pages return to the pool once they fall behind the window.
+  A request is admitted when both pools can hold it. The windowed pool gets at
+  most half the budget and at most 16 full windows.
+- **Other memory**: the worker keeps 1 GiB plus 0.5 MiB per prefill token for
+  step activations, and at most 256 MiB of freed buffers. It keeps no freed
+  buffers while loading, so loading peaks about 1 GiB above the weights.
+- **Output** is the raw generated text: the model's message and reasoning
+  markers appear in `content`. The chat template's own default thinking effort
+  applies.
+
+Only the 5.4 GB and 12.8 GB packs have been served end to end. Run
+`mlx-host-validation/scripts/native_packed_checkpoints.sh --checkpoint MODEL`
+before relying on another size.
+
+The bit layouts and decode kernels follow the reference runtime
+[lookatmyquant](https://github.com/ShinMegamiBoson/lookatmyquant) (MIT; its
+license is in `python/mlx_worker/native_mlx/kernels/LICENSE.lookatmyquant`).
+
+## Speculative Decoding
+
+`mlx-air serve --drafter MODEL` (or `[worker] drafter`) loads a drafter that
+proposes tokens from the target's hidden states. The target checks the
+proposals in one step. It is supported for
+`Inkling2LoopForConditionalGeneration` with
+`shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter`; a drafter for any other
+model, or a directory that is not a drafter, fails startup with
+`DRAFTER_UNSUPPORTED`, and the v1 backend rejects the setting. When the drafter
+repository holds a file distilled for the served pack, that file is loaded;
+otherwise the stock file is.
+
+- A proposed token is kept only when it equals the target's own draw for that
+  position, for greedy and sampled requests alike. The drafter never changes
+  which distribution a token is drawn from.
+- Steps propose tokens only while exactly one request is decoding and no
+  request waits for prefill. Otherwise they are ordinary batched steps.
+- The drafter reports its probability of each proposed token. The step verifies
+  the leading proposals that yield the most tokens per second, given how often
+  proposals of that probability were kept and what steps of each length cost.
+  It can verify none, and a request stops drafting while plain steps are
+  faster.
+- A drafted step needs the previous step's token before it can be built, so it
+  starts one scheduler tick later than a plain overlapped step. The previous
+  token is sent first; the first token is not delayed.
+- The drafter's weights and request contexts come out of the KV budget.
+
+Decisions behind the packed-checkpoint and speculation design:
+
+| Decision | Choice | Reason |
+| --- | --- | --- |
+| Checkpoints | All six LookAtMyQuant sizes | One packed format; other layouts need a different loader and more memory |
+| Kernels | Own batch-safe kernels, plain upstream ones as reference | Upstream kernels run one request at a time |
+| Sliding-window KV | Second page pool that frees pages behind the window | Keeping the whole history would spend most of the budget on unreachable keys |
+| Output text | Raw, markers included | No protocol change |
+| Enabling the drafter | Explicit setting, off by default | No hidden memory use |
+| When to speculate | One decoding request only | Batched steps are faster when several requests decode |
+| Which tokens to keep | Exact match with the target's draw, all requests | Works for sampled requests without a second distribution |
 
 ## Attention Backend Contract
 
@@ -285,7 +375,13 @@ request totals.
 
 - The only registered production execution backend is currently `native-metal-paged-sdpa`.
 - Only explicitly implemented architecture classes are supported.
-- Hybrid models (LFM2-MoE, Qwen3.5) run without a prefix cache.
+- Hybrid models (LFM2-MoE, Qwen3.5) and Inkling-2-Mini run without a prefix cache.
+- Inkling-2-Mini rounds its packed inputs to float16 and its message gates to
+  bfloat16, like the reference runtime. Expert routing can flip on near-ties,
+  so logits depend slightly on step shape and greedy text can differ with
+  batching or prompt chunking. Speculation does not change greedy text.
+- Inkling-2-Mini serves text only, and `ModelDiagnostics.forward_token_ids` is
+  not available for it.
 - Qwen3.5 mixture-of-experts checkpoints and the Qwen3.5 vision tower are not
   implemented.
 - Native decoding supports `temperature` and `top_p`. `temperature: 0` is greedy and bit-identical to `argmax`; a positive temperature scales the logits, keeps the smallest set of tokens whose probability reaches `top_p`, and draws on the device with the Gumbel-max trick. Each request gets a random seed, and every draw is keyed by that seed and the token position, so the random draw does not depend on serial or overlap execution, batch composition, or prompt chunking. The logits themselves can differ in the last bits with batch composition and with how much of the prompt came from the prefix cache, so two runs of the same prompt are not guaranteed to produce identical text. A per-request `seed` field is not exposed yet. `top_k`, penalties, and logprobs are not supported.

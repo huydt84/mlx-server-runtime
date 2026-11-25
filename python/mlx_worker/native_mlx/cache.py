@@ -89,6 +89,12 @@ class KVCacheGeometry:
     Hybrid models whose other layers keep only request-local state list their
     attention layers here so the KV budget is not spent on unused pages.
     """
+    window_layer_indices: tuple[int, ...] = ()
+    """Layers of a windowed cache family that keep only the window."""
+    window_size: int = 0
+    """Keys a query of a windowed layer can attend to."""
+    max_append_tokens: int = 1024
+    """Largest append one request makes in a step."""
 
 
 class RequestCache(Protocol):

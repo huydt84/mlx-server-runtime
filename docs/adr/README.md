@@ -19,6 +19,9 @@ what it costs. Code comments are banned in this repository (see
 | [0008](0008-checkpoint-loading-compatibility.md) | Checkpoint loading compatibility | Accepted |
 | [0009](0009-benchmark-measurement-integrity.md) | Benchmark measurement integrity | Accepted |
 | [0010](0010-pipeline-profile-timing.md) | Pipeline profile timing model | Accepted |
+| [0011](0011-packed-weight-kernels.md) | Packed weight kernels | Accepted |
+| [0012](0012-windowed-kv-and-step-memory.md) | Windowed KV pool, relative attention, and step memory | Accepted |
+| [0013](0013-speculative-decoding.md) | Speculative decoding | Accepted |
 
 The [2026-11-22 comment audit](comment-audit-2026-11-22.md) lists every comment
 that ADRs 0002–0010 replaced.

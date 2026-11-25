@@ -796,6 +796,9 @@ fn worker_env(config: &RuntimeConfig) -> Vec<(&'static str, String)> {
             config.worker.tool_call_parser.clone(),
         ),
     ];
+    if let Some(drafter) = &config.worker.drafter {
+        values.push(("MLX_RUNTIME_DRAFTER", drafter.clone()));
+    }
     if let Some(bytes) = config.memory.kv_cache_bytes {
         values.push(("MLX_RUNTIME_KV_CACHE_BYTES", bytes.to_string()));
     }
@@ -946,6 +949,20 @@ mod tests {
         assert!(env
             .iter()
             .any(|(key, value)| *key == "MLX_RUNTIME_MAX_TOTAL_TOKENS_EXPLICIT" && value == "1"));
+    }
+
+    #[test]
+    fn worker_env_forwards_the_drafter_only_when_set() {
+        let mut config = RuntimeConfig::default();
+        assert!(!worker_env(&config)
+            .iter()
+            .any(|(key, _)| *key == "MLX_RUNTIME_DRAFTER"));
+
+        config.worker.drafter = Some("drafter-model".to_string());
+
+        assert!(worker_env(&config)
+            .iter()
+            .any(|(key, value)| *key == "MLX_RUNTIME_DRAFTER" && value == "drafter-model"));
     }
 
     #[test]

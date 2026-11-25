@@ -88,6 +88,14 @@ checkpoint = "prism-ml/Bonsai-27B-mlx-1bit"
 [models.hybrid_ternary]
 checkpoint = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
 
+# Inkling-2-Mini packs (LookAtMyQuant codes): a distilled drafter exists for
+# the 5.4 GB pack; the 12.8 GB pack uses the stock one.
+[models.packed_small]
+checkpoint = "shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB"
+
+[models.packed_large]
+checkpoint = "shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-12.8GB"
+
 # These configurations pin the KV pool and the prefix-cache entry limit so
 # their results stay comparable across versions; native-mlx's own defaults size
 # both from the memory planner (see mail_native). 2 GiB holds ~14.5k tokens on
@@ -109,6 +117,17 @@ environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUT
 [runtime_configurations.mlx_lm]
 backend = "v1"
 environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_TEXT_CACHE_BUDGET_BYTES = "0", MLX_RUNTIME_TEXT_CACHE_MAX_ENTRIES = "0" }
+
+# The overlap scheduler without and with a drafter. The KV pool holds the
+# largest mail_assistant request and still fits beside the 12.8 GB pack on a
+# 24 GB host.
+[runtime_configurations.packed]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_KV_CACHE_BYTES = "805306368" }
+
+[runtime_configurations.packed_drafter]
+backend = "native-mlx"
+environment = { MLX_RUNTIME_CONTINUOUS_BATCHING = "1", MLX_RUNTIME_NATIVE_EXECUTION_MODE = "overlap", MLX_RUNTIME_KV_CACHE_BYTES = "805306368", MLX_RUNTIME_DRAFTER = "shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter" }
 
 # The v1 backend with every worker default, as `mlx-air serve --backend v1`
 # runs it, including its prompt cache and serial request handling.
@@ -352,3 +371,14 @@ trials = 2
 runtime_configurations = ["mail_v1", "mail_native"]
 diagnostics = []
 coverage = { mail = ["mail_assistant_c1", "mail_assistant_c2"] }
+
+# Inkling-2-Mini packs with and without the drafter. The drafter only runs
+# while one request decodes alone, so steady_short_c4 covers the plain path.
+# These models keep no prefix cache, so warm-prefix and cache-pressure
+# workloads are not covered.
+[suites.speculation]
+rounds = 2
+trials = 2
+runtime_configurations = ["packed", "packed_drafter"]
+diagnostics = []
+coverage = { packed_small = ["interactive_stream_c1", "decode_128_c1", "mail_assistant_c1", "steady_short_c4"], packed_large = ["interactive_stream_c1", "decode_128_c1", "mail_assistant_c1", "steady_short_c4"] }

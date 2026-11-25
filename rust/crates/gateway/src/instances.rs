@@ -713,6 +713,9 @@ fn render_runtime_config(config: &RuntimeConfig) -> Result<String, InstanceError
     )
     .ok();
     writeln!(output, "model = {}", toml_string(&config.worker.model)?).ok();
+    if let Some(drafter) = &config.worker.drafter {
+        writeln!(output, "drafter = {}", toml_string(drafter)?).ok();
+    }
     if let Some(vlm_model) = &config.worker.vlm_model {
         writeln!(output, "vlm_model = {}", toml_string(vlm_model)?).ok();
     }

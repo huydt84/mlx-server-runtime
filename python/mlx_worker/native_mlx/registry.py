@@ -6,13 +6,15 @@ import importlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache, cached_property
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 
 from .cache import KVCacheGeometry
 from .interfaces import NativeModel
-from .mapping import WeightMappingAdapter
+from .mapping import WeightIndex, WeightMappingAdapter, load_weight_index
+from .speculative import DrafterCheckpoint
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,21 @@ class CompatibilityProbe:
     model_ref: str
     expected_category: str
     expected_stage: str
+
+
+@dataclass(frozen=True)
+class StepMemory:
+    """Measured memory of a family's steps beside its weights and KV.
+
+    Attributes:
+        base_bytes: Activations of a step of few tokens.
+        bytes_per_token: Further activations per prefill token.
+        buffer_cache_bytes: Freed buffers worth keeping for reuse.
+    """
+
+    base_bytes: int
+    bytes_per_token: int
+    buffer_cache_bytes: int
 
 
 @dataclass(frozen=True)
@@ -45,6 +62,12 @@ class ArchitectureSpec:
     cache_geometry_factory: Callable[[Any], KVCacheGeometry]
     supports_prefix_cache: bool = True
     cache_family: str = "kv"
+    weight_index_loader_name: str | None = None
+    """Loader in the model module for checkpoints without safetensors indexes."""
+    drafter_module_name: str | None = None
+    """Module whose ``load_drafter`` opens the family's drafter checkpoints."""
+    step_memory: StepMemory | None = None
+    """Replaces the estimate of activation memory where it does not fit."""
 
     @cached_property
     def resolve(self) -> ArchitectureExecutionPlan:
@@ -59,7 +82,30 @@ class ArchitectureSpec:
             cache_geometry=self.cache_geometry_factory,
             supports_prefix_cache=self.supports_prefix_cache,
             cache_family=self.cache_family,
+            load_weight_index=(
+                load_weight_index
+                if self.weight_index_loader_name is None
+                else getattr(module, self.weight_index_loader_name)
+            ),
         )
+
+    def load_drafter(self, drafter_path: Path, model_path: Path) -> DrafterCheckpoint:
+        """Open a drafter checkpoint for this family.
+
+        Args:
+            drafter_path: Local drafter checkpoint directory.
+            model_path: Local directory of the served checkpoint.
+
+        Raises:
+            ValueError: If the family has no drafter or cannot use this one.
+        """
+
+        if self.drafter_module_name is None:
+            raise ValueError(
+                f"native-mlx has no speculative decoding for {self.architecture_class}"
+            )
+        module = _load_module(self.drafter_module_name)
+        return module.load_drafter(drafter_path, model_path)
 
     @property
     def parse_config(self) -> Callable[[dict[str, Any]], Any]:
@@ -94,8 +140,10 @@ class ArchitectureExecutionPlan:
     cache_geometry: Callable[[Any], KVCacheGeometry]
     supports_prefix_cache: bool
     cache_family: str
+    load_weight_index: Callable[[Path], WeightIndex] = load_weight_index
 
 
+_MIB = 1024 * 1024
 _KV_DTYPES = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
 
 
@@ -199,6 +247,32 @@ _REGISTRY: dict[str, ArchitectureSpec] = {
         ),
         supports_prefix_cache=False,
         cache_family="hybrid",
+    ),
+    "Inkling2LoopForConditionalGeneration": ArchitectureSpec(
+        architecture_class="Inkling2LoopForConditionalGeneration",
+        known_good_checkpoint=("shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB"),
+        compatibility_probes=(),
+        module_name=".models.inkling2",
+        parse_config_name="parse_inkling2_config",
+        weight_adapter_name="Inkling2PackAdapter",
+        model_factory_name="build_inkling2_model",
+        cache_geometry_factory=lambda config: KVCacheGeometry(
+            num_layers=int(config.num_visits),
+            num_kv_heads=int(config.num_key_value_heads),
+            head_dim=int(config.head_dim),
+            dtype=_KV_DTYPES[config.kv_cache_dtype],
+            window_layer_indices=tuple(config.window_visits),
+            window_size=int(config.window_size),
+        ),
+        supports_prefix_cache=False,
+        cache_family="windowed",
+        weight_index_loader_name="load_packed_weight_index",
+        drafter_module_name=".models.inkling2_drafter",
+        step_memory=StepMemory(
+            base_bytes=1024 * _MIB,
+            bytes_per_token=_MIB // 2,
+            buffer_cache_bytes=256 * _MIB,
+        ),
     ),
 }
 

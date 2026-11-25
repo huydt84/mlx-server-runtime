@@ -113,6 +113,9 @@ class ForwardBatch:
     layer_attention: tuple[LayerAttentionContext, ...]
     logits_positions: tuple[int, ...] | None = None
     """Per-row token index to compute logits for; ``None`` means every token."""
+    device_idle: bool = False
+    """Whether the device waits for this step, so that a model may launch the
+    first layers while it still builds the others."""
 
 
 def select_logits_positions(hidden: mx.array, forward_batch: ForwardBatch) -> mx.array:
@@ -171,6 +174,8 @@ class ExecutionRequest:
     positions: tuple[int, ...]
     cache_handle: str | None
     sampling: SamplingParams = SamplingParams()
+    draft_tokens: int = 0
+    """Tokens a drafter proposes after ``token_ids`` for this step to verify."""
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,8 @@ class StepRequestResult:
     cache_handle: str | None
     cache_length: int
     next_token_id: int | None = None
+    accepted_token_ids: tuple[int, ...] = ()
+    """Verified proposals that precede ``next_token_id``."""
     model_terminal: bool = False
     error_code: str | None = None
     error_message: str | None = None

@@ -5,9 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+import mlx.core as mx
 
 from ..ipc import ModelError
 from ..prism_hadamard import generation_eos_token_ids, is_prism_hadamard_checkpoint
@@ -26,7 +30,6 @@ from .mapping import (
     WeightArtifactValidationError,
     WeightMappingBug,
     load_mapped_weights,
-    load_weight_index,
 )
 from .memory import (
     KVMemoryError,
@@ -36,6 +39,7 @@ from .memory import (
     plan_kv_pool,
     recommended_working_set_bytes,
     resolve_max_total_tokens,
+    step_reserve_bytes,
     weights_nbytes,
 )
 from .prefix_cache import (
@@ -50,6 +54,7 @@ from .registry import (
     architecture_for_model_type,
     get_architecture_spec,
 )
+from .speculative import DrafterCheckpoint, Speculator
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,7 @@ def build_native_artifacts(
     prefix_cache_strategy: str = "radix",
     graph_profile: bool = False,
     memory: KVMemorySettings | None = None,
+    drafter: str | None = None,
 ) -> BootstrapArtifacts:
     """Validate and construct the registered architecture and shared executor.
 
@@ -118,6 +124,7 @@ def build_native_artifacts(
         graph_profile: Wrap the model for graph profiling.
         memory: Size the KV pool from memory settings after the weights load
             and derive the per-request token limit from it.
+        drafter: Drafter checkpoint that enables speculative decoding.
 
     Returns:
         The constructed serving dependencies.
@@ -156,7 +163,7 @@ def build_native_artifacts(
             str(architecture.model_path / "config.json"),
         ) from exc
     try:
-        index = load_weight_index(architecture.model_path)
+        index = plan.load_weight_index(architecture.model_path)
     except WeightArtifactValidationError as exc:
         raise _failure(
             "INVALID_WEIGHT_ARTIFACTS",
@@ -185,22 +192,36 @@ def build_native_artifacts(
             "malformed_checkpoint",
             str(architecture.model_path),
         ) from exc
+    drafter_checkpoint = _open_drafter(drafter, architecture)
     if stage_callback:
         stage_callback("weight_mapping", "loading_weights")
     kv_memory: KVMemoryPlan | None = None
+    cache_limit: int | None = None
     if memory is not None:
+        step_memory = architecture.spec.step_memory
+        cache_limit = memory.buffer_cache_limit_bytes
+        if step_memory is None:
+            reserve = activation_reserve_bytes(
+                architecture.raw_config,
+                prefill_tokens=memory.prefill_tokens,
+                prefill_rows=memory.prefill_rows,
+                buffer_cache_limit_bytes=cache_limit,
+            )
+        else:
+            cache_limit = min(cache_limit, step_memory.buffer_cache_bytes)
+            reserve = step_reserve_bytes(
+                step_memory,
+                prefill_tokens=memory.prefill_tokens,
+                buffer_cache_limit_bytes=cache_limit,
+            )
         try:
             kv_memory = plan_kv_pool(
                 kv_cache_bytes=memory.kv_cache_bytes,
                 utilization=memory.utilization,
                 working_set_bytes=recommended_working_set_bytes(),
-                weights_bytes=weights_nbytes(weights),
-                reserve_bytes=activation_reserve_bytes(
-                    architecture.raw_config,
-                    prefill_tokens=memory.prefill_tokens,
-                    prefill_rows=memory.prefill_rows,
-                    buffer_cache_limit_bytes=memory.buffer_cache_limit_bytes,
-                ),
+                weights_bytes=weights_nbytes(weights)
+                + (drafter_checkpoint.nbytes if drafter_checkpoint else 0),
+                reserve_bytes=reserve,
             )
         except KVMemoryError as exc:
             raise _failure(
@@ -212,11 +233,26 @@ def build_native_artifacts(
             ) from exc
         cache_budget_bytes = kv_memory.pool_bytes
     try:
-        native_model = plan.create_model(config, weights)
+        with _loading_buffers(cache_limit):
+            native_model = plan.create_model(config, weights)
+            drafter_model = (
+                drafter_checkpoint.build(native_model) if drafter_checkpoint else None
+            )
         config = getattr(native_model, "resolved_config", config)
         if graph_profile:
             native_model = GraphProfiledModel(native_model)
         geometry = plan.cache_geometry(config)
+        if memory is not None:
+            geometry = replace(
+                geometry,
+                max_append_tokens=max(1, memory.prefill_tokens // memory.prefill_rows),
+            )
+        speculator = None
+        if drafter_checkpoint is not None and drafter_model is not None:
+            speculator = Speculator.from_drafter(drafter_model)
+            cache_budget_bytes = int(
+                cache_budget_bytes * (1.0 - drafter_checkpoint.kv_share)
+            )
         execution_backend = build_native_execution_backend(
             execution_backend_id,
             geometry,
@@ -254,6 +290,7 @@ def build_native_artifacts(
             model=native_model,
             cache_backend=cache_backend,
             attention_backend=attention_backend,
+            speculator=speculator,
         )
     except Exception as exc:
         raise _failure(
@@ -292,6 +329,45 @@ def build_native_artifacts(
         kv_memory=kv_memory,
         max_total_tokens=max_total_tokens,
     )
+
+
+@contextmanager
+def _loading_buffers(cache_limit: int | None) -> Iterator[None]:
+    """Keep no freed buffers while weights load, then apply ``cache_limit``.
+
+    Assembling weights frees buffers that serving never reuses.
+
+    Args:
+        cache_limit: Freed buffers MLX may retain afterwards; ``None`` restores
+            the previous limit.
+    """
+
+    previous = mx.set_cache_limit(0)
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(previous if cache_limit is None else cache_limit)
+
+
+def _open_drafter(
+    drafter: str | None, architecture: NativeArchitecture
+) -> DrafterCheckpoint | None:
+    """Validate the configured drafter before any weights load."""
+
+    if drafter is None:
+        return None
+    try:
+        return architecture.spec.load_drafter(
+            resolve_model_path(drafter), architecture.model_path
+        )
+    except ValueError as exc:
+        raise _failure(
+            "DRAFTER_UNSUPPORTED",
+            str(exc),
+            "artifact_validation",
+            "invalid_configuration",
+            drafter,
+        ) from exc
 
 
 def _resolve_request_limit(

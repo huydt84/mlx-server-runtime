@@ -26,6 +26,7 @@ compatibility contract.
 | `model` | string | `"mlx-community/Qwen2.5-7B-Instruct-4bit"` | Hugging Face model ID |
 | `vlm_model` | string or null | `null` | Optional VLM model ID |
 | `transcription_model` | string or null | `null` | Optional Whisper checkpoint served by `/v1/audio/transcriptions` and `/v1/audio/translations` through `mlx-audio`, such as `mlx-community/whisper-large-v3-turbo-asr-fp16`. Works with both backends. The worker loads it right after startup; its weights are outside the native-mlx `[memory]` budget |
+| `drafter` | string or null | `null` | Drafter for [speculative decoding](native-mlx-v2.md#speculative-decoding), native-mlx only: a model ID or local directory. CLI: `mlx-air serve --drafter` |
 | `ipc_path` | string | `"/tmp/mlx-runtime.sock"` | Unix domain socket path |
 | `tool_call_parser` | string | `"auto"` | Tool-call format of the text model: `auto` infers it, `none` rejects requests with tools, and `json_tools`, `qwen3_coder`, `pythonic` or `inkling2` selects one. An unknown name stops the worker at startup. CLI: `mlx-air serve --tool-call-parser`. See [Tool Calling](../explanation/tool-calling.md) |
 
@@ -62,7 +63,8 @@ kv_pool = utilization x Metal recommended working set - weights - activation res
 The activation reserve is the MLX buffer-cache limit
 (`MLX_RUNTIME_NATIVE_MLX_CACHE_LIMIT_BYTES`, 1 GiB by default), the hidden and
 MLP activations of one full prefill step, last-position logits, and 256 MiB of
-slack. The worker logs the result at startup, for example
+slack. For Inkling-2-Mini it is instead measured: 1 GiB, 0.5 MiB per token of a
+full prefill step, and a buffer-cache limit of at most 256 MiB. The worker logs the result at startup, for example
 `native-mlx memory kv_pool=3.41GiB source=memory_utilization utilization=0.5 ...`.
 
 | Field | Type | Default | Description |

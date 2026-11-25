@@ -303,3 +303,14 @@ def test_load_config_rejects_invalid_memory_sizing(monkeypatch, name, value) -> 
 
     with pytest.raises(ValueError, match=name):
         load_config()
+
+
+def test_load_config_reads_an_optional_drafter(monkeypatch) -> None:
+    monkeypatch.delenv("MLX_RUNTIME_DRAFTER", raising=False)
+    assert load_config().drafter is None
+
+    monkeypatch.setenv("MLX_RUNTIME_DRAFTER", " ")
+    assert load_config().drafter is None
+
+    monkeypatch.setenv("MLX_RUNTIME_DRAFTER", "models/drafter")
+    assert load_config().drafter == "models/drafter"

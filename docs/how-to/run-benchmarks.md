@@ -22,6 +22,7 @@ Suites, focuses, workloads, and models are defined in
 | `exhaustive` | 2 × 4 | Every workload on every model role. |
 | `mlx_lm_comparison` | 2 × 2 | native-mlx `overlap` against the `mlx_lm` baseline on the Qwen3.5 hybrid checkpoints (`hybrid_binary`, `hybrid_ternary`). |
 | `mail_assistant` | 2 × 2 | A local mail assistant's traffic on Qwen3-8B: `mail_v1` (the v1 backend with every worker default, as `mlx-air serve --backend v1` runs it) against `mail_native` (native-mlx with its defaults, the default backend). |
+| `speculation` | 2 × 2 | Inkling-2-Mini's 5.4 GB and 12.8 GB packs (`packed_small`, `packed_large`): native-mlx `overlap` without (`packed`) and with (`packed_drafter`) the drafter. |
 
 The `smoke`, `optimization`, `release`, and `exhaustive` suites run the native
 `serial` and `overlap` runtime configurations. The `mlx_lm` runtime

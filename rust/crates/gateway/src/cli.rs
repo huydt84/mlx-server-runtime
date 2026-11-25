@@ -105,6 +105,10 @@ struct ServeArgs {
     /// `/v1/audio/transcriptions` and `/v1/audio/translations`.
     #[arg(long, value_name = "MODEL")]
     transcription_model: Option<String>,
+    /// Drafter checkpoint for speculative decoding: a model identifier or
+    /// local path. Off unless set; native-mlx only.
+    #[arg(long, value_name = "MODEL")]
+    drafter: Option<String>,
     /// Runtime configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -602,6 +606,7 @@ fn resolve_serve_context(
     let overrides = CliConfigOverrides {
         model: args.model.clone(),
         transcription_model: args.transcription_model.clone(),
+        drafter: args.drafter.clone(),
         backend: args.backend.map(Into::into),
         port: args.port,
         memory_utilization: args.memory_utilization,

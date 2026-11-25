@@ -24,6 +24,8 @@ pub struct WorkerConfig {
     pub backend: BackendKind,
     /// Text model identifier.
     pub model: String,
+    /// Drafter checkpoint for speculative decoding; off when unset.
+    pub drafter: Option<String>,
     /// Optional VLM model identifier.
     pub vlm_model: Option<String>,
     /// Optional Whisper speech-to-text model identifier served by
@@ -219,6 +221,7 @@ impl Default for RuntimeConfig {
                 module: "mlx_worker.main".to_string(),
                 backend: BackendKind::NativeMlx,
                 model: "mlx-community/Qwen2.5-7B-Instruct-4bit".to_string(),
+                drafter: None,
                 vlm_model: None,
                 transcription_model: None,
                 ipc_path: "/tmp/mlx-runtime.sock".to_string(),
@@ -313,6 +316,9 @@ impl RuntimeConfig {
                     config.worker.backend = BackendKind::parse(&backend)?
                 }
                 ("worker", "model", Value::String(model)) => config.worker.model = model,
+                ("worker", "drafter", Value::String(drafter)) => {
+                    config.worker.drafter = Some(drafter)
+                }
                 ("worker", "vlm_model", Value::String(vlm_model)) => {
                     config.worker.vlm_model = Some(vlm_model)
                 }
@@ -466,11 +472,12 @@ impl RuntimeConfig {
         );
         let _ = writeln!(
             rendered,
-            "worker python={} module={} backend={} model={} vlm_model={} transcription_model={} ipc_path={}",
+            "worker python={} module={} backend={} model={} drafter={} vlm_model={} transcription_model={} ipc_path={}",
             self.worker.python,
             self.worker.module,
             self.worker.backend.as_str(),
             self.worker.model,
+            self.worker.drafter.as_deref().unwrap_or("<none>"),
             self.worker.vlm_model.as_deref().unwrap_or("<none>"),
             self.worker.transcription_model.as_deref().unwrap_or("<none>"),
             self.worker.ipc_path
@@ -685,6 +692,7 @@ mod tests {
             module = "mlx_worker.main"
             backend = "native-mlx"
             model = "test-model"
+            drafter = "test-drafter"
             vlm_model = "mlx-community/Qwen3-VL-2B-Instruct-4bit"
             transcription_model = "mlx-community/whisper-large-v3-turbo-asr-fp16"
             ipc_path = "/tmp/test.sock"
@@ -720,6 +728,7 @@ mod tests {
         assert_eq!(config.worker.python, "/usr/bin/python3");
         assert_eq!(config.worker.backend, BackendKind::NativeMlx);
         assert_eq!(config.worker.model, "test-model");
+        assert_eq!(config.worker.drafter.as_deref(), Some("test-drafter"));
         assert_eq!(
             config.worker.vlm_model,
             Some("mlx-community/Qwen3-VL-2B-Instruct-4bit".to_string())
@@ -750,6 +759,7 @@ mod tests {
         let mut config = RuntimeConfig::default();
         config.worker.backend = BackendKind::NativeMlx;
         config.worker.model = "native-model".to_string();
+        config.worker.drafter = Some("drafter-model".to_string());
         config.worker.vlm_model = Some("vlm-model".to_string());
         config.worker.transcription_model = Some("whisper-model".to_string());
         config.worker.ipc_path = "/tmp/native.sock".to_string();
@@ -760,6 +770,7 @@ mod tests {
         assert!(rendered.contains("runtime_config path=/tmp/runtime.toml"));
         assert!(rendered.contains("backend=native-mlx"));
         assert!(rendered.contains("model=native-model"));
+        assert!(rendered.contains("drafter=drafter-model"));
         assert!(rendered.contains("vlm_model=vlm-model"));
         assert!(rendered.contains("transcription_model=whisper-model"));
         assert!(rendered.contains(&format!("max_audio_bytes={DEFAULT_MAX_AUDIO_BYTES}")));
