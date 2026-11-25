@@ -31,6 +31,7 @@ _INPUT_SOURCE = """
     uint matrix = index / TOKENS;
     uint token = index % TOKENS;
     constexpr uint WIDTH = A * B;
+    threadgroup float staged[INPUT == mlx_air::ROTATE_SOFT ? WIDTH : 1];
     uint row = inputs[matrix] * TOKENS + token;
     mlx_air::RotationSource<INPUT, A * B, X> source{
         x + ulong(row) * (INPUT == mlx_air::ROTATE_SOFT ? 2 * WIDTH : WIDTH),
@@ -38,7 +39,7 @@ _INPUT_SOURCE = """
         signs + matrix * WIDTH, float2(caps[0], caps[1])};
     mlx_air::rotate_input<INPUT, A, B, SIMDGROUPS, RAW>(
         source, factor, y + ulong(index) * WIDTH,
-        y + ulong(MATRICES * TOKENS + token) * WIDTH, matrix,
+        y + ulong(MATRICES * TOKENS + token) * WIDTH, staged, matrix,
         simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """
 

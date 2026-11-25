@@ -183,11 +183,12 @@ about 1.5 GiB for KV at 0.85; stop other GPU work and large applications before
 serving it on that machine.
 
 - **Weights** stay packed in memory. `packed_matmul` decodes rows inside the
-  kernel (hash-trellis, trellis, NVFP4, and Lloyd-Max formats). A step with at
-  least 128 inputs decodes each dense weight bank once and multiplies it with
-  MLX instead, which needs about 0.3–0.5 GB more transient memory. A step with
-  at most 8 tokens computes exactly what one-token steps compute, so verified
-  proposals reproduce plain decoding.
+  kernel (hash-trellis, trellis, NVFP4, and Lloyd-Max formats). A step with
+  more than 8 tokens multiplies each decoded 16-row by 32-column tile with up to
+  32 tokens as 8x8 SIMD-group matrix products, so weights are never expanded in
+  device memory ([ADR-0014](../adr/0014-blocked-packed-products.md)). A step
+  with at most 8 tokens computes exactly what one-token steps compute, so
+  verified proposals reproduce plain decoding.
 - **Model graph**: 24 layers run as 48 visits, because layers 6 to 17 run three
   times. Every visit has its own KV and convolution history. Attention adds a
   relative-position bias, and 40 of the 48 visits see only the last 1,024

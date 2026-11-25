@@ -35,6 +35,12 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - `AGENTS.md` and `CONTRIBUTING.md` document the comment ban and the ratchet
   check.
 
+- Packed Inkling-2-Mini steps of more than eight tokens multiply decoded weight
+  tiles with up to 32 tokens as SIMD-group matrix products, and no longer
+  expand dense weight banks in device memory. The soft-gated rotation computes
+  each gated value once. Steps of at most eight tokens are unchanged.
+- `packed_prefill` benchmark suite for long-prompt prefill on the 5.4 GB pack.
+
 ### Fixed
 
 - Paged decode binds the KV dtype separately from the query dtype.

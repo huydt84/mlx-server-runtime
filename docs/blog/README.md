@@ -129,10 +129,20 @@ millisecond, plus the unstable rows and null results.
 
 ---
 
+**Nov 26, 2026 · 10 min read**
+
+### [Prefill on Packed Weights: Decode Once, Multiply in 8x8 Blocks](2026-11-26-packed-prefill-simdgroup-matrices.md)
+
+Why a decode-tuned packed-weight kernel stalls on prompts, a register cliff in
+`simdgroup_matrix` products, and the kernel that cut a 3,725-token prompt's
+time to first token on Inkling-2-Mini from 17.8 s to 9.7 s.
+
+---
+
 ## Reading paths
 
 - **New to LLM inference:** 2, 5, 3, 6, 8, 11.
-- **Apple Silicon and MLX specifics:** 3, 4, 6, 9.
+- **Apple Silicon and MLX specifics:** 3, 4, 6, 9, 13.
 - **Running or operating MLX Air:** 1, 10, 11.
 
 ## Writing a post

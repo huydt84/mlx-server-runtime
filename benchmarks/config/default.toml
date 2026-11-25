@@ -382,3 +382,12 @@ trials = 2
 runtime_configurations = ["packed", "packed_drafter"]
 diagnostics = []
 coverage = { packed_small = ["interactive_stream_c1", "decode_128_c1", "mail_assistant_c1", "steady_short_c4"], packed_large = ["interactive_stream_c1", "decode_128_c1", "mail_assistant_c1", "steady_short_c4"] }
+
+# Long-prompt prefill on the 5.4 GB Inkling-2-Mini pack, with streaming and
+# decode rows to check that short steps keep their speed.
+[suites.packed_prefill]
+rounds = 2
+trials = 3
+runtime_configurations = ["packed"]
+diagnostics = []
+coverage = { packed_small = ["cold_prefill_2k_c1", "interactive_stream_c1", "decode_128_c1"] }

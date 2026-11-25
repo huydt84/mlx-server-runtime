@@ -1,6 +1,7 @@
 # 0011. Packed weight kernels
 
-- Status: Accepted
+- Status: Accepted; the bullets on steps of more than eight tokens are superseded
+  by [0014](0014-blocked-packed-products.md)
 - Date: 2026-11-25
 
 ## Context

@@ -1,0 +1,6 @@
+[transformers] You are using a model of type `inkling2_loop` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+native-mlx memory kv_pool=0.75GiB source=kv_cache_bytes utilization=0.5 working_set=17.76GiB weights=4.98GiB reserve=1.75GiB max_total_tokens_per_request=4480 drafter=none
+native-mlx tool_call_parser=inkling2
+[transformers] You are using a model of type `inkling2_loop` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+native-mlx memory kv_pool=0.75GiB source=kv_cache_bytes utilization=0.5 working_set=17.76GiB weights=4.98GiB reserve=1.75GiB max_total_tokens_per_request=4480 drafter=none
+native-mlx tool_call_parser=inkling2

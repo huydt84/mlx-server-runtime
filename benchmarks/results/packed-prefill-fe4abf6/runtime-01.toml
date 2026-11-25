@@ -1,0 +1,27 @@
+[server]
+host = "127.0.0.1"
+port = 59208
+
+[worker]
+python = "/private/tmp/claude-501/-Users-huydinhtrong--claude-spares-spare-NmHaOW/cb721205-6589-4cdf-b369-b09a911ef93f/scratchpad/bench/home-base/Library/Application Support/mlx-air/environments/benchmark/0.3.0/ff153408bf7916cfce76a0b9917ab53d8c84919c7c2aead5f5a8b39cdce39fac/bin/python3"
+module = "mlx_worker.main"
+backend = "native-mlx"
+model = "shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-5.4GB"
+ipc_path = "/tmp/mlx-air-501/benchmark-44972-dadd0a8e7d5b.sock"
+
+[generation]
+temperature = 0.0
+top_p = 1.0
+max_tokens = 128
+
+[limits]
+max_pending_requests = 8
+max_active_requests = 1
+max_prompt_tokens = 4352
+max_completion_tokens = 128
+max_total_tokens_per_request = 4480
+request_timeout_seconds = 300
+
+[telemetry]
+enable_prometheus = true
+metrics_path = "/metrics"

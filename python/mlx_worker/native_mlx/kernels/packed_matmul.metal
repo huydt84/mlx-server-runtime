@@ -6,6 +6,11 @@ namespace mlx_air {
 
 constexpr constant int PACKED_DESCRIPTOR = 8;
 constexpr constant int PACKED_MAX_TOKENS = 8;
+constexpr constant int PACKED_BLOCK = 8;
+constexpr constant int PACKED_TILE_ROWS = 16;
+constexpr constant int PACKED_TILE_COLUMNS = 32;
+constexpr constant int PACKED_TILE_WEIGHTS = PACKED_TILE_ROWS * PACKED_TILE_COLUMNS;
+constexpr constant int PACKED_SMALL_UNIT = 4;
 
 template <int LANES>
 inline float packed_sub_sum(float value) {
@@ -196,6 +201,134 @@ inline void packed_rows_multi(
   }
 }
 
+using PackedBlock = simdgroup_matrix<float, PACKED_BLOCK, PACKED_BLOCK>;
+
+inline uint packed_block_row(uint lane) {
+  return ((lane >> 4) & 1u) * 4u + ((lane >> 1) & 3u);
+}
+
+inline uint packed_block_column(uint lane) {
+  return ((lane >> 3) & 1u) * 4u + (lane & 1u) * 2u;
+}
+
+inline thread float2& packed_block_share(thread PackedBlock& block) {
+  return reinterpret_cast<thread float2&>(block.thread_elements());
+}
+
+template <int FORMAT, int N>
+inline void packed_decode_tile(
+    const thread PackedGroup& g,
+    uint first_row,
+    uint first_chunk,
+    threadgroup const half* lut,
+    threadgroup PackedWeight<FORMAT>* tile,
+    uint lane) {
+  constexpr uint ROWS = PACKED_TILE_ROWS;
+  const uint row = min(first_row + lane % ROWS, g.rows - 1u);
+  const uint chunk = first_chunk + lane / ROWS;
+  vec<PackedWeight<FORMAT>, 4> w[4];
+  packed_decode_chunk<FORMAT, N>(g, row, chunk, lut, w);
+  const PackedWeight<FORMAT> scale =
+      PackedWeight<FORMAT>(packed_chunk_scale<FORMAT, N>(g, row, chunk));
+  threadgroup PackedWeight<FORMAT>* target =
+      tile + (lane / ROWS) * uint(PACKED_CHUNK) * ROWS + lane % ROWS;
+#pragma unroll
+  for (uint c = 0; c < uint(PACKED_CHUNK); c++) {
+    const PackedWeight<FORMAT> weight = w[c >> 2][c & 3];
+    target[c * ROWS] = FORMAT == PACKED_NVFP4 ? weight * scale : weight;
+  }
+}
+
+template <
+    int FORMAT,
+    int N,
+    int SIMDGROUPS,
+    int TOKEN_BLOCKS,
+    typename X,
+    typename Y>
+inline void packed_rows_blocked(
+    const thread PackedGroup& g,
+    const device X* x,
+    const thread uint* x_rows,
+    device Y* y,
+    const thread uint* y_offsets,
+    uint count,
+    threadgroup const half* lut,
+    threadgroup float* tiles,
+    uint simd,
+    uint lane) {
+  using W = PackedWeight<FORMAT>;
+  constexpr uint ROWS = PACKED_TILE_ROWS;
+  constexpr uint ROW_BLOCKS = PACKED_TILE_ROWS / PACKED_BLOCK;
+  constexpr uint COLUMN_BLOCKS = PACKED_TILE_COLUMNS / PACKED_BLOCK;
+  constexpr uint TILE_CHUNKS = PACKED_TILE_COLUMNS / PACKED_CHUNK;
+  threadgroup W* tile =
+      reinterpret_cast<threadgroup W*>(tiles + simd * uint(PACKED_TILE_WEIGHTS));
+  const uint block_row = packed_block_row(lane);
+  const uint block_column = packed_block_column(lane);
+  const device vec<X, 2>* inputs[TOKEN_BLOCKS];
+#pragma unroll
+  for (int t = 0; t < TOKEN_BLOCKS; t++) {
+    inputs[t] = reinterpret_cast<const device vec<X, 2>*>(
+        x + ulong(x_rows[t]) * N + block_column);
+  }
+  for (uint first = simd * ROWS; first < g.rows; first += SIMDGROUPS * ROWS) {
+    PackedBlock acc[TOKEN_BLOCKS][ROW_BLOCKS];
+#pragma unroll
+    for (int t = 0; t < TOKEN_BLOCKS; t++) {
+#pragma unroll
+      for (uint r = 0; r < ROW_BLOCKS; r++) {
+        acc[t][r] = PackedBlock(0.0f);
+      }
+    }
+    for (uint chunk = 0; chunk < uint(N / PACKED_CHUNK); chunk += TILE_CHUNKS) {
+      packed_decode_tile<FORMAT, N>(g, first, chunk, lut, tile, lane);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+      for (uint c = 0; c < COLUMN_BLOCKS; c++) {
+        const uint column = c * uint(PACKED_BLOCK);
+        PackedBlock weights[ROW_BLOCKS];
+#pragma unroll
+        for (uint r = 0; r < ROW_BLOCKS; r++) {
+          const uint row = r * uint(PACKED_BLOCK) + block_column;
+          packed_block_share(weights[r]) = float2(
+              *reinterpret_cast<threadgroup const vec<W, 2>*>(
+                  tile + (column + block_row) * ROWS + row));
+        }
+#pragma unroll
+        for (int t = 0; t < TOKEN_BLOCKS; t++) {
+          PackedBlock input;
+          packed_block_share(input) =
+              float2(inputs[t][(chunk * uint(PACKED_CHUNK) + column) / 2u]);
+#pragma unroll
+          for (uint r = 0; r < ROW_BLOCKS; r++) {
+            simdgroup_multiply_accumulate(acc[t][r], input, weights[r], acc[t][r]);
+          }
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#pragma unroll
+    for (int t = 0; t < TOKEN_BLOCKS; t++) {
+      if (uint(t * PACKED_BLOCK) + block_row >= count) {
+        continue;
+      }
+#pragma unroll
+      for (uint r = 0; r < ROW_BLOCKS; r++) {
+        const float2 totals = packed_block_share(acc[t][r]);
+#pragma unroll
+        for (uint i = 0; i < 2; i++) {
+          const uint row = first + r * uint(PACKED_BLOCK) + block_column + i;
+          if (row < g.rows) {
+            y[ulong(y_offsets[t]) + row] =
+                Y(totals[i] * packed_row_scale<FORMAT>(g, row));
+          }
+        }
+      }
+    }
+  }
+}
+
 template <int FORMAT, int SIMDGROUPS>
 inline void packed_load_table(
     const device half* luts,
@@ -235,12 +368,33 @@ inline void packed_run_group(
     const thread uint* y_offsets,
     uint count,
     threadgroup half* lut,
+    threadgroup float* tiles,
     uint simd,
     uint lane) {
   packed_load_table<FORMAT, SIMDGROUPS>(luts, levels, lut, simd * 32 + lane);
   if (MAX_TOKENS == 1 || count == 1u) {
     packed_rows_single<FORMAT, N, LANES, SIMDGROUPS>(
         g, x + ulong(x_rows[0]) * N, y + y_offsets[0], lut, simd, lane);
+  } else if constexpr (MAX_TOKENS > PACKED_MAX_TOKENS) {
+    if (count == 2u) {
+      packed_rows_multi<FORMAT, N, LANES, SIMDGROUPS, 2>(
+          g, x, x_rows, y, y_offsets, lut, simd, lane);
+    } else if (count <= uint(PACKED_SMALL_UNIT)) {
+      packed_rows_multi<FORMAT, N, LANES, SIMDGROUPS, PACKED_SMALL_UNIT>(
+          g, x, x_rows, y, y_offsets, lut, simd, lane);
+    } else if (count <= 8u) {
+      packed_rows_blocked<FORMAT, N, SIMDGROUPS, 1>(
+          g, x, x_rows, y, y_offsets, count, lut, tiles, simd, lane);
+    } else if (count <= 16u) {
+      packed_rows_blocked<FORMAT, N, SIMDGROUPS, 2>(
+          g, x, x_rows, y, y_offsets, count, lut, tiles, simd, lane);
+    } else if (count <= 24u) {
+      packed_rows_blocked<FORMAT, N, SIMDGROUPS, 3>(
+          g, x, x_rows, y, y_offsets, count, lut, tiles, simd, lane);
+    } else {
+      packed_rows_blocked<FORMAT, N, SIMDGROUPS, 4>(
+          g, x, x_rows, y, y_offsets, count, lut, tiles, simd, lane);
+    }
   } else if (MAX_TOKENS < PACKED_MAX_TOKENS) {
     packed_rows_multi<FORMAT, N, LANES, SIMDGROUPS, MAX_TOKENS>(
         g, x, x_rows, y, y_offsets, lut, simd, lane);
@@ -260,7 +414,8 @@ inline void packed_run_group(
   case FORMAT:                                                                \
     if ((FORMATS & (1 << FORMAT)) != 0) {                                     \
       packed_run_group<FORMAT, N, LANES, SIMDGROUPS, MAX_TOKENS>(             \
-          g, luts, levels, x, x_rows, y, y_offsets, count, lut, simd, lane);  \
+          g, luts, levels, x, x_rows, y, y_offsets, count, lut, tiles, simd,  \
+          lane);                                                              \
     }                                                                         \
     break;
 
@@ -282,6 +437,7 @@ inline void packed_dispatch(
     const thread uint* y_offsets,
     uint count,
     threadgroup half* lut,
+    threadgroup float* tiles,
     uint simd,
     uint lane) {
   const PackedGroup g = packed_group(blob, descriptor);
@@ -303,6 +459,13 @@ inline void packed_dispatch(
 }
 
 #undef MLX_AIR_PACKED_CASE
+
+inline uint packed_unit_member(uint count, uint entry, uint lane) {
+  const uint member = count <= uint(PACKED_SMALL_UNIT)
+      ? entry
+      : entry * uint(PACKED_BLOCK) + packed_block_row(lane);
+  return min(member, count - 1u);
+}
 
 template <
     int FORMATS,
@@ -337,7 +500,18 @@ inline void packed_dense_matmul(
     y_offsets[t] = token * total_rows + descriptor[5];
   }
   packed_dispatch<FORMATS, N, LANES, SIMDGROUPS, MAX_TOKENS>(
-      blob, luts, descriptor, x, x_rows, y, y_offsets, count, lut, simd, lane);
+      blob,
+      luts,
+      descriptor,
+      x,
+      x_rows,
+      y,
+      y_offsets,
+      count,
+      lut,
+      static_cast<threadgroup float*>(nullptr),
+      simd,
+      lane);
 }
 
 template <
@@ -395,7 +569,110 @@ inline void packed_expert_matmul(
     y_offsets[t] = slot * expert_rows + descriptor[5];
   }
   packed_dispatch<FORMATS, N, LANES, SIMDGROUPS, MAX_TOKENS>(
-      blob, luts, descriptor, x, x_rows, y, y_offsets, count, lut, simd, lane);
+      blob,
+      luts,
+      descriptor,
+      x,
+      x_rows,
+      y,
+      y_offsets,
+      count,
+      lut,
+      static_cast<threadgroup float*>(nullptr),
+      simd,
+      lane);
+}
+
+template <
+    int FORMATS,
+    int N,
+    int LANES,
+    int SIMDGROUPS,
+    int MAX_TOKENS,
+    typename X,
+    typename Y,
+    typename Meta>
+inline void packed_dense_blocks(
+    const device uint* blob,
+    const device half* luts,
+    const device uint* descriptors,
+    const device X* x,
+    Meta meta,
+    device Y* y,
+    threadgroup half* lut,
+    threadgroup float* tiles,
+    uint2 group,
+    uint simd,
+    uint lane) {
+  const uint tokens = meta[0];
+  const uint total_rows = meta[1];
+  const device uint* descriptor = descriptors + group.y * PACKED_DESCRIPTOR;
+  const uint first_token = group.x * MAX_TOKENS;
+  const uint count = min(uint(MAX_TOKENS), tokens - first_token);
+  uint x_rows[MAX_TOKENS / PACKED_BLOCK];
+  uint y_offsets[MAX_TOKENS / PACKED_BLOCK];
+#pragma unroll
+  for (uint i = 0; i < uint(MAX_TOKENS / PACKED_BLOCK); i++) {
+    const uint token = first_token + packed_unit_member(count, i, lane);
+    x_rows[i] = descriptor[6] * tokens + token;
+    y_offsets[i] = token * total_rows + descriptor[5];
+  }
+  packed_dispatch<FORMATS, N, LANES, SIMDGROUPS, MAX_TOKENS>(
+      blob, luts, descriptor, x, x_rows, y, y_offsets, count, lut, tiles, simd, lane);
+}
+
+template <
+    int FORMATS,
+    int N,
+    int LANES,
+    int SIMDGROUPS,
+    int MAX_TOKENS,
+    typename X,
+    typename Y,
+    typename Experts,
+    typename Order,
+    typename Units,
+    typename Meta>
+inline void packed_expert_blocks(
+    const device uint* blob,
+    const device half* luts,
+    const device uint* descriptors,
+    const device X* x,
+    Experts experts,
+    Order order,
+    Units units,
+    uint unit_count,
+    Meta meta,
+    device Y* y,
+    threadgroup half* lut,
+    threadgroup float* tiles,
+    uint2 group,
+    uint simd,
+    uint lane) {
+  const uint slots = meta[0];
+  const uint expert_rows = meta[1];
+  const uint groups = meta[2];
+  const uint x_div = meta[3];
+  const uint start = units[group.x];
+  if (start >= slots) {
+    return;
+  }
+  const uint end = group.x + 1u < unit_count ? units[group.x + 1u] : slots;
+  const uint count = end - start;
+  const uint expert = experts[order[start]];
+  const device uint* descriptor =
+      descriptors + (expert * groups + group.y) * PACKED_DESCRIPTOR;
+  const uint first_row = descriptor[6] * (slots / x_div);
+  uint x_rows[MAX_TOKENS / PACKED_BLOCK];
+  uint y_offsets[MAX_TOKENS / PACKED_BLOCK];
+#pragma unroll
+  for (uint i = 0; i < uint(MAX_TOKENS / PACKED_BLOCK); i++) {
+    const uint slot = order[start + packed_unit_member(count, i, lane)];
+    x_rows[i] = slot / x_div + first_row;
+    y_offsets[i] = slot * expert_rows + descriptor[5];
+  }
+  packed_dispatch<FORMATS, N, LANES, SIMDGROUPS, MAX_TOKENS>(
+      blob, luts, descriptor, x, x_rows, y, y_offsets, count, lut, tiles, simd, lane);
 }
 
 template <int FORMAT, int N, int SIMDGROUPS>
@@ -480,20 +757,6 @@ inline void packed_row_lookup(
       y + ulong(index) * N,
       lut,
       tid);
-}
-
-template <int FORMATS, int N, int SIMDGROUPS>
-inline void packed_decode_bank(
-    const device uint* blob,
-    const device half* luts,
-    const device uint* descriptors,
-    device float* y,
-    threadgroup half* lut,
-    uint index,
-    uint tid) {
-  const device uint* descriptor = descriptors + index * PACKED_DESCRIPTOR;
-  packed_decode<FORMATS, N, SIMDGROUPS>(
-      blob, luts, descriptor, 0, descriptor[4], y + ulong(descriptor[5]) * N, lut, tid);
 }
 
 #undef MLX_AIR_PACKED_ROW_CASE

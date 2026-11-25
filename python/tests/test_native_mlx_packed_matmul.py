@@ -6,7 +6,6 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mlx_worker.native_mlx import packed_matmul
 from mlx_worker.native_mlx.packed_matmul import (
     FORMAT_IDS,
     PackedBank,
@@ -42,7 +41,7 @@ def _close(actual: mx.array, expected: np.ndarray) -> None:
 
 
 @pytest.mark.parametrize("fmt", sorted(FORMAT_IDS))
-@pytest.mark.parametrize("tokens", [1, 2, 3, 8, 11])
+@pytest.mark.parametrize("tokens", [1, 2, 3, 8, 9, 20, 32, 33, 34, 35, 36, 40, 60])
 def test_dense_bank_multiplies_decoded_rows(fmt: str, tokens: int) -> None:
     rng = np.random.default_rng(FORMAT_IDS[fmt])
     tables = random_tables(rng)
@@ -56,8 +55,7 @@ def test_dense_bank_multiplies_decoded_rows(fmt: str, tokens: int) -> None:
 
 
 @pytest.mark.parametrize("tokens", [1, 5, 40])
-def test_dense_bank_mixes_formats_and_inputs(monkeypatch, tokens: int) -> None:
-    monkeypatch.setattr(packed_matmul, "_DECODE_TOKENS", 40)
+def test_dense_bank_mixes_formats_and_inputs(tokens: int) -> None:
     rng = np.random.default_rng(3)
     tables = random_tables(rng)
     specs = [("rtr4", 64, 0), ("ht3", 32, 1), ("lm6", 130, 1), ("rtr1", 16, 0)]
@@ -175,7 +173,7 @@ def _expert_bank(
     ("formats", "groups"),
     [(["ht1", "ht2", "rtr1"], 1), (["nvfp4", "ht3"], 1), (["ht2", "rtr2", "rtr3"], 2)],
 )
-@pytest.mark.parametrize("tokens", [1, 4, 30])
+@pytest.mark.parametrize("tokens", [1, 4, 9, 30, 120])
 def test_expert_bank_multiplies_each_slot_with_its_expert(
     formats: list[str], groups: int, tokens: int
 ) -> None:
@@ -200,15 +198,15 @@ def test_expert_bank_multiplies_each_slot_with_its_expert(
     _close(actual, np.stack(expected))
 
 
-def test_plan_puts_at_most_eight_slots_of_one_expert_in_a_unit() -> None:
-    experts = mx.array([5] * 19 + [2] * 3 + [7], dtype=mx.uint32)
+def test_plan_puts_at_most_32_slots_of_one_expert_in_a_unit() -> None:
+    experts = mx.array([5] * 70 + [2] * 3 + [7], dtype=mx.uint32)
 
-    plan = plan_experts(experts, 8, 19)
+    plan = plan_experts(experts, 8, 70)
 
     ordered = np.array(experts)[np.array(plan.order)]
-    starts = [int(start) for start in np.array(plan.units) if start < 23]
-    assert ordered.tolist() == [2] * 3 + [5] * 19 + [7]
-    assert starts == [0, 3, 11, 19, 22]
+    starts = [int(start) for start in np.array(plan.units) if start < 74]
+    assert ordered.tolist() == [2] * 3 + [5] * 70 + [7]
+    assert starts == [0, 3, 35, 67, 73]
     assert plan.unit_count >= len(starts)
 
 
@@ -266,9 +264,9 @@ def test_bank_rejects_a_missing_expert_block() -> None:
 def test_tables_and_widths_are_validated() -> None:
     with pytest.raises(ValueError, match="must have shape"):
         build_trellis_luts({"ht1": mx.zeros((4, 4))})
-    with pytest.raises(ValueError, match="multiple of 16"):
+    with pytest.raises(ValueError, match="multiple of 32"):
         lanes_for(40)
-    assert [lanes_for(width) for width in (16, 48, 2304, 3072)] == [1, 1, 16, 16]
+    assert [lanes_for(width) for width in (32, 96, 1152, 2304)] == [2, 2, 8, 16]
 
 
 @pytest.mark.parametrize("width", [32, 64, 96, 1152, 2304, 3072])

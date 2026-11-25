@@ -11,8 +11,9 @@ the launches of a 48-visit forward, so a :class:`PackedBank` concatenates all
 row groups that share an input width into one buffer and describes each group
 with a small descriptor. One launch then covers all formats of the bank.
 
-Weights are never expanded: the kernel decodes 16 columns at a time while it
-multiplies. The bit layouts follow the reference runtime published with the
+Weights are never expanded: the kernels decode 16 columns of a row at a time
+while they multiply. Steps of more than eight tokens multiply up to 32 inputs
+with each decoded tile as 8x8 blocks. The bit layouts follow the reference runtime published with the
 packs (lookatmyquant, MIT License, Copyright (c) 2026 Shin Megami Boson).
 """
 
@@ -71,7 +72,8 @@ _SIMDGROUPS = 8
 _SIMD_WIDTH = 32
 _CHUNK = 16
 _MAX_TOKENS = 8
-_DECODE_TOKENS = 128
+_BLOCKED_TOKENS = 32
+_BLOCKED_COLUMNS = 32
 
 _DENSE_SOURCE = """
     threadgroup half lut[mlx_air::PACKED_LUT_HALVES];
@@ -96,11 +98,22 @@ _ROWS_SOURCE = """
         threadgroup_position_in_grid.x, thread_position_in_threadgroup.x);
 """
 
-_DECODE_SOURCE = """
+_DENSE_BLOCKS_SOURCE = """
     threadgroup half lut[mlx_air::PACKED_LUT_HALVES];
-    mlx_air::packed_decode_bank<FORMATS, N, SIMDGROUPS>(
-        blob, luts, descriptors, y, lut,
-        threadgroup_position_in_grid.x, thread_position_in_threadgroup.x);
+    threadgroup float tiles[SIMDGROUPS * mlx_air::PACKED_TILE_WEIGHTS];
+    mlx_air::packed_dense_blocks<FORMATS, N, LANES, SIMDGROUPS, MAX_TOKENS>(
+        blob, luts, descriptors, x, meta, y, lut, tiles,
+        threadgroup_position_in_grid.xy, simdgroup_index_in_threadgroup,
+        thread_index_in_simdgroup);
+"""
+
+_EXPERT_BLOCKS_SOURCE = """
+    threadgroup half lut[mlx_air::PACKED_LUT_HALVES];
+    threadgroup float tiles[SIMDGROUPS * mlx_air::PACKED_TILE_WEIGHTS];
+    mlx_air::packed_expert_blocks<FORMATS, N, LANES, SIMDGROUPS, MAX_TOKENS>(
+        blob, luts, descriptors, x, experts, order, units, units_shape[0], meta,
+        y, lut, tiles, threadgroup_position_in_grid.xy,
+        simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """
 
 _PLAN_SOURCE = """
@@ -131,32 +144,21 @@ def _rows_kernel() -> Any:
     )
 
 
-@lru_cache(maxsize=1)
-def _decode_kernel() -> Any:
+@lru_cache(maxsize=2)
+def _dense_kernel(blocked: bool) -> Any:
     return mx.fast.metal_kernel(
-        name="native_packed_decode_bank",
-        input_names=["blob", "luts", "descriptors"],
-        output_names=["y"],
-        source=_DECODE_SOURCE,
-        header=metal_header("packed_matmul.metal"),
-    )
-
-
-@lru_cache(maxsize=1)
-def _dense_kernel() -> Any:
-    return mx.fast.metal_kernel(
-        name="native_packed_dense_matmul",
+        name="native_packed_dense_" + ("blocks" if blocked else "matmul"),
         input_names=["blob", "luts", "descriptors", "x", "meta"],
         output_names=["y"],
-        source=_DENSE_SOURCE,
+        source=_DENSE_BLOCKS_SOURCE if blocked else _DENSE_SOURCE,
         header=metal_header("packed_matmul.metal"),
     )
 
 
-@lru_cache(maxsize=1)
-def _expert_kernel() -> Any:
+@lru_cache(maxsize=2)
+def _expert_kernel(blocked: bool) -> Any:
     return mx.fast.metal_kernel(
-        name="native_packed_expert_matmul",
+        name="native_packed_expert_" + ("blocks" if blocked else "matmul"),
         input_names=[
             "blob",
             "luts",
@@ -168,7 +170,7 @@ def _expert_kernel() -> Any:
             "meta",
         ],
         output_names=["y"],
-        source=_EXPERT_SOURCE,
+        source=_EXPERT_BLOCKS_SOURCE if blocked else _EXPERT_SOURCE,
         header=metal_header("packed_matmul.metal"),
     )
 
@@ -243,12 +245,12 @@ def lanes_for(input_width: int) -> int:
     """Return the sub-warp width whose lanes evenly cover one row.
 
     Raises:
-        ValueError: If the width is not a multiple of one 16-column chunk.
+        ValueError: If the width does not hold whole 32-column tiles.
     """
 
-    if input_width <= 0 or input_width % _CHUNK:
+    if input_width <= 0 or input_width % _BLOCKED_COLUMNS:
         raise ValueError(
-            f"packed input width {input_width} must be a multiple of {_CHUNK}"
+            f"packed input width {input_width} must be a multiple of {_BLOCKED_COLUMNS}"
         )
     chunks = input_width // _CHUNK
     lanes = 16
@@ -291,7 +293,6 @@ class PackedBank:
         self.format_mask = 0
         placed: dict[int, list[tuple[int, ...]]] = {}
         dense: list[tuple[int, ...]] = []
-        ranges: list[tuple[int, int, int]] = []
         self.output_rows = 0
         for matrix in matrices:
             blocks = self._place(matrix)
@@ -302,9 +303,6 @@ class PackedBank:
                     base = matrix.output_row + block_index * matrix.rows
                     dense.extend(self._split(block, base, matrix.input_index))
                     self.output_rows = max(self.output_rows, base + matrix.rows)
-                first = matrix.output_row
-                last = first + len(blocks) * matrix.rows
-                ranges.append((first, last, matrix.input_index))
             else:
                 if fid in placed:
                     raise ValueError(f"expert bank repeats format {matrix.fmt!r}")
@@ -318,7 +316,6 @@ class PackedBank:
                 placed, expert_groups
             )
             self.experts = len(expert_groups)
-        self._ranges = _input_ranges(ranges)
         self.whole_groups = all(
             entry[5] == index * ROWS_PER_GROUP for index, entry in enumerate(dense)
         )
@@ -462,11 +459,10 @@ class PackedBank:
         """
 
         tokens = int(x.shape[1])
-        if tokens >= _DECODE_TOKENS:
-            return self._dense_decoded(x)
-        max_tokens = min(tokens, _MAX_TOKENS)
-        blocks = (tokens + max_tokens - 1) // max_tokens
-        return _dense_kernel()(
+        blocked = tokens > _MAX_TOKENS
+        max_tokens = _BLOCKED_TOKENS if blocked else tokens
+        units = (tokens + max_tokens - 1) // max_tokens
+        return _dense_kernel(blocked)(
             inputs=[
                 self.blob,
                 self.luts,
@@ -475,30 +471,11 @@ class PackedBank:
                 _meta(tokens, self.output_rows, 0, 0),
             ],
             template=self._template(max_tokens),
-            grid=(blocks * _SIMDGROUPS * _SIMD_WIDTH, self.groups, 1),
+            grid=(units * _SIMDGROUPS * _SIMD_WIDTH, self.groups, 1),
             threadgroup=(_SIMDGROUPS * _SIMD_WIDTH, 1, 1),
             output_shapes=[(tokens, self.output_rows)],
             output_dtypes=[mx.float32],
         )[0]
-
-    def _dense_decoded(self, x: mx.array) -> mx.array:
-        weights = _decode_kernel()(
-            inputs=[self.blob, self.luts, self.descriptors],
-            template=[
-                ("FORMATS", self.format_mask),
-                ("N", self.input_width),
-                ("SIMDGROUPS", _SIMDGROUPS),
-            ],
-            grid=(self.groups * _SIMDGROUPS * _SIMD_WIDTH, 1, 1),
-            threadgroup=(_SIMDGROUPS * _SIMD_WIDTH, 1, 1),
-            output_shapes=[(self.output_rows, self.input_width)],
-            output_dtypes=[mx.float32],
-        )[0]
-        products = [
-            x[index].astype(mx.float32) @ weights[first:last].T
-            for first, last, index in self._ranges
-        ]
-        return mx.concatenate(products, axis=1)
 
     def rows(self, rows: mx.array) -> mx.array:
         """Decode individual rows of a dense bank.
@@ -553,7 +530,7 @@ class PackedBank:
         """
 
         slots = int(experts.shape[0])
-        return _expert_kernel()(
+        return _expert_kernel(plan.max_tokens > _MAX_TOKENS)(
             inputs=[
                 self.blob,
                 self.luts,
@@ -600,7 +577,10 @@ class ExpertPlan:
 
 
 def plan_experts(experts: mx.array, num_experts: int, tokens: int) -> ExpertPlan:
-    """Group slots that use the same expert into units of at most eight.
+    """Group slots that use the same expert into units.
+
+    A unit holds at most eight slots when the step has at most eight tokens, and
+    at most 32 otherwise.
 
     Args:
         experts: ``(slots,)`` uint32 expert per slot.
@@ -628,10 +608,11 @@ def plan_experts(experts: mx.array, num_experts: int, tokens: int) -> ExpertPlan
     positions = mx.arange(slots, dtype=mx.uint32)
     first = mx.concatenate([mx.array([True]), ordered[1:] != ordered[:-1]])
     run_start = mx.cummax(mx.where(first, positions, mx.array(0, dtype=mx.uint32)))
-    leads = (positions - run_start) % _MAX_TOKENS == 0
+    leads = (positions - run_start) % _BLOCKED_TOKENS == 0
     starts = mx.where(leads, positions, mx.array(slots, dtype=mx.uint32))
-    unit_count = min(slots, slots // _MAX_TOKENS + num_experts)
-    return ExpertPlan(order, mx.sort(starts)[:unit_count], unit_count, _MAX_TOKENS)
+    unit_count = min(slots, slots // _BLOCKED_TOKENS + num_experts)
+    units = mx.sort(starts)[:unit_count]
+    return ExpertPlan(order, units, unit_count, _BLOCKED_TOKENS)
 
 
 _NO_PLAN: dict[int, ExpertPlan] = {}
@@ -646,24 +627,6 @@ def single_token_plan(slots: int) -> ExpertPlan:
         plan = ExpertPlan(empty, empty, slots, 1)
         _NO_PLAN[slots] = plan
     return plan
-
-
-def _input_ranges(
-    matrices: Sequence[tuple[int, int, int]],
-) -> tuple[tuple[int, int, int], ...]:
-    """Merge adjacent row ranges that multiply the same input.
-
-    Returns:
-        ``(first row, end row, input index)`` in row order.
-    """
-
-    merged: list[tuple[int, int, int]] = []
-    for first, last, index in sorted(matrices):
-        if merged and merged[-1][1] == first and merged[-1][2] == index:
-            merged[-1] = (merged[-1][0], last, index)
-        else:
-            merged.append((first, last, index))
-    return tuple(merged)
 
 
 def _float_bits(value: float) -> int:

@@ -120,19 +120,39 @@ struct SignedRotationTarget {
   void operator()(uint i, float value) const { y[i] = value * signs[i]; }
 };
 
+struct RotationStaged {
+  threadgroup const float* x;
+
+  float operator()(uint i) const { return x[i]; }
+};
+
 template <int INPUT, int A, int B, int SIMDGROUPS, bool RAW, typename X, typename Y>
 inline void rotate_input(
     const thread RotationSource<INPUT, A * B, X>& source,
     const device float* factor,
     device Y* y,
     device Y* raw,
+    threadgroup float* staged,
     uint matrix,
     uint simd,
     uint lane) {
-  rotate_vector<A, B, SIMDGROUPS>(source, factor, RotationTarget<Y>{y}, simd, lane);
-  if (RAW && matrix == 0) {
+  if constexpr (INPUT == ROTATE_SOFT) {
     for (uint i = simd * 32 + lane; i < uint(A * B); i += SIMDGROUPS * 32) {
-      raw[i] = Y(source.raw(i));
+      const float value = source.raw(i);
+      staged[i] = value * source.signs[i];
+      if (RAW && matrix == 0) {
+        raw[i] = Y(value);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    rotate_vector<A, B, SIMDGROUPS>(
+        RotationStaged{staged}, factor, RotationTarget<Y>{y}, simd, lane);
+  } else {
+    rotate_vector<A, B, SIMDGROUPS>(source, factor, RotationTarget<Y>{y}, simd, lane);
+    if (RAW && matrix == 0) {
+      for (uint i = simd * 32 + lane; i < uint(A * B); i += SIMDGROUPS * 32) {
+        raw[i] = Y(source.raw(i));
+      }
     }
   }
 }
