@@ -157,6 +157,12 @@ class _Session:
 
 @needs_metal
 def test_chunked_and_batched_steps_match_one_forward(model: Any) -> None:
+    """Chunked steps agree with one long step up to accumulation order.
+
+    The step shape decides whether an expert's slots use the per-lane loops or
+    the blocked products, which sum in a different order. Logits differ by up to
+    about 0.01 on an M4 Pro and 0.03 on CI runners, whose std is about 1.3.
+    """
     whole = _Session(model).step({"a": _PROMPT})["a"]
     assert whole.shape == (len(_PROMPT), inkling2_pack.OUTPUT)
     assert np.isfinite(whole).all() and whole.std() > 1e-3
@@ -168,7 +174,7 @@ def test_chunked_and_batched_steps_match_one_forward(model: Any) -> None:
         session.step({"a": _PROMPT[21:40], "c": (1,)})["a"],
         *(session.step({"a": (token,)})["a"] for token in _PROMPT[40:]),
     ]
-    np.testing.assert_allclose(np.concatenate(parts), whole, atol=2e-2)
+    np.testing.assert_allclose(np.concatenate(parts), whole, atol=5e-2)
 
 
 @needs_metal
