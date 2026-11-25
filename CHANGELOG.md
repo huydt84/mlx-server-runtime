@@ -6,6 +6,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
 ### Added
 
 - `scripts/check_comments.py`: a lint that bans code comments in tracked
@@ -34,7 +36,6 @@ and versions follow [Semantic Versioning](https://semver.org/).
   [#4](https://github.com/huydt84/mlx-server-runtime/issues/4)–[#10](https://github.com/huydt84/mlx-server-runtime/issues/10).
 - `AGENTS.md` and `CONTRIBUTING.md` document the comment ban and the ratchet
   check.
-
 - Packed Inkling-2-Mini steps of more than eight tokens multiply decoded weight
   tiles with up to 32 tokens as SIMD-group matrix products, and no longer
   expand dense weight banks in device memory. The soft-gated rotation computes
@@ -87,6 +88,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
   bounded.
 - Decode rows are never padded to a prefill chunk.
 
-[Unreleased]: https://github.com/huydt84/mlx-server-runtime/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/huydt84/mlx-server-runtime/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/huydt84/mlx-server-runtime/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/huydt84/mlx-server-runtime/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/huydt84/mlx-server-runtime/releases/tag/v0.2.0

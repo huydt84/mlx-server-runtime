@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-worker"
-version = "0.3.0"
+version = "0.4.0"
 description = "Python MLX worker bootstrap for the local runtime"
 requires-python = ">=3.12,<3.14"
 dependencies = [
