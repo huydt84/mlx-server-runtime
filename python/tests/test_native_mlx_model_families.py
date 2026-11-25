@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
+import pytest
+from mlx.utils import tree_flatten
 
+import mlx_worker.native_mlx.attention as native_attention
 from mlx_worker.native_mlx.attention import DenseReferenceAttentionBackend
 from mlx_worker.native_mlx.cache import (
     DenseKVCacheBackend,
@@ -13,9 +16,13 @@ from mlx_worker.native_mlx.cache import (
     KVCacheGeometry,
 )
 from mlx_worker.native_mlx.execution_backends import build_native_execution_backend
+from mlx_worker.native_mlx.executor import MlxGenerationExecutor
 from mlx_worker.native_mlx.interfaces import (
+    ExecutionBatch,
+    ExecutionRequest,
     ForwardBatch,
     ForwardMode,
+    SamplingParams,
     select_logits_positions,
 )
 from mlx_worker.native_mlx.models.gemma3 import (
@@ -27,6 +34,7 @@ from mlx_worker.native_mlx.models.lfm2 import (
     Lfm2MoeForCausalLM,
     parse_lfm2_config,
 )
+from mlx_worker.native_mlx.models.qwen2 import Qwen2ForCausalLM
 from mlx_worker.native_mlx.models.qwen3 import (
     Qwen3ForCausalLM,
     parse_qwen3_config,
@@ -186,6 +194,107 @@ def test_qwen3_and_gemma3_tiny_graphs_produce_logits() -> None:
         mx.eval(output)
         assert output.shape == (1, 3, 64)
         reservation.commit()
+
+
+@pytest.mark.parametrize(
+    ("architecture_class", "model_type"),
+    [
+        ("Qwen2ForCausalLM", "qwen2"),
+        ("Qwen3ForCausalLM", "qwen3"),
+        ("Gemma3ForCausalLM", "gemma3_text"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("config_dtype", "weight_dtype"),
+    [("bfloat16", mx.float16), ("float16", mx.bfloat16)],
+)
+def test_paged_decode_runs_when_config_dtype_differs_from_weights(
+    architecture_class: str,
+    model_type: str,
+    config_dtype: str,
+    weight_dtype: mx.Dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = get_architecture_spec(architecture_class)
+    config = spec.parse_config(
+        {
+            "architectures": [architecture_class],
+            "model_type": model_type,
+            "hidden_size": 64,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-6,
+            "sliding_window": 4,
+            "_sliding_window_pattern": 2,
+            "torch_dtype": config_dtype,
+        }
+    )
+    model_class = {
+        "Qwen2ForCausalLM": Qwen2ForCausalLM,
+        "Qwen3ForCausalLM": Qwen3ForCausalLM,
+        "Gemma3ForCausalLM": Gemma3ForCausalLM,
+    }[architecture_class]
+    weights = [
+        (name, value.astype(weight_dtype))
+        for name, value in tree_flatten(model_class(config).parameters())
+    ]
+    model = spec.create_model(config, weights)
+    config = getattr(model, "resolved_config", config)
+    bundle = build_native_execution_backend(
+        "native-metal-paged-sdpa",
+        spec.cache_geometry(config),
+        page_size=8,
+        cache_budget_bytes=1 << 20,
+        cache_family=spec.resolve.cache_family,
+    )
+    executor = MlxGenerationExecutor(
+        architecture_class=architecture_class,
+        model=model,
+        cache_backend=bundle.cache_backend,
+        attention_backend=bundle.attention_backend,
+    )
+    query_dtypes = []
+    paged_decode = native_attention.paged_decode_attention
+
+    def recording_paged_decode(queries, *args, **kwargs):
+        query_dtypes.append(queries.dtype)
+        return paged_decode(queries, *args, **kwargs)
+
+    monkeypatch.setattr(
+        native_attention, "paged_decode_attention", recording_paged_decode
+    )
+    handle = bundle.cache_backend.create("mixed")
+
+    def step(phase: str, token_ids: tuple[int, ...], start: int) -> int:
+        result = executor.execute_batch(
+            ExecutionBatch(
+                requests=(
+                    ExecutionRequest(
+                        request_id="mixed",
+                        phase=phase,  # type: ignore[arg-type]
+                        token_ids=token_ids,
+                        positions=tuple(range(start, start + len(token_ids))),
+                        cache_handle=handle,
+                        sampling=SamplingParams(),
+                    ),
+                )
+            )
+        )
+        token_id = result.results[0].next_token_id
+        assert token_id is not None
+        return token_id
+
+    token = step("prefill", (1, 2, 3), 0)
+    token = step("decode", (token,), 3)
+    step("decode", (token,), 4)
+
+    assert query_dtypes == [weight_dtype] * 4
+    assert bundle.cache_backend.length(handle) == 5
 
 
 def test_lfm2_tiny_graph_commits_hybrid_conv_state_and_length() -> None:
