@@ -16,6 +16,7 @@ from ..ipc import (
     SchedulerMetricsEvent,
     WorkerCommandError,
 )
+from ..streaming_text import RedecodingDetokenizer
 from ..tool_calling import (
     OutputDelta,
     ToolCallFormat,
@@ -44,8 +45,11 @@ class _StopTextAssembler:
     stop_sequences: tuple[str, ...]
     pending: str = ""
     emitted: str = ""
+    stopped: bool = False
 
     def push(self, text: str) -> tuple[str, bool]:
+        if self.stopped:
+            return "", True
         self.pending += text
         matches = [
             index
@@ -57,6 +61,7 @@ class _StopTextAssembler:
             chunk = self.pending[:index]
             self.emitted += chunk
             self.pending = ""
+            self.stopped = True
             return chunk, True
         hold = max((len(stop) - 1 for stop in self.stop_sequences), default=0)
         if len(self.pending) <= hold:
@@ -84,7 +89,6 @@ class _RuntimeState:
     enqueued_at: float
     completion_token_ids: list[int]
     detokenizer: Any | None = None
-    decoded_prefix: str = ""
     prefill_time_ms: int = 0
     decode_time_ms: int = 0
     prompt_batch_size: int | None = None
@@ -571,18 +575,10 @@ class NativeRuntime:
             self._finish(state, "stop", output, turn_ended=True)
             return
         detokenize_started_ns = time.perf_counter_ns()
-        if state.detokenizer is not None:
-            state.detokenizer.add_token(token_id)
-            delta = str(state.detokenizer.last_segment)
-        else:
-            text = str(
-                self._decode_target.decode(
-                    state.completion_token_ids,
-                    skip_special_tokens=False,
-                )
-            )
-            delta = text.removeprefix(state.decoded_prefix)
-            state.decoded_prefix = text
+        if state.detokenizer is None:
+            state.detokenizer = RedecodingDetokenizer(self._decode_target)
+        state.detokenizer.add_token(token_id)
+        delta = str(state.detokenizer.last_segment)
         emitted, stop_hit = state.stop.push(delta)
         if self._profiler is not None:
             self._profiler.record(

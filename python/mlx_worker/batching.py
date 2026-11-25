@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from .ipc import ChatCompletionRequest, ChatCompletionResponse
+from .streaming_text import next_delta
 from .tool_calling import OutputDelta, ToolOutputParser, request_error_code
 
 CacheMatchKind = Literal["exact", "shorter_prefix", "trimmed_longer_prefix"]
@@ -870,7 +871,7 @@ class ContinuousBatchScheduler:
         self._batch_generator_cls = batch_generator_cls
         return batch_generator_cls
 
-    def _emit_delta(self, job: _ScheduledRequest) -> None:
+    def _emit_delta(self, job: _ScheduledRequest, *, final: bool = False) -> None:
         if job.tool_text is not None:
             decoded = self._context.tokenizer.decode(job.generated_tokens)
             self._emit_tool_delta(job, job.tool_text.push(decoded))
@@ -880,12 +881,12 @@ class ContinuousBatchScheduler:
             return
 
         decoded = self._context.tokenizer.decode(job.generated_tokens)
-        delta = decoded.removeprefix(job.rendered_text)
+        delta = next_delta(decoded, job.rendered_text, final=final)
         if delta:
             self._sink.emit_delta(job.request.request_id, delta)
             if job.timing.first_token_at is None:
                 job.timing.first_token_at = time.perf_counter()
-        job.rendered_text = decoded
+        job.rendered_text += delta
 
     def _emit_tool_delta(self, job: _ScheduledRequest, delta: OutputDelta) -> None:
         if not delta:
@@ -927,6 +928,8 @@ class ContinuousBatchScheduler:
                 job.timing.first_token_at = now
                 if job.timing.decode_started_at is None:
                     job.timing.decode_started_at = now
+        else:
+            self._emit_delta(job, final=True)
 
         if prompt_cache is not None:
             cached_prefix_tokens = (

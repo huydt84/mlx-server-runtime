@@ -33,6 +33,7 @@ from .ipc import (
     ImageContent,
     TextContent,
 )
+from .streaming_text import next_delta
 
 
 def _make_sampler(temp: float, top_p: float) -> Callable[[Any], Any]:
@@ -1193,10 +1194,13 @@ class VlmContinuousBatchScheduler:
             token = getattr(response, "token", None)
             if token is not None:
                 job.generated_tokens.append(int(token))
+            finish_reason = getattr(response, "finish_reason", None)
             tokenizer = getattr(self._engine.processor, "tokenizer", None)
             if tokenizer is not None and job.generated_tokens:
                 decoded = tokenizer.decode(job.generated_tokens)
-                delta_text = decoded.removeprefix(job.rendered_text)
+                delta_text = next_delta(
+                    decoded, job.rendered_text, final=finish_reason is not None
+                )
             else:
                 delta_text = getattr(response, "text", "") or ""
             if delta_text:
@@ -1206,7 +1210,6 @@ class VlmContinuousBatchScheduler:
                     job.timing.first_token_at = time.perf_counter()
                 job.rendered_text += delta_text
 
-            finish_reason = getattr(response, "finish_reason", None)
             if finish_reason is None:
                 continue
 
@@ -1509,10 +1512,11 @@ class VlmContinuousBatchScheduler:
         finish_reason: str,
     ) -> None:
         tokenizer = getattr(self._engine.processor, "tokenizer", None)
-        if tokenizer is not None and job.generated_tokens:
-            job.rendered_text = tokenizer.decode(job.generated_tokens)
-        elif not job.stream:
-            job.rendered_text = job.rendered_text or getattr(response, "text", "")
+        if not job.stream:
+            if tokenizer is not None and job.generated_tokens:
+                job.rendered_text = tokenizer.decode(job.generated_tokens)
+            else:
+                job.rendered_text = job.rendered_text or getattr(response, "text", "")
         if job.generated_tokens and job.timing.first_token_at is None:
             now = time.perf_counter()
             job.timing.first_token_at = now
